@@ -1,0 +1,20 @@
+[project]
+name = "vrcwscrape"
+version = "0.1.0"
+description = "maintain a copy of the vrchat worlds metadata database"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "logfire>=3.21.1",
+    "mysql-connector-python>=9.3.0",
+    "pydantic>=2.11.7",
+    "python-dotenv>=1.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.12.0",
+]
