@@ -1,0 +1,17 @@
+{
+  "id": "wrld_test123",
+  "name": "Test World",
+  "description": "A test world for unit testing",
+  "authorId": "usr_test",
+  "capacity": 16,
+  "favorites": 100,
+  "heat": 5,
+  "popularity": 3,
+  "occupants": 2,
+  "privateOccupants": 1,
+  "publicOccupants": 1,
+  "visits": 1000,
+  "created_at": "2024-01-01T00:00:00.000Z",
+  "updated_at": "2024-01-01T12:00:00.000Z",
+  "tags": ["system_approved", "content_sex"]
+}

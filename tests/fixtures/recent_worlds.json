@@ -1,0 +1,11 @@
+[
+  {
+    "id": "wrld_test123",
+    "name": "Test World",
+    "authorId": "usr_test",
+    "authorName": "Test Author",
+    "imageUrl": "https://api.vrchat.cloud/api/1/file/file_test/1/file",
+    "thumbnailImageUrl": "https://api.vrchat.cloud/api/1/file/file_test_thumb/1/file",
+    "updated_at": "2024-01-01T12:00:00.000Z"
+  }
+]

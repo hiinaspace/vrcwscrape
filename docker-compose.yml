@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  dolt:
+    image: dolthub/dolt-sql-server:latest
+    ports:
+      - "13306:3306"
+    environment:
+      - DOLT_ROOT_PATH=/var/lib/dolt
+    volumes:
+      - dolt_data:/var/lib/dolt
+    command: ["dolt", "sql-server", "--host", "0.0.0.0", "--port", "3306"]
+
+volumes:
+  dolt_data:
