@@ -87,7 +87,9 @@ class FileImageDownloader:
             headers={"Cookie": f"auth={auth_cookie}"},
         )
 
-    async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
+    async def download_image(
+        self, file_id: str, download_url: str, expected_md5: str
+    ) -> Tuple[bool, str, int, str]:
         """Download and verify an image file.
 
         Args:
@@ -117,11 +119,18 @@ class FileImageDownloader:
 
             # Verify MD5 hash
             if not self._verify_md5(content, expected_md5):
-                return False, str(image_path), actual_size, "MD5 hash verification failed"
+                return (
+                    False,
+                    str(image_path),
+                    actual_size,
+                    "MD5 hash verification failed",
+                )
 
             # Write verified content to disk
             image_path.write_bytes(content)
-            logger.debug(f"Successfully downloaded and verified image {file_id} ({actual_size} bytes)")
+            logger.debug(
+                f"Successfully downloaded and verified image {file_id} ({actual_size} bytes)"
+            )
 
             return True, str(image_path), actual_size, ""
 

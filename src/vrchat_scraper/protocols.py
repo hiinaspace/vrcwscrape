@@ -24,7 +24,9 @@ class VRChatAPIClient(Protocol):
 class ImageDownloader(Protocol):
     """Protocol for image downloader implementations."""
 
-    async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
+    async def download_image(
+        self, file_id: str, download_url: str, expected_md5: str
+    ) -> Tuple[bool, str, int, str]:
         """Download and verify an image file.
 
         Args:

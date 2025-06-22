@@ -5,7 +5,16 @@ import pytest_asyncio
 from datetime import datetime, timedelta
 from sqlalchemy import select
 
-from vrchat_scraper.database import Database, World, WorldMetrics, ScrapeStatus
+from vrchat_scraper.database import (
+    Database,
+    World,
+    WorldMetrics,
+    FileMetadata,
+    WorldImage,
+    ScrapeStatus,
+    DownloadStatus,
+)
+from vrchat_scraper.models import FileReference, FileType
 
 
 @pytest_asyncio.fixture
@@ -235,3 +244,398 @@ async def test_get_worlds_to_scrape_limit(test_db):
     world_ids = await test_db.get_worlds_to_scrape(limit=3)
 
     assert len(world_ids) == 3
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files(test_db):
+    """Test upserting world with file metadata in a single transaction."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World", "description": "A test world"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Create some file references
+    discovered_files = [
+        FileReference(
+            file_id="file_image_123",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="https://api.vrchat.cloud/api/1/file/file_image_123/1/file",
+        ),
+        FileReference(
+            file_id="file_unity_456",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=5,
+            original_url="https://api.vrchat.cloud/api/1/file/file_unity_456/5/file",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Verify world was created
+    async with test_db.async_session() as session:
+        world_result = await session.execute(
+            select(World).where(World.world_id == world_id)
+        )
+        world = world_result.scalar_one()
+        assert world.world_metadata == metadata
+        assert world.scrape_status == ScrapeStatus.SUCCESS
+
+        # Verify metrics were created
+        metrics_result = await session.execute(
+            select(WorldMetrics).where(WorldMetrics.world_id == world_id)
+        )
+        world_metrics = metrics_result.scalar_one()
+        assert world_metrics.favorites == 100
+        assert world_metrics.visits == 1500
+
+        # Verify file metadata was created
+        file_result = await session.execute(
+            select(FileMetadata).where(FileMetadata.world_id == world_id)
+        )
+        files = file_result.fetchall()
+        assert len(files) == 2
+
+        # Check image file
+        image_file = next(f[0] for f in files if f[0].file_type == FileType.IMAGE.value)
+        assert image_file.file_id == "file_image_123"
+        assert image_file.version_number == 1
+        assert image_file.scrape_status == ScrapeStatus.PENDING
+
+        # Check unity package file
+        unity_file = next(
+            f[0] for f in files if f[0].file_type == FileType.UNITY_PACKAGE.value
+        )
+        assert unity_file.file_id == "file_unity_456"
+        assert unity_file.version_number == 5
+
+        # Verify world_images entry was created for image file
+        image_result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_image_123")
+        )
+        world_image = image_result.scalar_one()
+        assert world_image.download_status == DownloadStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_update_removes_old_files(test_db):
+    """Test that updating world with files removes old file references."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # First insert with 2 files
+    initial_files = [
+        FileReference(
+            file_id="file_old_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+        FileReference(
+            file_id="file_old_2",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=1,
+            original_url="url2",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, initial_files)
+
+    # Update with only 1 file (different file)
+    updated_files = [
+        FileReference(
+            file_id="file_new_1",
+            file_type=FileType.IMAGE,
+            version_number=2,
+            original_url="url3",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, updated_files)
+
+    # Verify old files were removed and new file was added
+    async with test_db.async_session() as session:
+        file_result = await session.execute(
+            select(FileMetadata).where(FileMetadata.world_id == world_id)
+        )
+        files = file_result.fetchall()
+        assert len(files) == 1
+        assert files[0][0].file_id == "file_new_1"
+
+
+@pytest.mark.asyncio
+async def test_get_pending_file_metadata(test_db):
+    """Test getting pending file metadata."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_pending_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+        FileReference(
+            file_id="file_pending_2",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=1,
+            original_url="url2",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    pending_files = await test_db.get_pending_file_metadata(limit=10)
+    assert len(pending_files) == 2
+
+    file_ids = [f[0] for f in pending_files]
+    file_types = [f[1] for f in pending_files]
+
+    assert "file_pending_1" in file_ids
+    assert "file_pending_2" in file_ids
+    assert FileType.IMAGE.value in file_types
+    assert FileType.UNITY_PACKAGE.value in file_types
+
+
+@pytest.mark.asyncio
+async def test_update_file_metadata_success(test_db):
+    """Test updating file metadata after successful scrape."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_test_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Update file metadata
+    file_metadata = {"size": 12345, "md5": "abcdef", "versions": []}
+    await test_db.update_file_metadata("file_test_1", file_metadata, "SUCCESS")
+
+    # Verify update
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_test_1")
+        )
+        file_meta = result.scalar_one()
+        assert file_meta.file_metadata == file_metadata
+        assert file_meta.scrape_status == ScrapeStatus.SUCCESS
+        assert file_meta.last_scrape_time is not None
+        assert file_meta.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_update_file_metadata_error(test_db):
+    """Test updating file metadata after failed scrape."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_test_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Update with error
+    await test_db.update_file_metadata("file_test_1", {}, "ERROR", "404 Not Found")
+
+    # Verify update
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_test_1")
+        )
+        file_meta = result.scalar_one()
+        assert file_meta.file_metadata is None
+        assert file_meta.scrape_status == ScrapeStatus.ERROR
+        assert file_meta.error_message == "404 Not Found"
+
+
+@pytest.mark.asyncio
+async def test_get_pending_image_downloads(test_db):
+    """Test getting pending image downloads."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_image_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+        FileReference(
+            file_id="file_unity_1",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=1,
+            original_url="url2",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Update file metadata to SUCCESS (required for image downloads)
+    file_metadata = {"versions": [{"file": {"url": "download_url", "md5": "abc123"}}]}
+    await test_db.update_file_metadata("file_image_1", file_metadata, "SUCCESS")
+
+    # Get pending downloads
+    pending_downloads = await test_db.get_pending_image_downloads(limit=10)
+
+    # Should only return image files with SUCCESS file metadata
+    assert len(pending_downloads) == 1
+    assert pending_downloads[0][0] == "file_image_1"
+    assert pending_downloads[0][1] == file_metadata
+    assert pending_downloads[0][2] == FileType.IMAGE.value
+
+
+@pytest.mark.asyncio
+async def test_update_image_download_success(test_db):
+    """Test updating image download status after successful download."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_image_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Update download status
+    await test_db.update_image_download(
+        "file_image_1",
+        "SUCCESS",
+        local_file_path="/images/abc/def/file_image_1.png",
+        downloaded_md5="abc123",
+        downloaded_size_bytes=12345,
+    )
+
+    # Verify update
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_image_1")
+        )
+        world_image = result.scalar_one()
+        assert world_image.download_status == DownloadStatus.SUCCESS
+        assert world_image.local_file_path == "/images/abc/def/file_image_1.png"
+        assert world_image.downloaded_md5 == "abc123"
+        assert world_image.downloaded_size_bytes == 12345
+        assert world_image.success_time is not None
+        assert world_image.last_attempt_time is not None
+
+
+@pytest.mark.asyncio
+async def test_update_image_download_error(test_db):
+    """Test updating image download status after failed download."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    discovered_files = [
+        FileReference(
+            file_id="file_image_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
+
+    # Update with error
+    await test_db.update_image_download(
+        "file_image_1", "ERROR", error_message="Connection timeout"
+    )
+
+    # Verify update
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_image_1")
+        )
+        world_image = result.scalar_one()
+        assert world_image.download_status == DownloadStatus.ERROR
+        assert world_image.error_message == "Connection timeout"
+        assert world_image.success_time is None
+        assert world_image.last_attempt_time is not None
