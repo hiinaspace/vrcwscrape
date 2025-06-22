@@ -60,9 +60,11 @@ class VRChatScraper:
         """Discover new worlds via recent API every hour."""
         while not self._shutdown_event.is_set():
             try:
-                # Check if we can make an API request
-                delay = await self._get_api_request_delay()
-                if delay > 0:
+                # Wait until we can make an API request
+                while True:
+                    delay = await self._get_api_request_delay()
+                    if delay <= 0:
+                        break
                     await self._sleep_func(delay)
 
                 # Launch recent worlds discovery task
@@ -92,9 +94,11 @@ class VRChatScraper:
                     if self._shutdown_event.is_set():
                         break
 
-                    # Use rate limiter + circuit breaker as concurrency control
-                    delay = await self._get_api_request_delay()
-                    if delay > 0:
+                    # Wait until we can make an API request
+                    while True:
+                        delay = await self._get_api_request_delay()
+                        if delay <= 0:
+                            break
                         await self._sleep_func(delay)
 
                     # Launch individual world scraping task
@@ -235,9 +239,11 @@ class VRChatScraper:
 
     async def _download_image_task(self, world_id: str, image_url: str):
         """Handle image download with separate rate limiting."""
-        # Wait for image request permission
-        delay = await self._get_image_request_delay()
-        if delay > 0:
+        # Wait until we can make an image request
+        while True:
+            delay = await self._get_image_request_delay()
+            if delay <= 0:
+                break
             await self._sleep_func(delay)
 
         request_id = f"image-{world_id}-{self._time_source()}"

@@ -52,7 +52,7 @@ class WorldDetail(BaseModel):
 
     def stable_metadata(self) -> Dict[str, Any]:
         """Return metadata without ephemeral fields."""
-        data = self.model_dump()
+        data = self.model_dump(mode="json")  # Serialize datetimes as ISO strings
         ephemeral_fields = [
             "favorites",
             "heat",
