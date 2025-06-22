@@ -4,6 +4,8 @@ import pytest
 import pytest_asyncio
 from datetime import datetime
 
+from tests.test_utils import async_timeout
+
 from src.vrchat_scraper.circuit_breaker import CircuitBreaker
 from src.vrchat_scraper.database import Database
 from src.vrchat_scraper.rate_limiter import BBRRateLimiter
@@ -100,6 +102,7 @@ def scraper(
 
 
 @pytest.mark.asyncio
+@async_timeout(5.0)
 async def test_scrape_world_happy_path(
     scraper,
     test_database,
@@ -152,6 +155,7 @@ async def test_scrape_world_happy_path(
 
 
 @pytest.mark.asyncio
+@async_timeout(5.0)
 async def test_scrape_world_with_database_state(
     scraper,
     test_database,

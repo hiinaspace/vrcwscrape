@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sys
 import time
 from datetime import datetime
 from typing import Awaitable, Callable
@@ -44,13 +45,20 @@ class VRChatScraper:
         self._time_source = time_source
         self._sleep_func = sleep_func
         self._shutdown_event = asyncio.Event()
+        self._task_group: asyncio.TaskGroup | None = None
 
     async def run_forever(self):
         """Main entry point - runs scraping tasks forever."""
-        await asyncio.gather(
-            self._scrape_recent_worlds_periodically(),
-            self._process_pending_worlds_continuously(),
-        )
+        if sys.version_info >= (3, 11):
+            async with asyncio.TaskGroup() as tg:
+                self._task_group = tg
+                tg.create_task(self._scrape_recent_worlds_periodically())
+                tg.create_task(self._process_pending_worlds_continuously())
+        else:
+            await asyncio.gather(
+                self._scrape_recent_worlds_periodically(),
+                self._process_pending_worlds_continuously(),
+            )
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
@@ -68,7 +76,10 @@ class VRChatScraper:
                     await self._sleep_func(delay)
 
                 # Launch recent worlds discovery task
-                asyncio.create_task(self._scrape_recent_worlds_task())
+                if self._task_group:
+                    self._task_group.create_task(self._scrape_recent_worlds_task())
+                else:
+                    asyncio.create_task(self._scrape_recent_worlds_task())
 
                 # Wait an hour before next discovery
                 try:
@@ -102,7 +113,10 @@ class VRChatScraper:
                         await self._sleep_func(delay)
 
                     # Launch individual world scraping task
-                    asyncio.create_task(self._scrape_world_task(world_id))
+                    if self._task_group:
+                        self._task_group.create_task(self._scrape_world_task(world_id))
+                    else:
+                        asyncio.create_task(self._scrape_world_task(world_id))
 
             except Exception as e:
                 logger.error(f"Error in pending worlds processing: {e}")
@@ -203,9 +217,14 @@ class VRChatScraper:
 
             # Launch image download if needed
             if world_details.image_url and not await self._image_exists(world_id):
-                asyncio.create_task(
-                    self._download_image_task(world_id, world_details.image_url)
-                )
+                if self._task_group:
+                    self._task_group.create_task(
+                        self._download_image_task(world_id, world_details.image_url)
+                    )
+                else:
+                    asyncio.create_task(
+                        self._download_image_task(world_id, world_details.image_url)
+                    )
 
             logger.debug(f"Successfully scraped world {world_id}")
 
