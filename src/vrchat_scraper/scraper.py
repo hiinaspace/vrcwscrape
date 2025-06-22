@@ -302,6 +302,60 @@ class VRChatScraper:
             datetime.utcnow(),
         )
 
+    async def _scrape_recent_worlds_batch(self):
+        """Execute one round of recent worlds discovery and await completion.
+
+        This is the extracted inner logic from _scrape_recent_worlds_periodically
+        without the timing/sleep aspects, useful for testing.
+        """
+        # Wait until we can make an API request
+        while True:
+            delay = await self._get_api_request_delay()
+            if delay <= 0:
+                break
+            await self._sleep_func(delay)
+
+        # Launch recent worlds discovery task and await it
+        await self._scrape_recent_worlds_task()
+
+    async def _process_pending_worlds_batch(self, limit: int = 100):
+        """Execute one batch of pending worlds processing and await all tasks.
+
+        This is the extracted inner logic from _process_pending_worlds_continuously
+        without the timing/sleep aspects, useful for testing.
+
+        Args:
+            limit: Maximum number of worlds to process in this batch
+
+        Returns:
+            Number of worlds that were processed
+        """
+        worlds = await self.database.get_worlds_to_scrape(limit=limit)
+        if not worlds:
+            return 0
+
+        batch_tasks = []
+        for world_id in worlds:
+            if self._shutdown_event.is_set():
+                break
+
+            # Wait until we can make an API request
+            while True:
+                delay = await self._get_api_request_delay()
+                if delay <= 0:
+                    break
+                await self._sleep_func(delay)
+
+            # Launch individual world scraping task
+            task = self._create_task(self._scrape_world_task(world_id))
+            batch_tasks.append(task)
+
+        # Wait for all tasks in this batch to complete before returning
+        if batch_tasks:
+            await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        return len(batch_tasks)
+
     async def _mark_world_deleted(self, world_id: str):
         """Mark a world as deleted in the database."""
         await self.database.upsert_world(world_id, {}, status="DELETED")

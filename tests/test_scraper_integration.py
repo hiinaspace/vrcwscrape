@@ -19,6 +19,35 @@ from tests.fakes import (
 )
 
 
+class StubRateLimiter:
+    """Stub rate limiter that always allows requests through immediately."""
+
+    def get_delay_until_next_request(self, now: float) -> float:
+        return 0.0  # Always allow requests immediately
+
+    def on_request_sent(self, request_id: str, timestamp: float):
+        pass  # No-op
+
+    def on_success(self, request_id: str, timestamp: float):
+        pass  # No-op
+
+    def on_error(self, request_id: str, timestamp: float):
+        pass  # No-op
+
+
+class StubCircuitBreaker:
+    """Stub circuit breaker that never blocks requests."""
+
+    def get_delay_until_proceed(self, now: float) -> float:
+        return 0.0  # Always allow requests immediately
+
+    def on_success(self):
+        pass  # No-op
+
+    def on_error(self, timestamp: float):
+        pass  # No-op
+
+
 @pytest_asyncio.fixture
 async def test_database():
     """Create an in-memory SQLite database for testing."""
@@ -64,6 +93,18 @@ def image_rate_limiter(mock_time):
 
 
 @pytest.fixture
+def stub_api_rate_limiter():
+    """Create a stub rate limiter for API requests that never blocks."""
+    return StubRateLimiter()
+
+
+@pytest.fixture
+def stub_image_rate_limiter():
+    """Create a stub rate limiter for image requests that never blocks."""
+    return StubRateLimiter()
+
+
+@pytest.fixture
 def api_circuit_breaker():
     """Create a circuit breaker for API requests."""
     return CircuitBreaker()
@@ -73,6 +114,18 @@ def api_circuit_breaker():
 def image_circuit_breaker():
     """Create a circuit breaker for image requests."""
     return CircuitBreaker()
+
+
+@pytest.fixture
+def stub_api_circuit_breaker():
+    """Create a stub circuit breaker for API requests that never blocks."""
+    return StubCircuitBreaker()
+
+
+@pytest.fixture
+def stub_image_circuit_breaker():
+    """Create a stub circuit breaker for image requests that never blocks."""
+    return StubCircuitBreaker()
 
 
 @pytest.fixture
