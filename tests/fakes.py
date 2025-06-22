@@ -1,8 +1,9 @@
 """Fake implementations for testing VRChat scraper components."""
 
 import asyncio
+import heapq
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -246,14 +247,47 @@ class MockTime:
     def __init__(self, start_time: float = 1000.0):
         """Initialize with starting time."""
         self._time = start_time
+        self._sleep_manager: Optional["MockAsyncSleep"] = None
 
     def now(self) -> float:
         """Get current time."""
         return self._time
 
-    def advance(self, seconds: float):
-        """Advance time by specified seconds."""
+    def set_sleep_manager(self, sleep_manager: "MockAsyncSleep"):
+        """Set the sleep manager for coordinated time advancement."""
+        self._sleep_manager = sleep_manager
+
+    def advance_sync(self, seconds: float):
+        """Synchronously advance time by specified seconds (for simple cases)."""
         self._time += seconds
+
+    async def advance(self, seconds: float):
+        """Advance time by specified seconds, processing sleep futures along the way."""
+        target_time = self._time + seconds
+
+        # Yield control initially to let coroutines start
+        await asyncio.sleep(0)
+
+        while self._time < target_time:
+            if not self._sleep_manager:
+                # No sleep manager, just advance to target
+                self._time = target_time
+                break
+
+            # Check for the next sleep that should complete
+            next_sleep_time = self._sleep_manager.get_next_sleep_time()
+
+            if next_sleep_time is None or next_sleep_time > target_time:
+                # No pending sleeps before target time, advance to target
+                self._time = target_time
+                break
+            else:
+                # Advance to the next sleep completion time
+                self._time = next_sleep_time
+                self._sleep_manager.resolve_sleeps_due_by(self._time)
+
+                # Yield control to let resolved coroutines run
+                await asyncio.sleep(0)
 
     def set_time(self, time: float):
         """Set absolute time."""
@@ -267,29 +301,48 @@ class MockAsyncSleep:
         """Initialize with mock time source."""
         self.mock_time = mock_time
         self.sleep_log: List[Dict[str, Any]] = []
-        self.sleep_futures: List[asyncio.Future] = []
+
+        # Priority queue of (completion_time, future) pairs
+        self._pending_sleeps: List[Tuple[float, asyncio.Future]] = []
         self.auto_advance = True
 
+        # Register with MockTime for coordinated advancement
+        mock_time.set_sleep_manager(self)
+
     async def sleep(self, seconds: float):
-        """Mock sleep implementation that returns a future."""
+        """Mock sleep implementation."""
         start_time = self.mock_time.now()
+        end_time = start_time + seconds
 
         sleep_entry = {
             "duration": seconds,
             "start_time": start_time,
-            "end_time": start_time + seconds,
+            "end_time": end_time,
         }
         self.sleep_log.append(sleep_entry)
 
         if self.auto_advance:
-            self.mock_time.advance(seconds)
+            self.mock_time.advance_sync(seconds)
             # Return immediately if auto-advancing
             return
         else:
-            # Create a future that tests can resolve manually
+            # Create a future and add to priority queue
             future = asyncio.Future()
-            self.sleep_futures.append(future)
+            heapq.heappush(self._pending_sleeps, (end_time, future))
             await future
+
+    def get_next_sleep_time(self) -> Optional[float]:
+        """Get the completion time of the next sleep to complete, or None if no pending sleeps."""
+        if self._pending_sleeps:
+            return self._pending_sleeps[0][0]
+        return None
+
+    def resolve_sleeps_due_by(self, time: float):
+        """Resolve all sleep futures that should complete by the given time."""
+        while self._pending_sleeps and self._pending_sleeps[0][0] <= time:
+            _, future = heapq.heappop(self._pending_sleeps)
+            if not future.done():
+                future.set_result(None)
 
     def get_total_sleep_time(self) -> float:
         """Get total time spent sleeping."""
@@ -305,7 +358,7 @@ class MockAsyncSleep:
 
     def clear_futures(self):
         """Clear all pending sleep futures."""
-        self.sleep_futures.clear()
+        self._pending_sleeps.clear()
 
     def disable_auto_advance(self):
         """Disable automatic time advancement on sleep."""
@@ -316,15 +369,15 @@ class MockAsyncSleep:
         self.auto_advance = True
 
     def resolve_next_sleep(self):
-        """Resolve the next pending sleep future."""
-        if self.sleep_futures:
-            future = self.sleep_futures.pop(0)
+        """Resolve the next pending sleep future (for compatibility)."""
+        if self._pending_sleeps:
+            _, future = heapq.heappop(self._pending_sleeps)
             if not future.done():
                 future.set_result(None)
 
     def resolve_all_sleeps(self):
-        """Resolve all pending sleep futures."""
-        while self.sleep_futures:
+        """Resolve all pending sleep futures (for compatibility)."""
+        while self._pending_sleeps:
             self.resolve_next_sleep()
 
 

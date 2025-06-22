@@ -172,16 +172,11 @@ async def test_recent_worlds_discovery_and_scraping(
     # Now start the pending worlds processor
     pending_task = asyncio.create_task(scraper._process_pending_worlds_continuously())
 
-    # Give it multiple cycles to process the pending worlds
-    for i in range(5):  # Multiple cycles to ensure processing
-        await asyncio.sleep(0)
-        mock_sleep.resolve_all_sleeps()  # Resolve rate limiting delays
-        await asyncio.sleep(0)
-
-        # Check if worlds have been processed
-        pending_check = await test_database.get_worlds_to_scrape(limit=10)
-        if not pending_check:
-            break  # All worlds processed
+    # The pending processor may initially find no worlds and sleep for 60s
+    # Let time advance to trigger the actual processing
+    await mock_time.advance(
+        65.0
+    )  # Skip past initial no-work sleep and allow processing
 
     # Assert: Verify both worlds were scraped successfully
     pending_worlds_after = await test_database.get_worlds_to_scrape(limit=10)
@@ -236,34 +231,28 @@ async def test_periodic_timing_with_manual_sleep_control(
     # Act: Start recent worlds task
     task = asyncio.create_task(scraper._scrape_recent_worlds_periodically())
 
-    # Let the first iteration start
-    await asyncio.sleep(0)
+    # Let the first iteration start and complete
+    await mock_time.advance(1.0)  # Give time for first iteration
 
-    # Resolve the first iteration's sleeps (should trigger first call)
-    mock_sleep.resolve_all_sleeps()
-    await asyncio.sleep(0)
-
-    # Should have made first call at time 1000
+    # Should have made first call
     assert len(call_times) == 1
-    assert call_times[0] == 1000.0
+    first_call_time = call_times[0]
 
-    # Advance time by 1 hour and resolve sleeps (should trigger second call)
-    mock_time.advance(3600)  # 1 hour
-    mock_sleep.resolve_all_sleeps()
-    await asyncio.sleep(0)
+    # Advance time by 1 hour (should trigger second call)
+    await mock_time.advance(3600)  # 1 hour
 
-    # Should have made second call at time 4600
+    # Should have made second call
     assert len(call_times) == 2
-    assert call_times[1] == 4600.0
+    second_call_time = call_times[1]
+    assert second_call_time - first_call_time >= 3600  # At least 1 hour later
 
-    # Advance time by another hour and resolve sleeps
-    mock_time.advance(3600)  # Another hour
-    mock_sleep.resolve_all_sleeps()
-    await asyncio.sleep(0)
+    # Advance time by another hour
+    await mock_time.advance(3600)  # Another hour
 
-    # Should have made third call at time 8200
+    # Should have made third call
     assert len(call_times) == 3
-    assert call_times[2] == 8200.0
+    third_call_time = call_times[2]
+    assert third_call_time - second_call_time >= 3600  # At least 1 hour later
 
     # Verify we have proper sleep call tracking
     assert mock_sleep.get_sleep_count() >= 3, "Should have recorded sleep calls"
@@ -321,28 +310,20 @@ async def test_pending_worlds_processing_with_rate_limiting(
 
     # Act: Start pending worlds processing
     task = asyncio.create_task(scraper._process_pending_worlds_continuously())
-    await asyncio.sleep(0)  # Let task start
 
-    # Process worlds one by one, resolving sleeps between them
+    # Let processing begin
+    await mock_time.advance(0.1)
+
+    # Process worlds one by one with rate limiting delays
     for i, world_id in enumerate(world_ids):
-        # Advance time first to satisfy rate limiter
-        mock_time.advance(1.0)  # Give enough time for rate limiter
-
-        # Resolve any delay sleeps
-        mock_sleep.resolve_all_sleeps()
-        await asyncio.sleep(0)
-
-        # Give more processing cycles
-        for _ in range(3):
-            mock_sleep.resolve_all_sleeps()
-            await asyncio.sleep(0)
+        # Advance time to satisfy rate limiter (2 req/s = 0.5s between requests)
+        await mock_time.advance(0.6)  # Slightly more than needed to ensure processing
 
         # Should have made API call for this world
         assert fake_api_client.get_request_count("world_details") >= i + 1
 
     # Let final processing complete
-    mock_sleep.resolve_all_sleeps()
-    await asyncio.sleep(0)
+    await mock_time.advance(1.0)
 
     # Assert: All worlds should be processed
     assert fake_api_client.get_request_count("world_details") == 3
