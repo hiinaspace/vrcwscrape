@@ -32,6 +32,9 @@ class VRChatScraper:
         image_circuit_breaker: CircuitBreaker,
         time_source: Callable[[], float] = time.time,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        recent_worlds_interval: float = 3600,  # 1 hour
+        idle_wait_time: float = 60,  # 1 minute
+        error_backoff_time: float = 60,  # 1 minute
     ):
         """Initialize scraper with all dependencies."""
         self.database = database
@@ -43,6 +46,9 @@ class VRChatScraper:
         self.image_circuit_breaker = image_circuit_breaker
         self._time_source = time_source
         self._sleep_func = sleep_func
+        self._recent_worlds_interval = recent_worlds_interval
+        self._idle_wait_time = idle_wait_time
+        self._error_backoff_time = error_backoff_time
         self._shutdown_event = asyncio.Event()
         self._task_group = asyncio.TaskGroup()
 
@@ -88,13 +94,13 @@ class VRChatScraper:
                     )
                     break  # Shutdown requested
                 except asyncio.TimeoutError:
-                    # Sleep for an hour using injected sleep function
-                    await self._sleep_func(3600)
+                    # Sleep for configured interval using injected sleep function
+                    await self._sleep_func(self._recent_worlds_interval)
                     continue
 
             except Exception as e:
                 logger.error(f"Error in recent worlds periodic task: {e}")
-                await self._sleep_func(60)  # Back off on errors
+                await self._sleep_func(self._error_backoff_time)  # Back off on errors
 
     async def _process_pending_worlds_continuously(self):
         """Continuously process pending worlds from database."""
@@ -102,11 +108,13 @@ class VRChatScraper:
             try:
                 processed_count = await self._process_pending_worlds_batch(limit=100)
                 if processed_count == 0:
-                    await self._sleep_func(60)  # Wait before checking again
+                    await self._sleep_func(
+                        self._idle_wait_time
+                    )  # Wait before checking again
 
             except Exception as e:
                 logger.error(f"Error in pending worlds processing: {e}")
-                await self._sleep_func(60)  # Back off on errors
+                await self._sleep_func(self._error_backoff_time)  # Back off on errors
 
     async def _get_api_request_delay(self) -> float:
         """Check both circuit breaker and rate limiter for API requests."""
