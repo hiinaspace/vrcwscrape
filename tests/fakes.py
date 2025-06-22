@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import httpx
 
@@ -12,34 +12,51 @@ from src.vrchat_scraper.models import WorldDetail, WorldSummary
 class FakeVRChatAPIClient:
     """Fake VRChat API client for testing."""
 
-    def __init__(self):
+    def __init__(self, time_source: Callable[[], float]):
         """Initialize with configurable behavior."""
-        self.recent_worlds_responses: List[List[WorldSummary]] = []
-        self.world_detail_responses: Dict[str, WorldDetail] = {}
-        self.error_responses: Dict[str, Exception] = {}
+        self.time_source = time_source
         self.request_log: List[Dict[str, Any]] = []
-        self.request_delays: Dict[str, float] = {}
+
+        # Future-based responses for precise test control
+        self.recent_worlds_futures: List[asyncio.Future] = []
+        self.world_detail_futures: Dict[str, asyncio.Future] = {}
 
         # Rate limiting simulation
         self.rate_limit_bucket = 100.0
         self.rate_limit_refill_rate = 10.0  # requests per second
         self.last_refill_time = 0.0
 
+    def add_recent_worlds_future(self, future: asyncio.Future):
+        """Add a future for the next get_recent_worlds call."""
+        self.recent_worlds_futures.append(future)
+
+    def add_world_detail_future(self, world_id: str, future: asyncio.Future):
+        """Add a future for a specific world ID."""
+        self.world_detail_futures[world_id] = future
+
     def set_recent_worlds_response(self, worlds: List[WorldSummary]):
-        """Set the response for get_recent_worlds."""
-        self.recent_worlds_responses = [worlds]
+        """Convenience method to set an immediate response."""
+        future = asyncio.Future()
+        future.set_result(worlds)
+        self.add_recent_worlds_future(future)
 
     def set_world_detail_response(self, world_id: str, world: WorldDetail):
-        """Set the response for a specific world ID."""
-        self.world_detail_responses[world_id] = world
+        """Convenience method to set an immediate response."""
+        future = asyncio.Future()
+        future.set_result(world)
+        self.add_world_detail_future(world_id, future)
 
-    def set_error_response(self, endpoint: str, error: Exception):
-        """Set an error response for an endpoint."""
-        self.error_responses[endpoint] = error
+    def set_recent_worlds_error(self, error: Exception):
+        """Convenience method to set an immediate error."""
+        future = asyncio.Future()
+        future.set_exception(error)
+        self.add_recent_worlds_future(future)
 
-    def set_request_delay(self, endpoint: str, delay: float):
-        """Set a delay for requests to an endpoint."""
-        self.request_delays[endpoint] = delay
+    def set_world_detail_error(self, world_id: str, error: Exception):
+        """Convenience method to set an immediate error."""
+        future = asyncio.Future()
+        future.set_exception(error)
+        self.add_world_detail_future(world_id, future)
 
     def simulate_rate_limit(self, enabled: bool = True, rate: float = 10.0):
         """Enable/disable rate limit simulation."""
@@ -70,36 +87,29 @@ class FakeVRChatAPIClient:
 
     async def get_recent_worlds(self) -> List[WorldSummary]:
         """Fake implementation of get_recent_worlds."""
-        endpoint = "recent_worlds"
-        now = asyncio.get_event_loop().time()
+        now = self.time_source()
 
         self.request_log.append(
-            {"endpoint": endpoint, "timestamp": now, "args": [], "kwargs": {}}
+            {"endpoint": "recent_worlds", "timestamp": now, "args": [], "kwargs": {}}
         )
 
-        # Simulate delay
-        if endpoint in self.request_delays:
-            await asyncio.sleep(self.request_delays[endpoint])
-
-        # Check for errors
-        if endpoint in self.error_responses:
-            raise self.error_responses[endpoint]
-
-        # Check rate limiting
+        # Check rate limiting before waiting on future
         if self._check_rate_limit(now):
             raise httpx.HTTPStatusError(
                 "Rate limited", request=None, response=httpx.Response(429)
             )
 
-        # Return configured response or empty list
-        if self.recent_worlds_responses:
-            return self.recent_worlds_responses[0]
-        return []
+        # Get and await the next future
+        if self.recent_worlds_futures:
+            future = self.recent_worlds_futures.pop(0)
+            return await future
+        else:
+            # No future configured, return empty list
+            return []
 
     async def get_world_details(self, world_id: str) -> WorldDetail:
         """Fake implementation of get_world_details."""
-        endpoint = f"world_details_{world_id}"
-        now = asyncio.get_event_loop().time()
+        now = self.time_source()
 
         self.request_log.append(
             {
@@ -110,34 +120,21 @@ class FakeVRChatAPIClient:
             }
         )
 
-        # Simulate delay
-        if endpoint in self.request_delays or "world_details" in self.request_delays:
-            delay = self.request_delays.get(
-                endpoint, self.request_delays.get("world_details", 0)
-            )
-            await asyncio.sleep(delay)
-
-        # Check for specific world errors
-        if endpoint in self.error_responses:
-            raise self.error_responses[endpoint]
-
-        # Check for general world detail errors
-        if "world_details" in self.error_responses:
-            raise self.error_responses["world_details"]
-
-        # Check rate limiting
+        # Check rate limiting before waiting on future
         if self._check_rate_limit(now):
             raise httpx.HTTPStatusError(
                 "Rate limited", request=None, response=httpx.Response(429)
             )
 
-        # Return configured response or raise 404
-        if world_id in self.world_detail_responses:
-            return self.world_detail_responses[world_id]
-
-        raise httpx.HTTPStatusError(
-            "World not found", request=None, response=httpx.Response(404)
-        )
+        # Get and await the future for this world
+        if world_id in self.world_detail_futures:
+            future = self.world_detail_futures.pop(world_id)
+            return await future
+        else:
+            # No future configured, return 404
+            raise httpx.HTTPStatusError(
+                "World not found", request=None, response=httpx.Response(404)
+            )
 
     def get_request_count(self, endpoint: Optional[str] = None) -> int:
         """Get the number of requests made to an endpoint."""
@@ -149,8 +146,15 @@ class FakeVRChatAPIClient:
         """Clear the request log."""
         self.request_log.clear()
 
-    def set_timeout_error(self, endpoint: str, timeout_type: str = "read"):
-        """Set a timeout error for an endpoint."""
+    def clear_futures(self):
+        """Clear all pending futures."""
+        self.recent_worlds_futures.clear()
+        self.world_detail_futures.clear()
+
+    def set_timeout_error(
+        self, world_id: Optional[str] = None, timeout_type: str = "read"
+    ):
+        """Set a timeout error for recent worlds or specific world."""
         if timeout_type == "read":
             error = httpx.ReadTimeout("Request timed out")
         elif timeout_type == "connect":
@@ -159,31 +163,38 @@ class FakeVRChatAPIClient:
             error = httpx.PoolTimeout("Pool timeout")
         else:
             error = httpx.TimeoutException("Generic timeout")
-        self.set_error_response(endpoint, error)
+
+        if world_id is None:
+            self.set_recent_worlds_error(error)
+        else:
+            self.set_world_detail_error(world_id, error)
 
 
 class FakeImageDownloader:
     """Fake image downloader for testing."""
 
-    def __init__(self):
+    def __init__(self, time_source: Callable[[], float]):
         """Initialize fake image downloader."""
+        self.time_source = time_source
         self.download_log: List[Dict[str, Any]] = []
-        self.success_responses: Dict[str, bool] = {}
-        self.error_responses: Dict[str, Exception] = {}
-        self.request_delays: Dict[str, float] = {}
+        self.download_futures: Dict[str, asyncio.Future] = {}
         self.existing_images: Set[str] = set()
 
+    def add_download_future(self, world_id: str, future: asyncio.Future):
+        """Add a future for downloading a world's image."""
+        self.download_futures[world_id] = future
+
     def set_download_response(self, world_id: str, success: bool):
-        """Set the response for downloading a world's image."""
-        self.success_responses[world_id] = success
+        """Convenience method to set an immediate response."""
+        future = asyncio.Future()
+        future.set_result(success)
+        self.add_download_future(world_id, future)
 
     def set_error_response(self, world_id: str, error: Exception):
-        """Set an error response for downloading a world's image."""
-        self.error_responses[world_id] = error
-
-    def set_request_delay(self, world_id: str, delay: float):
-        """Set a delay for downloading a world's image."""
-        self.request_delays[world_id] = delay
+        """Convenience method to set an immediate error."""
+        future = asyncio.Future()
+        future.set_exception(error)
+        self.add_download_future(world_id, future)
 
     def set_image_exists(self, world_id: str, exists: bool = True):
         """Set whether an image exists for a world."""
@@ -194,28 +205,21 @@ class FakeImageDownloader:
 
     async def download_image(self, url: str, world_id: str) -> bool:
         """Fake implementation of download_image."""
-        now = asyncio.get_event_loop().time()
+        now = self.time_source()
 
         self.download_log.append({"url": url, "world_id": world_id, "timestamp": now})
 
-        # Simulate delay
-        if world_id in self.request_delays:
-            await asyncio.sleep(self.request_delays[world_id])
-
-        # Check for errors
-        if world_id in self.error_responses:
-            raise self.error_responses[world_id]
-
-        # Return configured response or default success
-        if world_id in self.success_responses:
-            success = self.success_responses[world_id]
+        # Get and await the future for this download
+        if world_id in self.download_futures:
+            future = self.download_futures.pop(world_id)
+            success = await future
             if success:
                 self.existing_images.add(world_id)
             return success
-
-        # Default to success
-        self.existing_images.add(world_id)
-        return True
+        else:
+            # No future configured, default to success
+            self.existing_images.add(world_id)
+            return True
 
     def image_exists(self, world_id: str) -> bool:
         """Check if image exists for a world."""
@@ -230,6 +234,10 @@ class FakeImageDownloader:
     def clear_download_log(self):
         """Clear the download log."""
         self.download_log.clear()
+
+    def clear_futures(self):
+        """Clear all pending futures."""
+        self.download_futures.clear()
 
 
 class MockTime:
@@ -259,24 +267,29 @@ class MockAsyncSleep:
         """Initialize with mock time source."""
         self.mock_time = mock_time
         self.sleep_log: List[Dict[str, Any]] = []
+        self.sleep_futures: List[asyncio.Future] = []
         self.auto_advance = True
 
     async def sleep(self, seconds: float):
-        """Mock sleep implementation."""
+        """Mock sleep implementation that returns a future."""
         start_time = self.mock_time.now()
-        self.sleep_log.append(
-            {
-                "duration": seconds,
-                "start_time": start_time,
-                "end_time": start_time + seconds,
-            }
-        )
+
+        sleep_entry = {
+            "duration": seconds,
+            "start_time": start_time,
+            "end_time": start_time + seconds,
+        }
+        self.sleep_log.append(sleep_entry)
 
         if self.auto_advance:
             self.mock_time.advance(seconds)
-
-        # Actually sleep a tiny amount to yield control
-        await asyncio.sleep(0.001)
+            # Return immediately if auto-advancing
+            return
+        else:
+            # Create a future that tests can resolve manually
+            future = asyncio.Future()
+            self.sleep_futures.append(future)
+            await future
 
     def get_total_sleep_time(self) -> float:
         """Get total time spent sleeping."""
@@ -290,6 +303,10 @@ class MockAsyncSleep:
         """Clear the sleep log."""
         self.sleep_log.clear()
 
+    def clear_futures(self):
+        """Clear all pending sleep futures."""
+        self.sleep_futures.clear()
+
     def disable_auto_advance(self):
         """Disable automatic time advancement on sleep."""
         self.auto_advance = False
@@ -298,13 +315,29 @@ class MockAsyncSleep:
         """Enable automatic time advancement on sleep."""
         self.auto_advance = True
 
+    def resolve_next_sleep(self):
+        """Resolve the next pending sleep future."""
+        if self.sleep_futures:
+            future = self.sleep_futures.pop(0)
+            if not future.done():
+                future.set_result(None)
+
+    def resolve_all_sleeps(self):
+        """Resolve all pending sleep futures."""
+        while self.sleep_futures:
+            self.resolve_next_sleep()
+
 
 def create_test_world_summary(
     world_id: str = "wrld_test_123",
     name: str = "Test World",
     author_id: str = "usr_test",
+    updated_at: Optional[datetime] = None,
 ) -> WorldSummary:
     """Create a test WorldSummary object."""
+    if updated_at is None:
+        updated_at = datetime(2024, 1, 1, 12, 0, 0)  # Fixed time for tests
+
     return WorldSummary(
         id=world_id,
         name=name,
@@ -312,7 +345,7 @@ def create_test_world_summary(
         authorName="Test Author",
         imageUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}/1/file",
         thumbnailImageUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}/1/thumb",
-        updated_at=datetime.utcnow(),
+        updated_at=updated_at,
     )
 
 
@@ -322,8 +355,15 @@ def create_test_world_detail(
     author_id: str = "usr_test",
     favorites: int = 100,
     visits: int = 1000,
+    created_at: Optional[datetime] = None,
+    updated_at: Optional[datetime] = None,
 ) -> WorldDetail:
     """Create a test WorldDetail object."""
+    if created_at is None:
+        created_at = datetime(2024, 1, 1, 10, 0, 0)  # Fixed time for tests
+    if updated_at is None:
+        updated_at = datetime(2024, 1, 1, 12, 0, 0)  # Fixed time for tests
+
     return WorldDetail(
         id=world_id,
         name=name,
@@ -338,94 +378,11 @@ def create_test_world_detail(
         privateOccupants=3,
         publicOccupants=9,
         visits=visits,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+        created_at=created_at,
+        updated_at=updated_at,
         tags=["system_approved"],
     )
 
 
-class FakeDatabase:
-    """Fake database for testing."""
-
-    def __init__(self):
-        """Initialize fake database."""
-        self.worlds: Dict[str, Dict[str, Any]] = {}
-        self.metrics: List[Dict[str, Any]] = []
-        self.operation_log: List[Dict[str, Any]] = []
-
-    async def init_schema(self):
-        """Fake schema initialization."""
-        self.operation_log.append({"operation": "init_schema"})
-
-    async def upsert_world(
-        self, world_id: str, metadata: dict, status: str = "SUCCESS"
-    ):
-        """Fake world upsert."""
-        self.operation_log.append(
-            {
-                "operation": "upsert_world",
-                "world_id": world_id,
-                "metadata": metadata,
-                "status": status,
-            }
-        )
-
-        if world_id in self.worlds:
-            self.worlds[world_id].update(
-                {
-                    "metadata": metadata,
-                    "status": status,
-                    "last_scrape_time": datetime.utcnow(),
-                }
-            )
-        else:
-            self.worlds[world_id] = {
-                "world_id": world_id,
-                "metadata": metadata,
-                "status": status,
-                "last_scrape_time": datetime.utcnow(),
-            }
-
-    async def insert_metrics(
-        self, world_id: str, metrics: Dict[str, int], scrape_time: datetime
-    ):
-        """Fake metrics insertion."""
-        self.operation_log.append(
-            {
-                "operation": "insert_metrics",
-                "world_id": world_id,
-                "metrics": metrics,
-                "scrape_time": scrape_time,
-            }
-        )
-
-        self.metrics.append(
-            {"world_id": world_id, "scrape_time": scrape_time, **metrics}
-        )
-
-    async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
-        """Fake get worlds to scrape."""
-        self.operation_log.append({"operation": "get_worlds_to_scrape", "limit": limit})
-
-        # Return worlds with PENDING status
-        pending_worlds = [
-            world_id
-            for world_id, world_data in self.worlds.items()
-            if world_data["status"] == "PENDING"
-        ]
-
-        return pending_worlds[:limit]
-
-    def get_world(self, world_id: str) -> Optional[Dict[str, Any]]:
-        """Get a world from the fake database."""
-        return self.worlds.get(world_id)
-
-    def get_world_metrics(self, world_id: str) -> List[Dict[str, Any]]:
-        """Get metrics for a world."""
-        return [m for m in self.metrics if m["world_id"] == world_id]
-
-    def clear(self):
-        """Clear all data."""
-        self.worlds.clear()
-        self.metrics.clear()
-        self.operation_log.clear()
+# Note: Use real in-memory SQLite database for unit tests instead of fake database
+# This exercises the actual SQLAlchemy code while remaining fast and isolated
