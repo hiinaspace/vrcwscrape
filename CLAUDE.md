@@ -10,9 +10,12 @@ This guide helps Claude Code work effectively with the VRChat world metadata scr
 uv run python -m vrchat_scraper.main
 
 # Run tests
-uv run pytest
-uv run pytest -v tests/test_rate_limiter.py  # Run specific test file
-uv run pytest -k "test_circuit_breaker"       # Run tests matching pattern
+uv run coverage run -m pytest
+uv run coverage run -m pytest -v tests/test_rate_limiter.py  # Run specific test file
+uv run coverage run -m pytest -k "test_circuit_breaker"       # Run tests matching pattern
+
+# get coverage report from unit test run
+uv run coverage report -m
 
 # Add new dependencies
 uv add <package>
@@ -124,7 +127,7 @@ from vrchat_scraper.config import Config
 async def import_worlds():
     config = Config()
     db = Database(config.database_url)
-    
+
     with open('existing_world_ids.txt') as f:
         for line in f:
             world_id = line.strip()
