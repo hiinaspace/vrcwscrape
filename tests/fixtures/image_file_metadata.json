@@ -1,0 +1,61 @@
+{
+    "extension": ".png",
+    "id": "file_447b6078-e5fb-488c-bff5-432d4631f6cf",
+    "mimeType": "image/png",
+    "name": "World - Sandy Beach - Image - 2022․3․22f1_4_standalonewindows_Release",
+    "ownerId": "usr_6c126be6-bada-464f-ab99-9b39b525f8bb",
+    "tags": [],
+    "versions": [
+        {
+            "created_at": "2024-07-13T13:24:41.332Z",
+            "status": "complete",
+            "version": 0
+        },
+        {
+            "created_at": "2024-07-13T13:24:41.655Z",
+            "file": {
+                "category": "simple",
+                "fileName": "World-Sandy-Beach-Image-2022322f.file_447b6078-e5fb-488c-bff5-432d4631f6cf.1.png",
+                "md5": "5ZCuCA7a2tu8ho49tb34SQ==",
+                "sizeInBytes": 220015,
+                "status": "complete",
+                "uploadId": "",
+                "url": "https://api.vrchat.cloud/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf/1/file"
+            },
+            "signature": {
+                "category": "simple",
+                "fileName": "World-Sandy-Beach-Image-2022322f.file_447b6078-e5fb-488c-bff5-432d4631f6cf.1.png.signature",
+                "md5": "x7rIrqAQcwh50RdrIrvTpg==",
+                "sizeInBytes": 3900,
+                "status": "complete",
+                "uploadId": "",
+                "url": "https://api.vrchat.cloud/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf/1/signature"
+            },
+            "status": "complete",
+            "version": 1
+        },
+        {
+            "created_at": "2024-07-18T03:05:48.236Z",
+            "file": {
+                "category": "simple",
+                "fileName": "World-Sandy-Beach-Image-2022322f.file_447b6078-e5fb-488c-bff5-432d4631f6cf.2.png",
+                "md5": "Kr+54w1dA19dG24hsMusPg==",
+                "sizeInBytes": 311598,
+                "status": "complete",
+                "uploadId": "",
+                "url": "https://api.vrchat.cloud/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf/2/file"
+            },
+            "signature": {
+                "category": "simple",
+                "fileName": "World-Sandy-Beach-Image-2022322f.file_447b6078-e5fb-488c-bff5-432d4631f6cf.2.png.signature",
+                "md5": "aATXZOPLbeXrLOIFx7cCkQ==",
+                "sizeInBytes": 5520,
+                "status": "complete",
+                "uploadId": "",
+                "url": "https://api.vrchat.cloud/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf/2/signature"
+            },
+            "status": "complete",
+            "version": 2
+        }
+    ]
+}
