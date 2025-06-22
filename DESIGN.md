@@ -114,32 +114,25 @@ VRChat API → Rate Limiter → Scraper → DoltDB
 
 ## Rate Limiting Strategy
 
-### BBR-Inspired Algorithm
+### Separated Components
 
-The scraper implements a congestion control algorithm inspired by TCP BBR:
+The scraper uses two separate components for request control:
 
-1. **Tracking**:
-   - Moving window of successful request rate (past few minutes)
-   - Error rates for 429s, 500s, and timeouts
-   - Current pacing gain (multiplier for request rate)
+1. **BBRRateLimiter**: Discovers and maintains optimal request rate
+   - Tracks delivery rate and request latency in sliding windows
+   - Implements probe cycles to discover increased capacity
+   - Uses pacing gains (cruising: 1.0, probing_up: 1.25, probing_down: 0.9)
+   - Operates at 1-10 RPS scale with 10-second windows
 
-2. **Decision Logic**:
-   ```
-   if error_rate > threshold:
-     circuit_break_with_exponential_backoff()
-   elif error_rate > 0:
-     decrease_pacing_gain()
-   else:
-     if stable_for_duration:
-       probe_bandwidth()  # temporarily increase pacing_gain to 1.2
-   ```
+2. **CircuitBreaker**: Handles catastrophic failure scenarios  
+   - Monitors error rates and activates on high failure rates
+   - Exponential backoff on repeated failures
+   - Independent of rate limiting - focuses on service availability
 
-3. **Implementation Details**:
-   - Base rate limit estimate: ~10 requests/second
-   - Max concurrent requests: 10 (via httpx limits)
-   - Normal pacing gain: 1.0
-   - Probe pacing gain: 1.2
-   - Circuit breaker threshold: configurable error rate
+3. **Key Differences from TCP BBR**:
+   - No app_limited detection (unnecessary at our 1-10 RPS scale)
+   - Probe cycles provide sufficient recovery from temporary rate degradation
+   - Simpler than full BBR due to limited operational scale
 
 ## Scraping Strategy
 
@@ -222,102 +215,86 @@ Heuristic based on world age and activity:
 
 ### Overview
 
-Comprehensive testing is critical for validating the rate limiter behavior and ensuring robust operation. The test suite should exercise all code paths without requiring actual VRChat API access.
+Comprehensive test coverage validates rate limiter behavior, error handling, and integration flows without requiring actual VRChat API access. The test suite is organized into fast unit tests and slow integration tests.
+
+### Test Organization
+
+**Fast Unit Tests** (`tests/test_*.py`):
+- Use stub rate limiters and circuit breakers for immediate responses
+- In-memory SQLite database with SQLAlchemy async support
+- Mock time sources and fake API clients
+- Complete in under 1 second, suitable for TDD and CI
+
+**Slow Integration Tests** (`tests/test_*_slow.py`):
+- Real BBRRateLimiter and CircuitBreaker with fast parameters
+- Delayed API responses via coroutines (50-500ms delays)
+- Tests actual rate limiting behavior and probe cycles
+- Marked with `@pytest.mark.slow`, can be excluded with `-m "not slow"`
 
 ### Rate Limiter Testing
 
-**Mock VRChat API**: Implement a fake API server that simulates VRChat's rate limiting behavior:
+**Implemented Test Coverage**:
+- **Basic pacing**: Verifies request spacing based on delivery rate
+- **Delivery rate sampling**: Tests BBR's multi-request sampling logic
+- **Error handling**: Circuit breaker activation and rate reduction
+- **State machine**: Probe cycle transitions (CRUISING → PROBING_UP → PROBING_DOWN)
+- **Window filters**: Sliding window max/min tracking with sample expiration
+- **Probe recovery**: Recovery from degraded rates through bandwidth probing
 
+**Key Test Scenarios**:
 ```python
-class MockVRChatAPI:
-    """Simulates a leaky bucket rate limiter with variable limits"""
-    def __init__(self, initial_limit=10.0, bucket_size=100):
-        self.rate_limit = initial_limit
-        self.bucket = bucket_size
-        self.last_request = time.time()
-        
-    async def handle_request(self):
-        # Refill bucket based on time elapsed
-        # Return 429 if bucket empty
-        # Randomly return 500s to test error handling
-        
-    def change_rate_limit(self, new_limit):
-        """Simulate dynamic rate limit changes"""
-        self.rate_limit = new_limit
+# Probe recovery test shows rate limiter discovering higher capacity
+Initial max_rate: 1.00 req/s  # Degraded state
+Final max_rate: 34.04 req/s   # Discovered through probing
+Observed rate: 6.81 req/s     # Actual achieved throughput
 ```
-
-Test scenarios:
-- Stable rate limit: Verify scraper finds and maintains optimal rate
-- Decreasing limit: Verify scraper backs off appropriately
-- Increasing limit: Verify bandwidth probing discovers new capacity
-- Error bursts: Verify circuit breaker activates and recovers
-- Mixed errors: Verify different error types handled correctly
 
 ### Database Testing
 
-**In-Memory Testing**: Use transaction rollbacks or an in-memory SQLite database for fast tests:
+**SQLAlchemy with In-Memory SQLite**:
+- Async session management with proper cleanup
+- Transaction isolation between tests
+- Schema identical to production DoltDB
+- Direct SQL table inspection for state verification
 
-```python
-@pytest.fixture
-async def test_db():
-    # Option 1: Use SQLite with similar schema
-    # Option 2: Use real MySQL/DoltDB with rollback
-    # Option 3: Create simple mock at Database class level
-```
+**Test Coverage**:
+- World state transitions (PENDING → SUCCESS → DELETED) 
+- Metrics time-series storage (append-only behavior)
+- Upsert operations and conflict resolution
+- Database schema initialization
 
-Test scenarios:
-- World state transitions (PENDING → SUCCESS → DELETED)
-- Metrics append-only behavior
-- Rescrape scheduling logic with various world ages
-- Concurrent access patterns
+### Scraper Integration Testing
 
-### Scraper Integration Tests
+**Comprehensive Error Handling**:
+- Authentication failures (401) → shutdown behavior
+- Rate limit responses (429) → circuit breaker activation  
+- Server errors (500, 502, 503) → retry logic
+- Network timeouts → backoff behavior
+- World deletion (404) → status marking
+- Image download failures → graceful degradation
 
-Test the full scraping flow with mock HTTP responses:
+**Integration Flow Testing**:
+- Recent worlds discovery with rate limiting
+- Batch processing with concurrent world scraping
+- Configurable timing parameters for testing
+- Real rate limiting delays (2-4 seconds per test)
 
-```python
-@pytest.fixture
-def mock_vrchat_responses():
-    return {
-        "/api/1/worlds?sort=updated": load_fixture("recent_worlds.json"),
-        "/api/1/worlds/wrld_123": load_fixture("world_detail.json"),
-        # Add 404, 429, 500 responses
-    }
-```
+### Testing Tools
 
-### Async Testing Tools
+**Current Stack**:
+- **pytest-asyncio**: Async test fixtures and execution
+- **Custom fakes**: FakeVRChatAPIClient, FakeImageDownloader with future-based delays
+- **MockTime/MockAsyncSleep**: Deterministic time control for unit tests
+- **Real asyncio.sleep**: Actual delays for integration tests
+- **Coverage tracking**: 76% coverage on scraper core logic
 
-- **pytest-asyncio**: Provides async test support and fixtures
-- **aioresponses**: Mock aiohttp/httpx requests
-- **freezegun** or **time-machine**: Control time in tests for rate limiting logic
-- **asyncio.sleep** mocking: Speed up tests by patching sleep calls
+### Performance Validation
 
-Example test structure:
-
-```python
-@pytest.mark.asyncio
-async def test_rate_limiter_finds_optimal_rate(mock_time):
-    api = MockVRChatAPI(initial_limit=5.0)
-    limiter = RateLimiter()
-    
-    # Simulate successful requests
-    for _ in range(100):
-        await limiter.acquire()
-        api.handle_request()
-        limiter.record_result(success=True)
-        mock_time.advance(0.1)  # Simulate time passing
-    
-    # Verify converged to ~5 req/s
-    assert 4.5 <= limiter.effective_rate <= 5.5
-```
-
-### Performance Testing
-
-While not part of regular CI, performance tests ensure the scraper can handle expected load:
-
-- Verify 250 worlds/day scraping capacity
-- Measure memory usage with 237k world IDs in queue
-- Test database query performance at scale
+**Slow Integration Tests**:
+- Verify rate limiting actually delays requests (2+ seconds for rate-limited batches)
+- Test probe cycle discovery with 3+ batches over multiple probe cycles
+- Validate concurrent processing with realistic API latency (50-500ms per request)
+- Confirm idle behavior when no pending worlds available
 
 ## Dependencies
 
@@ -325,15 +302,17 @@ While not part of regular CI, performance tests ensure the scraper can handle ex
 
 - **httpx**: Async HTTP client with connection pooling
 - **pydantic**: Data validation and settings management
-- **mysql-connector-python**: Database connectivity
-- **pytest**: Testing framework
+- **sqlalchemy[asyncio]**: Async ORM with MySQL support via aiomysql
+- **aiosqlite**: SQLite support for testing
+- **pytest**: Testing framework with asyncio support
 - **logfire**: OpenTelemetry-based observability
 
 ### Why These Choices
 
-- **No ORM**: Direct SQL for simplicity with small schema
-- **No OpenAPI Client**: Overhead not worth it for 4 endpoints
+- **SQLAlchemy**: Provides async support and enables in-memory SQLite testing
+- **No OpenAPI Client**: Overhead not worth it for 4 endpoints  
 - **Asyncio**: Natural fit for I/O-bound scraping workload
+- **Separated Rate Limiting**: Independent components for rate discovery vs failure handling
 
 ## Future Considerations
 

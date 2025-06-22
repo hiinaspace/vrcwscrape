@@ -47,7 +47,7 @@ uv run pytest
 ### Database
 - Using DoltDB (MySQL-compatible with Git-like versioning)
 - Connection via standard MySQL protocol on port 13306 (mapped from container's 3306)
-- No ORM - use direct SQL queries with mysql-connector-python
+- SQLAlchemy async ORM with aiomysql for production, aiosqlite for testing
 - DoltDB automatically commits periodically (configure on server)
 
 ### Data Scale
