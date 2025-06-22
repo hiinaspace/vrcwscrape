@@ -362,3 +362,235 @@ async def test_scrape_recent_worlds_batch_happy_path(
 
     # Verify API was called once
     assert fake_api_client.get_request_count("recent_worlds") == 1
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_recent_worlds_batch_handles_authentication_error(
+    stub_scraper, fake_api_client
+):
+    """Test that authentication errors in recent worlds are handled properly."""
+    # Arrange: Set up authentication error
+    from src.vrchat_scraper.http_client import AuthenticationError
+
+    fake_api_client.set_recent_worlds_error(AuthenticationError("Invalid auth"))
+
+    # Act & Assert: Should raise and shutdown
+    with pytest.raises(AuthenticationError):
+        await stub_scraper._scrape_recent_worlds_batch()
+
+    # Verify shutdown was called
+    assert stub_scraper._shutdown_event.is_set()
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_recent_worlds_batch_handles_http_errors(stub_scraper, fake_api_client):
+    """Test that HTTP errors in recent worlds are handled gracefully."""
+    # Arrange: Set up HTTP error
+    import httpx
+
+    error_response = httpx.Response(429)
+    fake_api_client.set_recent_worlds_error(
+        httpx.HTTPStatusError("Rate limited", request=None, response=error_response)
+    )
+
+    # Act: Should not raise, just handle gracefully
+    await stub_scraper._scrape_recent_worlds_batch()
+
+    # Assert: API was called once, error was handled
+    assert fake_api_client.get_request_count("recent_worlds") == 1
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_recent_worlds_batch_handles_timeout_errors(
+    stub_scraper, fake_api_client
+):
+    """Test that timeout errors in recent worlds are handled gracefully."""
+    # Arrange: Set up timeout error
+    import httpx
+
+    fake_api_client.set_recent_worlds_error(httpx.ReadTimeout("Request timed out"))
+
+    # Act: Should not raise, just handle gracefully
+    await stub_scraper._scrape_recent_worlds_batch()
+
+    # Assert: API was called once, error was handled
+    assert fake_api_client.get_request_count("recent_worlds") == 1
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scrape_world_handles_authentication_error(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that authentication errors in world scraping are handled properly."""
+    # Arrange
+    world_id = "wrld_auth_error_test"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    from src.vrchat_scraper.http_client import AuthenticationError
+
+    fake_api_client.set_world_detail_error(
+        world_id, AuthenticationError("Invalid auth")
+    )
+
+    # Act & Assert: Should raise and shutdown
+    with pytest.raises(AuthenticationError):
+        await stub_scraper._scrape_world_task(world_id)
+
+    # Verify shutdown was called
+    assert stub_scraper._shutdown_event.is_set()
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scrape_world_handles_404_deleted_world(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 404 errors mark world as deleted."""
+    # Arrange
+    world_id = "wrld_deleted_test"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+
+    error_response = httpx.Response(404)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError("Not found", request=None, response=error_response),
+    )
+
+    # Act: Should handle gracefully
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: World should be marked as DELETED
+    async with test_database.async_session() as session:
+        from src.vrchat_scraper.database import World
+        from sqlalchemy import select
+
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world_record = result.scalar_one()
+        assert world_record.scrape_status == "DELETED"
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scrape_world_handles_other_http_errors(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that other HTTP errors are handled gracefully."""
+    # Arrange
+    world_id = "wrld_http_error_test"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+
+    error_response = httpx.Response(500)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError("Server error", request=None, response=error_response),
+    )
+
+    # Act: Should handle gracefully
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: World should remain PENDING (not updated)
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    assert world_id in pending_worlds
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scrape_world_handles_timeout_errors(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that timeout errors are handled gracefully."""
+    # Arrange
+    world_id = "wrld_timeout_test"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+
+    fake_api_client.set_world_detail_error(
+        world_id, httpx.ConnectTimeout("Connection timed out")
+    )
+
+    # Act: Should handle gracefully
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: World should remain PENDING
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    assert world_id in pending_worlds
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_image_download_handles_failure(
+    stub_scraper, test_database, fake_api_client, fake_image_downloader
+):
+    """Test that image download failures are handled gracefully."""
+    # Arrange
+    world_id = "wrld_image_fail_test"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    test_world = create_test_world_detail(world_id=world_id, name="Image Fail Test")
+    fake_api_client.set_world_detail_response(world_id, test_world)
+    fake_image_downloader.set_download_response(world_id, False)  # Failure
+
+    # Act: Should complete world scraping despite image failure
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: World should be marked as SUCCESS (image failure doesn't block world scraping)
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    assert world_id not in pending_worlds  # Should be processed successfully
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scraper_close_method(stub_scraper):
+    """Test that the close method works correctly."""
+    # Act: Close the scraper
+    await stub_scraper.close()
+
+    # Assert: No exceptions should be raised (our fake clients don't have close methods)
+    # This test mainly exercises the hasattr checks in the close method
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_image_exists_check(stub_scraper, fake_image_downloader):
+    """Test the _image_exists method."""
+    # Arrange: Set up an image as existing
+    world_id = "wrld_image_exists_test"
+    fake_image_downloader.set_image_exists(world_id, True)
+
+    # Act & Assert: Should return True for existing image
+    exists = await stub_scraper._image_exists(world_id)
+    assert exists is True
+
+    # Act & Assert: Should return False for non-existing image
+    exists = await stub_scraper._image_exists("wrld_nonexistent")
+    assert exists is False
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_process_pending_worlds_batch_empty_database(stub_scraper):
+    """Test that batch processing handles empty database correctly."""
+    # Act: Process batch when no worlds are pending
+    processed_count = await stub_scraper._process_pending_worlds_batch(limit=10)
+
+    # Assert: Should return 0 for no worlds processed
+    assert processed_count == 0
