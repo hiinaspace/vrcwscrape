@@ -57,6 +57,8 @@ class VRChatScraper:
         async with self._task_group:
             self._task_group.create_task(self._scrape_recent_worlds_periodically())
             self._task_group.create_task(self._process_pending_worlds_continuously())
+            self._task_group.create_task(self._process_pending_file_metadata_continuously())
+            self._task_group.create_task(self._process_pending_image_downloads_continuously())
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
@@ -209,11 +211,8 @@ class VRChatScraper:
             # Update database immediately
             await self._update_database_with_world(world_id, world_details)
 
-            # Launch image download if needed
-            if world_details.image_url and not await self._image_exists(world_id):
-                self._create_task(
-                    self._download_image_task(world_id, world_details.image_url)
-                )
+            # Note: Image downloads are now handled through the file metadata workflow
+            # Files are queued as PENDING in the database, then processed separately
 
             logger.debug(f"Successfully scraped world {world_id}")
 
@@ -286,6 +285,224 @@ class VRChatScraper:
         except Exception as e:
             self.image_rate_limiter.on_error(request_id, self._time_source())
             logger.error(f"Unexpected error downloading image for {world_id}: {e}")
+
+    async def _scrape_file_metadata_task(self, file_id: str):
+        """Handle file metadata scraping for a specific file."""
+        request_id = f"file-{file_id}-{self._time_source()}"
+        now = self._time_source()
+
+        try:
+            # Record request start
+            self.api_rate_limiter.on_request_sent(request_id, now)
+
+            # Make API call to get file metadata
+            file_metadata = await self.api_client.get_file_metadata(file_id)
+
+            # Record success
+            self.api_rate_limiter.on_success(request_id, self._time_source())
+            self.api_circuit_breaker.on_success()
+
+            # Update database with file metadata (use aliases for consistency)
+            await self.database.update_file_metadata(
+                file_id,
+                file_metadata.model_dump(mode="json", by_alias=True),
+                status="SUCCESS"
+            )
+
+            logger.debug(f"Successfully scraped file metadata for {file_id}")
+
+        except AuthenticationError:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.critical("Authentication failed - shutting down")
+            self.shutdown()
+            raise
+
+        except httpx.HTTPStatusError as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+
+            if e.response.status_code == 404:
+                await self.database.update_file_metadata(
+                    file_id, {}, status="ERROR", error_message="File not found"
+                )
+                logger.info(f"File {file_id} not found (deleted?)")
+            elif e.response.status_code in [429, 500, 502, 503]:
+                self.api_circuit_breaker.on_error(self._time_source())
+                logger.warning(f"Failed to scrape file metadata {file_id}: {e}")
+            else:
+                logger.warning(f"Failed to scrape file metadata {file_id}: {e}")
+
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.warning(f"Timeout scraping file metadata {file_id}: {e}")
+
+        except Exception as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            logger.error(f"Unexpected error scraping file metadata {file_id}: {e}")
+
+    async def _download_image_from_metadata_task(self, file_id: str, file_metadata_json: dict):
+        """Handle image download based on file metadata."""
+        # Wait until we can make an image request
+        while True:
+            delay = await self._get_image_request_delay()
+            if delay <= 0:
+                break
+            await self._sleep_func(delay)
+
+        request_id = f"image-metadata-{file_id}-{self._time_source()}"
+        now = self._time_source()
+
+        try:
+            # Record request start
+            self.image_rate_limiter.on_request_sent(request_id, now)
+
+            # Parse file metadata to get download URL and MD5
+            from .models import FileMetadata
+            file_metadata = FileMetadata(**file_metadata_json)
+            latest_version = file_metadata.get_latest_version()
+            
+            if not latest_version or not latest_version.file:
+                await self.database.update_image_download(
+                    file_id, "ERROR", error_message="No valid file version found"
+                )
+                return
+
+            download_url = latest_version.file.url
+            expected_md5 = latest_version.file.md5
+            
+            # Download image with MD5 verification
+            success, local_path, size, error = await self.image_downloader.download_image(
+                file_id, download_url, expected_md5
+            )
+
+            # Record result in rate limiter
+            if success:
+                self.image_rate_limiter.on_success(request_id, self._time_source())
+                self.image_circuit_breaker.on_success()
+                logger.debug(f"Successfully downloaded image for {file_id}")
+            else:
+                self.image_rate_limiter.on_error(request_id, self._time_source())
+                logger.warning(f"Failed to download image for {file_id}: {error}")
+
+            # Update database with download result
+            if success:
+                await self.database.update_image_download(
+                    file_id, "SUCCESS", 
+                    local_file_path=local_path,
+                    downloaded_size_bytes=size
+                )
+            else:
+                await self.database.update_image_download(
+                    file_id, "ERROR", error_message=error
+                )
+
+        except Exception as e:
+            self.image_rate_limiter.on_error(request_id, self._time_source())
+            await self.database.update_image_download(
+                file_id, "ERROR", error_message=str(e)
+            )
+            logger.error(f"Unexpected error downloading image for {file_id}: {e}")
+
+    async def _process_pending_file_metadata_continuously(self):
+        """Continuously process pending file metadata from database."""
+        while not self._shutdown_event.is_set():
+            try:
+                processed_count = await self._process_pending_file_metadata_batch(limit=50)
+                if processed_count == 0:
+                    await self._sleep_func(
+                        self._idle_wait_time
+                    )  # Wait before checking again
+
+            except Exception as e:
+                logger.error(f"Error in pending file metadata processing: {e}")
+                await self._sleep_func(self._error_backoff_time)  # Back off on errors
+
+    async def _process_pending_image_downloads_continuously(self):
+        """Continuously process pending image downloads from database."""
+        while not self._shutdown_event.is_set():
+            try:
+                processed_count = await self._process_pending_image_downloads_batch(limit=20)
+                if processed_count == 0:
+                    await self._sleep_func(
+                        self._idle_wait_time
+                    )  # Wait before checking again
+
+            except Exception as e:
+                logger.error(f"Error in pending image downloads processing: {e}")
+                await self._sleep_func(self._error_backoff_time)  # Back off on errors
+
+    async def _process_pending_file_metadata_batch(self, limit: int = 50):
+        """Execute one batch of pending file metadata processing.
+
+        Args:
+            limit: Maximum number of files to process in this batch
+
+        Returns:
+            Number of files that were processed
+        """
+        pending_files = await self.database.get_pending_file_metadata(limit=limit)
+        if not pending_files:
+            return 0
+
+        batch_tasks = []
+        for file_id, file_type in pending_files:
+            if self._shutdown_event.is_set():
+                break
+
+            # Wait until we can make an API request
+            while True:
+                delay = await self._get_api_request_delay()
+                if delay <= 0:
+                    break
+                await self._sleep_func(delay)
+
+            # Launch individual file metadata scraping task
+            task = self._create_task(self._scrape_file_metadata_task(file_id))
+            batch_tasks.append(task)
+
+        # Wait for all tasks in this batch to complete before returning
+        if batch_tasks:
+            await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        return len(batch_tasks)
+
+    async def _process_pending_image_downloads_batch(self, limit: int = 20):
+        """Execute one batch of pending image downloads processing.
+
+        Args:
+            limit: Maximum number of images to process in this batch
+
+        Returns:
+            Number of images that were processed
+        """
+        pending_images = await self.database.get_pending_image_downloads(limit=limit)
+        if not pending_images:
+            return 0
+
+        batch_tasks = []
+        for file_id, file_metadata_json, file_type in pending_images:
+            if self._shutdown_event.is_set():
+                break
+
+            # Wait until we can make an image request
+            while True:
+                delay = await self._get_image_request_delay()
+                if delay <= 0:
+                    break
+                await self._sleep_func(delay)
+
+            # Launch individual image download task
+            task = self._create_task(
+                self._download_image_from_metadata_task(file_id, file_metadata_json)
+            )
+            batch_tasks.append(task)
+
+        # Wait for all tasks in this batch to complete before returning
+        if batch_tasks:
+            await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        return len(batch_tasks)
 
     async def _update_database_with_world(
         self, world_id: str, world_details: WorldDetail

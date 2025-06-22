@@ -62,14 +62,10 @@ class WorldSummary(BaseModel):
         """Extract file references from URLs in this world summary."""
         files = []
 
-        # Parse image URLs
-        for url_field, file_type in [
-            (self.image_url, FileType.IMAGE),
-            (self.thumbnail_url, FileType.IMAGE),
-        ]:
-            file_ref = _parse_file_url(url_field, file_type)
-            if file_ref:
-                files.append(file_ref)
+        # Parse image URL only (skip thumbnail - it's the same file with dynamic resizing)
+        file_ref = _parse_file_url(self.image_url, FileType.IMAGE)
+        if file_ref:
+            files.append(file_ref)
 
         return files
 
@@ -104,14 +100,10 @@ class WorldDetail(BaseModel):
         """Extract file references from URLs in this world detail."""
         files = []
 
-        # Parse image URLs
-        for url_field, file_type in [
-            (self.image_url, FileType.IMAGE),
-            (self.thumbnail_url, FileType.IMAGE),
-        ]:
-            file_ref = _parse_file_url(url_field, file_type)
-            if file_ref:
-                files.append(file_ref)
+        # Parse image URL only (skip thumbnail - it's the same file with dynamic resizing)
+        file_ref = _parse_file_url(self.image_url, FileType.IMAGE)
+        if file_ref:
+            files.append(file_ref)
 
         # Parse unity package URLs
         for unity_package in self.unity_packages:

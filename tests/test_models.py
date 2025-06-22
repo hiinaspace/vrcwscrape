@@ -134,7 +134,7 @@ def test_discovered_files_from_world_summary():
     world = WorldSummary(**recent_worlds_data[0])
 
     files = world.discovered_files
-    assert len(files) == 2  # imageUrl and thumbnailImageUrl
+    assert len(files) == 1  # imageUrl only (thumbnailImageUrl is same file with dynamic resizing)
 
     # Check image file
     image_file = next(
@@ -152,11 +152,11 @@ def test_discovered_files_from_world_detail():
     world = WorldDetail(**world_data)
 
     files = world.discovered_files
-    assert len(files) == 3  # imageUrl, thumbnailImageUrl, and 1 unity package
+    assert len(files) == 2  # imageUrl only (no thumbnailImageUrl) and 1 unity package
 
     # Check image files
     image_files = [f for f in files if f.file_type == FileType.IMAGE]
-    assert len(image_files) == 2
+    assert len(image_files) == 1
 
     # Check unity package file
     unity_files = [f for f in files if f.file_type == FileType.UNITY_PACKAGE]

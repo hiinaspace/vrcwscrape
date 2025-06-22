@@ -158,7 +158,7 @@ def scraper(
 @pytest.mark.asyncio
 @async_timeout(5.0)
 async def test_scrape_world_happy_path(
-    scraper,
+    stub_scraper,
     test_database,
     fake_api_client,
     fake_image_downloader,
@@ -171,38 +171,100 @@ async def test_scrape_world_happy_path(
         world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
     )
 
-    # Set up successful API response
+    # Set up successful API response with unity packages for file metadata testing
     test_world = create_test_world_detail(
         world_id=world_id,
         name="Test World",
         favorites=150,
         visits=2000,
+        include_unity_packages=True,
     )
     fake_api_client.set_world_detail_response(world_id, test_world)
 
-    # Set up successful image download
-    fake_image_downloader.set_download_response(world_id, True)
+    # Set up file metadata responses for discovered files
+    from tests.fakes import create_test_file_metadata
+    discovered_files = test_world.discovered_files
+    for file_ref in discovered_files:
+        if file_ref.file_type.value == "IMAGE":
+            file_metadata = create_test_file_metadata(
+                file_id=file_ref.file_id,
+                name="test_image.png",
+                extension=".png",
+                mime_type="image/png",
+                version=file_ref.version_number,
+            )
+        else:  # UNITY_PACKAGE
+            file_metadata = create_test_file_metadata(
+                file_id=file_ref.file_id,
+                name="test_unity.vrcw",
+                extension=".vrcw",
+                mime_type="application/gzip",
+                version=file_ref.version_number,
+                file_size=20000000,  # 20MB unity package
+            )
+        fake_api_client.set_file_metadata_response(file_ref.file_id, file_metadata)
 
-    # Act: Scrape the world
-    await scraper._scrape_world_task(world_id)
+    # Set up successful image downloads for all image files
+    for file_ref in discovered_files:
+        if file_ref.file_type.value == "IMAGE":
+            fake_image_downloader.set_download_result(
+                file_ref.file_id, True, f"/fake/path/{file_ref.file_id}.png", 100000, ""
+            )
+
+    # Act: Scrape the world and process the full workflow
+    await stub_scraper._scrape_world_task(world_id)
+    
+    # Process pending file metadata batch
+    await stub_scraper._process_pending_file_metadata_batch(limit=100)
+    
+    # Process pending image downloads batch  
+    await stub_scraper._process_pending_image_downloads_batch(limit=100)
 
     # Assert: Verify the world was updated in database
     worlds_in_db = await test_database.get_worlds_to_scrape(limit=100)
     assert world_id not in worlds_in_db, "World should no longer be pending"
 
-    # Verify API client was called
+    # Verify API client was called for world details
     assert fake_api_client.get_request_count("world_details") == 1
     world_request = fake_api_client.request_log[0]
     assert world_request["args"] == [world_id]
 
-    # Verify image download was attempted
-    assert fake_image_downloader.get_download_count(world_id) == 1
-    download_request = fake_image_downloader.download_log[0]
-    assert download_request["file_id"] == f"file_{world_id}"
-    assert download_request["url"] == test_world.image_url
+    # Verify file metadata API calls were made for discovered files
+    expected_file_metadata_calls = len([f for f in discovered_files])
+    assert fake_api_client.get_request_count("file_metadata") == expected_file_metadata_calls
+    
+    # Verify file metadata was stored in database
+    async with test_database.async_session() as session:
+        from src.vrchat_scraper.database import FileMetadata
+        from sqlalchemy import select
+        
+        file_records = await session.execute(
+            select(FileMetadata).where(FileMetadata.world_id == world_id)
+        )
+        file_records = file_records.scalars().all()
+        assert len(file_records) == len(discovered_files)
+        
+        # Check that all files have SUCCESS status (metadata was scraped)
+        for file_record in file_records:
+            assert file_record.scrape_status == "SUCCESS"
+            assert file_record.file_metadata is not None
 
-    # Verify image exists now
-    assert fake_image_downloader.image_exists(world_id)
+    # Verify image downloads were attempted for image files only
+    image_files = [f for f in discovered_files if f.file_type.value == "IMAGE"]
+    total_downloads = sum(fake_image_downloader.get_download_count(f"dummy_{i}") for i in range(10))  # Count all downloads
+    assert len(fake_image_downloader.download_log) == len(image_files)
+    
+    # Verify image download database records
+    async with test_database.async_session() as session:
+        from src.vrchat_scraper.database import WorldImage
+        
+        image_records = await session.execute(select(WorldImage))
+        image_records = image_records.scalars().all()
+        assert len(image_records) == len(image_files)
+        
+        for image_record in image_records:
+            assert image_record.download_status == "SUCCESS"
+            assert image_record.local_file_path is not None
 
     # Verify no sleep was needed (no delays from rate limiter/circuit breaker)
     assert mock_time._time == 1000.0, "Time should not have advanced"
@@ -332,9 +394,18 @@ async def test_process_pending_worlds_batch_happy_path(
     # Verify API calls were made for each world
     assert fake_api_client.get_request_count("world_details") == 3
 
-    # Verify image downloads were attempted for each world
-    for world_id in world_ids:
-        assert fake_image_downloader.get_download_count(world_id) == 1
+    # Verify that file metadata entries were created (images will be downloaded later)
+    async with test_database.async_session() as session:
+        from src.vrchat_scraper.database import FileMetadata
+        from sqlalchemy import select
+        
+        file_records = await session.execute(select(FileMetadata))
+        file_records = file_records.scalars().all()
+        
+        # Each world should have one image file entry
+        assert len(file_records) == len(world_ids)
+        for file_record in file_records:
+            assert file_record.scrape_status == "PENDING"  # Ready for file metadata scraping
 
 
 @pytest.mark.asyncio
