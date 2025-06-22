@@ -53,7 +53,7 @@ async def main():
 
     # Create API client and image downloader
     api_client = HTTPVRChatAPIClient(config.vrchat_auth_cookie)
-    image_downloader = FileImageDownloader(config.image_storage_path)
+    image_downloader = FileImageDownloader(config.vrchat_auth_cookie, config.image_storage_path)
 
     # Create rate limiters and circuit breakers
     now = time.time()

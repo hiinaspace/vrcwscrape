@@ -8,6 +8,8 @@ from typing import List, Tuple
 
 import httpx
 
+from vrchat_scraper.protocols import VRChatAPIClient
+
 from .models import WorldDetail, WorldSummary, FileMetadata
 
 logger = logging.getLogger(__name__)
@@ -75,10 +77,15 @@ class HTTPVRChatAPIClient:
 class FileImageDownloader:
     """File system-based image downloader with MD5 verification."""
 
-    def __init__(self, storage_path: str):
+    def __init__(self, auth_cookie: str, storage_path: str, timeout: float = 30.0):
         """Initialize with image storage directory."""
         self.storage_path = Path(storage_path)
-        self.client = httpx.AsyncClient(timeout=30.0)
+        # the initial request still requires vrchat auth, even if the download is direct from s3.
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=10),
+            headers={"Cookie": f"auth={auth_cookie}"},
+        )
 
     async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
         """Download and verify an image file.
@@ -95,38 +102,39 @@ class FileImageDownloader:
         image_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            response = await self.client.get(download_url)
+            # vrchat file links redirect to s3 signed urls.
+            response = await self.client.get(download_url, follow_redirects=True)
 
             if response.status_code == 404:
                 # File no longer exists on VRChat CDN
                 return False, str(image_path), 0, "Image not found on VRChat CDN (404)"
 
             response.raise_for_status()
-            
+
             # Get downloaded content
             content = response.content
             actual_size = len(content)
-            
+
             # Verify MD5 hash
             if not self._verify_md5(content, expected_md5):
                 return False, str(image_path), actual_size, "MD5 hash verification failed"
-            
+
             # Write verified content to disk
             image_path.write_bytes(content)
             logger.debug(f"Successfully downloaded and verified image {file_id} ({actual_size} bytes)")
-            
+
             return True, str(image_path), actual_size, ""
 
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             error_msg = f"Timeout downloading image {file_id}: {e}"
             logger.warning(error_msg)
             return False, str(image_path), 0, error_msg
-            
+
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP error downloading image {file_id}: {e}"
             logger.warning(error_msg)
             return False, str(image_path), 0, error_msg
-            
+
         except Exception as e:
             error_msg = f"Unexpected error downloading image {file_id}: {e}"
             logger.error(error_msg)
@@ -143,13 +151,13 @@ class FileImageDownloader:
         try:
             # Calculate MD5 of downloaded content
             actual_md5_hex = hashlib.md5(content).hexdigest()
-            
+
             # Decode VRChat's base64 MD5 to hex
             expected_md5_bytes = base64.b64decode(expected_md5_b64)
             expected_md5_hex = expected_md5_bytes.hex()
-            
+
             return actual_md5_hex == expected_md5_hex
-            
+
         except Exception as e:
             logger.warning(f"MD5 verification failed due to encoding error: {e}")
             return False
