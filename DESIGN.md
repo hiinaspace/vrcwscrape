@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project maintains a copy of VRChat's world metadata database by periodically scraping their HTTP API. The data is stored in DoltDB (a Git-like MySQL-compatible database) to enable versioned data access and collaborative scraping. 
+This project maintains a copy of VRChat's world metadata database by periodically scraping their HTTP API. The data is stored in DoltDB (a Git-like MySQL-compatible database) to enable versioned data access and collaborative scraping.
 
 Primary goals:
 1. Enable better search interfaces than VRChat's native search capabilities
@@ -40,12 +40,12 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
    ┌─────────────────────────────────────────────────┘
    │
    ├─ World Discovery Queue (PENDING worlds)
-   ├─ File Metadata Queue (PENDING file_metadata) 
+   ├─ File Metadata Queue (PENDING file_metadata)
    ├─ Image Download Queue (PENDING world_images)
    │
    └─ Coordination via Database State
                 ↓
-          Image Storage 
+          Image Storage
      (MD5 verified, organized by file_uuid)
 ```
 
@@ -56,17 +56,17 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
 - **Recent Worlds**: `GET /api/1/worlds?sort=updated`
   - Returns array of recently updated worlds (up to 1000)
   - Used hourly to discover new/updated worlds
-  
+
 - **World Details**: `GET /api/1/worlds/{world_id}`
   - Returns complete metadata for a single world
   - Includes all fields except file metadata
-  
+
 - **File Metadata**: `GET /api/1/file/{file_id}`
   - Returns version history, download sizes, and MD5 hashes
   - Covers both world images and unity packages
   - Multiple versions per file possible
   - Example: `https://vrchat.com/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf`
-  
+
 - **Images**: Direct URLs from `imageUrl` and `thumbnailImageUrl` fields
   - Typically 800x600 PNG files
   - No authentication required for public world images
@@ -74,7 +74,7 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
 ### Authentication
 
 - Uses browser auth cookie (`VRCHAT_AUTH_COOKIE` environment variable)
-- Cookie expires after weeks/months
+- Cookie expires after a year it seems, so manual refresh is easiest.
 - System monitors 401 responses and circuit breaks on auth failures
 
 ## Database Schema
@@ -164,7 +164,7 @@ The scraper uses two separate components for request control:
    - Uses pacing gains (cruising: 1.0, probing_up: 1.25, probing_down: 0.9)
    - Operates at 1-10 RPS scale with 10-second windows
 
-2. **CircuitBreaker**: Handles catastrophic failure scenarios  
+2. **CircuitBreaker**: Handles catastrophic failure scenarios
    - Monitors error rates and activates on high failure rates
    - Exponential backoff on repeated failures
    - Independent of rate limiting - focuses on service availability
@@ -211,7 +211,7 @@ The scraper uses two separate components for request control:
 Heuristic based on world age and activity:
 
 - **New Worlds** (< 1 week old): Daily scrapes
-- **Recent Worlds** (1-4 weeks): Weekly scrapes  
+- **Recent Worlds** (1-4 weeks): Weekly scrapes
 - **Active Worlds** (< 1 year, regular visitors): Monthly scrapes
 - **Inactive Worlds** (> 1 year, few visitors): Yearly scrapes
 - **Minimum Interval**: 24 hours between scrapes of same world
@@ -220,7 +220,7 @@ Heuristic based on world age and activity:
 
 **File Discovery and Metadata:**
 - Extract file UUIDs and versions from world metadata URLs using URL parsing
-- Two file types: `IMAGE` (for viewing) and `UNITY_PACKAGE` (for size tracking)  
+- Two file types: `IMAGE` (for viewing) and `UNITY_PACKAGE` (for size tracking)
 - Version tracking enables skipping unchanged files when world metadata updates
 - File metadata scraped separately from world metadata for parallelization
 - VRChat provides authoritative MD5 hashes and sizes per file version
@@ -232,12 +232,12 @@ Heuristic based on world age and activity:
 4. Storage layout: `/images/{file_uuid[0:2]}/{file_uuid[2:4]}/{file_id}.png`
 
 **Status Tracking:**
-- **file_metadata.scrape_status**: 
+- **file_metadata.scrape_status**:
   - `PENDING`: File discovered from world, metadata not scraped
   - `SUCCESS`: VRChat file metadata successfully retrieved
   - `ERROR`: File metadata scrape failed (retry eligible)
 - **world_images.download_status**:
-  - `PENDING`: File metadata available, download not attempted  
+  - `PENDING`: File metadata available, download not attempted
   - `SUCCESS`: Image downloaded and MD5 verified
   - `NOT_FOUND`: Image URL returned 404 (file may be deleted)
   - `ERROR`: Download failed due to network/verification error (retry eligible)
@@ -296,7 +296,7 @@ Heuristic based on world age and activity:
 - World scrape queue depth (PENDING worlds)
 
 **File Metadata Metrics:**
-- File metadata scrape rate and latencies  
+- File metadata scrape rate and latencies
 - Files discovered per world (images + unity packages)
 - File metadata queue depth (PENDING file_metadata rows)
 
@@ -394,7 +394,7 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 - Direct SQL table inspection for state verification
 
 **Test Coverage**:
-- World state transitions (PENDING → SUCCESS → DELETED) 
+- World state transitions (PENDING → SUCCESS → DELETED)
 - Metrics time-series storage (append-only behavior)
 - Upsert operations and conflict resolution
 - Database schema initialization
@@ -403,7 +403,7 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 
 **Comprehensive Error Handling**:
 - Authentication failures (401) → shutdown behavior
-- Rate limit responses (429) → circuit breaker activation  
+- Rate limit responses (429) → circuit breaker activation
 - Server errors (500, 502, 503) → retry logic
 - Network timeouts → backoff behavior
 - World deletion (404) → status marking
@@ -446,7 +446,7 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 ### Why These Choices
 
 - **SQLAlchemy**: Provides async support and enables in-memory SQLite testing
-- **No OpenAPI Client**: Overhead not worth it for 4 endpoints  
+- **No OpenAPI Client**: Overhead not worth it for 4 endpoints
 - **Asyncio**: Natural fit for I/O-bound scraping workload
 - **Separated Rate Limiting**: Independent components for rate discovery vs failure handling
 
