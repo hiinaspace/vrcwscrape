@@ -1,0 +1,84 @@
+# vrcwscrape/src/vrchat_scraper/rate_limiter/circuit_breaker.py
+
+from enum import Enum, auto
+
+
+class CircuitBreakerState(Enum):
+    """Enumerates the possible states of the CircuitBreaker."""
+
+    CLOSED = auto()
+    OPEN = auto()
+    HALF_OPEN = auto()
+
+
+class CircuitBreaker:
+    """
+    A Circuit Breaker implementation to halt requests during catastrophic failures.
+
+    This pattern provides a critical safety layer on top of a rate limiter. It is
+    designed to react to signals that suggest a fundamental problem with making
+    requests, such as total API downtime (5xx errors), authentication failure (401),
+    or severe, repeated rate limiting (many 429s).
+    """
+
+    def __init__(
+        self,
+        error_threshold: int = 5,
+        initial_backoff_sec: float = 5.0,
+        max_backoff_sec: float = 300.0,
+    ):
+        self.state = CircuitBreakerState.CLOSED
+        self._error_threshold = error_threshold
+        self._initial_backoff_sec = initial_backoff_sec
+        self._max_backoff_sec = max_backoff_sec
+
+        self._consecutive_errors = 0
+        self._last_error_time = 0.0
+        self._backoff_duration = self._initial_backoff_sec
+
+    def get_delay_until_proceed(self, now: float) -> float:
+        """
+        Returns the number of seconds to wait before proceeding. 0.0 means
+        the action is permitted immediately.
+        """
+        if self.state == CircuitBreakerState.OPEN:
+            # Check if the backoff period has expired.
+            if now > self._last_error_time + self._backoff_duration:
+                self.state = CircuitBreakerState.HALF_OPEN
+                return 0.0  # Permit one trial request
+
+            # If still within the backoff period, return the remaining time.
+            return (self._last_error_time + self._backoff_duration) - now
+
+        # In CLOSED or HALF_OPEN states, we can proceed immediately.
+        return 0.0
+
+    def on_success(self):
+        """Records a successful outcome, closing the breaker if it was half-open."""
+        self._consecutive_errors = 0
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.CLOSED
+            self._backoff_duration = self._initial_backoff_sec
+
+    def on_error(self, now: float):
+        """Records a failure, potentially tripping the breaker to the OPEN state."""
+        self._consecutive_errors += 1
+
+        # Determine if the breaker should trip based on its current state.
+        should_trip = (
+            self.state == CircuitBreakerState.HALF_OPEN
+            or self._consecutive_errors >= self._error_threshold
+        )
+
+        if not should_trip:
+            return
+
+        # If we are re-tripping from HALF_OPEN, we double the backoff for the next period.
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self._backoff_duration = min(
+                self._backoff_duration * 2, self._max_backoff_sec
+            )
+
+        # Now, transition to OPEN state and record the time.
+        self.state = CircuitBreakerState.OPEN
+        self._last_error_time = now

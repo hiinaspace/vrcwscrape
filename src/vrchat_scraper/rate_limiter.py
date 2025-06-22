@@ -1,148 +1,235 @@
-"""BBR-inspired rate limiting for VRChat API."""
-
-import asyncio
-import logging
-import time
-from collections import deque
-from dataclasses import dataclass
-from typing import Optional
-
-logger = logging.getLogger(__name__)
+from collections import deque, namedtuple
+from enum import Enum, auto
+from typing import Deque, Tuple, Dict, Any, Callable
 
 
-@dataclass
-class RequestResult:
-    """Result of a request for rate limiting purposes."""
+class BbrState(Enum):
+    """Enumerates the probing states of the BBR-inspired rate limiter."""
 
-    timestamp: float
-    success: bool
-    status_code: Optional[int] = None
+    CRUISING = auto()
+    PROBING_UP = auto()
+    PROBING_DOWN = auto()
 
 
-class RateLimiter:
-    """BBR-inspired rate limiter that adapts to API behavior."""
+# A lightweight struct to hold the limiter's state when a request was sent.
+RequestState = namedtuple(
+    "RequestState", ["send_time", "completed_at_send", "last_response_time_at_send"]
+)
+
+
+class _WindowedFilter:
+    """
+    An efficient implementation for tracking the min/max of values within a
+    sliding time window using the "monotonic deque" algorithm.
+
+    This ensures that each update operation is amortized O(1), as each element
+    is added to and removed from the internal deque only once.
+    """
 
     def __init__(
         self,
-        base_rate: float = 10.0,  # requests per second
-        window_size: int = 120,  # seconds
-        error_threshold: float = 0.1,
-        probe_interval: float = 60.0,
+        window_size: float,
+        initial_value: float,
+        op: Callable,
+        op_is_better: Callable,
     ):
-        """Initialize rate limiter with adaptive parameters."""
-        self.base_rate = base_rate
-        self.window_size = window_size
-        self.error_threshold = error_threshold
-        self.probe_interval = probe_interval
+        self._window_size = window_size
+        self._op = op  # The operator (min or max)
+        self._op_is_better = op_is_better  # The comparison (e.g., < for min, > for max)
+        self._history: Deque[Tuple[float, float]] = deque()
+        self.value = initial_value
 
-        self.request_history = deque()
-        self.pacing_gain = 1.0
-        self.last_probe_time = time.time()
-        self.circuit_breaker_until = 0
-        self.backoff_seconds = 5  # Start with 5s backoff
-        self.last_request_time = 0
+    def update(self, new_sample: float, now: float):
+        # Remove old samples from the front of the deque.
+        cutoff = now - self._window_size
+        while self._history and self._history[0][0] < cutoff:
+            self._history.popleft()
 
-    async def acquire(self):
-        """Wait until it's safe to make a request."""
-        now = time.time()
+        # Remove elements from the back that are "worse" than the new sample.
+        # For a min-filter, we remove larger elements.
+        # For a max-filter, we remove smaller elements.
+        while self._history and self._op_is_better(new_sample, self._history[-1][1]):
+            self._history.pop()
 
-        # Check circuit breaker
-        if now < self.circuit_breaker_until:
-            wait_time = self.circuit_breaker_until - now
-            logger.info(f"Circuit breaker active, waiting {wait_time:.1f}s")
-            await asyncio.sleep(wait_time)
-            now = time.time()
+        self._history.append((now, new_sample))
 
-        # Clean old history
-        cutoff = now - self.window_size
-        while self.request_history and self.request_history[0].timestamp < cutoff:
-            self.request_history.popleft()
+        # The best value in the window is always at the front of the deque.
+        self.value = self._history[0][1]
 
-        # Calculate delay based on current rate
-        if self.last_request_time > 0:
-            target_rate = self.base_rate * self.pacing_gain
-            min_interval = 1.0 / target_rate if target_rate > 0 else 1.0
-            elapsed = now - self.last_request_time
 
-            if elapsed < min_interval:
-                wait_time = min_interval - elapsed
-                await asyncio.sleep(wait_time)
+class BBRRateLimiter:
+    """
+    Adapts API request rate using an algorithm inspired by BBR congestion control.
 
-        self.last_request_time = time.time()
+    This implementation maintains a model of the API's capacity by measuring request
+    latency and delivery rate. It does not handle catastrophic failures (that is the
+    job of the CircuitBreaker); instead, it focuses on finding the optimal
+    performance point and reacting gracefully to transient congestion (e.g., a few 429s).
 
-    def record_result(self, success: bool, status_code: Optional[int] = None):
-        """Record the result of a request and adjust rate accordingly."""
-        result = RequestResult(
-            timestamp=time.time(),
-            success=success,
-            status_code=status_code,
+    BBR Terminology Mapping:
+    The design is justified by concepts in the BBR spec (draft-ietf-ccwg-bbr-02).
+    - BBR.max_bw (Long-term model): Our `_max_rate` windowed-max filter. It stores
+      the optimistic, best-observed delivery rate.
+    - BBR.bw_shortterm (Short-term model): Our `_short_term_rate_cap`. This is a
+      pessimistic "brake" applied immediately on errors.
+    - BBR.bw (Effective Bandwidth): The `min(self.max_rate, self._short_term_rate_cap)`.
+    - Delivery Rate Sampling (BBR Spec 4.5.2): The core logic in `on_success` that
+      calculates throughput based on a flight of requests, not just one.
+    - ProbeBW Cycle (BBR Spec 4.3.3): Our state machine (`CRUISING`, `PROBING_UP`,
+      `PROBING_DOWN`) mimics this to safely probe for more capacity.
+    """
+
+    def __init__(
+        self,
+        now: float,
+        initial_rate: float = 2.0,
+        probe_cycle_duration_sec: float = 5.0,
+        window_size_sec: float = 10.0,
+        min_requests_for_pipe: int = 4,
+        probe_up_gain: float = 1.25,
+        probe_down_gain: float = 0.9,
+    ):
+        # --- BBR State & Model ---
+        self.state = BbrState.CRUISING
+        self._max_rate = _WindowedFilter(
+            window_size_sec, initial_rate, max, lambda a, b: a >= b
         )
-        self.request_history.append(result)
+        self._short_term_rate_cap = float("inf")
+        self._min_latency = _WindowedFilter(
+            window_size_sec, 0.5, min, lambda a, b: a <= b
+        )
+        self._is_app_limited = False
 
-        # Calculate error rate
-        if len(self.request_history) >= 10:  # Need minimum samples
-            recent_errors = sum(
-                1
-                for r in self.request_history
-                if not r.success and r.timestamp > time.time() - 30  # Last 30s
-            )
-            recent_total = len(
-                [r for r in self.request_history if r.timestamp > time.time() - 30]
-            )
-            error_rate = recent_errors / recent_total if recent_total > 0 else 0
+        # --- Delivery Rate Sampling State ---
+        self._total_requests_completed = 0
+        self._last_response_time = now
 
-            if error_rate > self.error_threshold:
-                self._activate_circuit_breaker()
-            elif error_rate > 0:
-                # Reduce rate on any errors
-                self.pacing_gain = max(0.5, self.pacing_gain * 0.9)
-                logger.info(f"Reduced pacing gain to {self.pacing_gain:.2f}")
-            else:
-                # Consider probing for more bandwidth
-                if time.time() - self.last_probe_time > self.probe_interval:
-                    self._probe_bandwidth()
+        # --- Concurrency & Pacing ---
+        self.inflight = 0
+        self._pacing_rate = initial_rate
+        self._inflight_target = initial_rate * self._min_latency.value
+        self._min_pipe_size = min_requests_for_pipe
+        self._probe_up_gain = probe_up_gain
+        self._probe_down_gain = probe_down_gain
 
-        # Reset backoff on success
-        if success:
-            self.backoff_seconds = 5
+        # --- In-flight Request Tracking ---
+        self._inflight_requests: Dict[Any, RequestState] = {}
 
-    def _activate_circuit_breaker(self):
-        """Activate circuit breaker with exponential backoff."""
-        self.circuit_breaker_until = time.time() + self.backoff_seconds
-        logger.warning(f"Circuit breaker activated for {self.backoff_seconds}s")
+        # --- Timing ---
+        self._last_send_time = 0.0
+        self._last_probe_cycle_start = now
+        self._probe_cycle_duration = probe_cycle_duration_sec
 
-        # Exponential backoff for next time
-        self.backoff_seconds = min(self.backoff_seconds * 2, 300)  # Max 5 min
+    @property
+    def max_rate(self) -> float:
+        """Returns the long-term, windowed-max delivery rate estimate."""
+        return self._max_rate.value
 
-        # Reduce rate significantly
-        self.pacing_gain = 0.5
+    @property
+    def min_latency(self) -> float:
+        """Returns the windowed-minimum latency estimate."""
+        return self._min_latency.value
 
-    def _probe_bandwidth(self):
-        """Temporarily increase rate to test limits."""
-        if self.pacing_gain < 0.9:  # Only probe if we're not already near max
+    def get_delay_until_next_request(self, now: float) -> float:
+        """
+        Returns the seconds to wait before sending the next request. 0.0 means
+        the request can be sent immediately.
+        """
+        self._update_state_machine(now)
+
+        time_since_last = now - self._last_send_time
+        pacing_rate = self._get_effective_rate() * self._get_pacing_gain()
+        required_delay = 1.0 / pacing_rate if pacing_rate > 0 else float("inf")
+
+        if time_since_last < required_delay:
+            return required_delay - time_since_last
+
+        inflight_target = max(
+            self._min_pipe_size, self._get_effective_rate() * self.min_latency
+        )
+        if self.inflight >= max(self._min_pipe_size, inflight_target * 2):
+            return self.min_latency / 2
+
+        return 0.0
+
+    def on_request_sent(self, request_id: Any, now: float):
+        """Call this immediately after dispatching a request."""
+        self.inflight += 1
+        self._last_send_time = now
+        self._inflight_requests[request_id] = RequestState(
+            send_time=now,
+            completed_at_send=self._total_requests_completed,
+            last_response_time_at_send=self._last_response_time,
+        )
+
+    def on_success(self, request_id: Any, now: float):
+        """Records a successful request, updating the rate model."""
+        request_state = self._inflight_requests.pop(request_id, None)
+        if not request_state:
             return
 
-        logger.info("Probing for additional bandwidth")
-        self.pacing_gain = min(1.2, self.pacing_gain * 1.1)
-        self.last_probe_time = time.time()
+        self.inflight = max(0, self.inflight - 1)
+        self._total_requests_completed += 1
 
-        # Schedule return to normal after probe
-        asyncio.create_task(self._end_probe())
+        requests_in_sample = (
+            self._total_requests_completed - request_state.completed_at_send
+        )
+        time_interval = now - request_state.last_response_time_at_send
+        self._last_response_time = now
 
-    async def _end_probe(self):
-        """End bandwidth probe after test period."""
-        await asyncio.sleep(10)  # Probe for 10 seconds
+        if requests_in_sample > 0 and time_interval > 0:
+            delivery_rate = requests_in_sample / time_interval
+            if not self._is_app_limited or delivery_rate > self.max_rate:
+                self._max_rate.update(delivery_rate, now)
 
-        # Check if probe was successful (no errors in probe period)
-        probe_errors = sum(
-            1
-            for r in self.request_history
-            if not r.success and r.timestamp > self.last_probe_time
+        latency = now - request_state.send_time
+        if not self._is_app_limited or latency < self.min_latency:
+            self._min_latency.update(latency, now)
+
+    def on_error(self, request_id: Any, now: float):
+        """
+        Records a failed request, applying a short-term brake on the rate.
+        This signals transient congestion.
+        """
+        if request_id in self._inflight_requests:
+            self._inflight_requests.pop(request_id)
+            self.inflight = max(0, self.inflight - 1)
+
+        effective_rate = self._get_effective_rate()
+
+        # Apply the pessimistic short-term brake.
+        factor = 0.8 if self.state == BbrState.PROBING_UP else 0.9
+        self._short_term_rate_cap = min(
+            self._short_term_rate_cap, effective_rate * factor
         )
 
-        if probe_errors == 0:
-            logger.info("Probe successful, keeping higher rate")
-            self.pacing_gain = min(1.0, self.pacing_gain)  # Don't exceed 1.0
-        else:
-            logger.info("Probe hit errors, reverting rate")
-            self.pacing_gain = 0.9
+        # A probe that results in an error has failed; immediately back off.
+        if self.state == BbrState.PROBING_UP:
+            self.state = BbrState.PROBING_DOWN
+
+    def set_app_limited(self, is_limited: bool):
+        """Informs the limiter if the application has work to do."""
+        self._is_app_limited = is_limited
+
+    def _get_effective_rate(self) -> float:
+        return min(self.max_rate, self._short_term_rate_cap)
+
+    def _get_pacing_gain(self) -> float:
+        return {
+            BbrState.CRUISING: 1.0,
+            BbrState.PROBING_UP: self._probe_up_gain,
+            BbrState.PROBING_DOWN: self._probe_down_gain,
+        }[self.state]
+
+    def _update_state_machine(self, now: float):
+        if now > self._last_probe_cycle_start + self._probe_cycle_duration:
+            self._last_probe_cycle_start = now
+            # A new probe cycle is a chance to be optimistic again. Remove the brake.
+            self._short_term_rate_cap = float("inf")
+
+            if self.state == BbrState.CRUISING:
+                self.state = BbrState.PROBING_UP
+            elif self.state == BbrState.PROBING_UP:
+                self.state = BbrState.PROBING_DOWN
+            elif self.state == BbrState.PROBING_DOWN:
+                self.state = BbrState.CRUISING

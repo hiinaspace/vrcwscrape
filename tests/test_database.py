@@ -4,7 +4,6 @@ import pytest
 import pytest_asyncio
 
 
-
 @pytest_asyncio.fixture
 async def test_db():
     """Create test database."""

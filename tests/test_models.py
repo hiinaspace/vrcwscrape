@@ -1,8 +1,6 @@
 """Tests for Pydantic models."""
 
 
-
-
 def test_world_summary_parsing():
     """Test WorldSummary model parsing."""
     # TODO: Implement test with sample data
