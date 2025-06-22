@@ -169,6 +169,11 @@ class VRChatScraper:
 
             logger.warning(f"Recent worlds request failed: {e}")
 
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.warning(f"Timeout in recent worlds request: {e}")
+
         except Exception as e:
             self.api_rate_limiter.on_error(request_id, self._time_source())
             logger.error(f"Unexpected error in recent worlds task: {e}")
@@ -218,6 +223,11 @@ class VRChatScraper:
                 logger.warning(f"Failed to scrape world {world_id}: {e}")
             else:
                 logger.warning(f"Failed to scrape world {world_id}: {e}")
+
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.warning(f"Timeout scraping world {world_id}: {e}")
 
         except Exception as e:
             self.api_rate_limiter.on_error(request_id, self._time_source())

@@ -87,6 +87,9 @@ class FileImageDownloader:
             image_path.write_bytes(response.content)
             return True
 
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            logger.warning(f"Timeout downloading image for {world_id}: {e}")
+            return False
         except Exception as e:
             logger.warning(f"Failed to download image for {world_id}: {e}")
             return False
