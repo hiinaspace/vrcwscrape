@@ -262,3 +262,96 @@ async def test_idle_time_behavior_with_empty_database(
     assert duration >= 0.4, (
         f"Should have waited at least 0.4 seconds for idle time, took {duration}"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+@async_timeout(10.0)
+async def test_app_limited_rate_preservation(
+    integration_scraper,
+    test_database,
+    fast_api_client,
+    fast_image_downloader,
+    real_api_rate_limiter,
+):
+    """Test that rate limiter preserves high max_rate when app is limited by few pending worlds.
+
+    This test demonstrates the app_limited issue: when we have a high detected rate (e.g. 10 req/s)
+    but only a few pending worlds to scrape, the delivery rate will be artificially low.
+    Without proper app_limited signaling, this would incorrectly lower the max_rate.
+    """
+    # Arrange: Set up just 2 pending worlds (not enough to saturate a high rate limit)
+    world_ids = ["wrld_app_limited_1", "wrld_app_limited_2"]
+
+    for world_id in world_ids:
+        await test_database.upsert_world(
+            world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+        )
+
+        # Set up delayed responses (100ms per API call to simulate realistic network latency)
+        test_world = create_test_world_detail(
+            world_id=world_id,
+            name=f"App Limited World {world_id[-1]}",
+        )
+
+        # Create a coroutine that delays before returning the result
+        async def delayed_world_response():
+            await asyncio.sleep(
+                0.5
+            )  # 500ms delay to create a low delivery rate (2 req/s max)
+            return test_world
+
+        fast_api_client.add_world_detail_future(world_id, delayed_world_response())
+        fast_image_downloader.set_download_response(world_id, True)
+
+    # Prime the rate limiter with a high max_rate (10 req/s) as if we had previously
+    # detected this rate when we had lots of work to do
+    current_time = asyncio.get_running_loop().time()
+    real_api_rate_limiter._max_rate.update(10.0, current_time)  # 10 req/s
+    real_api_rate_limiter._pacing_rate = 10.0
+    initial_max_rate = real_api_rate_limiter.max_rate
+
+    # Record the initial state
+    assert initial_max_rate == 10.0, "Should start with high max_rate"
+
+    # Act: Process the small batch of worlds - the API client will provide realistic delays
+    start_time = asyncio.get_running_loop().time()
+    processed_count = await integration_scraper._process_pending_worlds_batch(limit=10)
+    end_time = asyncio.get_running_loop().time()
+
+    # Assert: We processed the 2 worlds
+    assert processed_count == 2, "Should have processed 2 worlds"
+
+    # The processing took some time due to API client delays
+    # With 500ms delay per API call and concurrent processing, should take ~500ms + overhead
+    duration = end_time - start_time
+    assert duration > 0.45, (
+        f"Should have taken at least 450ms (500ms API latency + overhead), took {duration}"
+    )
+
+    # The problem: Without proper app_limited signaling, the rate limiter may have
+    # updated its max_rate based on the delivery rate it measured during this small batch
+    final_max_rate = real_api_rate_limiter.max_rate
+
+    # Check if the rate limiter thinks it's app-limited (it should be, but probably isn't set)
+    is_app_limited = real_api_rate_limiter._is_app_limited
+
+    print(f"Initial max_rate: {initial_max_rate}")
+    print(f"Final max_rate: {final_max_rate}")
+    print(f"App limited flag: {is_app_limited}")
+    print(f"Processing duration: {duration}")
+    print(f"Expected delivery rate: {processed_count / duration:.2f} req/s")
+    print(
+        f"Total requests completed: {real_api_rate_limiter._total_requests_completed}"
+    )
+    print(f"Last response time: {real_api_rate_limiter._last_response_time}")
+
+    # This assertion demonstrates the app_limited issue:
+    # The scraper should call set_app_limited(True) when it has insufficient work to saturate
+    # the rate limit. The app_limited flag should be True, but it's currently False.
+    assert is_app_limited, (
+        f"Rate limiter app_limited flag should be True when processing only {processed_count} worlds "
+        f"(insufficient to saturate a {initial_max_rate} req/s rate limit), but it's {is_app_limited}. "
+        f"This indicates the scraper is not calling set_app_limited(True) when it has insufficient "
+        f"work to saturate the rate limit."
+    )
