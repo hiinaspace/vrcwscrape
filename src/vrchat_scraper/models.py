@@ -25,6 +25,7 @@ class WorldDetail(BaseModel):
     name: str
     description: Optional[str] = None
     author_id: str = Field(alias="authorId")
+    image_url: str = Field(alias="imageUrl")
     capacity: int
     favorites: int
     heat: int
