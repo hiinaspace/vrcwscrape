@@ -186,52 +186,6 @@ def test_new_probe_cycle_resets_short_term_cap(
     assert limiter._get_effective_rate() == limiter.max_rate
 
 
-def test_app_limited_ignores_bad_samples(limiter: BBRRateLimiter, mock_time: MockTime):
-    """Test that when app-limited, the model isn't polluted by slow rates."""
-    # Establish a high rate
-    limiter.on_request_sent("req-fast", mock_time.now)
-    request_state = limiter._inflight_requests["req-fast"]
-
-    limiter.on_success("req-fast", mock_time.now)  # Simplified success
-    limiter._max_rate.update(20.0, mock_time.now)
-    assert limiter.max_rate == 20.0
-
-    limiter.set_app_limited(True)
-
-    # Simulate a very slow delivery rate (e.g., 1 req/s)
-    mock_time.advance(1.0)  # 1s interval
-
-    # Manually craft a slow sample
-    requests_in_sample = (
-        limiter._total_requests_completed - request_state.completed_at_send
-    )
-    delivery_rate = requests_in_sample / (
-        mock_time.now - request_state.last_response_time_at_send
-    )
-    assert delivery_rate < 5.0  # Verify our test setup is creating a slow rate
-
-    # The model should ignore this slow sample because we are app-limited.
-    limiter.on_success("req-fast", mock_time.now)
-    assert limiter.max_rate == 20.0
-
-
-def test_app_limited_accepts_good_samples(limiter: BBRRateLimiter, mock_time: MockTime):
-    """Test that when app-limited, the model WILL update if it finds a new best rate."""
-    assert limiter.max_rate == 10.0
-    limiter.set_app_limited(True)
-
-    # Simulate a request cycle that produces a delivery rate of 25.0 req/s
-    limiter.on_request_sent("req-1", mock_time.now)
-    limiter.on_request_sent("req-2", mock_time.now)
-    mock_time.advance(0.08)
-    limiter.on_success("req-1", mock_time.now)
-    limiter.on_success("req-2", mock_time.now)
-
-    # Even though app-limited, the rate was better than the model's belief,
-    # so it must be updated.
-    assert limiter.max_rate > 20.0
-
-
 def test_windowed_filter_discards_old_samples(mock_time: MockTime):
     """
     Test that the _WindowedFilter correctly discards samples that have aged

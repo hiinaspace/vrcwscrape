@@ -77,6 +77,13 @@ class BBRRateLimiter:
       calculates throughput based on a flight of requests, not just one.
     - ProbeBW Cycle (BBR Spec 4.3.3): Our state machine (`CRUISING`, `PROBING_UP`,
       `PROBING_DOWN`) mimics this to safely probe for more capacity.
+
+    Note on App-Limited Detection:
+    Unlike TCP BBR which operates across 12 orders of magnitude, this rate limiter
+    operates at 1-10 RPS with short windows (10s). App-limited scenarios (where we
+    have insufficient work to saturate the rate limit) will temporarily lower the
+    detected rate, but the probe cycle quickly recovers. The complexity of proper
+    app-limited detection isn't justified at our scale and steady-state operation.
     """
 
     def __init__(
@@ -98,7 +105,6 @@ class BBRRateLimiter:
         self._min_latency = _WindowedFilter(
             window_size_sec, 0.5, min, lambda a, b: a <= b
         )
-        self._is_app_limited = False
 
         # --- Delivery Rate Sampling State ---
         self._total_requests_completed = 0
@@ -179,12 +185,10 @@ class BBRRateLimiter:
 
         if requests_in_sample > 0 and time_interval > 0:
             delivery_rate = requests_in_sample / time_interval
-            if not self._is_app_limited or delivery_rate > self.max_rate:
-                self._max_rate.update(delivery_rate, now)
+            self._max_rate.update(delivery_rate, now)
 
         latency = now - request_state.send_time
-        if not self._is_app_limited or latency < self.min_latency:
-            self._min_latency.update(latency, now)
+        self._min_latency.update(latency, now)
 
     def on_error(self, request_id: Any, now: float):
         """
@@ -206,10 +210,6 @@ class BBRRateLimiter:
         # A probe that results in an error has failed; immediately back off.
         if self.state == BbrState.PROBING_UP:
             self.state = BbrState.PROBING_DOWN
-
-    def set_app_limited(self, is_limited: bool):
-        """Informs the limiter if the application has work to do."""
-        self._is_app_limited = is_limited
 
     def _get_effective_rate(self) -> float:
         return min(self.max_rate, self._short_term_rate_cap)
