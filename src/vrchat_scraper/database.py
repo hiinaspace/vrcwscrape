@@ -30,7 +30,7 @@ class World(Base):
     __tablename__ = "worlds"
 
     world_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    metadata: Mapped[dict] = mapped_column(JSON)
+    world_metadata: Mapped[dict] = mapped_column(JSON)
     publish_date: Mapped[datetime | None] = mapped_column(DateTime)
     update_date: Mapped[datetime | None] = mapped_column(DateTime)
     last_scrape_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -91,14 +91,14 @@ class Database:
 
             if existing_world:
                 # Update existing world
-                existing_world.metadata = metadata
+                existing_world.world_metadata = metadata
                 existing_world.last_scrape_time = datetime.utcnow()
                 existing_world.scrape_status = ScrapeStatus(status)
             else:
                 # Create new world
                 new_world = World(
                     world_id=world_id,
-                    metadata=metadata,
+                    world_metadata=metadata,
                     last_scrape_time=datetime.utcnow(),
                     scrape_status=ScrapeStatus(status),
                 )
