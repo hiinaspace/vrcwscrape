@@ -16,6 +16,7 @@ from tests.fakes import (
     MockTime,
     MockAsyncSleep,
     create_test_world_detail,
+    create_test_world_summary,
 )
 
 
@@ -261,3 +262,103 @@ async def test_scrape_world_with_database_state(
         assert metrics_record.favorites == 250
         assert metrics_record.visits == 5000
         assert metrics_record.occupants == 12  # From test data
+
+
+@pytest.fixture
+def stub_scraper(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_time,
+    mock_sleep,
+):
+    """Create a VRChat scraper with stub dependencies that don't cause delays."""
+    return VRChatScraper(
+        database=test_database,
+        api_client=fake_api_client,
+        image_downloader=fake_image_downloader,
+        api_rate_limiter=stub_api_rate_limiter,
+        image_rate_limiter=stub_image_rate_limiter,
+        api_circuit_breaker=stub_api_circuit_breaker,
+        image_circuit_breaker=stub_image_circuit_breaker,
+        time_source=mock_time.now,
+        sleep_func=mock_sleep.sleep,
+    )
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_process_pending_worlds_batch_happy_path(
+    stub_scraper,
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+):
+    """Test that a batch of pending worlds are processed successfully."""
+    # Arrange: Add multiple pending worlds to database
+    world_ids = ["wrld_batch_1", "wrld_batch_2", "wrld_batch_3"]
+
+    for world_id in world_ids:
+        await test_database.upsert_world(
+            world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+        )
+
+        # Set up successful responses for each world
+        test_world = create_test_world_detail(
+            world_id=world_id,
+            name=f"Batch World {world_id[-1]}",
+            favorites=100 + int(world_id[-1]),
+        )
+        fake_api_client.set_world_detail_response(world_id, test_world)
+        fake_image_downloader.set_download_response(world_id, True)
+
+    # Act: Process the batch
+    processed_count = await stub_scraper._process_pending_worlds_batch(limit=10)
+
+    # Assert: Verify all worlds were processed
+    assert processed_count == 3, "Should have processed 3 worlds"
+
+    # Verify no worlds are still pending
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    for world_id in world_ids:
+        assert world_id not in pending_worlds, (
+            f"World {world_id} should no longer be pending"
+        )
+
+    # Verify API calls were made for each world
+    assert fake_api_client.get_request_count("world_details") == 3
+
+    # Verify image downloads were attempted for each world
+    for world_id in world_ids:
+        assert fake_image_downloader.get_download_count(world_id) == 1
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_scrape_recent_worlds_batch_happy_path(
+    stub_scraper,
+    test_database,
+    fake_api_client,
+):
+    """Test that recent worlds discovery batch works correctly."""
+    # Arrange: Set up recent worlds response
+    world_1 = create_test_world_summary("wrld_recent_1", "Recent World 1")
+    world_2 = create_test_world_summary("wrld_recent_2", "Recent World 2")
+    recent_worlds = [world_1, world_2]
+
+    fake_api_client.set_recent_worlds_response(recent_worlds)
+
+    # Act: Execute recent worlds discovery batch
+    await stub_scraper._scrape_recent_worlds_batch()
+
+    # Assert: Verify worlds were queued as PENDING
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    assert "wrld_recent_1" in pending_worlds, "World 1 should be queued as pending"
+    assert "wrld_recent_2" in pending_worlds, "World 2 should be queued as pending"
+
+    # Verify API was called once
+    assert fake_api_client.get_request_count("recent_worlds") == 1

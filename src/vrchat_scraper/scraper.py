@@ -100,24 +100,9 @@ class VRChatScraper:
         """Continuously process pending worlds from database."""
         while not self._shutdown_event.is_set():
             try:
-                worlds = await self.database.get_worlds_to_scrape(limit=100)
-                if not worlds:
+                processed_count = await self._process_pending_worlds_batch(limit=100)
+                if processed_count == 0:
                     await self._sleep_func(60)  # Wait before checking again
-                    continue
-
-                for world_id in worlds:
-                    if self._shutdown_event.is_set():
-                        break
-
-                    # Wait until we can make an API request
-                    while True:
-                        delay = await self._get_api_request_delay()
-                        if delay <= 0:
-                            break
-                        await self._sleep_func(delay)
-
-                    # Launch individual world scraping task
-                    self._create_task(self._scrape_world_task(world_id))
 
             except Exception as e:
                 logger.error(f"Error in pending worlds processing: {e}")
