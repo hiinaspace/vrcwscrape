@@ -639,3 +639,397 @@ async def test_update_image_download_error(test_db):
         assert world_image.error_message == "Connection timeout"
         assert world_image.success_time is None
         assert world_image.last_attempt_time is not None
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_empty_files_deletes_all(test_db):
+    """Test that upserting world with empty files list deletes all existing files."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # First insert with files
+    initial_files = [
+        FileReference(
+            file_id="file_to_delete_1",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+        FileReference(
+            file_id="file_to_delete_2",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=1,
+            original_url="url2",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, initial_files)
+
+    # Verify files were created
+    async with test_db.async_session() as session:
+        file_result = await session.execute(
+            select(FileMetadata).where(FileMetadata.world_id == world_id)
+        )
+        files = file_result.fetchall()
+        assert len(files) == 2
+
+    # Update with empty files list
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, [])
+
+    # Verify all files were deleted
+    async with test_db.async_session() as session:
+        file_result = await session.execute(
+            select(FileMetadata).where(FileMetadata.world_id == world_id)
+        )
+        files = file_result.fetchall()
+        assert len(files) == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_version_change_resets_status(test_db):
+    """Test that changing file version resets scrape status to PENDING."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Insert file with version 1
+    initial_files = [
+        FileReference(
+            file_id="file_version_test",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, initial_files)
+
+    # Update file metadata to SUCCESS with some data
+    file_metadata = {"size": 12345, "md5": "abcdef"}
+    await test_db.update_file_metadata("file_version_test", file_metadata, "SUCCESS")
+
+    # Verify file is marked as SUCCESS
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_version_test")
+        )
+        file_meta = result.scalar_one()
+        assert file_meta.scrape_status == ScrapeStatus.SUCCESS
+        assert file_meta.file_metadata == file_metadata
+        assert file_meta.last_scrape_time is not None
+
+    # Update world with same file but different version
+    updated_files = [
+        FileReference(
+            file_id="file_version_test",
+            file_type=FileType.IMAGE,
+            version_number=2,  # Version changed
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, updated_files)
+
+    # Verify file status was reset to PENDING
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_version_test")
+        )
+        file_meta = result.scalar_one()
+        assert file_meta.version_number == 2  # Version updated
+        assert file_meta.scrape_status == ScrapeStatus.PENDING  # Status reset
+        assert file_meta.file_metadata is None  # Metadata cleared
+        assert file_meta.last_scrape_time is None  # Timestamp cleared
+        assert file_meta.error_message is None  # Error cleared
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_same_version_no_change(test_db):
+    """Test that upserting same file version doesn't change existing metadata."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Insert file with version 1
+    initial_files = [
+        FileReference(
+            file_id="file_same_version",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, initial_files)
+
+    # Update file metadata to SUCCESS
+    file_metadata = {"size": 12345, "md5": "abcdef"}
+    await test_db.update_file_metadata("file_same_version", file_metadata, "SUCCESS")
+
+    # Get the current state for comparison
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_same_version")
+        )
+        original_file = result.scalar_one()
+        original_scrape_time = original_file.last_scrape_time
+
+    # Update world with same file and same version
+    same_files = [
+        FileReference(
+            file_id="file_same_version",
+            file_type=FileType.IMAGE,
+            version_number=1,  # Same version
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, same_files)
+
+    # Verify file metadata was not changed
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_same_version")
+        )
+        file_meta = result.scalar_one()
+        assert file_meta.version_number == 1
+        assert file_meta.scrape_status == ScrapeStatus.SUCCESS  # Unchanged
+        assert file_meta.file_metadata == file_metadata  # Unchanged
+        assert file_meta.last_scrape_time == original_scrape_time  # Unchanged
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_unity_package_no_world_images(test_db):
+    """Test that UNITY_PACKAGE files don't create world_images entries."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Insert only unity package file
+    unity_files = [
+        FileReference(
+            file_id="file_unity_only",
+            file_type=FileType.UNITY_PACKAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, unity_files)
+
+    # Verify file_metadata was created
+    async with test_db.async_session() as session:
+        file_result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "file_unity_only")
+        )
+        file_meta = file_result.scalar_one()
+        assert file_meta.file_type == FileType.UNITY_PACKAGE.value
+
+        # Verify no world_images entry was created
+        image_result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_unity_only")
+        )
+        world_image = image_result.scalar_one_or_none()
+        assert world_image is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_with_files_existing_world_images_not_duplicated(test_db):
+    """Test that existing world_images entries are not duplicated."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Insert image file
+    image_files = [
+        FileReference(
+            file_id="file_image_existing",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, image_files)
+
+    # Verify world_images entry was created
+    async with test_db.async_session() as session:
+        image_result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_image_existing")
+        )
+        world_images = image_result.fetchall()
+        assert len(world_images) == 1
+
+    # Update world again with same image file (but different world metadata)
+    updated_metadata = {"name": "Updated Test World"}
+    await test_db.upsert_world_with_files(
+        world_id, updated_metadata, metrics, image_files
+    )
+
+    # Verify still only one world_images entry exists
+    async with test_db.async_session() as session:
+        image_result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "file_image_existing")
+        )
+        world_images = image_result.fetchall()
+        assert len(world_images) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_pending_file_metadata_limit_respected(test_db):
+    """Test that the limit parameter is respected in get_pending_file_metadata."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Create 5 pending files
+    pending_files = [
+        FileReference(
+            file_id=f"file_pending_{i}",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url=f"url{i}",
+        )
+        for i in range(5)
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, pending_files)
+
+    # Get only 3 files with limit
+    result = await test_db.get_pending_file_metadata(limit=3)
+    assert len(result) == 3
+
+    # Get all files with higher limit
+    result = await test_db.get_pending_file_metadata(limit=10)
+    assert len(result) == 5
+
+
+@pytest.mark.asyncio
+async def test_get_pending_image_downloads_only_success_files(test_db):
+    """Test that get_pending_image_downloads only returns files with SUCCESS file_metadata."""
+    world_id = "wrld_test_123"
+    metadata = {"name": "Test World"}
+    metrics = {
+        "favorites": 100,
+        "heat": 5,
+        "popularity": 8,
+        "occupants": 12,
+        "private_occupants": 3,
+        "public_occupants": 9,
+        "visits": 1500,
+    }
+
+    # Create image files
+    image_files = [
+        FileReference(
+            file_id="file_image_success",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url1",
+        ),
+        FileReference(
+            file_id="file_image_pending",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url2",
+        ),
+        FileReference(
+            file_id="file_image_error",
+            file_type=FileType.IMAGE,
+            version_number=1,
+            original_url="url3",
+        ),
+    ]
+    await test_db.upsert_world_with_files(world_id, metadata, metrics, image_files)
+
+    # Update one file to SUCCESS, one to ERROR, leave one PENDING
+    await test_db.update_file_metadata(
+        "file_image_success", {"test": "data"}, "SUCCESS"
+    )
+    await test_db.update_file_metadata("file_image_error", {}, "ERROR", "Test error")
+    # file_image_pending stays PENDING
+
+    # Get pending downloads - should only return the SUCCESS file
+    pending_downloads = await test_db.get_pending_image_downloads()
+    assert len(pending_downloads) == 1
+    assert pending_downloads[0][0] == "file_image_success"
+    assert pending_downloads[0][1] == {"test": "data"}
+
+
+@pytest.mark.asyncio
+async def test_update_file_metadata_nonexistent_file(test_db):
+    """Test that updating nonexistent file metadata handles gracefully."""
+    # Try to update a file that doesn't exist
+    await test_db.update_file_metadata("nonexistent_file", {"test": "data"}, "SUCCESS")
+
+    # Should not raise an error, just do nothing
+    # Verify no file was created
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(FileMetadata).where(FileMetadata.file_id == "nonexistent_file")
+        )
+        file_meta = result.scalar_one_or_none()
+        assert file_meta is None
+
+
+@pytest.mark.asyncio
+async def test_update_image_download_nonexistent_image(test_db):
+    """Test that updating nonexistent image download handles gracefully."""
+    # Try to update an image that doesn't exist
+    await test_db.update_image_download(
+        "nonexistent_image",
+        "SUCCESS",
+        local_file_path="/test/path.png",
+        downloaded_md5="abc123",
+        downloaded_size_bytes=12345,
+    )
+
+    # Should not raise an error, just do nothing
+    # Verify no image entry was created
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(WorldImage).where(WorldImage.file_id == "nonexistent_image")
+        )
+        world_image = result.scalar_one_or_none()
+        assert world_image is None
