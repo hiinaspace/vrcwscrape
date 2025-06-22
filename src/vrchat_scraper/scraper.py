@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import sys
 import time
 from datetime import datetime
 from typing import Awaitable, Callable
@@ -45,24 +44,26 @@ class VRChatScraper:
         self._time_source = time_source
         self._sleep_func = sleep_func
         self._shutdown_event = asyncio.Event()
-        self._task_group: asyncio.TaskGroup | None = None
+        self._task_group = asyncio.TaskGroup()
 
     async def run_forever(self):
         """Main entry point - runs scraping tasks forever."""
-        if sys.version_info >= (3, 11):
-            async with asyncio.TaskGroup() as tg:
-                self._task_group = tg
-                tg.create_task(self._scrape_recent_worlds_periodically())
-                tg.create_task(self._process_pending_worlds_continuously())
-        else:
-            await asyncio.gather(
-                self._scrape_recent_worlds_periodically(),
-                self._process_pending_worlds_continuously(),
-            )
+        async with self._task_group:
+            self._task_group.create_task(self._scrape_recent_worlds_periodically())
+            self._task_group.create_task(self._process_pending_worlds_continuously())
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
         self._shutdown_event.set()
+
+    def _create_task(self, coro):
+        """Create a task, using TaskGroup if active or falling back to asyncio.create_task."""
+        try:
+            # Try to use the TaskGroup if it's active
+            return self._task_group.create_task(coro)
+        except RuntimeError:
+            # TaskGroup not entered, fall back to regular create_task
+            return asyncio.create_task(coro)
 
     async def _scrape_recent_worlds_periodically(self):
         """Discover new worlds via recent API every hour."""
@@ -76,17 +77,20 @@ class VRChatScraper:
                     await self._sleep_func(delay)
 
                 # Launch recent worlds discovery task
-                if self._task_group:
-                    self._task_group.create_task(self._scrape_recent_worlds_task())
-                else:
-                    asyncio.create_task(self._scrape_recent_worlds_task())
+                self._create_task(self._scrape_recent_worlds_task())
 
                 # Wait an hour before next discovery
+                # Use injected sleep function for testability
                 try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=3600)
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=0.1,  # Short timeout to check shutdown quickly
+                    )
                     break  # Shutdown requested
                 except asyncio.TimeoutError:
-                    continue  # Normal timeout, continue loop
+                    # Sleep for an hour using injected sleep function
+                    await self._sleep_func(3600)
+                    continue
 
             except Exception as e:
                 logger.error(f"Error in recent worlds periodic task: {e}")
@@ -113,10 +117,7 @@ class VRChatScraper:
                         await self._sleep_func(delay)
 
                     # Launch individual world scraping task
-                    if self._task_group:
-                        self._task_group.create_task(self._scrape_world_task(world_id))
-                    else:
-                        asyncio.create_task(self._scrape_world_task(world_id))
+                    self._create_task(self._scrape_world_task(world_id))
 
             except Exception as e:
                 logger.error(f"Error in pending worlds processing: {e}")
@@ -217,14 +218,9 @@ class VRChatScraper:
 
             # Launch image download if needed
             if world_details.image_url and not await self._image_exists(world_id):
-                if self._task_group:
-                    self._task_group.create_task(
-                        self._download_image_task(world_id, world_details.image_url)
-                    )
-                else:
-                    asyncio.create_task(
-                        self._download_image_task(world_id, world_details.image_url)
-                    )
+                self._create_task(
+                    self._download_image_task(world_id, world_details.image_url)
+                )
 
             logger.debug(f"Successfully scraped world {world_id}")
 
