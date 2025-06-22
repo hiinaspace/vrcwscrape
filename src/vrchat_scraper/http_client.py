@@ -21,7 +21,7 @@ class AuthenticationError(Exception):
     pass
 
 
-class HTTPVRChatAPIClient:
+class HTTPVRChatAPIClient(VRChatAPIClient):
     """HTTP implementation of VRChat API client."""
 
     def __init__(self, auth_cookie: str, timeout: float = 30.0):
