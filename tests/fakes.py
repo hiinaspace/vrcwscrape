@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-from src.vrchat_scraper.models import WorldDetail, WorldSummary
+from src.vrchat_scraper.models import WorldDetail, WorldSummary, FileMetadata
 
 
 class FakeVRChatAPIClient:
@@ -21,6 +21,7 @@ class FakeVRChatAPIClient:
         # Future-based responses for precise test control
         self.recent_worlds_futures: List[asyncio.Future] = []
         self.world_detail_futures: Dict[str, asyncio.Future] = {}
+        self.file_metadata_futures: Dict[str, asyncio.Future] = {}
 
         # Rate limiting simulation
         self.rate_limit_bucket = 100.0
@@ -35,6 +36,10 @@ class FakeVRChatAPIClient:
         """Add a future for a specific world ID."""
         self.world_detail_futures[world_id] = future
 
+    def add_file_metadata_future(self, file_id: str, future: asyncio.Future):
+        """Add a future for a specific file ID."""
+        self.file_metadata_futures[file_id] = future
+
     def set_recent_worlds_response(self, worlds: List[WorldSummary]):
         """Convenience method to set an immediate response."""
         future = asyncio.Future()
@@ -47,6 +52,12 @@ class FakeVRChatAPIClient:
         future.set_result(world)
         self.add_world_detail_future(world_id, future)
 
+    def set_file_metadata_response(self, file_id: str, file_metadata: FileMetadata):
+        """Convenience method to set an immediate response."""
+        future = asyncio.Future()
+        future.set_result(file_metadata)
+        self.add_file_metadata_future(file_id, future)
+
     def set_recent_worlds_error(self, error: Exception):
         """Convenience method to set an immediate error."""
         future = asyncio.Future()
@@ -58,6 +69,12 @@ class FakeVRChatAPIClient:
         future = asyncio.Future()
         future.set_exception(error)
         self.add_world_detail_future(world_id, future)
+
+    def set_file_metadata_error(self, file_id: str, error: Exception):
+        """Convenience method to set an immediate error."""
+        future = asyncio.Future()
+        future.set_exception(error)
+        self.add_file_metadata_future(file_id, future)
 
     def simulate_rate_limit(self, enabled: bool = True, rate: float = 10.0):
         """Enable/disable rate limit simulation."""
@@ -137,6 +154,35 @@ class FakeVRChatAPIClient:
                 "World not found", request=None, response=httpx.Response(404)
             )
 
+    async def get_file_metadata(self, file_id: str) -> FileMetadata:
+        """Fake implementation of get_file_metadata."""
+        now = self.time_source()
+
+        self.request_log.append(
+            {
+                "endpoint": "file_metadata",
+                "timestamp": now,
+                "args": [file_id],
+                "kwargs": {},
+            }
+        )
+
+        # Check rate limiting before waiting on future
+        if self._check_rate_limit(now):
+            raise httpx.HTTPStatusError(
+                "Rate limited", request=None, response=httpx.Response(429)
+            )
+
+        # Get and await the future for this file
+        if file_id in self.file_metadata_futures:
+            future = self.file_metadata_futures.pop(file_id)
+            return await future
+        else:
+            # No future configured, return 404
+            raise httpx.HTTPStatusError(
+                "File not found", request=None, response=httpx.Response(404)
+            )
+
     def get_request_count(self, endpoint: Optional[str] = None) -> int:
         """Get the number of requests made to an endpoint."""
         if endpoint is None:
@@ -151,6 +197,7 @@ class FakeVRChatAPIClient:
         """Clear all pending futures."""
         self.recent_worlds_futures.clear()
         self.world_detail_futures.clear()
+        self.file_metadata_futures.clear()
 
     def set_timeout_error(
         self, world_id: Optional[str] = None, timeout_type: str = "read"
@@ -180,57 +227,91 @@ class FakeImageDownloader:
         self.download_log: List[Dict[str, Any]] = []
         self.download_futures: Dict[str, asyncio.Future] = {}
         self.existing_images: Set[str] = set()
+        # Map of file_id -> download result for configuring responses
+        self.download_results: Dict[str, Tuple[bool, str, int, str]] = {}
 
-    def add_download_future(self, world_id: str, future: asyncio.Future):
-        """Add a future for downloading a world's image."""
-        self.download_futures[world_id] = future
+    def add_download_future(self, file_id: str, future: asyncio.Future):
+        """Add a future for downloading a file."""
+        self.download_futures[file_id] = future
+
+    def set_download_result(self, file_id: str, success: bool, local_file_path: str = "", 
+                            actual_size_bytes: int = 100000, error_message: str = ""):
+        """Configure the download result for a specific file_id."""
+        self.download_results[file_id] = (success, local_file_path, actual_size_bytes, error_message)
 
     def set_download_response(self, world_id: str, success: bool):
-        """Convenience method to set an immediate response."""
-        future = asyncio.Future()
-        future.set_result(success)
-        self.add_download_future(world_id, future)
+        """Legacy convenience method for backward compatibility with existing tests."""
+        # For backward compatibility, derive file_id from world_id
+        file_id = f"file_{world_id}"
+        local_path = f"/fake/path/{file_id}.png" if success else ""
+        error_msg = "" if success else "Download failed"
+        self.set_download_result(file_id, success, local_path, 100000, error_msg)
 
-    def set_error_response(self, world_id: str, error: Exception):
+    def set_error_response(self, file_id: str, error: Exception):
         """Convenience method to set an immediate error."""
         future = asyncio.Future()
         future.set_exception(error)
-        self.add_download_future(world_id, future)
+        self.add_download_future(file_id, future)
 
     def set_image_exists(self, world_id: str, exists: bool = True):
         """Set whether an image exists for a world."""
+        file_id = f"file_{world_id}"
         if exists:
-            self.existing_images.add(world_id)
+            self.existing_images.add(file_id)
         else:
-            self.existing_images.discard(world_id)
+            self.existing_images.discard(file_id)
 
-    async def download_image(self, url: str, world_id: str) -> bool:
-        """Fake implementation of download_image."""
+    async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
+        """Fake implementation of download_image matching new protocol."""
         now = self.time_source()
 
-        self.download_log.append({"url": url, "world_id": world_id, "timestamp": now})
+        self.download_log.append({
+            "file_id": file_id, 
+            "url": download_url, 
+            "expected_md5": expected_md5,
+            "timestamp": now
+        })
 
-        # Get and await the future for this download
-        if world_id in self.download_futures:
-            future = self.download_futures.pop(world_id)
-            success = await future
+        # Check if we have a configured result for this file_id
+        if file_id in self.download_results:
+            result = self.download_results.pop(file_id)
+            success, local_path, size, error = result
             if success:
-                self.existing_images.add(world_id)
-            return success
+                self.existing_images.add(file_id)
+            return result
+        
+        # Get and await the future for this download if configured
+        if file_id in self.download_futures:
+            future = self.download_futures.pop(file_id)
+            success = await future
+            local_path = f"/fake/path/{file_id}.png" if success else ""
+            size = 100000 if success else 0
+            error = "" if success else "Download failed"
+            if success:
+                self.existing_images.add(file_id)
+            return (success, local_path, size, error)
         else:
-            # No future configured, default to success
-            self.existing_images.add(world_id)
-            return True
+            # No configuration, default to success
+            local_path = f"/fake/path/{file_id}.png"
+            self.existing_images.add(file_id)
+            return (True, local_path, 100000, "")
 
     def image_exists(self, world_id: str) -> bool:
-        """Check if image exists for a world."""
-        return world_id in self.existing_images
+        """Check if image exists for a world (legacy method for backward compatibility)."""
+        file_id = f"file_{world_id}"
+        return file_id in self.existing_images
+
+    def file_exists(self, file_id: str) -> bool:
+        """Check if file exists by file_id."""
+        return file_id in self.existing_images
 
     def get_download_count(self, world_id: Optional[str] = None) -> int:
         """Get the number of download requests."""
         if world_id is None:
             return len(self.download_log)
-        return len([d for d in self.download_log if d["world_id"] == world_id])
+        # Check both old format (world_id key) and new format (file_id key)
+        return len([d for d in self.download_log if 
+                   d.get("world_id") == world_id or d.get("file_id") == f"file_{world_id}"])
 
     def clear_download_log(self):
         """Clear the download log."""
@@ -386,10 +467,19 @@ def create_test_world_summary(
     name: str = "Test World",
     author_id: str = "usr_test",
     updated_at: Optional[datetime] = None,
+    include_unity_packages: bool = False,
 ) -> WorldSummary:
     """Create a test WorldSummary object."""
     if updated_at is None:
         updated_at = datetime(2024, 1, 1, 12, 0, 0)  # Fixed time for tests
+
+    unity_packages = []
+    if include_unity_packages:
+        from src.vrchat_scraper.models import UnityPackageBasic
+        unity_packages = [
+            UnityPackageBasic(platform="standalonewindows", unityVersion="2019.4.31f1"),
+            UnityPackageBasic(platform="android", unityVersion="2019.4.31f1"),
+        ]
 
     return WorldSummary(
         id=world_id,
@@ -397,8 +487,9 @@ def create_test_world_summary(
         authorId=author_id,
         authorName="Test Author",
         imageUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}/1/file",
-        thumbnailImageUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}/1/thumb",
+        thumbnailImageUrl=f"https://api.vrchat.cloud/api/1/image/file_{world_id}/1/256",
         updated_at=updated_at,
+        unityPackages=unity_packages,
     )
 
 
@@ -410,12 +501,27 @@ def create_test_world_detail(
     visits: int = 1000,
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None,
+    include_unity_packages: bool = False,
 ) -> WorldDetail:
     """Create a test WorldDetail object."""
     if created_at is None:
         created_at = datetime(2024, 1, 1, 10, 0, 0)  # Fixed time for tests
     if updated_at is None:
         updated_at = datetime(2024, 1, 1, 12, 0, 0)  # Fixed time for tests
+
+    unity_packages = []
+    if include_unity_packages:
+        from src.vrchat_scraper.models import UnityPackageDetailed
+        unity_packages = [
+            UnityPackageDetailed(
+                id=f"unp_{world_id}_1",
+                platform="standalonewindows",
+                unityVersion="2019.4.31f1",
+                assetUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}_unity/1/file",
+                assetVersion=1,
+                created_at=created_at,
+            ),
+        ]
 
     return WorldDetail(
         id=world_id,
@@ -435,7 +541,49 @@ def create_test_world_detail(
         created_at=created_at,
         updated_at=updated_at,
         tags=["system_approved"],
-        unityPackages=[],  # Empty list for basic tests
+        unityPackages=unity_packages,
+    )
+
+
+def create_test_file_metadata(
+    file_id: str = "file_test_123",
+    name: str = "test_image.png",
+    extension: str = ".png",
+    mime_type: str = "image/png",
+    owner_id: str = "usr_test",
+    version: int = 1,
+    file_size: int = 100000,
+    md5_hash: str = "abcd1234567890abcd1234567890abcd",
+    download_url: str = None,
+) -> "FileMetadata":
+    """Create a test FileMetadata object."""
+    from src.vrchat_scraper.models import FileMetadata, FileMetadataVersion, FileInfo
+    from datetime import datetime
+    
+    if download_url is None:
+        download_url = f"https://api.vrchat.cloud/api/1/file/{file_id}/{version}/file"
+    
+    file_info = FileInfo(
+        md5=md5_hash,
+        sizeInBytes=file_size,
+        url=download_url,
+        fileName=name,
+    )
+    
+    file_version = FileMetadataVersion(
+        version=version,
+        status="complete",
+        created_at=datetime(2024, 1, 1, 10, 0, 0),
+        file=file_info,
+    )
+    
+    return FileMetadata(
+        id=file_id,
+        name=name,
+        extension=extension,
+        mimeType=mime_type,
+        ownerId=owner_id,
+        versions=[file_version],
     )
 
 

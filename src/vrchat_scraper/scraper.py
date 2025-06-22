@@ -261,8 +261,18 @@ class VRChatScraper:
             # Record request start
             self.image_rate_limiter.on_request_sent(request_id, now)
 
-            # Download image
-            success = await self.image_downloader.download_image(image_url, world_id)
+            # Download image - extract file_id from image_url for new protocol
+            from .models import _parse_file_url, FileType
+            file_ref = _parse_file_url(image_url, FileType.IMAGE)
+            if file_ref:
+                file_id = file_ref.file_id
+                # For now, use a placeholder MD5 until we implement full file metadata workflow
+                success, local_path, size, error = await self.image_downloader.download_image(
+                    file_id, image_url, "placeholder_md5"
+                )
+                success = success  # Extract success from tuple
+            else:
+                success = False
 
             # Record result
             if success:
@@ -281,18 +291,13 @@ class VRChatScraper:
         self, world_id: str, world_details: WorldDetail
     ):
         """Update database with world metadata and metrics."""
-        # Store stable metadata
-        await self.database.upsert_world(
+        # Use new transactional method to store world + discovered files + metrics
+        await self.database.upsert_world_with_files(
             world_id,
             world_details.stable_metadata(),
-            status="SUCCESS",
-        )
-
-        # Store time-series metrics
-        await self.database.insert_metrics(
-            world_id,
             world_details.extract_metrics(),
-            datetime.utcnow(),
+            world_details.discovered_files,
+            status="SUCCESS",
         )
 
     async def _scrape_recent_worlds_batch(self):

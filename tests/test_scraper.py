@@ -198,7 +198,7 @@ async def test_scrape_world_happy_path(
     # Verify image download was attempted
     assert fake_image_downloader.get_download_count(world_id) == 1
     download_request = fake_image_downloader.download_log[0]
-    assert download_request["world_id"] == world_id
+    assert download_request["file_id"] == f"file_{world_id}"
     assert download_request["url"] == test_world.image_url
 
     # Verify image exists now
