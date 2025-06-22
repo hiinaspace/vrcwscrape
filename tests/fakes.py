@@ -423,6 +423,7 @@ def create_test_world_detail(
         description="A test world for unit testing",
         authorId=author_id,
         imageUrl=f"https://api.vrchat.cloud/api/1/file/file_{world_id}/1/file",
+        thumbnailImageUrl=f"https://api.vrchat.cloud/api/1/image/file_{world_id}/1/256",
         capacity=32,
         favorites=favorites,
         heat=3,
@@ -434,6 +435,7 @@ def create_test_world_detail(
         created_at=created_at,
         updated_at=updated_at,
         tags=["system_approved"],
+        unityPackages=[],  # Empty list for basic tests
     )
 
 

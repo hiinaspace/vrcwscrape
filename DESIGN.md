@@ -13,17 +13,20 @@ Primary goals:
 
 ### Core Components
 
-1. **Scraper Service** - Single Python asyncio process that:
+1. **Scraper Service** - Python asyncio processes that coordinate via database:
    - Discovers new worlds via the "recently updated" API endpoint
-   - Fetches complete metadata for individual worlds
-   - Downloads world thumbnail images
-   - Manages rate limiting to avoid API bans
-   - Stores data in DoltDB
+   - Fetches complete metadata for individual worlds with transactional file tracking
+   - Scrapes VRChat file metadata for images and unity packages
+   - Downloads and verifies world thumbnail images
+   - Manages independent rate limiting for each API endpoint
+   - Maintains transactional consistency across world and file metadata
 
-2. **Database** - DoltDB instance storing:
+2. **Database** - DoltDB instance coordinating distributed scraping:
    - World metadata (mostly raw JSON responses)
    - Time-series metrics (ephemeral fields like visitor counts)
-   - Scrape state and scheduling metadata
+   - File metadata with VRChat sizes, MD5 hashes, and versions
+   - Multi-phase work queues (world scraping, file metadata, image downloads)
+   - Download status and content verification results
 
 3. **File Storage** - Local filesystem storing:
    - World thumbnail images (800x600 PNGs)
@@ -32,9 +35,18 @@ Primary goals:
 ### Data Flow
 
 ```
-VRChat API → Rate Limiter → Scraper → DoltDB
-                              ↓
-                         Image Storage
+VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
+                                                      ↕
+   ┌─────────────────────────────────────────────────┘
+   │
+   ├─ World Discovery Queue (PENDING worlds)
+   ├─ File Metadata Queue (PENDING file_metadata) 
+   ├─ Image Download Queue (PENDING world_images)
+   │
+   └─ Coordination via Database State
+                ↓
+          Image Storage 
+     (MD5 verified, organized by file_uuid)
 ```
 
 ## API Integration
@@ -50,8 +62,10 @@ VRChat API → Rate Limiter → Scraper → DoltDB
   - Includes all fields except file metadata
   
 - **File Metadata**: `GET /api/1/file/{file_id}`
-  - Returns version history and download sizes
-  - Multiple versions per world possible
+  - Returns version history, download sizes, and MD5 hashes
+  - Covers both world images and unity packages
+  - Multiple versions per file possible
+  - Example: `https://vrchat.com/api/1/file/file_447b6078-e5fb-488c-bff5-432d4631f6cf`
   
 - **Images**: Direct URLs from `imageUrl` and `thumbnailImageUrl` fields
   - Typically 800x600 PNG files
@@ -98,10 +112,30 @@ VRChat API → Rate Limiter → Scraper → DoltDB
 3. **file_metadata**
    ```sql
    CREATE TABLE file_metadata (
-     file_id VARCHAR(64) PRIMARY KEY,
-     world_id VARCHAR(64),
-     metadata JSON NOT NULL,
-     last_scrape_time DATETIME NOT NULL
+     file_id VARCHAR(64) PRIMARY KEY,  -- VRChat file UUID
+     world_id VARCHAR(64) NOT NULL,
+     file_type ENUM('IMAGE', 'UNITY_PACKAGE') NOT NULL,
+     version_number INT NOT NULL,  -- Version parsed from world metadata URL
+     scrape_status ENUM('PENDING', 'SUCCESS', 'ERROR') NOT NULL,
+     metadata JSON,  -- Raw response from VRChat file API
+     last_scrape_time DATETIME,
+     error_message TEXT,
+     FOREIGN KEY (world_id) REFERENCES worlds(world_id)
+   );
+   ```
+
+4. **world_images**
+   ```sql
+   CREATE TABLE world_images (
+     file_id VARCHAR(64) PRIMARY KEY,  -- References file_metadata.file_id
+     download_status ENUM('PENDING', 'SUCCESS', 'NOT_FOUND', 'ERROR') NOT NULL,
+     downloaded_md5 VARCHAR(32),  -- MD5 of downloaded content for verification
+     downloaded_size_bytes INT,
+     local_file_path TEXT,
+     last_attempt_time DATETIME,
+     success_time DATETIME,
+     error_message TEXT,
+     FOREIGN KEY (file_id) REFERENCES file_metadata(file_id)
    );
    ```
 
@@ -109,7 +143,13 @@ VRChat API → Rate Limiter → Scraper → DoltDB
 
 - **JSON Storage**: Store mostly-raw API responses in JSON columns, removing only ephemeral fields
 - **Ephemeral Fields**: Extract time-varying fields (favorites, heat, popularity, occupants, visits) into separate metrics table
-- **No Complex Indices**: Only primary keys needed; dataset small enough to load all world IDs into memory
+- **Two-Phase File Handling**: File metadata scraped separately from world metadata, enabling distributed processing
+- **Transactional Consistency**: World metadata and associated file_metadata rows updated atomically
+- **VRChat File System**: Leverage VRChat's existing file UUIDs, MD5 hashes, and size metadata
+- **Selective Downloads**: Download images for viewing, collect metadata for unity packages without downloading
+- **Database Coordination**: Multiple scraper instances coordinate through shared database state
+- **Version Optimization**: Track file versions to detect unchanged files and skip redundant scrapes
+- **Simple Schema**: Primary keys only, full table scans sufficient at current scale
 - **Append-Only Metrics**: Every scrape appends to metrics table, even if values unchanged
 
 ## Rate Limiting Strategy
@@ -142,6 +182,30 @@ The scraper uses two separate components for request control:
 2. **Bootstrap Data**: Import ~237k existing world IDs from external dataset
 3. **Future Extensions**: Could use random endpoint or search API if needed
 
+### Multi-Phase Scraping
+
+**Phase 1: World Metadata**
+1. Scrape world metadata from `/api/1/worlds/{world_id}`
+2. Parse file UUIDs from `imageUrl`, `thumbnailImageUrl`, and unity package URLs
+3. In single transaction:
+   - Update world metadata and metrics
+   - Delete file_metadata rows no longer referenced by current world
+   - Upsert file_metadata rows for all discovered files (status: PENDING)
+   - For image files: upsert world_images rows (status: PENDING)
+
+**Phase 2: File Metadata Scraping**
+1. Query for PENDING file_metadata rows
+2. Scrape VRChat file metadata from `/api/1/file/{file_id}`
+3. Update file_metadata with sizes, MD5 hashes, and version info
+4. Mark as SUCCESS or ERROR with appropriate timestamps
+
+**Phase 3: Image Downloads**
+1. Query for PENDING world_images rows where file_metadata is SUCCESS
+2. Download actual image files from VRChat's CDN
+3. Verify downloaded content against VRChat's MD5 hash
+4. Store in hierarchical filesystem layout
+5. Update world_images with download status and verification results
+
 ### Rescrape Scheduling
 
 Heuristic based on world age and activity:
@@ -152,48 +216,120 @@ Heuristic based on world age and activity:
 - **Inactive Worlds** (> 1 year, few visitors): Yearly scrapes
 - **Minimum Interval**: 24 hours between scrapes of same world
 
-### Image Handling
+### File and Image Handling
 
-- **Decoupled from Metadata**: Separate process detects missing images
-- **404 Handling**: Write 0-byte file to indicate intentional missing image
-- **Storage Layout**: `/images/{uuid[0:2]}/{uuid[2:4]}/{world_id}.png`
+**File Discovery and Metadata:**
+- Extract file UUIDs and versions from world metadata URLs using URL parsing
+- Two file types: `IMAGE` (for viewing) and `UNITY_PACKAGE` (for size tracking)  
+- Version tracking enables skipping unchanged files when world metadata updates
+- File metadata scraped separately from world metadata for parallelization
+- VRChat provides authoritative MD5 hashes and sizes per file version
+
+**Image Download Pipeline:**
+1. File metadata scraped first to get VRChat's MD5 and size
+2. Image download triggered only for IMAGE type files
+3. Downloaded content verified against VRChat's MD5 hash
+4. Storage layout: `/images/{file_uuid[0:2]}/{file_uuid[2:4]}/{file_id}.png`
+
+**Status Tracking:**
+- **file_metadata.scrape_status**: 
+  - `PENDING`: File discovered from world, metadata not scraped
+  - `SUCCESS`: VRChat file metadata successfully retrieved
+  - `ERROR`: File metadata scrape failed (retry eligible)
+- **world_images.download_status**:
+  - `PENDING`: File metadata available, download not attempted  
+  - `SUCCESS`: Image downloaded and MD5 verified
+  - `NOT_FOUND`: Image URL returned 404 (file may be deleted)
+  - `ERROR`: Download failed due to network/verification error (retry eligible)
+
+**Coordination Benefits:**
+- Multiple scraper instances work on different phases simultaneously
+- Transactional consistency ensures world and file metadata stay synchronized
+- Failed downloads don't block world metadata updates
+- Unity package metadata collected without expensive downloads
 
 ## Error Handling
 
-### API Errors
+### World Metadata API Errors
 
 - **429 Rate Limit**: Exponential backoff, reduce request rate
-- **500 Server Error**: Treat similar to 429
+- **500 Server Error**: Treat similar to 429, retry later
 - **401 Unauthorized**: Circuit break, alert for manual cookie refresh
 - **404 Not Found**: Mark world as DELETED in database
+- **Validation Errors**: Log warnings, store partial data, mark for retry
 
-### Network Errors
+### File Metadata API Errors
 
-- **Timeouts**: Count toward error rate, retry with backoff
-- **Connection Errors**: Similar to timeouts
+- **404 Not Found**: File may be deleted, mark file_metadata as ERROR
+- **Rate Limiting**: Apply same rate limiting as world metadata
+- **Network Errors**: Mark file_metadata as ERROR with retry timestamps
+- **Parse Errors**: Invalid file UUID in world URL, log and skip
 
-### Data Validation
+### Image Download Errors
 
-- **Pydantic Models**: Validate API responses
-- **Unknown Fields**: Log warnings but still store in JSON
-- **Missing Required Fields**: Mark as ERROR, retry later
+- **404 Not Found**: Mark download_status as NOT_FOUND (file deleted from CDN)
+- **MD5 Mismatch**: Mark as ERROR, file may be corrupted or changed
+- **Network Timeouts**: Mark as ERROR with exponential backoff for retry
+- **Disk Full**: Circuit break image downloads, alert for disk space
+- **Permission Errors**: Log error, mark as ERROR (don't retry)
+
+### Transaction Consistency
+
+- **World + File Metadata**: If world metadata succeeds but file_metadata transaction fails, retry entire world
+- **Partial File Updates**: Failed individual file metadata scrapes don't rollback world metadata
+- **Download Independence**: Image download failures don't affect metadata consistency
+
+### Recovery Strategies
+
+- **Retry Logic**: Exponential backoff based on error type and frequency
+- **Circuit Breaking**: Per-endpoint circuit breakers for world, file metadata, and image APIs
+- **Graceful Degradation**: Continue world metadata even if file handling fails
+- **Monitoring**: Track error rates by phase (world, file metadata, downloads)
 
 ## Observability
 
 ### Metrics (via OpenTelemetry/Logfire)
 
-- Request rates and latencies
-- Error rates by type
-- Scrape queue depth
+**World Metadata Metrics:**
+- World scrape rate and latencies
 - Worlds scraped per hour/day
-- Rate limiter state (pacing gain, circuit breaker status)
+- World scrape queue depth (PENDING worlds)
+
+**File Metadata Metrics:**
+- File metadata scrape rate and latencies  
+- Files discovered per world (images + unity packages)
+- File metadata queue depth (PENDING file_metadata rows)
+
+**Image Download Metrics:**
+- Image download rate and throughput (MB/s)
+- Download success/failure rates by error type
+- Image download queue depth (PENDING world_images rows)
+- Disk usage for image storage
+
+**Rate Limiting Metrics:**
+- Rate limiter state per endpoint (world, file, image APIs)
+- Circuit breaker activations by endpoint
+- Request pacing gains and effective rates
+
+**Data Quality Metrics:**
+- MD5 verification success/failure rates
+- File size distribution (images vs unity packages)
+- World update frequency and patterns
 
 ### Logging
 
-- Structured logging with world IDs
-- Rate limit adjustments
-- Circuit breaker activations
-- Validation errors
+**Structured Context:**
+- World IDs, file IDs, and file types in all log messages
+- Request tracing across world → file metadata → image download phases
+- Transaction boundaries and consistency events
+
+**Key Events:**
+- World metadata updates and file discovery
+- File metadata scraping results and MD5 verification
+- Image download attempts and verification failures
+- Rate limit adjustments per endpoint
+- Circuit breaker activations by API type
+- Transaction rollbacks and retry scheduling
 
 ## Configuration
 
@@ -319,6 +455,8 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 ### Scalability
 
 - Current design handles expected load (250 new worlds/day)
+- Multiple scraper instances coordinate seamlessly via database state
+- Image downloads can be distributed across clients without conflicts
 - Could partition world ID space for multiple scrapers if needed
 - DoltDB merge capabilities enable distributed scraping
 
@@ -333,3 +471,12 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 - JSON storage provides flexibility for schema evolution
 - Validation warnings help detect API changes early
 - Ephemeral field list may need updates over time
+
+### Image and File Optimization
+
+- VRChat MD5 hashes enable detection of duplicate files across worlds
+- Could implement deduplication storage (symlinks or reference counting)
+- File metadata provides authoritative sizes for storage planning
+- Hash verification ensures data integrity and detects corruption
+- Separate file metadata and download phases enable selective processing
+- Unity package metadata collected without expensive downloads

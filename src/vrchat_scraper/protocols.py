@@ -1,8 +1,8 @@
 """Protocol definitions for VRChat scraper abstractions."""
 
-from typing import List, Protocol
+from typing import List, Protocol, Tuple
 
-from .models import WorldDetail, WorldSummary
+from .models import WorldDetail, WorldSummary, FileMetadata
 
 
 class VRChatAPIClient(Protocol):
@@ -16,13 +16,23 @@ class VRChatAPIClient(Protocol):
         """Fetch complete metadata for a single world."""
         ...
 
+    async def get_file_metadata(self, file_id: str) -> FileMetadata:
+        """Fetch metadata for a VRChat file by ID."""
+        ...
+
 
 class ImageDownloader(Protocol):
     """Protocol for image downloader implementations."""
 
-    async def download_image(self, url: str, world_id: str) -> bool:
-        """Download image for a world.
+    async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
+        """Download and verify an image file.
 
-        Returns True if download was successful, False otherwise.
+        Args:
+            file_id: VRChat file ID for storage path generation
+            download_url: Direct download URL from VRChat CDN
+            expected_md5: Base64-encoded MD5 hash from VRChat for verification
+
+        Returns:
+            Tuple of (success, local_file_path, actual_size_bytes, error_message)
         """
         ...
