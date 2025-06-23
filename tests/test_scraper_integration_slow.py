@@ -309,9 +309,10 @@ async def test_rate_limiter_probe_recovery():
         )
 
         # Create fast API responses (50ms delay = ~20 req/s theoretical max)
-        async def fast_world_response():
+        # Capture test_world by value to avoid closure issues
+        async def fast_world_response(captured_world=test_world):
             await asyncio.sleep(0.05)  # 50ms per request
-            return test_world
+            return captured_world
 
         api_client.add_world_detail_future(world_id, fast_world_response())
         image_downloader.set_download_response(world_id, True)
