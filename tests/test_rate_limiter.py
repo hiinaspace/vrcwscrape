@@ -273,51 +273,37 @@ def test_error_during_probing_up_forces_state_to_probing_down(
     assert limiter.state == BbrState.PROBING_DOWN
 
 
-def test_very_low_detected_rate_causes_excessive_delays(mock_time: MockTime):
+def test_insufficient_min_rate_still_allows_excessive_delays(mock_time: MockTime):
     """
-    Test that demonstrates the current issue: when max_rate collapses to very low
-    values, the required delay can become unacceptably long (> 2 seconds).
-    This test should FAIL until we implement the minimum rate feature.
+    Test that when min_rate is set too low, excessive delays can still occur.
+    This verifies the min_rate feature works correctly by testing the case where
+    min_rate doesn't help because it's lower than the collapsed detected rates.
     """
-    # Create a rate limiter with normal initial rate and very low min_rate
-    # This demonstrates the problem would occur without a reasonable min_rate
+    # Create a rate limiter with very low min_rate that won't prevent the problem
     limiter = BBRRateLimiter(
         now=mock_time.now,
         initial_rate=5.0,
-        min_rate=0.01,  # Very low min_rate to demonstrate the problem
-        name="test_low_rate",
+        min_rate=0.01,  # Too low to prevent excessive delays
+        name="test_insufficient_min_rate",
     )
 
-    # Force the max_rate to collapse to a very low value by directly manipulating
-    # the windowed filter. This simulates what could happen in app-limited scenarios
-    # or after a series of very slow responses.
-    limiter._max_rate.update(0.1, mock_time.now)  # 0.1 req/s = 10 second intervals
+    # Force the max_rate to collapse to a value higher than min_rate
+    limiter._max_rate.update(0.1, mock_time.now)  # 0.1 req/s
+    limiter._short_term_rate_cap = 0.05  # 0.05 req/s
 
-    # Also set a low short-term rate cap to make it even worse
-    limiter._short_term_rate_cap = 0.05  # 0.05 req/s = 20 second intervals
-
-    # The effective rate should be min(0.1, 0.05) = 0.05 req/s
+    # The effective rate should be max(0.01, min(0.1, 0.05)) = max(0.01, 0.05) = 0.05
+    # Since min_rate (0.01) < short_term_rate_cap (0.05), min_rate doesn't help
     assert limiter._get_effective_rate() == 0.05
 
     # Simulate sending a request recently to trigger pacing delay
     limiter.on_request_sent("recent_req", mock_time.now)
 
-    # Now check the delay immediately after sending - this should show the pacing delay
+    # Check the delay - should still be excessive due to insufficient min_rate
     delay = limiter.get_delay_until_next_request(mock_time.now)
 
-    # With pacing gain of 1.0 (CRUISING state), the required delay should be
-    # 1.0 / 0.05 = 20 seconds, which is unacceptable
-    print(f"Effective rate: {limiter._get_effective_rate()}")
-    print(f"Pacing gain: {limiter._get_pacing_gain()}")
-    print(f"Pacing rate: {limiter._get_effective_rate() * limiter._get_pacing_gain()}")
-    print(
-        f"Required delay: {1.0 / (limiter._get_effective_rate() * limiter._get_pacing_gain())}"
-    )
-    print(f"Actual delay: {delay}")
-
-    # This assertion should FAIL - we don't want delays over 2 seconds
-    assert delay <= 2.0, (
-        f"Rate limiter delay of {delay} seconds is too long; max should be 2.0 seconds"
+    # With min_rate too low, delay is still 1.0 / 0.05 = 20 seconds
+    assert delay == pytest.approx(20.0, rel=1e-3), (
+        f"Expected delay of 20.0 seconds with insufficient min_rate, got {delay}"
     )
 
 
@@ -357,3 +343,50 @@ def test_minimum_rate_prevents_excessive_delays(mock_time: MockTime):
     assert delay == pytest.approx(2.0, rel=1e-3), (
         f"Expected delay of 2.0 seconds, got {delay}"
     )
+
+
+def test_min_rate_edge_cases(mock_time: MockTime):
+    """
+    Test edge cases of min_rate logic to ensure complete branch coverage.
+    """
+    # Test case 1: min_rate between max_rate and short_term_rate_cap
+    limiter = BBRRateLimiter(
+        now=mock_time.now,
+        initial_rate=5.0,
+        min_rate=0.08,  # Between max_rate (0.1) and short_term_rate_cap (0.05)
+        name="test_edge_case_1",
+    )
+
+    limiter._max_rate.update(0.1, mock_time.now)  # 0.1 req/s
+    limiter._short_term_rate_cap = 0.05  # 0.05 req/s (lower than min_rate)
+
+    # Effective rate should be max(0.08, min(0.1, 0.05)) = max(0.08, 0.05) = 0.08
+    assert limiter._get_effective_rate() == 0.08
+
+    # Test case 2: min_rate higher than both max_rate and short_term_rate_cap
+    limiter2 = BBRRateLimiter(
+        now=mock_time.now,
+        initial_rate=5.0,
+        min_rate=0.2,  # Higher than both detected rates
+        name="test_edge_case_2",
+    )
+
+    limiter2._max_rate.update(0.1, mock_time.now)  # 0.1 req/s
+    limiter2._short_term_rate_cap = 0.15  # 0.15 req/s
+
+    # Effective rate should be max(0.2, min(0.1, 0.15)) = max(0.2, 0.1) = 0.2
+    assert limiter2._get_effective_rate() == 0.2
+
+    # Test case 3: Normal operation where detected rates are higher than min_rate
+    limiter3 = BBRRateLimiter(
+        now=mock_time.now,
+        initial_rate=5.0,
+        min_rate=0.5,  # Lower than detected rates
+        name="test_edge_case_3",
+    )
+
+    limiter3._max_rate.update(2.0, mock_time.now)  # 2.0 req/s
+    limiter3._short_term_rate_cap = 1.5  # 1.5 req/s
+
+    # Effective rate should be max(0.5, min(2.0, 1.5)) = max(0.5, 1.5) = 1.5
+    assert limiter3._get_effective_rate() == 1.5
