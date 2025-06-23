@@ -1084,3 +1084,95 @@ async def test_upsert_world_preserves_existing_metadata_on_discovery(test_db):
 
         # Status should be updated to PENDING for re-scraping
         assert world.scrape_status == ScrapeStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_worlds_new_worlds(test_db):
+    """Test batch upserting multiple new worlds."""
+    worlds_data = [
+        ("wrld_batch_1", {"name": "Batch World 1"}, "SUCCESS"),
+        ("wrld_batch_2", {"name": "Batch World 2"}, "PENDING"),
+        ("wrld_batch_3", {"discovered_at": "2024-01-01T00:00:00.000Z"}, "PENDING"),
+    ]
+
+    await test_db.batch_upsert_worlds(worlds_data)
+
+    # Verify all worlds were created
+    async with test_db.async_session() as session:
+        for world_id, expected_metadata, expected_status in worlds_data:
+            result = await session.execute(
+                select(World).where(World.world_id == world_id)
+            )
+            world = result.scalar_one()
+            assert world.world_metadata == expected_metadata
+            assert world.scrape_status == ScrapeStatus(expected_status)
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_worlds_mixed_new_and_existing(test_db):
+    """Test batch upserting with mix of new and existing worlds."""
+    # First create an existing world with detailed metadata
+    existing_world_id = "wrld_existing"
+    detailed_metadata = {
+        "name": "Existing World",
+        "description": "An existing world with details",
+        "capacity": 16,
+    }
+    await test_db.upsert_world(existing_world_id, detailed_metadata, "SUCCESS")
+
+    # Now batch upsert with discovery data for existing world + new worlds
+    worlds_data = [
+        (existing_world_id, {"discovered_at": "2024-01-01T12:00:00.000Z"}, "PENDING"),
+        ("wrld_new_1", {"name": "New World 1"}, "SUCCESS"),
+        ("wrld_new_2", {"discovered_at": "2024-01-01T12:00:00.000Z"}, "PENDING"),
+    ]
+
+    await test_db.batch_upsert_worlds(worlds_data)
+
+    # Verify existing world metadata was preserved and discovery timestamp added
+    async with test_db.async_session() as session:
+        result = await session.execute(
+            select(World).where(World.world_id == existing_world_id)
+        )
+        existing_world = result.scalar_one()
+
+        # Should have both original detailed metadata and discovery timestamp
+        assert existing_world.world_metadata["name"] == "Existing World"
+        assert (
+            existing_world.world_metadata["description"]
+            == "An existing world with details"
+        )
+        assert existing_world.world_metadata["capacity"] == 16
+        assert (
+            existing_world.world_metadata["discovered_at"] == "2024-01-01T12:00:00.000Z"
+        )
+        assert existing_world.scrape_status == ScrapeStatus.PENDING
+
+        # Verify new worlds were created correctly
+        result = await session.execute(
+            select(World).where(World.world_id == "wrld_new_1")
+        )
+        new_world1 = result.scalar_one()
+        assert new_world1.world_metadata == {"name": "New World 1"}
+        assert new_world1.scrape_status == ScrapeStatus.SUCCESS
+
+        result = await session.execute(
+            select(World).where(World.world_id == "wrld_new_2")
+        )
+        new_world2 = result.scalar_one()
+        assert new_world2.world_metadata == {
+            "discovered_at": "2024-01-01T12:00:00.000Z"
+        }
+        assert new_world2.scrape_status == ScrapeStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_worlds_empty_list(test_db):
+    """Test batch upserting with empty list does nothing."""
+    await test_db.batch_upsert_worlds([])
+
+    # Verify no worlds were created
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World))
+        worlds = result.fetchall()
+        assert len(worlds) == 0

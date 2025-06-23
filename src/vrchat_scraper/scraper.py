@@ -313,13 +313,14 @@ class VRChatScraper:
             )
 
             logger.info(f"Found {len(worlds)} recently updated worlds")
-            # Queue all discovered worlds as PENDING
-            for world in worlds:
-                await self.database.upsert_world(
-                    world.id,
-                    {"discovered_at": datetime.utcnow().isoformat()},
-                    status="PENDING",
-                )
+            # Queue all discovered worlds as PENDING in batch
+            if worlds:
+                discovery_time = datetime.utcnow().isoformat()
+                worlds_data = [
+                    (world.id, {"discovered_at": discovery_time}, "PENDING")
+                    for world in worlds
+                ]
+                await self.database.batch_upsert_worlds(worlds_data)
         except httpx.HTTPStatusError:
             # Let HTTP errors propagate - they're already logged by _execute_api_call
             pass

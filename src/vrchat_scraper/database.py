@@ -195,6 +195,47 @@ class Database:
 
             await session.commit()
 
+    async def batch_upsert_worlds(self, worlds_data: List[Tuple[str, dict, str]]):
+        """Batch upsert multiple worlds in a single transaction.
+
+        Args:
+            worlds_data: List of tuples (world_id, metadata, status)
+        """
+        async with self.async_session() as session:
+            for world_id, metadata, status in worlds_data:
+                # Try to get existing world
+                stmt = select(World).where(World.world_id == world_id)
+                result = await session.execute(stmt)
+                existing_world = result.scalar_one_or_none()
+
+                if existing_world:
+                    # Same logic as upsert_world
+                    is_discovery = self._is_discovery_metadata(metadata)
+
+                    if is_discovery and existing_world.world_metadata:
+                        # Merge discovery metadata with existing detailed metadata
+                        merged_metadata = existing_world.world_metadata.copy()
+                        merged_metadata.update(metadata)
+                        existing_world.world_metadata = merged_metadata
+                    else:
+                        # Full scrape or no existing metadata - replace completely
+                        existing_world.world_metadata = metadata
+
+                    existing_world.last_scrape_time = datetime.utcnow()
+                    existing_world.scrape_status = ScrapeStatus(status)
+                else:
+                    # Create new world
+                    new_world = World(
+                        world_id=world_id,
+                        world_metadata=metadata,
+                        last_scrape_time=datetime.utcnow(),
+                        scrape_status=ScrapeStatus(status),
+                    )
+                    session.add(new_world)
+
+            # Single commit for all worlds
+            await session.commit()
+
     def _is_discovery_metadata(self, metadata: dict) -> bool:
         """Determine if metadata represents a discovery operation vs full scrape.
 
