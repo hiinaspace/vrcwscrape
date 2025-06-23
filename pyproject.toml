@@ -16,6 +16,7 @@ dependencies = [
     "opentelemetry-instrumentation-sqlalchemy>=0.49.0",
     "opentelemetry-instrumentation-sqlite3>=0.49.0",
     "opentelemetry-instrumentation-mysql>=0.49.0",
+    "pydantic-settings>=2.10.0",
 ]
 
 [tool.pytest.ini_options]
