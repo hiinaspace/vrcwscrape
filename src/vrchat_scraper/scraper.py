@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -145,9 +145,24 @@ class VRChatScraper:
                 break
             await self._sleep_func(delay)
 
-    async def _scrape_recent_worlds_task(self):
-        """Handle recent worlds discovery."""
-        request_id = f"recent-{self._time_source()}"
+    async def _execute_api_call_with_retries(
+        self,
+        request_prefix: str,
+        api_call: Callable[[], Awaitable[Any]],
+        success_handler: Callable[[Any], Awaitable[None]],
+        error_context: str,
+        custom_http_error_handler: Optional[Callable[[httpx.HTTPStatusError], Awaitable[None]]] = None,
+    ):
+        """Execute an API call with standard rate limiting, circuit breaking, and error handling.
+        
+        Args:
+            request_prefix: Prefix for request ID generation
+            api_call: Async function that makes the API call and returns result
+            success_handler: Async function to handle successful result
+            error_context: Context string for error logging
+            custom_http_error_handler: Optional custom handler for HTTP errors
+        """
+        request_id = f"{request_prefix}-{self._time_source()}"
         now = self._time_source()
 
         try:
@@ -155,14 +170,47 @@ class VRChatScraper:
             self.api_rate_limiter.on_request_sent(request_id, now)
 
             # Make API call
-            worlds = await self.api_client.get_recent_worlds()
+            result = await api_call()
 
             # Record success
             self.api_rate_limiter.on_success(request_id, self._time_source())
             self.api_circuit_breaker.on_success()
 
-            logger.info(f"Found {len(worlds)} recently updated worlds")
+            # Handle successful result
+            await success_handler(result)
 
+        except AuthenticationError:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.critical("Authentication failed - shutting down")
+            self.shutdown()
+            raise
+
+        except httpx.HTTPStatusError as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+
+            # Use custom error handler if provided
+            if custom_http_error_handler:
+                await custom_http_error_handler(e)
+            else:
+                # Default HTTP error handling
+                if e.response.status_code in [429, 500, 502, 503]:
+                    self.api_circuit_breaker.on_error(self._time_source())
+                logger.warning(f"{error_context} failed: {e}")
+
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            self.api_circuit_breaker.on_error(self._time_source())
+            logger.warning(f"Timeout in {error_context}: {e}")
+
+        except Exception as e:
+            self.api_rate_limiter.on_error(request_id, self._time_source())
+            logger.error(f"Unexpected error in {error_context}: {e}")
+
+    async def _scrape_recent_worlds_task(self):
+        """Handle recent worlds discovery."""
+        async def handle_recent_worlds_success(worlds):
+            logger.info(f"Found {len(worlds)} recently updated worlds")
             # Queue all discovered worlds as PENDING
             for world in worlds:
                 await self.database.upsert_world(
@@ -171,64 +219,23 @@ class VRChatScraper:
                     status="PENDING",
                 )
 
-        except AuthenticationError:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.critical("Authentication failed - shutting down")
-            self.shutdown()
-            raise
-
-        except httpx.HTTPStatusError as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-
-            if e.response.status_code in [429, 500, 502, 503]:
-                self.api_circuit_breaker.on_error(self._time_source())
-
-            logger.warning(f"Recent worlds request failed: {e}")
-
-        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.warning(f"Timeout in recent worlds request: {e}")
-
-        except Exception as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            logger.error(f"Unexpected error in recent worlds task: {e}")
+        await self._execute_api_call_with_retries(
+            request_prefix="recent",
+            api_call=self.api_client.get_recent_worlds,
+            success_handler=handle_recent_worlds_success,
+            error_context="recent worlds request",
+        )
 
     async def _scrape_world_task(self, world_id: str):
         """Handle complete world scraping: metadata + image."""
-        request_id = f"world-{world_id}-{self._time_source()}"
-        now = self._time_source()
-
-        try:
-            # Record request start
-            self.api_rate_limiter.on_request_sent(request_id, now)
-
-            # Make API call
-            world_details = await self.api_client.get_world_details(world_id)
-
-            # Record success
-            self.api_rate_limiter.on_success(request_id, self._time_source())
-            self.api_circuit_breaker.on_success()
-
+        async def handle_world_success(world_details):
             # Update database immediately
             await self._update_database_with_world(world_id, world_details)
-
             # Note: Image downloads are now handled through the file metadata workflow
             # Files are queued as PENDING in the database, then processed separately
-
             logger.debug(f"Successfully scraped world {world_id}")
 
-        except AuthenticationError:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.critical("Authentication failed - shutting down")
-            self.shutdown()
-            raise
-
-        except httpx.HTTPStatusError as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-
+        async def handle_world_http_error(e: httpx.HTTPStatusError):
             if e.response.status_code == 404:
                 await self._mark_world_deleted(world_id)
                 logger.info(f"World {world_id} not found (deleted?)")
@@ -238,50 +245,26 @@ class VRChatScraper:
             else:
                 logger.warning(f"Failed to scrape world {world_id}: {e}")
 
-        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.warning(f"Timeout scraping world {world_id}: {e}")
-
-        except Exception as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            logger.error(f"Unexpected error scraping {world_id}: {e}")
+        await self._execute_api_call_with_retries(
+            request_prefix=f"world-{world_id}",
+            api_call=lambda: self.api_client.get_world_details(world_id),
+            success_handler=handle_world_success,
+            error_context=f"world {world_id} scraping",
+            custom_http_error_handler=handle_world_http_error,
+        )
 
     async def _scrape_file_metadata_task(self, file_id: str):
         """Handle file metadata scraping for a specific file."""
-        request_id = f"file-{file_id}-{self._time_source()}"
-        now = self._time_source()
-
-        try:
-            # Record request start
-            self.api_rate_limiter.on_request_sent(request_id, now)
-
-            # Make API call to get file metadata
-            file_metadata = await self.api_client.get_file_metadata(file_id)
-
-            # Record success
-            self.api_rate_limiter.on_success(request_id, self._time_source())
-            self.api_circuit_breaker.on_success()
-
+        async def handle_file_metadata_success(file_metadata):
             # Update database with file metadata (use aliases for consistency)
             await self.database.update_file_metadata(
                 file_id,
                 file_metadata.model_dump(mode="json", by_alias=True),
                 status="SUCCESS"
             )
-
             logger.debug(f"Successfully scraped file metadata for {file_id}")
 
-        except AuthenticationError:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.critical("Authentication failed - shutting down")
-            self.shutdown()
-            raise
-
-        except httpx.HTTPStatusError as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-
+        async def handle_file_metadata_http_error(e: httpx.HTTPStatusError):
             if e.response.status_code == 404:
                 await self.database.update_file_metadata(
                     file_id, {}, status="ERROR", error_message="File not found"
@@ -293,14 +276,13 @@ class VRChatScraper:
             else:
                 logger.warning(f"Failed to scrape file metadata {file_id}: {e}")
 
-        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
-            logger.warning(f"Timeout scraping file metadata {file_id}: {e}")
-
-        except Exception as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            logger.error(f"Unexpected error scraping file metadata {file_id}: {e}")
+        await self._execute_api_call_with_retries(
+            request_prefix=f"file-{file_id}",
+            api_call=lambda: self.api_client.get_file_metadata(file_id),
+            success_handler=handle_file_metadata_success,
+            error_context=f"file metadata {file_id} scraping",
+            custom_http_error_handler=handle_file_metadata_http_error,
+        )
 
     async def _download_image_from_metadata_task(self, file_id: str, file_metadata_json: dict):
         """Handle image download based on file metadata."""
