@@ -172,6 +172,7 @@ class VRChatScraper:
         rl_delay = self.image_rate_limiter.get_delay_until_next_request(now)
         return rl_delay
 
+    @logfire.instrument
     async def _wait_for_api_ready(self):
         """Wait until API requests are allowed by rate limiter and circuit breaker."""
         while True:
@@ -180,6 +181,7 @@ class VRChatScraper:
                 break
             await self._sleep_func(delay)
 
+    @logfire.instrument
     async def _wait_for_image_ready(self):
         """Wait until image requests are allowed by rate limiter and circuit breaker."""
         while True:

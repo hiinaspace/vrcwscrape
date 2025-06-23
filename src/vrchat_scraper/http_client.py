@@ -14,6 +14,8 @@ from .models import WorldDetail, WorldSummary, FileMetadata
 
 logger = logging.getLogger(__name__)
 
+USER_AGENT = "vrcwscrape/0.1.0 (hiina@hiina.space)"
+
 
 class AuthenticationError(Exception):
     """Raised when VRChat authentication fails."""
@@ -29,14 +31,14 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
         self.client = httpx.AsyncClient(
             timeout=timeout,
             limits=httpx.Limits(max_connections=10),
-            headers={"Cookie": f"auth={auth_cookie}"},
+            headers={"Cookie": f"auth={auth_cookie}", "User-Agent": USER_AGENT},
         )
 
     async def get_recent_worlds(self) -> List[WorldSummary]:
         """Fetch recently updated worlds from VRChat API."""
         response = await self.client.get(
             "https://api.vrchat.cloud/api/1/worlds",
-            params={"sort": "updated", "n": 1000},
+            params={"sort": "updated", "n": 100},
         )
 
         if response.status_code == 401:
@@ -84,7 +86,7 @@ class FileImageDownloader:
         self.client = httpx.AsyncClient(
             timeout=timeout,
             limits=httpx.Limits(max_connections=10),
-            headers={"Cookie": f"auth={auth_cookie}"},
+            headers={"Cookie": f"auth={auth_cookie}", "User-Agent": USER_AGENT},
         )
 
     async def download_image(

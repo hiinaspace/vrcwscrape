@@ -4,11 +4,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
+import sqlalchemy
 from sqlalchemy import (
     DateTime,
     Integer,
     String,
     func,
+    literal,
     select,
     JSON,
     Text,
@@ -131,7 +133,8 @@ class Database:
         """Initialize database connection."""
         self.connection_string = connection_string
         self.engine = create_async_engine(
-            self._convert_connection_string(connection_string)
+            self._convert_connection_string(connection_string),
+            pool_size=10
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
 
@@ -208,10 +211,10 @@ class Database:
         if "mysql" in self.connection_string.lower():
             # MySQL uses TIMESTAMPDIFF
             def days_diff(date1, date2):
-                return func.timestampdiff(func.literal_column("DAY"), date2, date1)
+                return func.timestampdiff(sqlalchemy.text("DAY"), date2, date1)
 
             def hours_diff(date1, date2):
-                return func.timestampdiff(func.literal_column("HOUR"), date2, date1)
+                return func.timestampdiff(sqlalchemy.text("HOUR"), date2, date1)
 
             return days_diff, hours_diff
         else:  # SQLite

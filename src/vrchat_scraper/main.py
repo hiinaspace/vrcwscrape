@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 import time
+import sys
 
 import logfire
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -43,7 +44,7 @@ class GracefulShutdown:
         self.shutdown_event.set()
 
 
-async def main():
+async def async_main():
     """Main application entry point."""
     # Load config
     config = Config()
@@ -87,6 +88,7 @@ async def main():
         def handle_shutdown():
             logger.info("Shutdown signal received")
             scraper.shutdown()
+            sys.exit()
 
         # Override shutdown handler
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -105,5 +107,8 @@ async def main():
         logger.info("Shutdown complete")
 
 
+def main():
+    asyncio.run(async_main())
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
