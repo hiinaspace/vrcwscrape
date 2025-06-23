@@ -169,7 +169,7 @@ class VRChatScraper:
         rl_delay = self.image_rate_limiter.get_delay_until_next_request(now)
         return rl_delay
 
-    @logfire.instrument
+    @logfire.instrument("wait_for_api_ready")
     async def _wait_for_api_ready(self):
         """Wait until API requests are allowed by rate limiter and circuit breaker."""
         while True:
@@ -178,7 +178,7 @@ class VRChatScraper:
                 break
             await self._sleep_func(delay)
 
-    @logfire.instrument
+    @logfire.instrument("wait_for_iamge_ready")
     async def _wait_for_image_ready(self):
         """Wait until image requests are allowed by rate limiter and circuit breaker."""
         while True:
@@ -567,9 +567,6 @@ class VRChatScraper:
             for file_id, file_metadata_json, file_type in pending_images:
                 if self._shutdown_event.is_set():
                     break
-
-                # Wait until we can make an image request
-                await self._wait_for_image_ready()
 
                 # Launch individual image download task
                 task_group.create_task(
