@@ -69,11 +69,7 @@ class VRChatScraper:
         while not self._shutdown_event.is_set():
             try:
                 # Wait until we can make an API request
-                while True:
-                    delay = await self._get_api_request_delay()
-                    if delay <= 0:
-                        break
-                    await self._sleep_func(delay)
+                await self._wait_for_api_ready()
 
                 # Launch recent worlds discovery task
                 await self._scrape_recent_worlds_task()
@@ -132,6 +128,22 @@ class VRChatScraper:
 
         rl_delay = self.image_rate_limiter.get_delay_until_next_request(now)
         return rl_delay
+
+    async def _wait_for_api_ready(self):
+        """Wait until API requests are allowed by rate limiter and circuit breaker."""
+        while True:
+            delay = await self._get_api_request_delay()
+            if delay <= 0:
+                break
+            await self._sleep_func(delay)
+
+    async def _wait_for_image_ready(self):
+        """Wait until image requests are allowed by rate limiter and circuit breaker."""
+        while True:
+            delay = await self._get_image_request_delay()
+            if delay <= 0:
+                break
+            await self._sleep_func(delay)
 
     async def _scrape_recent_worlds_task(self):
         """Handle recent worlds discovery."""
@@ -293,11 +305,7 @@ class VRChatScraper:
     async def _download_image_from_metadata_task(self, file_id: str, file_metadata_json: dict):
         """Handle image download based on file metadata."""
         # Wait until we can make an image request
-        while True:
-            delay = await self._get_image_request_delay()
-            if delay <= 0:
-                break
-            await self._sleep_func(delay)
+        await self._wait_for_image_ready()
 
         request_id = f"image-metadata-{file_id}-{self._time_source()}"
         now = self._time_source()
@@ -401,11 +409,7 @@ class VRChatScraper:
                     break
 
                 # Wait until we can make an API request
-                while True:
-                    delay = await self._get_api_request_delay()
-                    if delay <= 0:
-                        break
-                    await self._sleep_func(delay)
+                await self._wait_for_api_ready()
 
                 # Launch individual file metadata scraping task
                 task_group.create_task(self._scrape_file_metadata_task(file_id))
@@ -433,11 +437,7 @@ class VRChatScraper:
                     break
 
                 # Wait until we can make an image request
-                while True:
-                    delay = await self._get_image_request_delay()
-                    if delay <= 0:
-                        break
-                    await self._sleep_func(delay)
+                await self._wait_for_image_ready()
 
                 # Launch individual image download task
                 task_group.create_task(
@@ -467,11 +467,7 @@ class VRChatScraper:
         without the timing/sleep aspects, useful for testing.
         """
         # Wait until we can make an API request
-        while True:
-            delay = await self._get_api_request_delay()
-            if delay <= 0:
-                break
-            await self._sleep_func(delay)
+        await self._wait_for_api_ready()
 
         # Launch recent worlds discovery task and await it
         await self._scrape_recent_worlds_task()
@@ -499,11 +495,7 @@ class VRChatScraper:
                     break
 
                 # Wait until we can make an API request
-                while True:
-                    delay = await self._get_api_request_delay()
-                    if delay <= 0:
-                        break
-                    await self._sleep_func(delay)
+                await self._wait_for_api_ready()
 
                 # Launch individual world scraping task
                 task_group.create_task(self._scrape_world_task(world_id))
