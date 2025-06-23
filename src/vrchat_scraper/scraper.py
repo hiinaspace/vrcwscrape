@@ -33,7 +33,7 @@ class VRChatScraper:
         image_circuit_breaker: CircuitBreaker,
         time_source: Callable[[], float] = time.time,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        recent_worlds_interval: float = 3600,  # 1 hour
+        recent_worlds_interval: float = 600,
         idle_wait_time: float = 60,  # 1 minute
         error_backoff_time: float = 60,  # 1 minute
     ):

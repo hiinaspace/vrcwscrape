@@ -1082,8 +1082,152 @@ async def test_upsert_world_preserves_existing_metadata_on_discovery(test_db):
         assert "discovered_at" in world.world_metadata
         assert world.world_metadata["discovered_at"] == "2024-01-03T00:00:00.000Z"
 
-        # Status should be updated to PENDING for re-scraping
+        # Status should remain SUCCESS since world's updated_at (2024-01-02) is older than scrape time
+        # This is the new correct behavior - don't rescrape if world hasn't been updated since our last scrape
+        assert world.scrape_status == ScrapeStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_recent_worlds_discovery_should_not_overwrite_recent_scrapes(test_db):
+    """Test that recent worlds discovery doesn't set status to PENDING if world was already scraped after updated_at."""
+    world_id = "wrld_test_recent_discover"
+
+    # Simulate a world being scraped from recent worlds API initially
+    # World has an updated_at of 2024-01-02
+    recent_worlds_metadata = {
+        "updated_at": "2024-01-02T00:00:00.000Z",
+        "discovered_at": "2024-01-05T00:00:00.000Z",
+    }
+    await test_db.upsert_world(world_id, recent_worlds_metadata, "PENDING")
+
+    # Verify it's PENDING
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
         assert world.scrape_status == ScrapeStatus.PENDING
+
+    # Now simulate successful full scraping of the world on 2024-01-06 (after the world's updated_at)
+    detailed_metadata = {
+        "name": "Test World",
+        "description": "A detailed test world",
+        "capacity": 32,
+        "favorites": 100,
+        "visits": 1500,
+        "heat": 5,
+        "popularity": 8,
+        "tags": ["system_approved"],
+        "created_at": "2024-01-01T00:00:00.000Z",
+        "updated_at": "2024-01-02T00:00:00.000Z",  # Same as before - world hasn't changed
+        "discovered_at": "2024-01-05T00:00:00.000Z",
+    }
+
+    # Manually set the scrape time to simulate scraping on 2024-01-06
+    from datetime import datetime
+
+    scrape_time = datetime(2024, 1, 6)
+    await test_db.upsert_world(world_id, detailed_metadata, "SUCCESS")
+
+    # Manually update the last_scrape_time to simulate this happened on 2024-01-06
+    async with test_db.async_session() as session:
+        stmt = select(World).where(World.world_id == world_id)
+        result = await session.execute(stmt)
+        world = result.scalar_one()
+        world.last_scrape_time = scrape_time
+        await session.commit()
+
+    # Verify world is SUCCESS
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
+        assert world.scrape_status == ScrapeStatus.SUCCESS
+        assert world.last_scrape_time == scrape_time
+
+    # Now simulate recent worlds discovery running again with the SAME data
+    # (this commonly happens since recent worlds API returns similar results between calls)
+    recent_worlds_metadata_again = {
+        "updated_at": "2024-01-02T00:00:00.000Z",  # Same updated_at as before
+        "discovered_at": "2024-01-07T00:00:00.000Z",  # New discovery time
+    }
+
+    # This should NOT change the status back to PENDING since:
+    # - We scraped the world on 2024-01-06
+    # - The world's updated_at is 2024-01-02 (before our scrape)
+    # - So there's no need to re-scrape
+    await test_db.upsert_world(world_id, recent_worlds_metadata_again, "PENDING")
+
+    # The key assertion: status should remain SUCCESS, not be changed to PENDING
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
+
+        # Status should still be SUCCESS (the test should fail with current implementation)
+        assert world.scrape_status == ScrapeStatus.SUCCESS
+
+        # Discovery timestamp should be updated
+        assert world.world_metadata["discovered_at"] == "2024-01-07T00:00:00.000Z"
+
+        # All other metadata should be preserved
+        assert world.world_metadata["name"] == "Test World"
+        assert world.world_metadata["updated_at"] == "2024-01-02T00:00:00.000Z"
+
+
+@pytest.mark.asyncio
+async def test_recent_worlds_discovery_should_set_pending_for_newer_worlds(test_db):
+    """Test that recent worlds discovery DOES set status to PENDING if world updated_at is newer than last scrape."""
+    world_id = "wrld_test_newer_world"
+
+    # Simulate a world being successfully scraped on 2024-01-05
+    detailed_metadata = {
+        "name": "Test World",
+        "description": "A detailed test world",
+        "capacity": 32,
+        "favorites": 100,
+        "visits": 1500,
+        "heat": 5,
+        "popularity": 8,
+        "tags": ["system_approved"],
+        "created_at": "2024-01-01T00:00:00.000Z",
+        "updated_at": "2024-01-02T00:00:00.000Z",  # World was last updated 2024-01-02
+        "discovered_at": "2024-01-05T00:00:00.000Z",
+    }
+
+    await test_db.upsert_world(world_id, detailed_metadata, "SUCCESS")
+
+    # Manually set the scrape time to 2024-01-05
+    from datetime import datetime
+
+    old_scrape_time = datetime(2024, 1, 5)
+    async with test_db.async_session() as session:
+        stmt = select(World).where(World.world_id == world_id)
+        result = await session.execute(stmt)
+        world = result.scalar_one()
+        world.last_scrape_time = old_scrape_time
+        await session.commit()
+
+    # Now the world gets updated on VRChat (2024-01-10)
+    # Recent worlds discovery finds it with newer updated_at
+    recent_worlds_metadata = {
+        "updated_at": "2024-01-10T00:00:00.000Z",  # NEWER than our last scrape
+        "discovered_at": "2024-01-11T00:00:00.000Z",
+    }
+
+    # This SHOULD change the status to PENDING since the world was updated after our last scrape
+    await test_db.upsert_world(world_id, recent_worlds_metadata, "PENDING")
+
+    # Status should be PENDING because the world has been updated since our last scrape
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
+
+        # Status should be PENDING since world was updated after our last scrape
+        assert world.scrape_status == ScrapeStatus.PENDING
+
+        # The updated_at should be updated in metadata
+        assert world.world_metadata["updated_at"] == "2024-01-10T00:00:00.000Z"
+        assert world.world_metadata["discovered_at"] == "2024-01-11T00:00:00.000Z"
+
+        # Other metadata should be preserved
+        assert world.world_metadata["name"] == "Test World"
 
 
 @pytest.mark.asyncio

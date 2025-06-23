@@ -177,12 +177,26 @@ class Database:
                     merged_metadata = existing_world.world_metadata.copy()
                     merged_metadata.update(metadata)
                     existing_world.world_metadata = merged_metadata
-                else:
-                    # Full scrape or no existing metadata - replace completely
-                    existing_world.world_metadata = metadata
 
-                existing_world.last_scrape_time = datetime.utcnow()
-                existing_world.scrape_status = ScrapeStatus(status)
+                    # For discovery operations, check if we need to rescrape
+                    world_updated_at = merged_metadata.get("updated_at")
+                    if world_updated_at:
+                        # If we have updated_at info, only set status to PENDING if world was updated after our last scrape
+                        should_rescrape = self._should_rescrape_world(
+                            world_updated_at, existing_world.last_scrape_time
+                        )
+                        if should_rescrape:
+                            existing_world.scrape_status = ScrapeStatus(status)
+                            # Don't update last_scrape_time for discovery - that's only for actual scraping
+                    else:
+                        # If no updated_at info available, fall back to old behavior (always set status)
+                        existing_world.scrape_status = ScrapeStatus(status)
+
+                else:
+                    # Full scrape or no existing metadata - replace completely and update status
+                    existing_world.world_metadata = metadata
+                    existing_world.last_scrape_time = datetime.utcnow()
+                    existing_world.scrape_status = ScrapeStatus(status)
             else:
                 # Create new world
                 new_world = World(
@@ -217,12 +231,26 @@ class Database:
                         merged_metadata = existing_world.world_metadata.copy()
                         merged_metadata.update(metadata)
                         existing_world.world_metadata = merged_metadata
-                    else:
-                        # Full scrape or no existing metadata - replace completely
-                        existing_world.world_metadata = metadata
 
-                    existing_world.last_scrape_time = datetime.utcnow()
-                    existing_world.scrape_status = ScrapeStatus(status)
+                        # For discovery operations, check if we need to rescrape
+                        world_updated_at = merged_metadata.get("updated_at")
+                        if world_updated_at:
+                            # If we have updated_at info, only set status to PENDING if world was updated after our last scrape
+                            should_rescrape = self._should_rescrape_world(
+                                world_updated_at, existing_world.last_scrape_time
+                            )
+                            if should_rescrape:
+                                existing_world.scrape_status = ScrapeStatus(status)
+                                # Don't update last_scrape_time for discovery - that's only for actual scraping
+                        else:
+                            # If no updated_at info available, fall back to old behavior (always set status)
+                            existing_world.scrape_status = ScrapeStatus(status)
+
+                    else:
+                        # Full scrape or no existing metadata - replace completely and update status
+                        existing_world.world_metadata = metadata
+                        existing_world.last_scrape_time = datetime.utcnow()
+                        existing_world.scrape_status = ScrapeStatus(status)
                 else:
                     # Create new world
                     new_world = World(
@@ -242,8 +270,13 @@ class Database:
         Discovery metadata typically contains minimal info like timestamps,
         while full scrape metadata contains rich world details.
         """
-        # Common discovery-only keys
-        discovery_keys = {"discovered_at", "last_seen_at", "found_in_recent"}
+        # Common discovery-only keys (includes updated_at from recent worlds API)
+        discovery_keys = {
+            "discovered_at",
+            "last_seen_at",
+            "found_in_recent",
+            "updated_at",
+        }
 
         # Rich metadata keys that indicate a full scrape
         rich_keys = {
@@ -256,7 +289,6 @@ class Database:
             "popularity",
             "tags",
             "created_at",
-            "updated_at",
         }
 
         metadata_keys = set(metadata.keys())
@@ -271,6 +303,43 @@ class Database:
 
         # If it's empty or has unknown keys, default to full scrape behavior
         return False
+
+    def _should_rescrape_world(
+        self, world_updated_at: str, last_scrape_time: datetime
+    ) -> bool:
+        """Determine if a world should be rescraped based on its updated_at vs our last scrape time.
+
+        Args:
+            world_updated_at: The world's updated_at timestamp as ISO string (can be None)
+            last_scrape_time: When we last scraped this world (can be None)
+
+        Returns:
+            True if the world should be rescraped, False otherwise
+        """
+        # If we don't have a world updated_at, can't make a decision - default to no rescrape
+        if not world_updated_at:
+            return False
+
+        # If we've never scraped the world, we should scrape it
+        if not last_scrape_time:
+            return True
+
+        try:
+            # Parse the world's updated_at timestamp
+            from dateutil import parser
+
+            world_updated_dt = parser.isoparse(world_updated_at)
+
+            # Remove timezone info from world_updated_dt if present to match last_scrape_time format
+            if world_updated_dt.tzinfo:
+                world_updated_dt = world_updated_dt.replace(tzinfo=None)
+
+            # Should rescrape if the world was updated after our last scrape
+            return world_updated_dt > last_scrape_time
+
+        except (ValueError, TypeError):
+            # If we can't parse the timestamp, default to no rescrape to be safe
+            return False
 
     async def insert_metrics(
         self, world_id: str, metrics: Dict[str, int], scrape_time: datetime
