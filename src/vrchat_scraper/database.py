@@ -10,7 +10,6 @@ from sqlalchemy import (
     Integer,
     String,
     func,
-    literal,
     select,
     JSON,
     Text,
@@ -132,10 +131,14 @@ class Database:
     def __init__(self, connection_string: str):
         """Initialize database connection."""
         self.connection_string = connection_string
-        self.engine = create_async_engine(
-            self._convert_connection_string(connection_string),
-            pool_size=10
-        )
+        converted_connection_string = self._convert_connection_string(connection_string)
+
+        # SQLite doesn't support pool_size parameter
+        if connection_string.startswith("sqlite"):
+            self.engine = create_async_engine(converted_connection_string)
+        else:
+            self.engine = create_async_engine(converted_connection_string, pool_size=10)
+
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
 
     def _convert_connection_string(self, connection_string: str) -> str:
@@ -164,8 +167,20 @@ class Database:
             existing_world = result.scalar_one_or_none()
 
             if existing_world:
-                # Update existing world
-                existing_world.world_metadata = metadata
+                # Determine if this is a discovery operation vs full scrape
+                # Discovery operations have minimal metadata (like just discovered_at)
+                # Full scrapes have rich metadata (name, description, etc.)
+                is_discovery = self._is_discovery_metadata(metadata)
+
+                if is_discovery and existing_world.world_metadata:
+                    # Merge discovery metadata with existing detailed metadata
+                    merged_metadata = existing_world.world_metadata.copy()
+                    merged_metadata.update(metadata)
+                    existing_world.world_metadata = merged_metadata
+                else:
+                    # Full scrape or no existing metadata - replace completely
+                    existing_world.world_metadata = metadata
+
                 existing_world.last_scrape_time = datetime.utcnow()
                 existing_world.scrape_status = ScrapeStatus(status)
             else:
@@ -179,6 +194,42 @@ class Database:
                 session.add(new_world)
 
             await session.commit()
+
+    def _is_discovery_metadata(self, metadata: dict) -> bool:
+        """Determine if metadata represents a discovery operation vs full scrape.
+
+        Discovery metadata typically contains minimal info like timestamps,
+        while full scrape metadata contains rich world details.
+        """
+        # Common discovery-only keys
+        discovery_keys = {"discovered_at", "last_seen_at", "found_in_recent"}
+
+        # Rich metadata keys that indicate a full scrape
+        rich_keys = {
+            "name",
+            "description",
+            "capacity",
+            "favorites",
+            "visits",
+            "heat",
+            "popularity",
+            "tags",
+            "created_at",
+            "updated_at",
+        }
+
+        metadata_keys = set(metadata.keys())
+
+        # If it only has discovery keys and no rich keys, it's a discovery
+        if metadata_keys <= discovery_keys:
+            return True
+
+        # If it has any rich keys, it's a full scrape
+        if metadata_keys & rich_keys:
+            return False
+
+        # If it's empty or has unknown keys, default to full scrape behavior
+        return False
 
     async def insert_metrics(
         self, world_id: str, metrics: Dict[str, int], scrape_time: datetime

@@ -1033,3 +1033,54 @@ async def test_update_image_download_nonexistent_image(test_db):
         )
         world_image = result.scalar_one_or_none()
         assert world_image is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_world_preserves_existing_metadata_on_discovery(test_db):
+    """Test that upserting world from recent worlds discovery preserves existing detailed metadata."""
+    world_id = "wrld_test_123"
+
+    # First, simulate detailed world scraping with complete metadata
+    detailed_metadata = {
+        "name": "Test World",
+        "description": "A detailed test world",
+        "capacity": 32,
+        "favorites": 100,
+        "visits": 1500,
+        "heat": 5,
+        "popularity": 8,
+        "tags": ["system_approved"],
+        "created_at": "2024-01-01T00:00:00.000Z",
+        "updated_at": "2024-01-02T00:00:00.000Z",
+    }
+    await test_db.upsert_world(world_id, detailed_metadata, "SUCCESS")
+
+    # Verify detailed metadata was saved
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
+        assert world.world_metadata == detailed_metadata
+        assert world.scrape_status == ScrapeStatus.SUCCESS
+
+    # Now simulate recent worlds discovery with minimal metadata (what happens currently)
+    discovery_metadata = {"discovered_at": "2024-01-03T00:00:00.000Z"}
+    await test_db.upsert_world(world_id, discovery_metadata, "PENDING")
+
+    # Verify that detailed metadata is preserved (this test will fail with current implementation)
+    async with test_db.async_session() as session:
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world = result.scalar_one()
+
+        # The detailed metadata should still be there
+        assert "name" in world.world_metadata
+        assert "description" in world.world_metadata
+        assert "capacity" in world.world_metadata
+        assert world.world_metadata["name"] == "Test World"
+        assert world.world_metadata["description"] == "A detailed test world"
+
+        # But the discovery timestamp should be added/updated
+        assert "discovered_at" in world.world_metadata
+        assert world.world_metadata["discovered_at"] == "2024-01-03T00:00:00.000Z"
+
+        # Status should be updated to PENDING for re-scraping
+        assert world.scrape_status == ScrapeStatus.PENDING
