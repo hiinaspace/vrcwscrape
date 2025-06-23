@@ -467,3 +467,45 @@ class Database:
                     world_image.success_time = datetime.utcnow()
 
                 await session.commit()
+
+    async def get_queue_depths(self) -> Dict[str, int]:
+        """Get count of pending work for observability metrics.
+
+        Returns:
+            Dictionary with counts of pending worlds, files, and images
+        """
+        async with self.async_session() as session:
+            # Count pending worlds
+            pending_worlds_stmt = select(func.count(World.world_id)).where(
+                World.scrape_status == ScrapeStatus.PENDING
+            )
+            pending_worlds_result = await session.execute(pending_worlds_stmt)
+            pending_worlds = pending_worlds_result.scalar() or 0
+
+            # Count pending file metadata
+            pending_files_stmt = select(func.count(FileMetadata.file_id)).where(
+                FileMetadata.scrape_status == ScrapeStatus.PENDING
+            )
+            pending_files_result = await session.execute(pending_files_stmt)
+            pending_files = pending_files_result.scalar() or 0
+
+            # Count pending image downloads
+            pending_images_stmt = select(func.count(WorldImage.file_id)).where(
+                and_(
+                    WorldImage.download_status == DownloadStatus.PENDING,
+                    # Only count images where file metadata is ready
+                    WorldImage.file_id.in_(
+                        select(FileMetadata.file_id).where(
+                            FileMetadata.scrape_status == ScrapeStatus.SUCCESS
+                        )
+                    ),
+                )
+            )
+            pending_images_result = await session.execute(pending_images_stmt)
+            pending_images = pending_images_result.scalar() or 0
+
+            return {
+                "pending_worlds": pending_worlds,
+                "pending_file_metadata": pending_files,
+                "pending_image_downloads": pending_images,
+            }

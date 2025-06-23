@@ -52,6 +52,31 @@ class VRChatScraper:
         self._error_backoff_time = error_backoff_time
         self._shutdown_event = asyncio.Event()
 
+        # --- Phase 2 Observability: Business Metrics ---
+        self._worlds_scraped_counter = logfire.metric_counter("scraper.worlds_scraped")
+        self._files_processed_counter = logfire.metric_counter(
+            "scraper.files_processed"
+        )
+        self._images_downloaded_counter = logfire.metric_counter(
+            "scraper.images_downloaded"
+        )
+        self._api_errors_counter = logfire.metric_counter("scraper.api_errors")
+        self._image_errors_counter = logfire.metric_counter("scraper.image_errors")
+
+        # Queue depth gauges (callback-based for real-time monitoring)
+        self._pending_worlds_gauge = logfire.metric_gauge(
+            "scraper.queue.pending_worlds"
+        )
+        self._pending_files_gauge = logfire.metric_gauge(
+            "scraper.queue.pending_file_metadata"
+        )
+        self._pending_images_gauge = logfire.metric_gauge(
+            "scraper.queue.pending_image_downloads"
+        )
+
+        # Start periodic queue depth monitoring
+        self._queue_monitor_task = None
+
     async def run_forever(self):
         """Main entry point - runs scraping tasks forever."""
         async with asyncio.TaskGroup() as task_group:
@@ -59,10 +84,28 @@ class VRChatScraper:
             task_group.create_task(self._process_pending_worlds_continuously())
             task_group.create_task(self._process_pending_file_metadata_continuously())
             task_group.create_task(self._process_pending_image_downloads_continuously())
+            task_group.create_task(self._monitor_queue_depths_periodically())
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
         self._shutdown_event.set()
+
+    def _classify_http_error(self, status_code: int) -> str:
+        """Classify HTTP errors into categories for structured observability."""
+        if status_code == 401:
+            return "authentication_error"
+        elif status_code == 403:
+            return "authorization_error"
+        elif status_code == 404:
+            return "not_found_error"
+        elif status_code == 429:
+            return "rate_limit_error"
+        elif 400 <= status_code < 500:
+            return "client_error"
+        elif 500 <= status_code < 600:
+            return "server_error"
+        else:
+            return "unknown_http_error"
 
     async def _scrape_recent_worlds_periodically(self):
         """Discover new worlds via recent API every hour."""
@@ -186,6 +229,16 @@ class VRChatScraper:
         except AuthenticationError:
             self.api_rate_limiter.on_error(request_id, self._time_source())
             self.api_circuit_breaker.on_error(self._time_source())
+
+            # Enhanced error tracking
+            with logfire.span("authentication_error", error_context=error_context):
+                logfire.error(
+                    "Authentication failed - shutting down",
+                    error_type="authentication_error",
+                    request_id=request_id,
+                    context=error_context,
+                )
+
             logger.critical("Authentication failed - shutting down")
             self.shutdown()
             raise
@@ -197,17 +250,53 @@ class VRChatScraper:
             if e.response.status_code in [429, 500, 502, 503]:
                 self.api_circuit_breaker.on_error(self._time_source())
 
+            # Enhanced error tracking with structured context
+            error_type = self._classify_http_error(e.response.status_code)
+            with logfire.span("http_error", error_context=error_context):
+                logfire.error(
+                    f"{error_context} failed with HTTP error",
+                    error_type=error_type,
+                    status_code=e.response.status_code,
+                    request_id=request_id,
+                    context=error_context,
+                    response_headers=dict(e.response.headers),
+                )
+
             logger.warning(f"{error_context} failed: {e}")
             raise
 
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             self.api_rate_limiter.on_error(request_id, self._time_source())
             self.api_circuit_breaker.on_error(self._time_source())
+
+            # Enhanced error tracking
+            timeout_type = type(e).__name__
+            with logfire.span("timeout_error", error_context=error_context):
+                logfire.error(
+                    f"Timeout in {error_context}",
+                    error_type="timeout_error",
+                    timeout_type=timeout_type,
+                    request_id=request_id,
+                    context=error_context,
+                )
+
             logger.warning(f"Timeout in {error_context}: {e}")
             raise
 
         except Exception as e:
             self.api_rate_limiter.on_error(request_id, self._time_source())
+
+            # Enhanced error tracking for unexpected errors
+            with logfire.span("unexpected_error", error_context=error_context):
+                logfire.error(
+                    f"Unexpected error in {error_context}",
+                    error_type="unexpected_error",
+                    exception_type=type(e).__name__,
+                    exception_message=str(e),
+                    request_id=request_id,
+                    context=error_context,
+                )
+
             logger.error(f"Unexpected error in {error_context}: {e}")
             raise
 
@@ -252,12 +341,27 @@ class VRChatScraper:
             # Files are queued as PENDING in the database, then processed separately
             logger.debug(f"Successfully scraped world {world_id}")
 
+            # Record business metric
+            self._worlds_scraped_counter.add(1, {"status": "success"})
+
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 await self._mark_world_deleted(world_id)
                 logger.info(f"World {world_id} not found (deleted?)")
+                self._worlds_scraped_counter.add(1, {"status": "deleted"})
+            else:
+                self._worlds_scraped_counter.add(1, {"status": "error"})
+                self._api_errors_counter.add(
+                    1,
+                    {
+                        "error_type": "http_error",
+                        "status_code": str(e.response.status_code),
+                    },
+                )
             # Other HTTP errors are already logged by _execute_api_call
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout):
+            self._worlds_scraped_counter.add(1, {"status": "timeout"})
+            self._api_errors_counter.add(1, {"error_type": "timeout"})
             # Timeout errors are already logged by _execute_api_call
             pass
 
@@ -279,14 +383,29 @@ class VRChatScraper:
             )
             logger.debug(f"Successfully scraped file metadata for {file_id}")
 
+            # Record business metric
+            self._files_processed_counter.add(1, {"status": "success"})
+
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 await self.database.update_file_metadata(
                     file_id, {}, status="ERROR", error_message="File not found"
                 )
                 logger.info(f"File {file_id} not found (deleted?)")
+                self._files_processed_counter.add(1, {"status": "not_found"})
+            else:
+                self._files_processed_counter.add(1, {"status": "error"})
+                self._api_errors_counter.add(
+                    1,
+                    {
+                        "error_type": "http_error",
+                        "status_code": str(e.response.status_code),
+                    },
+                )
             # Other HTTP errors are already logged by _execute_api_call
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout):
+            self._files_processed_counter.add(1, {"status": "timeout"})
+            self._api_errors_counter.add(1, {"error_type": "timeout"})
             # Timeout errors are already logged by _execute_api_call
             pass
 
@@ -335,9 +454,16 @@ class VRChatScraper:
                 self.image_rate_limiter.on_success(request_id, self._time_source())
                 self.image_circuit_breaker.on_success()
                 logger.debug(f"Successfully downloaded image for {file_id}")
+
+                # Record business metric
+                self._images_downloaded_counter.add(1, {"status": "success"})
             else:
                 self.image_rate_limiter.on_error(request_id, self._time_source())
                 logger.warning(f"Failed to download image for {file_id}: {error}")
+
+                # Record business metric
+                self._images_downloaded_counter.add(1, {"status": "error"})
+                self._image_errors_counter.add(1, {"error_type": "download_failed"})
 
             # Update database with download result
             if success:
@@ -358,6 +484,10 @@ class VRChatScraper:
                 file_id, "ERROR", error_message=str(e)
             )
             logger.error(f"Unexpected error downloading image for {file_id}: {e}")
+
+            # Record business metrics
+            self._images_downloaded_counter.add(1, {"status": "error"})
+            self._image_errors_counter.add(1, {"error_type": "unexpected_error"})
 
     async def _process_pending_file_metadata_continuously(self):
         """Continuously process pending file metadata from database."""
@@ -450,6 +580,43 @@ class VRChatScraper:
                 processed_count += 1
 
         return processed_count
+
+    async def _monitor_queue_depths_periodically(self):
+        """Periodically update queue depth gauges for observability."""
+        while not self._shutdown_event.is_set():
+            try:
+                queue_depths = await self.database.get_queue_depths()
+
+                # Update gauges with current queue depths
+                self._pending_worlds_gauge.set(queue_depths["pending_worlds"])
+                self._pending_files_gauge.set(queue_depths["pending_file_metadata"])
+                self._pending_images_gauge.set(queue_depths["pending_image_downloads"])
+
+                # Log queue depths periodically for visibility
+                if (
+                    queue_depths["pending_worlds"] > 0
+                    or queue_depths["pending_file_metadata"] > 0
+                    or queue_depths["pending_image_downloads"] > 0
+                ):
+                    logger.info(
+                        f"Queue depths: {queue_depths['pending_worlds']} worlds, "
+                        f"{queue_depths['pending_file_metadata']} files, "
+                        f"{queue_depths['pending_image_downloads']} images"
+                    )
+
+                # Check for shutdown every 30 seconds
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=30.0,
+                    )
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error monitoring queue depths: {e}")
+                await self._sleep_func(self._error_backoff_time)
 
     async def _update_database_with_world(
         self, world_id: str, world_details: WorldDetail
