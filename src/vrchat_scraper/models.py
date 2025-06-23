@@ -39,7 +39,7 @@ class UnityPackageDetailed(BaseModel):
     unity_version: str = Field(alias="unityVersion")
     asset_url: str = Field(alias="assetUrl")
     asset_version: int = Field(alias="assetVersion")
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
 
 class WorldSummary(BaseModel):
@@ -147,7 +147,7 @@ class FileMetadataVersion(BaseModel):
 
     version: int
     status: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
     deleted: Optional[bool] = None
     file: Optional["FileInfo"] = None
 
