@@ -111,9 +111,6 @@ class VRChatScraper:
         """Discover new worlds via recent API every hour."""
         while not self._shutdown_event.is_set():
             try:
-                # Wait until we can make an API request
-                await self._wait_for_api_ready()
-
                 # Launch recent worlds discovery task
                 await self._scrape_recent_worlds_task()
 
@@ -306,6 +303,7 @@ class VRChatScraper:
     async def _scrape_recent_worlds_task(self):
         """Handle recent worlds discovery."""
         try:
+            await self._wait_for_api_ready()
             worlds = await self._execute_api_call(
                 request_prefix="recent",
                 api_call=self.api_client.get_recent_worlds,
@@ -332,6 +330,7 @@ class VRChatScraper:
     async def _scrape_world_task(self, world_id: str):
         """Handle complete world scraping: metadata + image."""
         try:
+            await self._wait_for_api_ready()
             world_details = await self._execute_api_call(
                 request_prefix=f"world-{world_id}",
                 api_call=lambda: self.api_client.get_world_details(world_id),
@@ -372,6 +371,7 @@ class VRChatScraper:
     async def _scrape_file_metadata_task(self, file_id: str):
         """Handle file metadata scraping for a specific file."""
         try:
+            await self._wait_for_api_ready()
             file_metadata = await self._execute_api_call(
                 request_prefix=f"file-{file_id}",
                 api_call=lambda: self.api_client.get_file_metadata(file_id),
@@ -417,16 +417,11 @@ class VRChatScraper:
         self, file_id: str, file_metadata_json: dict
     ):
         """Handle image download based on file metadata."""
-        # Wait until we can make an image request
-        await self._wait_for_image_ready()
 
         request_id = f"image-metadata-{file_id}-{self._time_source()}"
         now = self._time_source()
 
         try:
-            # Record request start
-            self.image_rate_limiter.on_request_sent(request_id, now)
-
             # Parse file metadata to get download URL and MD5
             from .models import FileMetadata
 
@@ -441,6 +436,10 @@ class VRChatScraper:
 
             download_url = latest_version.file.url
             expected_md5 = latest_version.file.md5
+
+            # Wait until we can make an image request
+            await self._wait_for_image_ready()
+            self.image_rate_limiter.on_request_sent(request_id, now)
 
             # Download image with MD5 verification
             (
@@ -543,10 +542,6 @@ class VRChatScraper:
             for file_id, file_type in pending_files:
                 if self._shutdown_event.is_set():
                     break
-
-                # Wait until we can make an API request
-                await self._wait_for_api_ready()
-
                 # Launch individual file metadata scraping task
                 task_group.create_task(self._scrape_file_metadata_task(file_id))
                 processed_count += 1
@@ -641,9 +636,6 @@ class VRChatScraper:
         This is the extracted inner logic from _scrape_recent_worlds_periodically
         without the timing/sleep aspects, useful for testing.
         """
-        # Wait until we can make an API request
-        await self._wait_for_api_ready()
-
         # Launch recent worlds discovery task and await it
         await self._scrape_recent_worlds_task()
 
@@ -669,9 +661,6 @@ class VRChatScraper:
             for world_id in worlds:
                 if self._shutdown_event.is_set():
                     break
-
-                # Wait until we can make an API request
-                await self._wait_for_api_ready()
 
                 # Launch individual world scraping task
                 task_group.create_task(self._scrape_world_task(world_id))
