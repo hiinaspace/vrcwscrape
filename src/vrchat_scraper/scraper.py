@@ -50,28 +50,19 @@ class VRChatScraper:
         self._idle_wait_time = idle_wait_time
         self._error_backoff_time = error_backoff_time
         self._shutdown_event = asyncio.Event()
-        self._task_group = asyncio.TaskGroup()
 
     async def run_forever(self):
         """Main entry point - runs scraping tasks forever."""
-        async with self._task_group:
-            self._task_group.create_task(self._scrape_recent_worlds_periodically())
-            self._task_group.create_task(self._process_pending_worlds_continuously())
-            self._task_group.create_task(self._process_pending_file_metadata_continuously())
-            self._task_group.create_task(self._process_pending_image_downloads_continuously())
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(self._scrape_recent_worlds_periodically())
+            task_group.create_task(self._process_pending_worlds_continuously())
+            task_group.create_task(self._process_pending_file_metadata_continuously())
+            task_group.create_task(self._process_pending_image_downloads_continuously())
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
         self._shutdown_event.set()
 
-    def _create_task(self, coro):
-        """Create a task, using TaskGroup if active or falling back to asyncio.create_task."""
-        try:
-            # Try to use the TaskGroup if it's active
-            return self._task_group.create_task(coro)
-        except RuntimeError:
-            # TaskGroup not entered, fall back to regular create_task
-            return asyncio.create_task(coro)
 
     async def _scrape_recent_worlds_periodically(self):
         """Discover new worlds via recent API every hour."""
@@ -85,7 +76,7 @@ class VRChatScraper:
                     await self._sleep_func(delay)
 
                 # Launch recent worlds discovery task
-                self._create_task(self._scrape_recent_worlds_task())
+                await self._scrape_recent_worlds_task()
 
                 # Wait an hour before next discovery
                 # Use injected sleep function for testability
@@ -244,48 +235,6 @@ class VRChatScraper:
             self.api_rate_limiter.on_error(request_id, self._time_source())
             logger.error(f"Unexpected error scraping {world_id}: {e}")
 
-    async def _download_image_task(self, world_id: str, image_url: str):
-        """Handle image download with separate rate limiting."""
-        # Wait until we can make an image request
-        while True:
-            delay = await self._get_image_request_delay()
-            if delay <= 0:
-                break
-            await self._sleep_func(delay)
-
-        request_id = f"image-{world_id}-{self._time_source()}"
-        now = self._time_source()
-
-        try:
-            # Record request start
-            self.image_rate_limiter.on_request_sent(request_id, now)
-
-            # Download image - extract file_id from image_url for new protocol
-            from .models import _parse_file_url, FileType
-            file_ref = _parse_file_url(image_url, FileType.IMAGE)
-            if file_ref:
-                file_id = file_ref.file_id
-                # For now, use a placeholder MD5 until we implement full file metadata workflow
-                success, local_path, size, error = await self.image_downloader.download_image(
-                    file_id, image_url, "placeholder_md5"
-                )
-                success = success  # Extract success from tuple
-            else:
-                success = False
-
-            # Record result
-            if success:
-                self.image_rate_limiter.on_success(request_id, self._time_source())
-                self.image_circuit_breaker.on_success()
-                logger.debug(f"Successfully downloaded image for {world_id}")
-            else:
-                self.image_rate_limiter.on_error(request_id, self._time_source())
-                logger.warning(f"Failed to download image for {world_id}")
-
-        except Exception as e:
-            self.image_rate_limiter.on_error(request_id, self._time_source())
-            logger.error(f"Unexpected error downloading image for {world_id}: {e}")
-
     async def _scrape_file_metadata_task(self, file_id: str):
         """Handle file metadata scraping for a specific file."""
         request_id = f"file-{file_id}-{self._time_source()}"
@@ -361,7 +310,7 @@ class VRChatScraper:
             from .models import FileMetadata
             file_metadata = FileMetadata(**file_metadata_json)
             latest_version = file_metadata.get_latest_version()
-            
+
             if not latest_version or not latest_version.file:
                 await self.database.update_image_download(
                     file_id, "ERROR", error_message="No valid file version found"
@@ -370,7 +319,7 @@ class VRChatScraper:
 
             download_url = latest_version.file.url
             expected_md5 = latest_version.file.md5
-            
+
             # Download image with MD5 verification
             success, local_path, size, error = await self.image_downloader.download_image(
                 file_id, download_url, expected_md5
@@ -388,7 +337,7 @@ class VRChatScraper:
             # Update database with download result
             if success:
                 await self.database.update_image_download(
-                    file_id, "SUCCESS", 
+                    file_id, "SUCCESS",
                     local_file_path=local_path,
                     downloaded_size_bytes=size
                 )
@@ -445,27 +394,24 @@ class VRChatScraper:
         if not pending_files:
             return 0
 
-        batch_tasks = []
-        for file_id, file_type in pending_files:
-            if self._shutdown_event.is_set():
-                break
-
-            # Wait until we can make an API request
-            while True:
-                delay = await self._get_api_request_delay()
-                if delay <= 0:
+        async with asyncio.TaskGroup() as task_group:
+            processed_count = 0
+            for file_id, file_type in pending_files:
+                if self._shutdown_event.is_set():
                     break
-                await self._sleep_func(delay)
 
-            # Launch individual file metadata scraping task
-            task = self._create_task(self._scrape_file_metadata_task(file_id))
-            batch_tasks.append(task)
+                # Wait until we can make an API request
+                while True:
+                    delay = await self._get_api_request_delay()
+                    if delay <= 0:
+                        break
+                    await self._sleep_func(delay)
 
-        # Wait for all tasks in this batch to complete before returning
-        if batch_tasks:
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+                # Launch individual file metadata scraping task
+                task_group.create_task(self._scrape_file_metadata_task(file_id))
+                processed_count += 1
 
-        return len(batch_tasks)
+        return processed_count
 
     async def _process_pending_image_downloads_batch(self, limit: int = 20):
         """Execute one batch of pending image downloads processing.
@@ -480,29 +426,26 @@ class VRChatScraper:
         if not pending_images:
             return 0
 
-        batch_tasks = []
-        for file_id, file_metadata_json, file_type in pending_images:
-            if self._shutdown_event.is_set():
-                break
-
-            # Wait until we can make an image request
-            while True:
-                delay = await self._get_image_request_delay()
-                if delay <= 0:
+        async with asyncio.TaskGroup() as task_group:
+            processed_count = 0
+            for file_id, file_metadata_json, file_type in pending_images:
+                if self._shutdown_event.is_set():
                     break
-                await self._sleep_func(delay)
 
-            # Launch individual image download task
-            task = self._create_task(
-                self._download_image_from_metadata_task(file_id, file_metadata_json)
-            )
-            batch_tasks.append(task)
+                # Wait until we can make an image request
+                while True:
+                    delay = await self._get_image_request_delay()
+                    if delay <= 0:
+                        break
+                    await self._sleep_func(delay)
 
-        # Wait for all tasks in this batch to complete before returning
-        if batch_tasks:
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+                # Launch individual image download task
+                task_group.create_task(
+                    self._download_image_from_metadata_task(file_id, file_metadata_json)
+                )
+                processed_count += 1
 
-        return len(batch_tasks)
+        return processed_count
 
     async def _update_database_with_world(
         self, world_id: str, world_details: WorldDetail
@@ -549,27 +492,24 @@ class VRChatScraper:
         if not worlds:
             return 0
 
-        batch_tasks = []
-        for world_id in worlds:
-            if self._shutdown_event.is_set():
-                break
-
-            # Wait until we can make an API request
-            while True:
-                delay = await self._get_api_request_delay()
-                if delay <= 0:
+        async with asyncio.TaskGroup() as task_group:
+            processed_count = 0
+            for world_id in worlds:
+                if self._shutdown_event.is_set():
                     break
-                await self._sleep_func(delay)
 
-            # Launch individual world scraping task
-            task = self._create_task(self._scrape_world_task(world_id))
-            batch_tasks.append(task)
+                # Wait until we can make an API request
+                while True:
+                    delay = await self._get_api_request_delay()
+                    if delay <= 0:
+                        break
+                    await self._sleep_func(delay)
 
-        # Wait for all tasks in this batch to complete before returning
-        if batch_tasks:
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+                # Launch individual world scraping task
+                task_group.create_task(self._scrape_world_task(world_id))
+                processed_count += 1
 
-        return len(batch_tasks)
+        return processed_count
 
     async def _mark_world_deleted(self, world_id: str):
         """Mark a world as deleted in the database."""
