@@ -134,7 +134,9 @@ def test_discovered_files_from_world_summary():
     world = WorldSummary(**recent_worlds_data[0])
 
     files = world.discovered_files
-    assert len(files) == 1  # imageUrl only (thumbnailImageUrl is same file with dynamic resizing)
+    assert (
+        len(files) == 1
+    )  # imageUrl only (thumbnailImageUrl is same file with dynamic resizing)
 
     # Check image file
     image_file = next(

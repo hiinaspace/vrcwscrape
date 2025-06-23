@@ -234,10 +234,21 @@ class FakeImageDownloader:
         """Add a future for downloading a file."""
         self.download_futures[file_id] = future
 
-    def set_download_result(self, file_id: str, success: bool, local_file_path: str = "", 
-                            actual_size_bytes: int = 100000, error_message: str = ""):
+    def set_download_result(
+        self,
+        file_id: str,
+        success: bool,
+        local_file_path: str = "",
+        actual_size_bytes: int = 100000,
+        error_message: str = "",
+    ):
         """Configure the download result for a specific file_id."""
-        self.download_results[file_id] = (success, local_file_path, actual_size_bytes, error_message)
+        self.download_results[file_id] = (
+            success,
+            local_file_path,
+            actual_size_bytes,
+            error_message,
+        )
 
     def set_download_response(self, world_id: str, success: bool):
         """Legacy convenience method for backward compatibility with existing tests."""
@@ -261,16 +272,20 @@ class FakeImageDownloader:
         else:
             self.existing_images.discard(file_id)
 
-    async def download_image(self, file_id: str, download_url: str, expected_md5: str) -> Tuple[bool, str, int, str]:
+    async def download_image(
+        self, file_id: str, download_url: str, expected_md5: str
+    ) -> Tuple[bool, str, int, str]:
         """Fake implementation of download_image matching new protocol."""
         now = self.time_source()
 
-        self.download_log.append({
-            "file_id": file_id, 
-            "url": download_url, 
-            "expected_md5": expected_md5,
-            "timestamp": now
-        })
+        self.download_log.append(
+            {
+                "file_id": file_id,
+                "url": download_url,
+                "expected_md5": expected_md5,
+                "timestamp": now,
+            }
+        )
 
         # Check if we have a configured result for this file_id
         if file_id in self.download_results:
@@ -279,7 +294,7 @@ class FakeImageDownloader:
             if success:
                 self.existing_images.add(file_id)
             return result
-        
+
         # Get and await the future for this download if configured
         if file_id in self.download_futures:
             future = self.download_futures.pop(file_id)
@@ -310,8 +325,14 @@ class FakeImageDownloader:
         if world_id is None:
             return len(self.download_log)
         # Check both old format (world_id key) and new format (file_id key)
-        return len([d for d in self.download_log if 
-                   d.get("world_id") == world_id or d.get("file_id") == f"file_{world_id}"])
+        return len(
+            [
+                d
+                for d in self.download_log
+                if d.get("world_id") == world_id
+                or d.get("file_id") == f"file_{world_id}"
+            ]
+        )
 
     def clear_download_log(self):
         """Clear the download log."""
@@ -476,6 +497,7 @@ def create_test_world_summary(
     unity_packages = []
     if include_unity_packages:
         from src.vrchat_scraper.models import UnityPackageBasic
+
         unity_packages = [
             UnityPackageBasic(platform="standalonewindows", unityVersion="2019.4.31f1"),
             UnityPackageBasic(platform="android", unityVersion="2019.4.31f1"),
@@ -512,6 +534,7 @@ def create_test_world_detail(
     unity_packages = []
     if include_unity_packages:
         from src.vrchat_scraper.models import UnityPackageDetailed
+
         unity_packages = [
             UnityPackageDetailed(
                 id=f"unp_{world_id}_1",
@@ -559,24 +582,24 @@ def create_test_file_metadata(
     """Create a test FileMetadata object."""
     from src.vrchat_scraper.models import FileMetadata, FileMetadataVersion, FileInfo
     from datetime import datetime
-    
+
     if download_url is None:
         download_url = f"https://api.vrchat.cloud/api/1/file/{file_id}/{version}/file"
-    
+
     file_info = FileInfo(
         md5=md5_hash,
         sizeInBytes=file_size,
         url=download_url,
         fileName=name,
     )
-    
+
     file_version = FileMetadataVersion(
         version=version,
         status="complete",
         created_at=datetime(2024, 1, 1, 10, 0, 0),
         file=file_info,
     )
-    
+
     return FileMetadata(
         id=file_id,
         name=name,

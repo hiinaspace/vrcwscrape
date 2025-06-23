@@ -183,6 +183,7 @@ async def test_scrape_world_happy_path(
 
     # Set up file metadata responses for discovered files
     from tests.fakes import create_test_file_metadata
+
     discovered_files = test_world.discovered_files
     for file_ref in discovered_files:
         if file_ref.file_type.value == "IMAGE":
@@ -213,11 +214,11 @@ async def test_scrape_world_happy_path(
 
     # Act: Scrape the world and process the full workflow
     await stub_scraper._scrape_world_task(world_id)
-    
+
     # Process pending file metadata batch
     await stub_scraper._process_pending_file_metadata_batch(limit=100)
-    
-    # Process pending image downloads batch  
+
+    # Process pending image downloads batch
     await stub_scraper._process_pending_image_downloads_batch(limit=100)
 
     # Assert: Verify the world was updated in database
@@ -231,19 +232,22 @@ async def test_scrape_world_happy_path(
 
     # Verify file metadata API calls were made for discovered files
     expected_file_metadata_calls = len([f for f in discovered_files])
-    assert fake_api_client.get_request_count("file_metadata") == expected_file_metadata_calls
-    
+    assert (
+        fake_api_client.get_request_count("file_metadata")
+        == expected_file_metadata_calls
+    )
+
     # Verify file metadata was stored in database
     async with test_database.async_session() as session:
         from src.vrchat_scraper.database import FileMetadata
         from sqlalchemy import select
-        
+
         file_records = await session.execute(
             select(FileMetadata).where(FileMetadata.world_id == world_id)
         )
         file_records = file_records.scalars().all()
         assert len(file_records) == len(discovered_files)
-        
+
         # Check that all files have SUCCESS status (metadata was scraped)
         for file_record in file_records:
             assert file_record.scrape_status == "SUCCESS"
@@ -251,17 +255,16 @@ async def test_scrape_world_happy_path(
 
     # Verify image downloads were attempted for image files only
     image_files = [f for f in discovered_files if f.file_type.value == "IMAGE"]
-    total_downloads = sum(fake_image_downloader.get_download_count(f"dummy_{i}") for i in range(10))  # Count all downloads
     assert len(fake_image_downloader.download_log) == len(image_files)
-    
+
     # Verify image download database records
     async with test_database.async_session() as session:
         from src.vrchat_scraper.database import WorldImage
-        
+
         image_records = await session.execute(select(WorldImage))
         image_records = image_records.scalars().all()
         assert len(image_records) == len(image_files)
-        
+
         for image_record in image_records:
             assert image_record.download_status == "SUCCESS"
             assert image_record.local_file_path is not None
@@ -398,14 +401,16 @@ async def test_process_pending_worlds_batch_happy_path(
     async with test_database.async_session() as session:
         from src.vrchat_scraper.database import FileMetadata
         from sqlalchemy import select
-        
+
         file_records = await session.execute(select(FileMetadata))
         file_records = file_records.scalars().all()
-        
+
         # Each world should have one image file entry
         assert len(file_records) == len(world_ids)
         for file_record in file_records:
-            assert file_record.scrape_status == "PENDING"  # Ready for file metadata scraping
+            assert (
+                file_record.scrape_status == "PENDING"
+            )  # Ready for file metadata scraping
 
 
 @pytest.mark.asyncio
