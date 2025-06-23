@@ -53,7 +53,10 @@ def fast_image_downloader():
 async def real_api_rate_limiter():
     """Create a real rate limiter for API requests with fast settings."""
     return BBRRateLimiter(
-        asyncio.get_running_loop().time(), initial_rate=5.0, name="integration_api"
+        asyncio.get_running_loop().time(),
+        initial_rate=5.0,
+        min_rate=0.5,
+        name="integration_api",
     )
 
 
@@ -61,7 +64,10 @@ async def real_api_rate_limiter():
 async def real_image_rate_limiter():
     """Create a real rate limiter for image requests with fast settings."""
     return BBRRateLimiter(
-        asyncio.get_running_loop().time(), initial_rate=10.0, name="integration_image"
+        asyncio.get_running_loop().time(),
+        initial_rate=10.0,
+        min_rate=0.5,
+        name="integration_image",
     )
 
 
@@ -288,6 +294,7 @@ async def test_rate_limiter_probe_recovery():
         initial_rate=1.0,  # Start low as if degraded by app-limited samples
         probe_cycle_duration_sec=2.0,  # Fast probe cycle
         window_size_sec=3.0,  # Short window
+        min_rate=0.5,  # Default min_rate
         name="test_fast",
     )
 
@@ -329,7 +336,7 @@ async def test_rate_limiter_probe_recovery():
         image_downloader=image_downloader,
         api_rate_limiter=fast_rate_limiter,
         image_rate_limiter=BBRRateLimiter(
-            current_time, initial_rate=20.0, name="test_image_bg"
+            current_time, initial_rate=20.0, min_rate=0.5, name="test_image_bg"
         ),  # Image limiter not under test
         api_circuit_breaker=CircuitBreaker(name="test_api_bg"),
         image_circuit_breaker=CircuitBreaker(name="test_image_bg"),

@@ -97,6 +97,7 @@ class BBRRateLimiter:
         min_requests_for_pipe: int = 4,
         probe_up_gain: float = 1.25,
         probe_down_gain: float = 0.9,
+        min_rate: float = 0.5,
         name: str = "default",
     ):
         # --- BBR State & Model ---
@@ -120,6 +121,7 @@ class BBRRateLimiter:
         self._min_pipe_size = min_requests_for_pipe
         self._probe_up_gain = probe_up_gain
         self._probe_down_gain = probe_down_gain
+        self._min_rate = min_rate
 
         # --- In-flight Request Tracking ---
         self._inflight_requests: Dict[Any, RequestState] = {}
@@ -261,7 +263,7 @@ class BBRRateLimiter:
             self._change_state(BbrState.PROBING_DOWN)
 
     def _get_effective_rate(self) -> float:
-        return min(self.max_rate, self._short_term_rate_cap)
+        return max(self._min_rate, min(self.max_rate, self._short_term_rate_cap))
 
     def _get_pacing_gain(self) -> float:
         return {
