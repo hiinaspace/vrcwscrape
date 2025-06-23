@@ -2,6 +2,8 @@
 
 from enum import Enum, auto
 
+import logfire
+
 
 class CircuitBreakerState(Enum):
     """Enumerates the possible states of the CircuitBreaker."""
@@ -36,6 +38,35 @@ class CircuitBreaker:
         self._last_error_time = 0.0
         self._backoff_duration = self._initial_backoff_sec
 
+        # --- Observability ---
+        self._state_gauge = logfire.metric_gauge("circuit_breaker.state")
+        self._consecutive_errors_gauge = logfire.metric_gauge(
+            "circuit_breaker.consecutive_errors"
+        )
+        self._backoff_duration_gauge = logfire.metric_gauge(
+            "circuit_breaker.backoff_duration"
+        )
+        self._state_transitions_counter = logfire.metric_counter(
+            "circuit_breaker.state_transitions"
+        )
+        self._requests_blocked_counter = logfire.metric_counter(
+            "circuit_breaker.requests_blocked"
+        )
+
+        # Initialize gauge values
+        self._state_gauge.set(self.state.value)
+        self._consecutive_errors_gauge.set(self._consecutive_errors)
+        self._backoff_duration_gauge.set(self._backoff_duration)
+
+    def _change_state(self, new_state: CircuitBreakerState):
+        """Helper method to change state and track metrics."""
+        if self.state != new_state:
+            self._state_transitions_counter.add(
+                1, {"from": self.state.name, "to": new_state.name}
+            )
+            self.state = new_state
+            self._state_gauge.set(self.state.value)
+
     def get_delay_until_proceed(self, now: float) -> float:
         """
         Returns the number of seconds to wait before proceeding. 0.0 means
@@ -44,11 +75,13 @@ class CircuitBreaker:
         if self.state == CircuitBreakerState.OPEN:
             # Check if the backoff period has expired.
             if now > self._last_error_time + self._backoff_duration:
-                self.state = CircuitBreakerState.HALF_OPEN
+                self._change_state(CircuitBreakerState.HALF_OPEN)
                 return 0.0  # Permit one trial request
 
             # If still within the backoff period, return the remaining time.
-            return (self._last_error_time + self._backoff_duration) - now
+            delay = (self._last_error_time + self._backoff_duration) - now
+            self._requests_blocked_counter.add(1)
+            return delay
 
         # In CLOSED or HALF_OPEN states, we can proceed immediately.
         return 0.0
@@ -56,13 +89,17 @@ class CircuitBreaker:
     def on_success(self):
         """Records a successful outcome, closing the breaker if it was half-open."""
         self._consecutive_errors = 0
+        self._consecutive_errors_gauge.set(self._consecutive_errors)
+
         if self.state == CircuitBreakerState.HALF_OPEN:
-            self.state = CircuitBreakerState.CLOSED
+            self._change_state(CircuitBreakerState.CLOSED)
             self._backoff_duration = self._initial_backoff_sec
+            self._backoff_duration_gauge.set(self._backoff_duration)
 
     def on_error(self, now: float):
         """Records a failure, potentially tripping the breaker to the OPEN state."""
         self._consecutive_errors += 1
+        self._consecutive_errors_gauge.set(self._consecutive_errors)
 
         # Determine if the breaker should trip based on its current state.
         should_trip = (
@@ -78,7 +115,8 @@ class CircuitBreaker:
             self._backoff_duration = min(
                 self._backoff_duration * 2, self._max_backoff_sec
             )
+            self._backoff_duration_gauge.set(self._backoff_duration)
 
         # Now, transition to OPEN state and record the time.
-        self.state = CircuitBreakerState.OPEN
+        self._change_state(CircuitBreakerState.OPEN)
         self._last_error_time = now

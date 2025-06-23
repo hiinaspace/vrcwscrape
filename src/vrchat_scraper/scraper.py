@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 import httpx
+import logfire
 
 from .circuit_breaker import CircuitBreaker
 from .database import Database
@@ -210,6 +211,7 @@ class VRChatScraper:
             logger.error(f"Unexpected error in {error_context}: {e}")
             raise
 
+    @logfire.instrument("scrape_recent_worlds_task")
     async def _scrape_recent_worlds_task(self):
         """Handle recent worlds discovery."""
         try:
@@ -234,6 +236,7 @@ class VRChatScraper:
             # Let timeout errors propagate - they're already logged by _execute_api_call
             pass
 
+    @logfire.instrument("scrape_world_task")
     async def _scrape_world_task(self, world_id: str):
         """Handle complete world scraping: metadata + image."""
         try:
@@ -258,6 +261,7 @@ class VRChatScraper:
             # Timeout errors are already logged by _execute_api_call
             pass
 
+    @logfire.instrument("scrape_file_metadata_task")
     async def _scrape_file_metadata_task(self, file_id: str):
         """Handle file metadata scraping for a specific file."""
         try:
@@ -286,6 +290,7 @@ class VRChatScraper:
             # Timeout errors are already logged by _execute_api_call
             pass
 
+    @logfire.instrument("download_image_from_metadata_task")
     async def _download_image_from_metadata_task(
         self, file_id: str, file_metadata_json: dict
     ):
@@ -386,6 +391,7 @@ class VRChatScraper:
                 logger.error(f"Error in pending image downloads processing: {e}")
                 await self._sleep_func(self._error_backoff_time)  # Back off on errors
 
+    @logfire.instrument("process_pending_file_metadata_batch")
     async def _process_pending_file_metadata_batch(self, limit: int = 50):
         """Execute one batch of pending file metadata processing.
 
@@ -414,6 +420,7 @@ class VRChatScraper:
 
         return processed_count
 
+    @logfire.instrument("process_pending_image_downloads_batch")
     async def _process_pending_image_downloads_batch(self, limit: int = 20):
         """Execute one batch of pending image downloads processing.
 
@@ -457,6 +464,7 @@ class VRChatScraper:
             status="SUCCESS",
         )
 
+    @logfire.instrument("scrape_recent_worlds_batch")
     async def _scrape_recent_worlds_batch(self):
         """Execute one round of recent worlds discovery and await completion.
 
@@ -469,6 +477,7 @@ class VRChatScraper:
         # Launch recent worlds discovery task and await it
         await self._scrape_recent_worlds_task()
 
+    @logfire.instrument("process_pending_worlds_batch")
     async def _process_pending_worlds_batch(self, limit: int = 100):
         """Execute one batch of pending worlds processing and await all tasks.
 

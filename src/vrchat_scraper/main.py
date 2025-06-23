@@ -6,6 +6,8 @@ import signal
 import time
 
 import logfire
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 from .circuit_breaker import CircuitBreaker
 from .config import Config
@@ -14,15 +16,20 @@ from .http_client import AuthenticationError, FileImageDownloader, HTTPVRChatAPI
 from .rate_limiter import BBRRateLimiter
 from .scraper import VRChatScraper
 
-# Configure logging
+# Configure observability first
+logfire.configure(service_name="vrchat-scraper")
+
+# Auto-instrument HTTP and database libraries
+HTTPXClientInstrumentor().instrument()
+SQLAlchemyInstrumentor().instrument()
+
+# Configure logging with Logfire integration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logfire.LogfireLoggingHandler()],
 )
 logger = logging.getLogger(__name__)
-
-# Configure observability
-logfire.configure()
 
 
 class GracefulShutdown:
@@ -86,8 +93,7 @@ async def main():
             loop.add_signal_handler(sig, handle_shutdown)
 
         # Run the scraper
-        with logfire.span("scraper_run"):
-            await scraper.run_forever()
+        await scraper.run_forever()
 
     except AuthenticationError:
         logger.critical("Authentication failed - exiting")

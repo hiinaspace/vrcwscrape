@@ -2,6 +2,8 @@ from collections import deque, namedtuple
 from enum import Enum, auto
 from typing import Deque, Tuple, Dict, Any, Callable
 
+import logfire
+
 
 class BbrState(Enum):
     """Enumerates the probing states of the BBR-inspired rate limiter."""
@@ -126,6 +128,30 @@ class BBRRateLimiter:
         self._last_probe_cycle_start = now
         self._probe_cycle_duration = probe_cycle_duration_sec
 
+        # --- Observability ---
+        self._max_rate_gauge = logfire.metric_gauge("rate_limiter.max_rate")
+        self._current_rate_gauge = logfire.metric_gauge("rate_limiter.current_rate")
+        self._queue_depth_gauge = logfire.metric_gauge("rate_limiter.queue_depth")
+        self._state_changes_counter = logfire.metric_counter(
+            "rate_limiter.state_changes"
+        )
+        self._request_delay_histogram = logfire.metric_histogram(
+            "rate_limiter.request_delay"
+        )
+
+        # Initialize gauge values
+        self._max_rate_gauge.set(self.max_rate)
+        self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+        self._queue_depth_gauge.set(0)
+
+    def _change_state(self, new_state: BbrState):
+        """Helper method to change state and track metrics."""
+        if self.state != new_state:
+            self._state_changes_counter.add(
+                1, {"from": self.state.name, "to": new_state.name}
+            )
+            self.state = new_state
+
     @property
     def max_rate(self) -> float:
         """Returns the long-term, windowed-max delivery rate estimate."""
@@ -147,16 +173,22 @@ class BBRRateLimiter:
         pacing_rate = self._get_effective_rate() * self._get_pacing_gain()
         required_delay = 1.0 / pacing_rate if pacing_rate > 0 else float("inf")
 
+        delay = 0.0
         if time_since_last < required_delay:
-            return required_delay - time_since_last
+            delay = required_delay - time_since_last
 
         inflight_target = max(
             self._min_pipe_size, self._get_effective_rate() * self.min_latency
         )
         if self.inflight >= max(self._min_pipe_size, inflight_target * 2):
-            return self.min_latency / 2
+            delay = max(delay, self.min_latency / 2)
 
-        return 0.0
+        # Update observability metrics
+        if delay > 0:
+            self._request_delay_histogram.record(delay)
+        self._queue_depth_gauge.set(self.inflight)
+
+        return delay
 
     def on_request_sent(self, request_id: Any, now: float):
         """Call this immediately after dispatching a request."""
@@ -187,6 +219,10 @@ class BBRRateLimiter:
             delivery_rate = requests_in_sample / time_interval
             self._max_rate.update(delivery_rate, now)
 
+            # Update observability metrics
+            self._max_rate_gauge.set(self.max_rate)
+            self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+
         latency = now - request_state.send_time
         self._min_latency.update(latency, now)
 
@@ -207,9 +243,12 @@ class BBRRateLimiter:
             self._short_term_rate_cap, effective_rate * factor
         )
 
+        # Update observability metrics
+        self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+
         # A probe that results in an error has failed; immediately back off.
         if self.state == BbrState.PROBING_UP:
-            self.state = BbrState.PROBING_DOWN
+            self._change_state(BbrState.PROBING_DOWN)
 
     def _get_effective_rate(self) -> float:
         return min(self.max_rate, self._short_term_rate_cap)
@@ -228,8 +267,11 @@ class BBRRateLimiter:
             self._short_term_rate_cap = float("inf")
 
             if self.state == BbrState.CRUISING:
-                self.state = BbrState.PROBING_UP
+                self._change_state(BbrState.PROBING_UP)
             elif self.state == BbrState.PROBING_UP:
-                self.state = BbrState.PROBING_DOWN
+                self._change_state(BbrState.PROBING_DOWN)
             elif self.state == BbrState.PROBING_DOWN:
-                self.state = BbrState.CRUISING
+                self._change_state(BbrState.CRUISING)
+
+            # Update current rate metric when short_term_rate_cap is reset
+            self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
