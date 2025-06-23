@@ -393,3 +393,126 @@ async def test_rate_limiter_probe_recovery():
         f"Should have achieved higher throughput once probe discovered capacity, "
         f"got {observed_rate:.2f} req/s"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+@async_timeout(12.0)
+async def test_minimum_rate_prevents_excessive_throttling():
+    """Test that minimum rate prevents the rate limiter from throttling too hard.
+
+    This test verifies that even when the rate limiter detects very low rates,
+    the minimum rate setting ensures delays never exceed 2 seconds and the
+    scraper continues to make reasonable progress.
+    """
+    # Create a rate limiter that will be forced to detect very low rates
+    current_time = asyncio.get_running_loop().time()
+    rate_limiter = BBRRateLimiter(
+        current_time,
+        initial_rate=5.0,
+        min_rate=0.5,  # Should cap delays at 2 seconds max
+        name="test_min_rate_throttling",
+    )
+
+    # Set up database with worlds to process
+    db = Database("sqlite:///:memory:")
+    await db.init_schema()
+
+    world_ids = [f"wrld_min_rate_test_{i}" for i in range(5)]
+    for world_id in world_ids:
+        await db.upsert_world(
+            world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+        )
+
+    # Set up fake clients
+    def time_source():
+        return asyncio.get_running_loop().time()
+
+    api_client = FakeVRChatAPIClient(time_source)
+    image_downloader = FakeImageDownloader(time_source)
+
+    for world_id in world_ids:
+        test_world = create_test_world_detail(
+            world_id=world_id, name=f"Min Rate Test {world_id[-1]}"
+        )
+        api_client.set_world_detail_response(world_id, test_world)
+        image_downloader.set_download_response(world_id, True)
+
+    # Create scraper
+    scraper = VRChatScraper(
+        database=db,
+        api_client=api_client,
+        image_downloader=image_downloader,
+        api_rate_limiter=rate_limiter,
+        image_rate_limiter=BBRRateLimiter(
+            current_time, initial_rate=20.0, min_rate=0.5, name="test_image_min_rate"
+        ),
+        api_circuit_breaker=CircuitBreaker(name="test_api_min_rate"),
+        image_circuit_breaker=CircuitBreaker(name="test_image_min_rate"),
+        time_source=time_source,
+        sleep_func=asyncio.sleep,
+    )
+
+    # Force the rate limiter to detect a very low rate (much lower than min_rate)
+    rate_limiter._max_rate.update(0.1, current_time)  # 0.1 req/s (10 second intervals)
+    rate_limiter._short_term_rate_cap = 0.05  # 0.05 req/s (20 second intervals)
+
+    # Verify that despite the low detected rates, effective rate is capped at min_rate
+    assert rate_limiter._get_effective_rate() == 0.5, (
+        "Effective rate should be capped at min_rate"
+    )
+
+    # Record start time and process worlds
+    start_time = asyncio.get_running_loop().time()
+
+    total_processed = 0
+    individual_delays = []
+
+    # Process worlds one at a time to measure individual delays
+    for _ in range(5):
+        # Measure delay before each request
+        delay_start = asyncio.get_running_loop().time()
+        processed_count = await scraper._process_pending_worlds_batch(limit=1)
+        delay_end = asyncio.get_running_loop().time()
+
+        if processed_count > 0:
+            individual_delays.append(delay_end - delay_start)
+            total_processed += processed_count
+        else:
+            break  # No more worlds to process
+
+    end_time = asyncio.get_running_loop().time()
+    total_duration = end_time - start_time
+
+    # Assertions
+    assert total_processed >= 4, (
+        f"Should have processed most worlds, got {total_processed}"
+    )
+
+    # Check that no individual request took longer than ~2.1 seconds
+    # (allowing small buffer for processing overhead beyond the rate limit delay)
+    max_delay = max(individual_delays) if individual_delays else 0
+    assert max_delay <= 2.5, (
+        f"Individual request delay should be capped by min_rate at ~2 seconds, "
+        f"got max delay of {max_delay:.2f} seconds"
+    )
+
+    # Check overall throughput - should be reasonable despite throttling
+    if total_duration > 0:
+        observed_rate = total_processed / total_duration
+        assert observed_rate >= 0.3, (
+            f"Overall rate should be reasonable despite throttling, "
+            f"got {observed_rate:.2f} req/s"
+        )
+
+    # Check that delays are actually being applied (not bypassed)
+    if individual_delays:
+        avg_delay = sum(individual_delays) / len(individual_delays)
+        assert avg_delay >= 1.0, (
+            f"Should have observable delays due to rate limiting, "
+            f"got average delay of {avg_delay:.2f} seconds"
+        )
+
+    print(f"Processed {total_processed} worlds in {total_duration:.2f}s")
+    print(f"Individual delays: {[f'{d:.2f}' for d in individual_delays]}")
+    print(f"Max delay: {max_delay:.2f}s, Average delay: {avg_delay:.2f}s")
