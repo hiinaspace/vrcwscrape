@@ -97,6 +97,7 @@ class BBRRateLimiter:
         min_requests_for_pipe: int = 4,
         probe_up_gain: float = 1.25,
         probe_down_gain: float = 0.9,
+        name: str = "default",
     ):
         # --- BBR State & Model ---
         self.state = BbrState.CRUISING
@@ -129,6 +130,8 @@ class BBRRateLimiter:
         self._probe_cycle_duration = probe_cycle_duration_sec
 
         # --- Observability ---
+        self._name = name
+        metric_labels = {"instance": name}
         self._max_rate_gauge = logfire.metric_gauge("rate_limiter.max_rate")
         self._current_rate_gauge = logfire.metric_gauge("rate_limiter.current_rate")
         self._queue_depth_gauge = logfire.metric_gauge("rate_limiter.queue_depth")
@@ -140,15 +143,18 @@ class BBRRateLimiter:
         )
 
         # Initialize gauge values
-        self._max_rate_gauge.set(self.max_rate)
-        self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
-        self._queue_depth_gauge.set(0)
+        self._max_rate_gauge.set(self.max_rate, metric_labels)
+        self._current_rate_gauge.set(
+            min(self.max_rate, self._short_term_rate_cap), metric_labels
+        )
+        self._queue_depth_gauge.set(0, metric_labels)
 
     def _change_state(self, new_state: BbrState):
         """Helper method to change state and track metrics."""
         if self.state != new_state:
             self._state_changes_counter.add(
-                1, {"from": self.state.name, "to": new_state.name}
+                1,
+                {"from": self.state.name, "to": new_state.name, "instance": self._name},
             )
             self.state = new_state
 
@@ -185,8 +191,8 @@ class BBRRateLimiter:
 
         # Update observability metrics
         if delay > 0:
-            self._request_delay_histogram.record(delay)
-        self._queue_depth_gauge.set(self.inflight)
+            self._request_delay_histogram.record(delay, {"instance": self._name})
+        self._queue_depth_gauge.set(self.inflight, {"instance": self._name})
 
         return delay
 
@@ -220,8 +226,10 @@ class BBRRateLimiter:
             self._max_rate.update(delivery_rate, now)
 
             # Update observability metrics
-            self._max_rate_gauge.set(self.max_rate)
-            self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+            self._max_rate_gauge.set(self.max_rate, {"instance": self._name})
+            self._current_rate_gauge.set(
+                min(self.max_rate, self._short_term_rate_cap), {"instance": self._name}
+            )
 
         latency = now - request_state.send_time
         self._min_latency.update(latency, now)
@@ -244,7 +252,9 @@ class BBRRateLimiter:
         )
 
         # Update observability metrics
-        self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+        self._current_rate_gauge.set(
+            min(self.max_rate, self._short_term_rate_cap), {"instance": self._name}
+        )
 
         # A probe that results in an error has failed; immediately back off.
         if self.state == BbrState.PROBING_UP:
@@ -274,4 +284,6 @@ class BBRRateLimiter:
                 self._change_state(BbrState.CRUISING)
 
             # Update current rate metric when short_term_rate_cap is reset
-            self._current_rate_gauge.set(min(self.max_rate, self._short_term_rate_cap))
+            self._current_rate_gauge.set(
+                min(self.max_rate, self._short_term_rate_cap), {"instance": self._name}
+            )

@@ -47,6 +47,7 @@ def limiter(mock_time: MockTime) -> BBRRateLimiter:
         now=mock_time.now,
         initial_rate=10.0,
         probe_cycle_duration_sec=10.0,
+        name="test",
     )
 
 
@@ -196,6 +197,7 @@ def test_windowed_filter_discards_old_samples(mock_time: MockTime):
         now=mock_time.now,
         window_size_sec=5.0,
         initial_rate=100.0,
+        name="test_window",
     )
     # add fake sample for the initial high rate
     limiter._max_rate.update(100.0, mock_time.now)

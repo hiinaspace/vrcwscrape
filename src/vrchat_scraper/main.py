@@ -67,10 +67,10 @@ async def async_main():
 
     # Create rate limiters and circuit breakers
     now = time.time()
-    api_rate_limiter = BBRRateLimiter(now, initial_rate=10.0)
-    image_rate_limiter = BBRRateLimiter(now, initial_rate=20.0)
-    api_circuit_breaker = CircuitBreaker()
-    image_circuit_breaker = CircuitBreaker()
+    api_rate_limiter = BBRRateLimiter(now, initial_rate=10.0, name="api")
+    image_rate_limiter = BBRRateLimiter(now, initial_rate=20.0, name="image")
+    api_circuit_breaker = CircuitBreaker(name="api")
+    image_circuit_breaker = CircuitBreaker(name="image")
 
     # Create main scraper
     scraper = VRChatScraper(

@@ -25,7 +25,7 @@ def mock_time():
 @pytest.fixture
 def breaker():
     """Provides a CircuitBreaker instance with a low threshold for easier testing."""
-    return CircuitBreaker(error_threshold=3, initial_backoff_sec=10.0)
+    return CircuitBreaker(error_threshold=3, initial_backoff_sec=10.0, name="test")
 
 
 def test_initial_state(breaker: CircuitBreaker):
@@ -138,7 +138,10 @@ def test_backoff_duration_respects_max_value(mock_time: MockTime):
     """Test that the exponential backoff is capped by max_backoff_sec."""
     # Use a breaker with a low max for easy testing
     breaker = CircuitBreaker(
-        error_threshold=1, initial_backoff_sec=10.0, max_backoff_sec=25.0
+        error_threshold=1,
+        initial_backoff_sec=10.0,
+        max_backoff_sec=25.0,
+        name="test_backoff",
     )
 
     # First error -> OPEN, backoff is 10s

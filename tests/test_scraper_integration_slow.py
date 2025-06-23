@@ -52,25 +52,29 @@ def fast_image_downloader():
 @pytest_asyncio.fixture
 async def real_api_rate_limiter():
     """Create a real rate limiter for API requests with fast settings."""
-    return BBRRateLimiter(asyncio.get_running_loop().time(), initial_rate=5.0)
+    return BBRRateLimiter(
+        asyncio.get_running_loop().time(), initial_rate=5.0, name="integration_api"
+    )
 
 
 @pytest_asyncio.fixture
 async def real_image_rate_limiter():
     """Create a real rate limiter for image requests with fast settings."""
-    return BBRRateLimiter(asyncio.get_running_loop().time(), initial_rate=10.0)
+    return BBRRateLimiter(
+        asyncio.get_running_loop().time(), initial_rate=10.0, name="integration_image"
+    )
 
 
 @pytest.fixture
 def api_circuit_breaker():
     """Create a circuit breaker for API requests."""
-    return CircuitBreaker()
+    return CircuitBreaker(name="integration_api")
 
 
 @pytest.fixture
 def image_circuit_breaker():
     """Create a circuit breaker for image requests."""
-    return CircuitBreaker()
+    return CircuitBreaker(name="integration_image")
 
 
 @pytest.fixture
@@ -284,6 +288,7 @@ async def test_rate_limiter_probe_recovery():
         initial_rate=1.0,  # Start low as if degraded by app-limited samples
         probe_cycle_duration_sec=2.0,  # Fast probe cycle
         window_size_sec=3.0,  # Short window
+        name="test_fast",
     )
 
     # Set up database with many pending worlds to ensure we can saturate throughput
@@ -324,10 +329,10 @@ async def test_rate_limiter_probe_recovery():
         image_downloader=image_downloader,
         api_rate_limiter=fast_rate_limiter,
         image_rate_limiter=BBRRateLimiter(
-            current_time, initial_rate=20.0
+            current_time, initial_rate=20.0, name="test_image_bg"
         ),  # Image limiter not under test
-        api_circuit_breaker=CircuitBreaker(),
-        image_circuit_breaker=CircuitBreaker(),
+        api_circuit_breaker=CircuitBreaker(name="test_api_bg"),
+        image_circuit_breaker=CircuitBreaker(name="test_image_bg"),
         time_source=time_source,
         sleep_func=asyncio.sleep,
     )

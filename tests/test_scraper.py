@@ -84,13 +84,13 @@ def fake_image_downloader(mock_time):
 @pytest.fixture
 def api_rate_limiter(mock_time):
     """Create a rate limiter for API requests."""
-    return BBRRateLimiter(mock_time.now(), initial_rate=10.0)
+    return BBRRateLimiter(mock_time.now(), initial_rate=10.0, name="test_api")
 
 
 @pytest.fixture
 def image_rate_limiter(mock_time):
     """Create a rate limiter for image requests."""
-    return BBRRateLimiter(mock_time.now(), initial_rate=20.0)
+    return BBRRateLimiter(mock_time.now(), initial_rate=20.0, name="test_image")
 
 
 @pytest.fixture
@@ -108,13 +108,13 @@ def stub_image_rate_limiter():
 @pytest.fixture
 def api_circuit_breaker():
     """Create a circuit breaker for API requests."""
-    return CircuitBreaker()
+    return CircuitBreaker(name="test_api")
 
 
 @pytest.fixture
 def image_circuit_breaker():
     """Create a circuit breaker for image requests."""
-    return CircuitBreaker()
+    return CircuitBreaker(name="test_image")
 
 
 @pytest.fixture
