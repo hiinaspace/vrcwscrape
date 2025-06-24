@@ -66,6 +66,19 @@ not terrible though.
 The project does use SQLAlchemy so if you don't want to deal with dolt yourself,
 it should scrape into any other database that SQLAlchemy supports.
 
+### Logfire
+
+I got memed into using [pydantic logfire](https://logfire.pydantic.dev/) for observability. It's not awful,
+and it is nice to see all the spans and metrics and stuff. Their web UI is clunky though; luckily it all uses
+[OpenTelemetry](https://opentelemetry.io/) so you can switch it to a different backend if you want, say self-hosted
+jaeger and prometheus.
+
+### Claude Code
+
+This project is about 95% slop as far as commited lines, but maybe 30% slop in terms of design. I did have to
+guide claude pretty hard to put this all together, and there are some deficiencies that I missed when (not) reviewing its commits, but claude is good at converting a pretty detailed design into actual python when pressed. There still is a general slop feel in the codebase, where there are things that could be more elegant, plus like vestigial code; it does all work though, so if you follow the vibe and just don't look at how the sausage is made,
+it's not too bad. Welcome to current year.
+
 ### Authentication
 
 You'll need to provide a VRChat authentication cookie to the scraper, which you can get by logging into the VRChat website and copying the `auth` cookie from your browser, from the same IP address that the scraper will run on.
