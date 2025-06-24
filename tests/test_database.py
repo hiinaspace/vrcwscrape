@@ -552,13 +552,13 @@ async def test_get_pending_image_downloads(test_db):
 
     # Should only return image files with SUCCESS file metadata
     assert len(pending_downloads) == 1
-    file_id, version, filename, md5, size_bytes, download_url = pending_downloads[0]
-    assert file_id == "file_image_1"
-    assert version == 1
-    assert filename == "test.png"
-    assert md5 == "abc123"
-    assert size_bytes == 100000
-    assert download_url == "download_url"
+    download = pending_downloads[0]
+    assert download.file_id == "file_image_1"
+    assert download.version == 1
+    assert download.filename == "test.png"
+    assert download.md5 == "abc123"
+    assert download.size_bytes == 100000
+    assert download.download_url == "download_url"
 
 
 @pytest.mark.asyncio
@@ -896,17 +896,17 @@ async def test_upsert_world_with_files_unity_package_no_world_images(test_db):
         file_meta = file_result.scalar_one()
         assert file_meta.file_type == FileType.UNITY_PACKAGE.value
 
-        # Verify no world_images entry was created
+        # Verify no ImageContent entry was created (UNITY_PACKAGE files don't get ImageContent entries)
         image_result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_unity_only")
+            select(ImageContent).where(ImageContent.file_id == "file_unity_only")
         )
-        world_image = image_result.scalar_one_or_none()
-        assert world_image is None
+        image_content = image_result.scalar_one_or_none()
+        assert image_content is None
 
 
 @pytest.mark.asyncio
 async def test_upsert_world_with_files_existing_world_images_not_duplicated(test_db):
-    """Test that existing world_images entries are not duplicated."""
+    """Test that existing ImageContent entries are not duplicated when processing file metadata."""
     world_id = "wrld_test_123"
     metadata = {"name": "Test World"}
     metrics = {
@@ -930,27 +930,40 @@ async def test_upsert_world_with_files_existing_world_images_not_duplicated(test
     ]
     await test_db.upsert_world_with_files(world_id, metadata, metrics, image_files)
 
-    # Verify world_images entry was created
+    # Process file metadata to create ImageContent entry
+    file_metadata = {
+        "versions": [
+            {
+                "version": 1,
+                "file": {
+                    "url": "download_url", 
+                    "md5": "abc123",
+                    "fileName": "test.png",
+                    "sizeInBytes": 100000
+                }
+            }
+        ]
+    }
+    await test_db.update_file_metadata("file_image_existing", file_metadata, "SUCCESS")
+
+    # Verify ImageContent entry was created
     async with test_db.async_session() as session:
         image_result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_image_existing")
+            select(ImageContent).where(ImageContent.file_id == "file_image_existing")
         )
-        world_images = image_result.fetchall()
-        assert len(world_images) == 1
+        image_contents = image_result.fetchall()
+        assert len(image_contents) == 1
 
-    # Update world again with same image file (but different world metadata)
-    updated_metadata = {"name": "Updated Test World"}
-    await test_db.upsert_world_with_files(
-        world_id, updated_metadata, metrics, image_files
-    )
+    # Process file metadata again with same data (should not create duplicate)
+    await test_db.update_file_metadata("file_image_existing", file_metadata, "SUCCESS")
 
-    # Verify still only one world_images entry exists
+    # Verify still only one ImageContent entry exists
     async with test_db.async_session() as session:
         image_result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_image_existing")
+            select(ImageContent).where(ImageContent.file_id == "file_image_existing")
         )
-        world_images = image_result.fetchall()
-        assert len(world_images) == 1
+        image_contents = image_result.fetchall()
+        assert len(image_contents) == 1
 
 
 @pytest.mark.asyncio
@@ -1028,8 +1041,21 @@ async def test_get_pending_image_downloads_only_success_files(test_db):
     await test_db.upsert_world_with_files(world_id, metadata, metrics, image_files)
 
     # Update one file to SUCCESS, one to ERROR, leave one PENDING
+    success_metadata = {
+        "versions": [
+            {
+                "version": 1,
+                "file": {
+                    "url": "download_url", 
+                    "md5": "abc123",
+                    "fileName": "success.png",
+                    "sizeInBytes": 100000
+                }
+            }
+        ]
+    }
     await test_db.update_file_metadata(
-        "file_image_success", {"test": "data"}, "SUCCESS"
+        "file_image_success", success_metadata, "SUCCESS"
     )
     await test_db.update_file_metadata("file_image_error", {}, "ERROR", "Test error")
     # file_image_pending stays PENDING
@@ -1037,8 +1063,13 @@ async def test_get_pending_image_downloads_only_success_files(test_db):
     # Get pending downloads - should only return the SUCCESS file
     pending_downloads = await test_db.get_pending_image_downloads()
     assert len(pending_downloads) == 1
-    assert pending_downloads[0][0] == "file_image_success"
-    assert pending_downloads[0][1] == {"test": "data"}
+    download = pending_downloads[0]
+    assert download.file_id == "file_image_success"
+    assert download.version == 1
+    assert download.filename == "success.png"
+    assert download.md5 == "abc123"
+    assert download.size_bytes == 100000
+    assert download.download_url == "download_url"
 
 
 @pytest.mark.asyncio
@@ -1061,22 +1092,22 @@ async def test_update_file_metadata_nonexistent_file(test_db):
 async def test_update_image_download_nonexistent_image(test_db):
     """Test that updating nonexistent image download handles gracefully."""
     # Try to update an image that doesn't exist
+    sha256_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
     await test_db.update_image_download(
         "nonexistent_image",
-        "SUCCESS",
-        local_file_path="/test/path.png",
-        downloaded_md5="abc123",
-        downloaded_size_bytes=12345,
+        1,  # version
+        "CONFIRMED",
+        sha256=sha256_hash,
     )
 
     # Should not raise an error, just do nothing
     # Verify no image entry was created
     async with test_db.async_session() as session:
         result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "nonexistent_image")
+            select(ImageContent).where(ImageContent.file_id == "nonexistent_image")
         )
-        world_image = result.scalar_one_or_none()
-        assert world_image is None
+        image_content = result.scalar_one_or_none()
+        assert image_content is None
 
 
 @pytest.mark.asyncio

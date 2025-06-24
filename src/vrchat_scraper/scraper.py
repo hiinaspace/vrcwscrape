@@ -427,41 +427,37 @@ class VRChatScraper:
             self.image_rate_limiter.on_request_sent(request_id, now)
 
             # Download image with dual hash verification
-            (
-                success,
-                sha256_hash,
-                error,
-            ) = await self.image_downloader.download_image(
+            result = await self.image_downloader.download_image(
                 file_id, version, download_url, md5, size_bytes
             )
 
             # Record result in rate limiter
-            if success:
+            if result.success:
                 self.image_rate_limiter.on_success(request_id, self._time_source())
                 self.image_circuit_breaker.on_success()
-                logger.debug(f"Successfully downloaded image for {file_id} v{version} (SHA256: {sha256_hash})")
+                logger.debug(f"Successfully downloaded image for {file_id} v{version} (SHA256: {result.sha256_hash})")
 
                 # Record business metric
                 self._images_downloaded_counter.add(1, {"status": "success"})
             else:
                 self.image_rate_limiter.on_error(request_id, self._time_source())
-                logger.warning(f"Failed to download image for {file_id} v{version}: {error}")
+                logger.warning(f"Failed to download image for {file_id} v{version}: {result.error_message}")
 
                 # Record business metric
                 self._images_downloaded_counter.add(1, {"status": "error"})
                 self._image_errors_counter.add(1, {"error_type": "download_failed"})
 
             # Update database with download result
-            if success:
+            if result.success:
                 await self.database.update_image_download(
                     file_id,
                     version,
                     "CONFIRMED",
-                    sha256=sha256_hash,
+                    sha256=result.sha256_hash,
                 )
             else:
                 await self.database.update_image_download(
-                    file_id, version, "ERROR", error_message=error
+                    file_id, version, "ERROR", error_message=result.error_message
                 )
 
         except Exception as e:
@@ -548,13 +544,20 @@ class VRChatScraper:
 
         async with asyncio.TaskGroup() as task_group:
             processed_count = 0
-            for file_id, version, filename, md5, size_bytes, download_url in pending_images:
+            for download in pending_images:
                 if self._shutdown_event.is_set():
                     break
 
                 # Launch individual image download task
                 task_group.create_task(
-                    self._download_image_content_task(file_id, version, filename, md5, size_bytes, download_url)
+                    self._download_image_content_task(
+                        download.file_id, 
+                        download.version, 
+                        download.filename, 
+                        download.md5, 
+                        download.size_bytes, 
+                        download.download_url
+                    )
                 )
                 processed_count += 1
 

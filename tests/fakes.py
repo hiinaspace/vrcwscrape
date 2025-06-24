@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-from src.vrchat_scraper.models import WorldDetail, WorldSummary, FileMetadata
+from src.vrchat_scraper.models import WorldDetail, WorldSummary, FileMetadata, ImageDownloadResult
 
 
 class FakeVRChatAPIClient:
@@ -276,7 +276,7 @@ class FakeImageDownloader:
 
     async def download_image(
         self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
-    ) -> Tuple[bool, str, str]:
+    ) -> ImageDownloadResult:
         """Fake implementation of download_image matching new protocol."""
         now = self.time_source()
 
@@ -303,9 +303,9 @@ class FakeImageDownloader:
             success, local_path, size, error = result
             if success:
                 self.existing_images.add(fake_sha256)
-                return (True, fake_sha256, "")
+                return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return (False, "", error)
+                return ImageDownloadResult(success=False, error_message=error)
 
         # Check for legacy file_id-only results
         if file_id in self.download_results:
@@ -313,9 +313,9 @@ class FakeImageDownloader:
             success, local_path, size, error = result
             if success:
                 self.existing_images.add(fake_sha256)
-                return (True, fake_sha256, "")
+                return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return (False, "", error)
+                return ImageDownloadResult(success=False, error_message=error)
 
         # Get and await the future for this download if configured
         if result_key in self.download_futures:
@@ -323,21 +323,21 @@ class FakeImageDownloader:
             success = await future
             if success:
                 self.existing_images.add(fake_sha256)
-                return (True, fake_sha256, "")
+                return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return (False, "", "Download failed")
+                return ImageDownloadResult(success=False, error_message="Download failed")
         elif file_id in self.download_futures:
             future = self.download_futures.pop(file_id)
             success = await future
             if success:
                 self.existing_images.add(fake_sha256)
-                return (True, fake_sha256, "")
+                return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return (False, "", "Download failed")
+                return ImageDownloadResult(success=False, error_message="Download failed")
         else:
             # No configuration, default to success
             self.existing_images.add(fake_sha256)
-            return (True, fake_sha256, "")
+            return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
 
     def image_exists(self, world_id: str) -> bool:
         """Check if image exists for a world (legacy method for backward compatibility)."""

@@ -289,12 +289,20 @@ async def test_file_metadata_still_enables_image_downloads(
         pending_images = await test_database.get_pending_image_downloads(limit=10)
         assert len(pending_images) == 1
 
-        found_file_id, found_metadata, found_file_type = pending_images[0]
-        assert found_file_id == file_id
-        assert found_metadata == raw_api_response
+        download = pending_images[0]
+        assert download.file_id == file_id
+        assert download.version == 1
+        assert download.filename == "download_test.png"
 
-        # Execute image download task with raw metadata
-        await stub_scraper._download_image_from_metadata_task(file_id, found_metadata)
+        # Execute image download task
+        await stub_scraper._download_image_content_task(
+            download.file_id, 
+            download.version, 
+            download.filename, 
+            download.md5, 
+            download.size_bytes, 
+            download.download_url
+        )
 
         # Verify image download succeeded
         async with test_database.async_session() as session:

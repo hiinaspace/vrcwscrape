@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import and_, or_
 
-from .models import FileReference, FileType
+from .models import FileReference, FileType, PendingImageDownload
 
 
 class Base(DeclarativeBase):
@@ -614,11 +614,11 @@ class Database:
 
     async def get_pending_image_downloads(
         self, limit: int = 100
-    ) -> List[Tuple[str, int, str, str, int, str]]:
+    ) -> List[PendingImageDownload]:
         """Get images that need downloading.
 
         Returns:
-            List of (file_id, version, filename, md5, size_bytes, download_url) tuples for PENDING images
+            List of PendingImageDownload objects for PENDING images
         """
         async with self.async_session() as session:
             stmt = (
@@ -655,7 +655,14 @@ class Database:
                             download_url = file_info.get("url", "")
                             break
                 
-                downloads.append((file_id, version, filename, md5, size_bytes, download_url))
+                downloads.append(PendingImageDownload(
+                    file_id=file_id,
+                    version=version,
+                    filename=filename,
+                    md5=md5,
+                    size_bytes=size_bytes,
+                    download_url=download_url
+                ))
             
             return downloads
 

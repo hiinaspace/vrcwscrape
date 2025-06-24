@@ -203,3 +203,22 @@ def _parse_file_url(url: str, file_type: FileType) -> Optional[FileReference]:
         version_number=version_number,
         original_url=url,
     )
+
+
+class PendingImageDownload(BaseModel):
+    """Data structure for a pending image download."""
+    
+    file_id: str
+    version: int
+    filename: str
+    md5: str
+    size_bytes: int
+    download_url: str
+
+
+class ImageDownloadResult(BaseModel):
+    """Result of an image download operation."""
+    
+    success: bool
+    sha256_hash: str = ""  # Empty if failed
+    error_message: str = ""  # Empty if success

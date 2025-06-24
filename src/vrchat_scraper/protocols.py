@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Protocol, Tuple, Any
 
-from .models import WorldSummary
+from .models import WorldSummary, ImageDownloadResult
 
 
 class VRChatAPIClient(Protocol):
@@ -26,7 +26,7 @@ class ImageDownloader(Protocol):
 
     async def download_image(
         self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
-    ) -> Tuple[bool, str, str]:
+    ) -> ImageDownloadResult:
         """Download and verify an image file using content-addressed storage.
 
         Args:
@@ -37,9 +37,6 @@ class ImageDownloader(Protocol):
             expected_size: Expected file size in bytes
 
         Returns:
-            Tuple of (success, sha256_hash, error_message)
-            - success: True if download and verification succeeded
-            - sha256_hash: SHA256 hash of downloaded content (empty if failed)
-            - error_message: Error description (empty if success)
+            ImageDownloadResult with success flag, SHA256 hash, and error message
         """
         ...
