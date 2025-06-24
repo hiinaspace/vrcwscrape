@@ -124,17 +124,20 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
    );
    ```
 
-4. **world_images**
+4. **image_content**
    ```sql
-   CREATE TABLE world_images (
-     file_id VARCHAR(64) PRIMARY KEY,  -- References file_metadata.file_id
-     download_status ENUM('PENDING', 'SUCCESS', 'NOT_FOUND', 'ERROR') NOT NULL,
-     downloaded_md5 VARCHAR(32),  -- MD5 of downloaded content for verification
-     downloaded_size_bytes INT,
-     local_file_path TEXT,
+   CREATE TABLE image_content (
+     file_id VARCHAR(64) NOT NULL,  -- References file_metadata.file_id
+     version INT NOT NULL,  -- Version from file_metadata
+     filename VARCHAR(255) NOT NULL,  -- Original filename from VRChat
+     md5 VARCHAR(32) NOT NULL,  -- MD5 from VRChat file metadata
+     size_bytes INT NOT NULL,  -- Size from VRChat file metadata
+     sha256 VARCHAR(64),  -- SHA256 of downloaded content (content addressing)
+     state ENUM('PENDING', 'CONFIRMED', 'ERROR') NOT NULL,
      last_attempt_time DATETIME,
      success_time DATETIME,
      error_message TEXT,
+     PRIMARY KEY (file_id, version),
      FOREIGN KEY (file_id) REFERENCES file_metadata(file_id)
    );
    ```
@@ -146,6 +149,8 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
 - **Two-Phase File Handling**: File metadata scraped separately from world metadata, enabling distributed processing
 - **Transactional Consistency**: World metadata and associated file_metadata rows updated atomically
 - **VRChat File System**: Leverage VRChat's existing file UUIDs, MD5 hashes, and size metadata
+- **Content-Addressed Storage**: Use SHA256 hashes for filesystem storage, enabling deduplication and portability
+- **Dual Hash Verification**: VRChat's MD5 for integrity verification, SHA256 for content addressing
 - **Selective Downloads**: Download images for viewing, collect metadata for unity packages without downloading
 - **Database Coordination**: Multiple scraper instances coordinate through shared database state
 - **Version Optimization**: Track file versions to detect unchanged files and skip redundant scrapes
@@ -191,20 +196,20 @@ The scraper uses two separate components for request control:
    - Update world metadata and metrics
    - Delete file_metadata rows no longer referenced by current world
    - Upsert file_metadata rows for all discovered files (status: PENDING)
-   - For image files: upsert world_images rows (status: PENDING)
 
 **Phase 2: File Metadata Scraping**
 1. Query for PENDING file_metadata rows
 2. Scrape VRChat file metadata from `/api/1/file/{file_id}`
 3. Update file_metadata with sizes, MD5 hashes, and version info
-4. Mark as SUCCESS or ERROR with appropriate timestamps
+4. For IMAGE files: create/update image_content rows with PENDING state
+5. Mark file_metadata as SUCCESS or ERROR with appropriate timestamps
 
 **Phase 3: Image Downloads**
-1. Query for PENDING world_images rows where file_metadata is SUCCESS
+1. Query for PENDING image_content rows where file_metadata is SUCCESS
 2. Download actual image files from VRChat's CDN
-3. Verify downloaded content against VRChat's MD5 hash
-4. Store in hierarchical filesystem layout
-5. Update world_images with download status and verification results
+3. Verify downloaded content against VRChat's MD5 hash and compute SHA256
+4. Store in content-addressed filesystem using SHA256 hash
+5. Update image_content with CONFIRMED state, SHA256, and timestamps
 
 ### Rescrape Scheduling
 
@@ -227,19 +232,19 @@ Heuristic based on world age and activity:
 
 **Image Download Pipeline:**
 1. File metadata scraped first to get VRChat's MD5 and size
-2. Image download triggered only for IMAGE type files
-3. Downloaded content verified against VRChat's MD5 hash
-4. Storage layout: `/images/{file_uuid[0:2]}/{file_uuid[2:4]}/{file_id}.png`
+2. Image content entries created for IMAGE type files with PENDING state
+3. Image download triggered only for PENDING image_content rows
+4. Downloaded content verified against VRChat's MD5 hash and SHA256 computed
+5. Content-addressed storage: `/images/{sha256[0:2]}/{sha256[2:4]}/{sha256}.png`
 
 **Status Tracking:**
 - **file_metadata.scrape_status**:
   - `PENDING`: File discovered from world, metadata not scraped
   - `SUCCESS`: VRChat file metadata successfully retrieved
   - `ERROR`: File metadata scrape failed (retry eligible)
-- **world_images.download_status**:
-  - `PENDING`: File metadata available, download not attempted
-  - `SUCCESS`: Image downloaded and MD5 verified
-  - `NOT_FOUND`: Image URL returned 404 (file may be deleted)
+- **image_content.state**:
+  - `PENDING`: File metadata available, image not downloaded
+  - `CONFIRMED`: Image downloaded, MD5 verified, SHA256 computed and stored
   - `ERROR`: Download failed due to network/verification error (retry eligible)
 
 **Coordination Benefits:**
@@ -303,7 +308,7 @@ Heuristic based on world age and activity:
 **Image Download Metrics:**
 - Image download rate and throughput (MB/s)
 - Download success/failure rates by error type
-- Image download queue depth (PENDING world_images rows)
+- Image download queue depth (PENDING image_content rows)
 - Disk usage for image storage
 
 **Rate Limiting Metrics:**
@@ -474,9 +479,20 @@ Observed rate: 6.81 req/s     # Actual achieved throughput
 
 ### Image and File Optimization
 
-- VRChat MD5 hashes enable detection of duplicate files across worlds
-- Could implement deduplication storage (symlinks or reference counting)
+**Content-Addressed Storage Benefits:**
+- SHA256-based filesystem layout enables automatic deduplication of identical images
+- Portable across different scraper instances and deployments
+- Immutable storage - files never change once written
+- Database state is mergeable between scrapers using DoltDB
+
+**Dual Hash Strategy:**
+- VRChat MD5 hashes used for integrity verification during download
+- SHA256 computed locally for content addressing and deduplication
 - File metadata provides authoritative sizes for storage planning
 - Hash verification ensures data integrity and detects corruption
+
+**Processing Optimization:**
 - Separate file metadata and download phases enable selective processing
 - Unity package metadata collected without expensive downloads
+- CONFIRMED state indicates local filesystem contains verified content
+- Version tracking enables intelligent re-download when files update
