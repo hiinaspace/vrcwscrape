@@ -366,6 +366,9 @@ class VRChatScraper:
             self._api_errors_counter.add(1, {"error_type": "timeout"})
             # Timeout errors are already logged by _execute_api_call
             pass
+        except Exception:
+            logger.error(f"Unexpected error scraping world {world_id}", exc_info=True)
+            pass
 
     @logfire.instrument("scrape_file_metadata_task")
     async def _scrape_file_metadata_task(self, file_id: str):
@@ -410,6 +413,9 @@ class VRChatScraper:
             self._files_processed_counter.add(1, {"status": "timeout"})
             self._api_errors_counter.add(1, {"error_type": "timeout"})
             # Timeout errors are already logged by _execute_api_call
+            pass
+        except Exception:
+            logger.error(f"Unexpected error scraping file {file_id}", exc_info=True)
             pass
 
     @logfire.instrument("download_image_content_task")
@@ -551,11 +557,11 @@ class VRChatScraper:
                 # Launch individual image download task
                 task_group.create_task(
                     self._download_image_content_task(
-                        download.file_id, 
-                        download.version, 
-                        download.filename, 
-                        download.md5, 
-                        download.size_bytes, 
+                        download.file_id,
+                        download.version,
+                        download.filename,
+                        download.md5,
+                        download.size_bytes,
                         download.download_url
                     )
                 )

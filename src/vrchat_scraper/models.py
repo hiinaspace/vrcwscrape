@@ -28,17 +28,17 @@ class UnityPackageBasic(BaseModel):
     """Basic unity package info from recent worlds endpoint."""
 
     platform: str
-    unity_version: str = Field(alias="unityVersion")
+    unity_version: Optional[str] = Field(alias="unityVersion", default="")
 
 
 class UnityPackageDetailed(BaseModel):
     """Detailed unity package info from world detail endpoint."""
 
     id: str
-    platform: str
-    unity_version: str = Field(alias="unityVersion")
-    asset_url: str = Field(alias="assetUrl")
-    asset_version: int = Field(alias="assetVersion")
+    platform: Optional[str] = None
+    unity_version: Optional[str] = Field(alias="unityVersion", default="")
+    asset_url: Optional[str] = Field(alias="assetUrl")
+    asset_version: int = Field(alias="assetVersion", default=0)
     created_at: Optional[datetime] = None
 
 
@@ -86,7 +86,7 @@ class WorldDetail(BaseModel):
     occupants: int
     private_occupants: int = Field(alias="privateOccupants", default=0)
     public_occupants: int = Field(alias="publicOccupants", default=0)
-    visits: int
+    visits: int = Field(default=0)
     created_at: datetime
     updated_at: datetime
     tags: List[str]
@@ -207,7 +207,7 @@ def _parse_file_url(url: str, file_type: FileType) -> Optional[FileReference]:
 
 class PendingImageDownload(BaseModel):
     """Data structure for a pending image download."""
-    
+
     file_id: str
     version: int
     filename: str
@@ -218,7 +218,7 @@ class PendingImageDownload(BaseModel):
 
 class ImageDownloadResult(BaseModel):
     """Result of an image download operation."""
-    
+
     success: bool
     sha256_hash: str = ""  # Empty if failed
     error_message: str = ""  # Empty if success
