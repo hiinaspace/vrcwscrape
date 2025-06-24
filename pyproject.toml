@@ -23,6 +23,9 @@ dependencies = [
 [tool.uv]
 package = true
 
+[tool.logfire]
+ignore_no_config = true
+
 [project.scripts]
 main = "vrchat_scraper.main:main"
 
