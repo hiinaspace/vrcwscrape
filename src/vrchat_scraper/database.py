@@ -47,6 +47,14 @@ class DownloadStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class ImageContentState(str, Enum):
+    """Image content state enumeration."""
+
+    PENDING = "PENDING"
+    CONFIRMED = "CONFIRMED"
+    ERROR = "ERROR"
+
+
 class World(Base):
     """World metadata table."""
 
@@ -103,20 +111,20 @@ class FileMetadata(Base):
     world: Mapped["World"] = relationship(back_populates="file_metadata")
 
 
-class WorldImage(Base):
-    """World images download tracking table."""
+class ImageContent(Base):
+    """Image content tracking table with content-addressed storage."""
 
-    __tablename__ = "world_images"
+    __tablename__ = "image_content"
 
     file_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("file_metadata.file_id"), primary_key=True
     )
-    download_status: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # DownloadStatus enum
-    downloaded_md5: Mapped[Optional[str]] = mapped_column(String(32))
-    downloaded_size_bytes: Mapped[Optional[int]] = mapped_column(Integer)
-    local_file_path: Mapped[Optional[str]] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    md5: Mapped[str] = mapped_column(String(32), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[Optional[str]] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(20), nullable=False)  # ImageContentState enum
     last_attempt_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     success_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
@@ -520,23 +528,6 @@ class Database:
                         )
                         session.add(new_file)
 
-                        # If it's an image file, also create world_images entry
-                        if file_ref.file_type == FileType.IMAGE:
-                            # Check if world_images entry already exists
-                            image_result = await session.execute(
-                                select(WorldImage).where(
-                                    WorldImage.file_id == file_ref.file_id
-                                )
-                            )
-                            existing_image = image_result.scalar_one_or_none()
-
-                            if not existing_image:
-                                new_image = WorldImage(
-                                    file_id=file_ref.file_id,
-                                    download_status=DownloadStatus.PENDING,
-                                )
-                                session.add(new_image)
-
     async def get_pending_file_metadata(
         self, limit: int = 100
     ) -> List[Tuple[str, str]]:
@@ -563,72 +554,139 @@ class Database:
     ):
         """Update file metadata after scraping."""
         async with self.async_session() as session:
-            result = await session.execute(
-                select(FileMetadata).where(FileMetadata.file_id == file_id)
-            )
-            file_metadata = result.scalar_one_or_none()
+            async with session.begin():
+                result = await session.execute(
+                    select(FileMetadata).where(FileMetadata.file_id == file_id)
+                )
+                file_metadata = result.scalar_one_or_none()
 
-            if file_metadata:
-                file_metadata.file_metadata = metadata if status == "SUCCESS" else None
-                file_metadata.scrape_status = ScrapeStatus(status)
-                file_metadata.last_scrape_time = datetime.utcnow()
-                file_metadata.error_message = error_message
+                if file_metadata:
+                    file_metadata.file_metadata = metadata if status == "SUCCESS" else None
+                    file_metadata.scrape_status = ScrapeStatus(status)
+                    file_metadata.last_scrape_time = datetime.utcnow()
+                    file_metadata.error_message = error_message
 
-                await session.commit()
+                    # For successful IMAGE file metadata, create/update image_content entry
+                    if status == "SUCCESS" and file_metadata.file_type == "IMAGE" and metadata:
+                        # Extract metadata from VRChat file response
+                        # Assume the latest version for now
+                        versions = metadata.get("versions", [])
+                        if versions:
+                            latest_version = max(versions, key=lambda v: v["version"])
+                            version_num = latest_version["version"]
+                            file_info = latest_version.get("file", {})
+                            
+                            if file_info:
+                                # Check if ImageContent already exists
+                                image_result = await session.execute(
+                                    select(ImageContent).where(
+                                        and_(
+                                            ImageContent.file_id == file_id,
+                                            ImageContent.version == version_num
+                                        )
+                                    )
+                                )
+                                existing_image = image_result.scalar_one_or_none()
+
+                                if existing_image:
+                                    # Update existing entry if MD5 changed
+                                    new_md5 = file_info.get("md5", "")
+                                    if existing_image.md5 != new_md5:
+                                        existing_image.md5 = new_md5
+                                        existing_image.size_bytes = file_info.get("sizeInBytes", 0)
+                                        existing_image.filename = file_info.get("fileName", "")
+                                        existing_image.state = ImageContentState.PENDING
+                                        existing_image.sha256 = None  # Reset SHA256 since content changed
+                                        existing_image.last_attempt_time = None
+                                        existing_image.success_time = None
+                                        existing_image.error_message = None
+                                else:
+                                    # Create new ImageContent entry
+                                    new_image = ImageContent(
+                                        file_id=file_id,
+                                        version=version_num,
+                                        filename=file_info.get("fileName", ""),
+                                        md5=file_info.get("md5", ""),
+                                        size_bytes=file_info.get("sizeInBytes", 0),
+                                        state=ImageContentState.PENDING,
+                                    )
+                                    session.add(new_image)
 
     async def get_pending_image_downloads(
         self, limit: int = 100
-    ) -> List[Tuple[str, dict, str]]:
+    ) -> List[Tuple[str, int, str, str, int, str]]:
         """Get images that need downloading.
 
         Returns:
-            List of (file_id, file_metadata_json, file_type) tuples where file_metadata has SUCCESS status
+            List of (file_id, version, filename, md5, size_bytes, download_url) tuples for PENDING images
         """
         async with self.async_session() as session:
             stmt = (
                 select(
-                    WorldImage.file_id,
+                    ImageContent.file_id,
+                    ImageContent.version,
+                    ImageContent.filename,
+                    ImageContent.md5,
+                    ImageContent.size_bytes,
                     FileMetadata.file_metadata,
-                    FileMetadata.file_type,
                 )
-                .join(FileMetadata, WorldImage.file_id == FileMetadata.file_id)
+                .join(FileMetadata, ImageContent.file_id == FileMetadata.file_id)
                 .where(
                     and_(
-                        WorldImage.download_status == DownloadStatus.PENDING,
+                        ImageContent.state == ImageContentState.PENDING,
                         FileMetadata.scrape_status == ScrapeStatus.SUCCESS,
                     )
                 )
                 .limit(limit)
             )
             result = await session.execute(stmt)
-            return [(row[0], row[1], row[2]) for row in result.fetchall()]
+            
+            # Extract download URL from file metadata
+            downloads = []
+            for row in result.fetchall():
+                file_id, version, filename, md5, size_bytes, file_metadata = row
+                download_url = ""
+                
+                if file_metadata and "versions" in file_metadata:
+                    # Find the matching version
+                    for ver in file_metadata["versions"]:
+                        if ver.get("version") == version:
+                            file_info = ver.get("file", {})
+                            download_url = file_info.get("url", "")
+                            break
+                
+                downloads.append((file_id, version, filename, md5, size_bytes, download_url))
+            
+            return downloads
 
     async def update_image_download(
         self,
         file_id: str,
-        status: str,
-        local_file_path: Optional[str] = None,
-        downloaded_md5: Optional[str] = None,
-        downloaded_size_bytes: Optional[int] = None,
+        version: int,
+        state: str,
+        sha256: Optional[str] = None,
         error_message: Optional[str] = None,
     ):
         """Update image download status."""
         async with self.async_session() as session:
             result = await session.execute(
-                select(WorldImage).where(WorldImage.file_id == file_id)
+                select(ImageContent).where(
+                    and_(
+                        ImageContent.file_id == file_id,
+                        ImageContent.version == version
+                    )
+                )
             )
-            world_image = result.scalar_one_or_none()
+            image_content = result.scalar_one_or_none()
 
-            if world_image:
-                world_image.download_status = DownloadStatus(status)
-                world_image.last_attempt_time = datetime.utcnow()
-                world_image.local_file_path = local_file_path
-                world_image.downloaded_md5 = downloaded_md5
-                world_image.downloaded_size_bytes = downloaded_size_bytes
-                world_image.error_message = error_message
+            if image_content:
+                image_content.state = ImageContentState(state)
+                image_content.last_attempt_time = datetime.utcnow()
+                image_content.sha256 = sha256
+                image_content.error_message = error_message
 
-                if status == "SUCCESS":
-                    world_image.success_time = datetime.utcnow()
+                if state == "CONFIRMED":
+                    image_content.success_time = datetime.utcnow()
 
                 await session.commit()
 
@@ -654,11 +712,11 @@ class Database:
             pending_files = pending_files_result.scalar() or 0
 
             # Count pending image downloads
-            pending_images_stmt = select(func.count(WorldImage.file_id)).where(
+            pending_images_stmt = select(func.count()).select_from(ImageContent).where(
                 and_(
-                    WorldImage.download_status == DownloadStatus.PENDING,
+                    ImageContent.state == ImageContentState.PENDING,
                     # Only count images where file metadata is ready
-                    WorldImage.file_id.in_(
+                    ImageContent.file_id.in_(
                         select(FileMetadata.file_id).where(
                             FileMetadata.scrape_status == ScrapeStatus.SUCCESS
                         )

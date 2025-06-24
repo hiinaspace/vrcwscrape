@@ -267,15 +267,15 @@ async def test_scrape_world_happy_path(
 
     # Verify image download database records
     async with test_database.async_session() as session:
-        from src.vrchat_scraper.database import WorldImage
+        from src.vrchat_scraper.database import ImageContent
 
-        image_records = await session.execute(select(WorldImage))
+        image_records = await session.execute(select(ImageContent))
         image_records = image_records.scalars().all()
         assert len(image_records) == len(image_files)
 
         for image_record in image_records:
-            assert image_record.download_status == "SUCCESS"
-            assert image_record.local_file_path is not None
+            assert image_record.state == "CONFIRMED"
+            assert image_record.sha256 is not None
 
     # Verify no sleep was needed (no delays from rate limiter/circuit breaker)
     assert mock_time._time == 1000.0, "Time should not have advanced"

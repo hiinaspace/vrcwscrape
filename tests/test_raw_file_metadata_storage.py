@@ -298,15 +298,15 @@ async def test_file_metadata_still_enables_image_downloads(
 
         # Verify image download succeeded
         async with test_database.async_session() as session:
-            from src.vrchat_scraper.database import WorldImage
+            from src.vrchat_scraper.database import ImageContent
             from sqlalchemy import select
 
             result = await session.execute(
-                select(WorldImage).where(WorldImage.file_id == file_id)
+                select(ImageContent).where(ImageContent.file_id == file_id)
             )
             image_record = result.scalar_one()
-            assert image_record.download_status == "SUCCESS"
-            assert image_record.local_file_path == f"/fake/path/{file_id}.png"
+            assert image_record.state == "CONFIRMED"
+            assert image_record.sha256 is not None
 
 
 @pytest.mark.asyncio

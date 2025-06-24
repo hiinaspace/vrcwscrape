@@ -10,9 +10,10 @@ from vrchat_scraper.database import (
     World,
     WorldMetrics,
     FileMetadata,
-    WorldImage,
+    ImageContent,
     ScrapeStatus,
     DownloadStatus,
+    ImageContentState,
 )
 from vrchat_scraper.models import FileReference, FileType
 
@@ -316,12 +317,7 @@ async def test_upsert_world_with_files(test_db):
         assert unity_file.file_id == "file_unity_456"
         assert unity_file.version_number == 5
 
-        # Verify world_images entry was created for image file
-        image_result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_image_123")
-        )
-        world_image = image_result.scalar_one()
-        assert world_image.download_status == DownloadStatus.PENDING
+        # Note: ImageContent entries are created during file metadata processing, not here
 
 
 @pytest.mark.asyncio
@@ -536,7 +532,19 @@ async def test_get_pending_image_downloads(test_db):
     await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
 
     # Update file metadata to SUCCESS (required for image downloads)
-    file_metadata = {"versions": [{"file": {"url": "download_url", "md5": "abc123"}}]}
+    file_metadata = {
+        "versions": [
+            {
+                "version": 1,
+                "file": {
+                    "url": "download_url", 
+                    "md5": "abc123",
+                    "fileName": "test.png",
+                    "sizeInBytes": 100000
+                }
+            }
+        ]
+    }
     await test_db.update_file_metadata("file_image_1", file_metadata, "SUCCESS")
 
     # Get pending downloads
@@ -544,9 +552,13 @@ async def test_get_pending_image_downloads(test_db):
 
     # Should only return image files with SUCCESS file metadata
     assert len(pending_downloads) == 1
-    assert pending_downloads[0][0] == "file_image_1"
-    assert pending_downloads[0][1] == file_metadata
-    assert pending_downloads[0][2] == FileType.IMAGE.value
+    file_id, version, filename, md5, size_bytes, download_url = pending_downloads[0]
+    assert file_id == "file_image_1"
+    assert version == 1
+    assert filename == "test.png"
+    assert md5 == "abc123"
+    assert size_bytes == 100000
+    assert download_url == "download_url"
 
 
 @pytest.mark.asyncio
@@ -575,27 +587,43 @@ async def test_update_image_download_success(test_db):
 
     await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
 
+    # First update file metadata to create ImageContent entry
+    file_metadata = {
+        "versions": [
+            {
+                "version": 1,
+                "file": {
+                    "url": "download_url", 
+                    "md5": "abc123",
+                    "fileName": "test.png",
+                    "sizeInBytes": 100000
+                }
+            }
+        ]
+    }
+    await test_db.update_file_metadata("file_image_1", file_metadata, "SUCCESS")
+
     # Update download status
+    sha256_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
     await test_db.update_image_download(
         "file_image_1",
-        "SUCCESS",
-        local_file_path="/images/abc/def/file_image_1.png",
-        downloaded_md5="abc123",
-        downloaded_size_bytes=12345,
+        1,  # version
+        "CONFIRMED",
+        sha256=sha256_hash,
     )
 
     # Verify update
     async with test_db.async_session() as session:
         result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_image_1")
+            select(ImageContent).where(
+                ImageContent.file_id == "file_image_1"
+            )
         )
-        world_image = result.scalar_one()
-        assert world_image.download_status == DownloadStatus.SUCCESS
-        assert world_image.local_file_path == "/images/abc/def/file_image_1.png"
-        assert world_image.downloaded_md5 == "abc123"
-        assert world_image.downloaded_size_bytes == 12345
-        assert world_image.success_time is not None
-        assert world_image.last_attempt_time is not None
+        image_content = result.scalar_one()
+        assert image_content.state == ImageContentState.CONFIRMED
+        assert image_content.sha256 == sha256_hash
+        assert image_content.success_time is not None
+        assert image_content.last_attempt_time is not None
 
 
 @pytest.mark.asyncio
@@ -624,21 +652,37 @@ async def test_update_image_download_error(test_db):
 
     await test_db.upsert_world_with_files(world_id, metadata, metrics, discovered_files)
 
+    # First update file metadata to create ImageContent entry
+    file_metadata = {
+        "versions": [
+            {
+                "version": 1,
+                "file": {
+                    "url": "download_url", 
+                    "md5": "abc123",
+                    "fileName": "test.png",
+                    "sizeInBytes": 100000
+                }
+            }
+        ]
+    }
+    await test_db.update_file_metadata("file_image_1", file_metadata, "SUCCESS")
+
     # Update with error
     await test_db.update_image_download(
-        "file_image_1", "ERROR", error_message="Connection timeout"
+        "file_image_1", 1, "ERROR", error_message="Connection timeout"
     )
 
     # Verify update
     async with test_db.async_session() as session:
         result = await session.execute(
-            select(WorldImage).where(WorldImage.file_id == "file_image_1")
+            select(ImageContent).where(ImageContent.file_id == "file_image_1")
         )
-        world_image = result.scalar_one()
-        assert world_image.download_status == DownloadStatus.ERROR
-        assert world_image.error_message == "Connection timeout"
-        assert world_image.success_time is None
-        assert world_image.last_attempt_time is not None
+        image_content = result.scalar_one()
+        assert image_content.state == ImageContentState.ERROR
+        assert image_content.error_message == "Connection timeout"
+        assert image_content.success_time is None
+        assert image_content.last_attempt_time is not None
 
 
 @pytest.mark.asyncio

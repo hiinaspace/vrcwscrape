@@ -77,7 +77,7 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
 
 
 class FileImageDownloader:
-    """File system-based image downloader with MD5 verification."""
+    """Content-addressed image downloader with dual hash verification."""
 
     def __init__(self, auth_cookie: str, storage_path: str, timeout: float = 30.0):
         """Initialize with image storage directory."""
@@ -90,28 +90,27 @@ class FileImageDownloader:
         )
 
     async def download_image(
-        self, file_id: str, download_url: str, expected_md5: str
-    ) -> Tuple[bool, str, int, str]:
-        """Download and verify an image file.
+        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+    ) -> Tuple[bool, str, str]:
+        """Download and verify an image file using content-addressed storage.
 
         Args:
-            file_id: VRChat file ID for storage path generation
+            file_id: VRChat file ID for tracking purposes
+            version: File version number
             download_url: Direct download URL from VRChat CDN
-            expected_md5: Base64-encoded MD5 hash from VRChat for verification
+            expected_md5: MD5 hash from VRChat for verification
+            expected_size: Expected file size in bytes
 
         Returns:
-            Tuple of (success, local_file_path, actual_size_bytes, error_message)
+            Tuple of (success, sha256_hash, error_message)
         """
-        image_path = self._get_image_path(file_id)
-        image_path.parent.mkdir(parents=True, exist_ok=True)
-
         try:
             # vrchat file links redirect to s3 signed urls.
             response = await self.client.get(download_url, follow_redirects=True)
 
             if response.status_code == 404:
                 # File no longer exists on VRChat CDN
-                return False, str(image_path), 0, "Image not found on VRChat CDN (404)"
+                return False, "", "Image not found on VRChat CDN (404)"
 
             response.raise_for_status()
 
@@ -119,43 +118,70 @@ class FileImageDownloader:
             content = response.content
             actual_size = len(content)
 
-            # Verify MD5 hash
+            # Verify size
+            if actual_size != expected_size:
+                return (
+                    False,
+                    "",
+                    f"Size mismatch: expected {expected_size}, got {actual_size}",
+                )
+
+            # Verify MD5 hash (for VRChat API compatibility)
             if not self._verify_md5(content, expected_md5):
                 return (
                     False,
-                    str(image_path),
-                    actual_size,
+                    "",
                     "MD5 hash verification failed",
                 )
 
-            # Write verified content to disk
+            # Compute SHA256 for content addressing
+            sha256_hash = hashlib.sha256(content).hexdigest()
+            image_path = self._get_content_addressed_path(sha256_hash)
+
+            # Check if we already have this content
+            if image_path.exists():
+                # Content already exists, verify it matches
+                existing_content = image_path.read_bytes()
+                existing_sha256 = hashlib.sha256(existing_content).hexdigest()
+                if existing_sha256 == sha256_hash:
+                    logger.debug(
+                        f"Image content already exists for {file_id} v{version} (SHA256: {sha256_hash})"
+                    )
+                    return True, sha256_hash, ""
+                else:
+                    logger.warning(
+                        f"SHA256 collision detected for {file_id} v{version}: existing file has different content"
+                    )
+                    return False, "", "SHA256 collision detected"
+
+            # Create directory and write content
+            image_path.parent.mkdir(parents=True, exist_ok=True)
             image_path.write_bytes(content)
+            
             logger.debug(
-                f"Successfully downloaded and verified image {file_id} ({actual_size} bytes)"
+                f"Successfully downloaded and verified image {file_id} v{version} ({actual_size} bytes, SHA256: {sha256_hash})"
             )
 
-            return True, str(image_path), actual_size, ""
+            return True, sha256_hash, ""
 
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            error_msg = f"Timeout downloading image {file_id}: {e}"
+            error_msg = f"Timeout downloading image {file_id} v{version}: {e}"
             logger.warning(error_msg)
-            return False, str(image_path), 0, error_msg
+            return False, "", error_msg
 
         except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP error downloading image {file_id}: {e}"
+            error_msg = f"HTTP error downloading image {file_id} v{version}: {e}"
             logger.warning(error_msg)
-            return False, str(image_path), 0, error_msg
+            return False, "", error_msg
 
         except Exception as e:
-            error_msg = f"Unexpected error downloading image {file_id}: {e}"
+            error_msg = f"Unexpected error downloading image {file_id} v{version}: {e}"
             logger.error(error_msg)
-            return False, str(image_path), 0, error_msg
+            return False, "", error_msg
 
-    def _get_image_path(self, file_id: str) -> Path:
-        """Generate hierarchical path for image storage using file ID."""
-        # file_id format: file_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        uuid_part = file_id[5:]  # Remove 'file_' prefix
-        return self.storage_path / uuid_part[0:2] / uuid_part[2:4] / f"{file_id}.png"
+    def _get_content_addressed_path(self, sha256_hash: str) -> Path:
+        """Generate hierarchical path for content-addressed storage using SHA256."""
+        return self.storage_path / sha256_hash[0:2] / sha256_hash[2:4] / f"{sha256_hash}.png"
 
     def _verify_md5(self, content: bytes, expected_md5_b64: str) -> bool:
         """Verify content against VRChat's base64-encoded MD5 hash."""
@@ -173,9 +199,9 @@ class FileImageDownloader:
             logger.warning(f"MD5 verification failed due to encoding error: {e}")
             return False
 
-    def image_exists(self, file_id: str) -> bool:
-        """Check if image already exists for a file ID."""
-        return self._get_image_path(file_id).exists()
+    def image_exists(self, sha256_hash: str) -> bool:
+        """Check if image already exists for a SHA256 hash."""
+        return self._get_content_addressed_path(sha256_hash).exists()
 
     async def close(self):
         """Clean up HTTP client resources."""

@@ -25,16 +25,21 @@ class ImageDownloader(Protocol):
     """Protocol for image downloader implementations."""
 
     async def download_image(
-        self, file_id: str, download_url: str, expected_md5: str
-    ) -> Tuple[bool, str, int, str]:
-        """Download and verify an image file.
+        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+    ) -> Tuple[bool, str, str]:
+        """Download and verify an image file using content-addressed storage.
 
         Args:
-            file_id: VRChat file ID for storage path generation
+            file_id: VRChat file ID for tracking purposes
+            version: File version number
             download_url: Direct download URL from VRChat CDN
-            expected_md5: Base64-encoded MD5 hash from VRChat for verification
+            expected_md5: MD5 hash from VRChat for verification
+            expected_size: Expected file size in bytes
 
         Returns:
-            Tuple of (success, local_file_path, actual_size_bytes, error_message)
+            Tuple of (success, sha256_hash, error_message)
+            - success: True if download and verification succeeded
+            - sha256_hash: SHA256 hash of downloaded content (empty if failed)
+            - error_message: Error description (empty if success)
         """
         ...

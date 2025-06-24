@@ -241,9 +241,11 @@ class FakeImageDownloader:
         local_file_path: str = "",
         actual_size_bytes: int = 100000,
         error_message: str = "",
+        version: int = 1,
     ):
-        """Configure the download result for a specific file_id."""
-        self.download_results[file_id] = (
+        """Configure the download result for a specific file_id and version."""
+        result_key = f"{file_id}_v{version}"
+        self.download_results[result_key] = (
             success,
             local_file_path,
             actual_size_bytes,
@@ -273,43 +275,69 @@ class FakeImageDownloader:
             self.existing_images.discard(file_id)
 
     async def download_image(
-        self, file_id: str, download_url: str, expected_md5: str
-    ) -> Tuple[bool, str, int, str]:
+        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+    ) -> Tuple[bool, str, str]:
         """Fake implementation of download_image matching new protocol."""
         now = self.time_source()
 
         self.download_log.append(
             {
                 "file_id": file_id,
+                "version": version,
                 "url": download_url,
                 "expected_md5": expected_md5,
+                "expected_size": expected_size,
                 "timestamp": now,
             }
         )
 
+        # Generate a fake SHA256 hash for testing
+        import hashlib
+        fake_content = f"{file_id}_v{version}_{expected_md5}".encode()
+        fake_sha256 = hashlib.sha256(fake_content).hexdigest()
+
         # Check if we have a configured result for this file_id
+        result_key = f"{file_id}_v{version}"
+        if result_key in self.download_results:
+            result = self.download_results.pop(result_key)
+            success, local_path, size, error = result
+            if success:
+                self.existing_images.add(fake_sha256)
+                return (True, fake_sha256, "")
+            else:
+                return (False, "", error)
+
+        # Check for legacy file_id-only results
         if file_id in self.download_results:
             result = self.download_results.pop(file_id)
             success, local_path, size, error = result
             if success:
-                self.existing_images.add(file_id)
-            return result
+                self.existing_images.add(fake_sha256)
+                return (True, fake_sha256, "")
+            else:
+                return (False, "", error)
 
         # Get and await the future for this download if configured
-        if file_id in self.download_futures:
+        if result_key in self.download_futures:
+            future = self.download_futures.pop(result_key)
+            success = await future
+            if success:
+                self.existing_images.add(fake_sha256)
+                return (True, fake_sha256, "")
+            else:
+                return (False, "", "Download failed")
+        elif file_id in self.download_futures:
             future = self.download_futures.pop(file_id)
             success = await future
-            local_path = f"/fake/path/{file_id}.png" if success else ""
-            size = 100000 if success else 0
-            error = "" if success else "Download failed"
             if success:
-                self.existing_images.add(file_id)
-            return (success, local_path, size, error)
+                self.existing_images.add(fake_sha256)
+                return (True, fake_sha256, "")
+            else:
+                return (False, "", "Download failed")
         else:
             # No configuration, default to success
-            local_path = f"/fake/path/{file_id}.png"
-            self.existing_images.add(file_id)
-            return (True, local_path, 100000, "")
+            self.existing_images.add(fake_sha256)
+            return (True, fake_sha256, "")
 
     def image_exists(self, world_id: str) -> bool:
         """Check if image exists for a world (legacy method for backward compatibility)."""
