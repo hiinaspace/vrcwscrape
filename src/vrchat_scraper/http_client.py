@@ -4,13 +4,13 @@ import base64
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import httpx
 
 from vrchat_scraper.protocols import VRChatAPIClient
 
-from .models import WorldDetail, WorldSummary, FileMetadata
+from .models import WorldSummary, FileMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,8 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
         response.raise_for_status()
         return [WorldSummary(**w) for w in response.json()]
 
-    async def get_world_details(self, world_id: str) -> WorldDetail:
-        """Fetch complete metadata for a single world."""
+    async def get_world_details(self, world_id: str) -> Dict[str, Any]:
+        """Fetch complete metadata for a single world as raw JSON."""
         response = await self.client.get(
             f"https://api.vrchat.cloud/api/1/worlds/{world_id}"
         )
@@ -57,7 +57,7 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
             raise AuthenticationError("VRChat authentication failed")
 
         response.raise_for_status()
-        return WorldDetail(**response.json())
+        return response.json()
 
     async def get_file_metadata(self, file_id: str) -> FileMetadata:
         """Fetch metadata for a VRChat file by ID."""

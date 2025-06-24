@@ -613,14 +613,15 @@ class VRChatScraper:
                 logger.error(f"Error monitoring queue depths: {e}")
                 await self._sleep_func(self._error_backoff_time)
 
-    async def _update_database_with_world(
-        self, world_id: str, world_details: WorldDetail
-    ):
+    async def _update_database_with_world(self, world_id: str, world_details_raw: dict):
         """Update database with world metadata and metrics."""
-        # Use new transactional method to store world + discovered files + metrics
+        # Parse raw JSON into WorldDetail only when needed for processing
+        world_details = WorldDetail(**world_details_raw)
+
+        # Store the raw API response directly, not the processed metadata
         await self.database.upsert_world_with_files(
             world_id,
-            world_details.stable_metadata(),
+            world_details_raw,  # Store raw JSON instead of stable_metadata()
             world_details.extract_metrics(),
             world_details.discovered_files,
             status="SUCCESS",

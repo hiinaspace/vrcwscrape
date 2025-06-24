@@ -1,8 +1,8 @@
 """Protocol definitions for VRChat scraper abstractions."""
 
-from typing import List, Protocol, Tuple
+from typing import Dict, List, Protocol, Tuple, Any
 
-from .models import WorldDetail, WorldSummary, FileMetadata
+from .models import WorldSummary, FileMetadata
 
 
 class VRChatAPIClient(Protocol):
@@ -12,8 +12,8 @@ class VRChatAPIClient(Protocol):
         """Fetch recently updated worlds from VRChat API."""
         ...
 
-    async def get_world_details(self, world_id: str) -> WorldDetail:
-        """Fetch complete metadata for a single world."""
+    async def get_world_details(self, world_id: str) -> Dict[str, Any]:
+        """Fetch complete metadata for a single world as raw JSON."""
         ...
 
     async def get_file_metadata(self, file_id: str) -> FileMetadata:

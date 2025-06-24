@@ -46,10 +46,10 @@ class FakeVRChatAPIClient:
         future.set_result(worlds)
         self.add_recent_worlds_future(future)
 
-    def set_world_detail_response(self, world_id: str, world: WorldDetail):
+    def set_world_detail_response(self, world_id: str, world_data: dict):
         """Convenience method to set an immediate response."""
         future = asyncio.Future()
-        future.set_result(world)
+        future.set_result(world_data)
         self.add_world_detail_future(world_id, future)
 
     def set_file_metadata_response(self, file_id: str, file_metadata: FileMetadata):
@@ -125,7 +125,7 @@ class FakeVRChatAPIClient:
             # No future configured, return empty list
             return []
 
-    async def get_world_details(self, world_id: str) -> WorldDetail:
+    async def get_world_details(self, world_id: str) -> dict:
         """Fake implementation of get_world_details."""
         now = self.time_source()
 

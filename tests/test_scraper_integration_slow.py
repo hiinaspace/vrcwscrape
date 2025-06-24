@@ -134,7 +134,9 @@ async def test_real_rate_limiting_integration(
             world_id=world_id,
             name=f"Rate Test World {world_id[-1]}",
         )
-        fast_api_client.set_world_detail_response(world_id, test_world)
+        # Convert WorldDetail to raw JSON for the new API interface
+        test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+        fast_api_client.set_world_detail_response(world_id, test_world_raw)
         fast_image_downloader.set_download_response(world_id, True)
 
     # Force a low rate by updating the max_rate filter and pacing rate
@@ -324,7 +326,8 @@ async def test_rate_limiter_probe_recovery():
         # Capture test_world by value to avoid closure issues
         async def fast_world_response(captured_world=test_world):
             await asyncio.sleep(0.05)  # 50ms per request
-            return captured_world
+            # Convert WorldDetail to raw JSON for the new API interface
+            return captured_world.model_dump(mode="json", by_alias=True)
 
         api_client.add_world_detail_future(world_id, fast_world_response())
         image_downloader.set_download_response(world_id, True)
@@ -435,7 +438,9 @@ async def test_minimum_rate_prevents_excessive_throttling():
         test_world = create_test_world_detail(
             world_id=world_id, name=f"Min Rate Test {world_id[-1]}"
         )
-        api_client.set_world_detail_response(world_id, test_world)
+        # Convert WorldDetail to raw JSON for the new API interface
+        test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+        api_client.set_world_detail_response(world_id, test_world_raw)
         image_downloader.set_download_response(world_id, True)
 
     # Create scraper

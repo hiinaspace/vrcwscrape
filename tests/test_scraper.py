@@ -183,7 +183,9 @@ async def test_scrape_world_happy_path(
         visits=2000,
         include_unity_packages=True,
     )
-    fake_api_client.set_world_detail_response(world_id, test_world)
+    # Convert WorldDetail to raw JSON for the new API interface
+    test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+    fake_api_client.set_world_detail_response(world_id, test_world_raw)
 
     # Set up file metadata responses for discovered files
     from tests.fakes import create_test_file_metadata
@@ -298,7 +300,9 @@ async def test_scrape_world_with_database_state(
         favorites=250,
         visits=5000,
     )
-    fake_api_client.set_world_detail_response(world_id, test_world)
+    # Convert WorldDetail to raw JSON for the new API interface
+    test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+    fake_api_client.set_world_detail_response(world_id, test_world_raw)
     fake_image_downloader.set_download_response(world_id, True)
 
     # Act
@@ -317,9 +321,11 @@ async def test_scrape_world_with_database_state(
         assert world_record.scrape_status == "SUCCESS"
         assert world_record.world_metadata["name"] == "Database Test World"
         assert world_record.world_metadata["id"] == world_id
-        # Verify ephemeral fields were removed from metadata
-        assert "favorites" not in world_record.world_metadata
-        assert "visits" not in world_record.world_metadata
+        # Verify ephemeral fields are now included in raw API response (new behavior)
+        assert "favorites" in world_record.world_metadata
+        assert "visits" in world_record.world_metadata
+        assert world_record.world_metadata["favorites"] == 250
+        assert world_record.world_metadata["visits"] == 5000
 
         # Check metrics were stored separately
         result = await session.execute(
@@ -382,7 +388,9 @@ async def test_process_pending_worlds_batch_happy_path(
             name=f"Batch World {world_id[-1]}",
             favorites=100 + int(world_id[-1]),
         )
-        fake_api_client.set_world_detail_response(world_id, test_world)
+        # Convert WorldDetail to raw JSON for the new API interface
+        test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+        fake_api_client.set_world_detail_response(world_id, test_world_raw)
         fake_image_downloader.set_download_response(world_id, True)
 
     # Act: Process the batch
@@ -626,7 +634,9 @@ async def test_image_download_handles_failure(
     )
 
     test_world = create_test_world_detail(world_id=world_id, name="Image Fail Test")
-    fake_api_client.set_world_detail_response(world_id, test_world)
+    # Convert WorldDetail to raw JSON for the new API interface
+    test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+    fake_api_client.set_world_detail_response(world_id, test_world_raw)
     fake_image_downloader.set_download_response(world_id, False)  # Failure
 
     # Act: Should complete world scraping despite image failure
