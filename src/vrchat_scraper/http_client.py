@@ -10,7 +10,7 @@ import httpx
 
 from vrchat_scraper.protocols import VRChatAPIClient
 
-from .models import WorldSummary, FileMetadata
+from .models import WorldSummary
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +59,8 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
         response.raise_for_status()
         return response.json()
 
-    async def get_file_metadata(self, file_id: str) -> FileMetadata:
-        """Fetch metadata for a VRChat file by ID."""
+    async def get_file_metadata(self, file_id: str) -> Dict[str, Any]:
+        """Fetch metadata for a VRChat file by ID as raw JSON."""
         response = await self.client.get(
             f"https://api.vrchat.cloud/api/1/file/{file_id}"
         )
@@ -69,7 +69,7 @@ class HTTPVRChatAPIClient(VRChatAPIClient):
             raise AuthenticationError("VRChat authentication failed")
 
         response.raise_for_status()
-        return FileMetadata(**response.json())
+        return response.json()
 
     async def close(self):
         """Clean up HTTP client resources."""

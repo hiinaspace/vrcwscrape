@@ -378,10 +378,10 @@ class VRChatScraper:
                 error_context=f"file metadata {file_id} scraping",
             )
 
-            # Update database with file metadata (use aliases for consistency)
+            # Store raw file metadata directly
             await self.database.update_file_metadata(
                 file_id,
-                file_metadata.model_dump(mode="json", by_alias=True),
+                file_metadata,
                 status="SUCCESS",
             )
             logger.debug(f"Successfully scraped file metadata for {file_id}")

@@ -52,10 +52,10 @@ class FakeVRChatAPIClient:
         future.set_result(world_data)
         self.add_world_detail_future(world_id, future)
 
-    def set_file_metadata_response(self, file_id: str, file_metadata: FileMetadata):
+    def set_file_metadata_response(self, file_id: str, file_metadata_data: dict):
         """Convenience method to set an immediate response."""
         future = asyncio.Future()
-        future.set_result(file_metadata)
+        future.set_result(file_metadata_data)
         self.add_file_metadata_future(file_id, future)
 
     def set_recent_worlds_error(self, error: Exception):
@@ -154,7 +154,7 @@ class FakeVRChatAPIClient:
                 "World not found", request=None, response=httpx.Response(404)
             )
 
-    async def get_file_metadata(self, file_id: str) -> FileMetadata:
+    async def get_file_metadata(self, file_id: str) -> dict:
         """Fake implementation of get_file_metadata."""
         now = self.time_source()
 

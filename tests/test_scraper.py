@@ -209,7 +209,9 @@ async def test_scrape_world_happy_path(
                 version=file_ref.version_number,
                 file_size=20000000,  # 20MB unity package
             )
-        fake_api_client.set_file_metadata_response(file_ref.file_id, file_metadata)
+        # Convert FileMetadata to raw JSON for the new API interface
+        file_metadata_raw = file_metadata.model_dump(mode="json", by_alias=True)
+        fake_api_client.set_file_metadata_response(file_ref.file_id, file_metadata_raw)
 
     # Set up successful image downloads for all image files
     for file_ref in discovered_files:

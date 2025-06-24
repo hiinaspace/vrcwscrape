@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Protocol, Tuple, Any
 
-from .models import WorldSummary, FileMetadata
+from .models import WorldSummary
 
 
 class VRChatAPIClient(Protocol):
@@ -16,8 +16,8 @@ class VRChatAPIClient(Protocol):
         """Fetch complete metadata for a single world as raw JSON."""
         ...
 
-    async def get_file_metadata(self, file_id: str) -> FileMetadata:
-        """Fetch metadata for a VRChat file by ID."""
+    async def get_file_metadata(self, file_id: str) -> Dict[str, Any]:
+        """Fetch metadata for a VRChat file by ID as raw JSON."""
         ...
 
 
