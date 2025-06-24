@@ -22,7 +22,7 @@ be a nice archival copy of the public world metadata, for when that happens.
 - `worlds`: raw JSON responses from the [GetWorld HTTP API](https://vrchatapi.github.io/docs/api)
   - There are ~237k public worlds as of June 2025.
   - includes all the fields e.g. name, description, tags, instance limit, published/updated dates.
-- `file_metadata`: raw JSON responses from the [ShowFile HTTP API(https://vrchat.community/openapi/get-file) for images and unityPackages
+- `file_metadata`: raw JSON responses from the [ShowFile HTTP API](https://vrchat.community/openapi/get-file) for images and unityPackages
   - this is mainly useful for the world download sizes.
 - `image_content`: sha256 hashes of the latest version of the full world images
   - the scraper also downloads the full images to calculate these, but they're too big to store in this database directly.
@@ -57,12 +57,14 @@ but it was kind of cool to watch it operate when doing the initial backfill of t
 
 ### Dolt
 
-Dolt is essentially mysql backed by git. It's in theory kind of nice for projects like this, in that it
-gives you a rigid content-addressed form of the database. Practically it's kind of hokey. At the scale of this
-data, it probably would've been better to just use sqlite. It's not terrible though.
+[Dolt](https://www.dolthub.com/) is essentially mysql backed by git. It's in
+theory kind of nice for projects like this, in that it gives you a rigid
+content-addressed form of the database. Practically it's kind of hokey. At the
+scale of this data, it probably would've been better to just use sqlite. It's
+not terrible though.
 
-The project does use SQLAlchemy so if you don't want to deal with dolt yourself, it should scrape into any
-other database that SQLAlchemy supports.
+The project does use SQLAlchemy so if you don't want to deal with dolt yourself,
+it should scrape into any other database that SQLAlchemy supports.
 
 ### Authentication
 
