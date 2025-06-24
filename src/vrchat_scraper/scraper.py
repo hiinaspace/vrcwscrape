@@ -45,6 +45,10 @@ class VRChatScraper:
         self.image_rate_limiter = image_rate_limiter
         self.api_circuit_breaker = api_circuit_breaker
         self.image_circuit_breaker = image_circuit_breaker
+        # used for fairness; the rate limiter is sort of a semaphore already
+        # but the sleep waiting doesn't seem to be fair (some tasks can starve for a while)
+        self.api_lock = asyncio.Lock()
+        self.image_lock = asyncio.Lock()
         self._time_source = time_source
         self._sleep_func = sleep_func
         self._recent_worlds_interval = recent_worlds_interval
@@ -172,20 +176,22 @@ class VRChatScraper:
     @logfire.instrument("wait_for_api_ready")
     async def _wait_for_api_ready(self):
         """Wait until API requests are allowed by rate limiter and circuit breaker."""
-        while True:
-            delay = await self._get_api_request_delay()
-            if delay <= 0:
-                break
-            await self._sleep_func(delay)
+        async with self.api_lock:
+            while True:
+                delay = await self._get_api_request_delay()
+                if delay <= 0:
+                    break
+                await self._sleep_func(delay)
 
     @logfire.instrument("wait_for_iamge_ready")
     async def _wait_for_image_ready(self):
         """Wait until image requests are allowed by rate limiter and circuit breaker."""
-        while True:
-            delay = await self._get_image_request_delay()
-            if delay <= 0:
-                break
-            await self._sleep_func(delay)
+        async with self.image_lock:
+            while True:
+                delay = await self._get_image_request_delay()
+                if delay <= 0:
+                    break
+                await self._sleep_func(delay)
 
     async def _execute_api_call(
         self,
