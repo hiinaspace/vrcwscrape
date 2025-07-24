@@ -90,6 +90,49 @@ class VRChatScraper:
             task_group.create_task(self._process_pending_image_downloads_continuously())
             task_group.create_task(self._monitor_queue_depths_periodically())
 
+    async def run_oneshot(self):
+        """One-shot execution - process all pending work and exit."""
+        logger.info("Starting one-shot scraping run")
+
+        try:
+            # Step 1: Scrape recent worlds to discover new ones
+            logger.info("Scraping recent worlds...")
+            await self._scrape_recent_worlds_batch()
+
+            # Step 2: Process all pending worlds until queue is empty
+            logger.info("Processing pending worlds...")
+            while True:
+                processed_count = await self._process_pending_worlds_batch(limit=100)
+                if processed_count == 0:
+                    break
+                logger.info(f"Processed {processed_count} worlds")
+
+            # Step 3: Process all pending file metadata until queue is empty
+            logger.info("Processing pending file metadata...")
+            while True:
+                processed_count = await self._process_pending_file_metadata_batch(
+                    limit=50
+                )
+                if processed_count == 0:
+                    break
+                logger.info(f"Processed {processed_count} file metadata entries")
+
+            # Step 4: Process all pending image downloads until queue is empty
+            logger.info("Processing pending image downloads...")
+            while True:
+                processed_count = await self._process_pending_image_downloads_batch(
+                    limit=20
+                )
+                if processed_count == 0:
+                    break
+                logger.info(f"Processed {processed_count} image downloads")
+
+            logger.info("One-shot scraping run completed successfully")
+
+        except Exception as e:
+            logger.error(f"Error during one-shot run: {e}")
+            raise
+
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""
         self._shutdown_event.set()
@@ -426,7 +469,13 @@ class VRChatScraper:
 
     @logfire.instrument("download_image_content_task")
     async def _download_image_content_task(
-        self, file_id: str, version: int, filename: str, md5: str, size_bytes: int, download_url: str
+        self,
+        file_id: str,
+        version: int,
+        filename: str,
+        md5: str,
+        size_bytes: int,
+        download_url: str,
     ):
         """Handle image download using content-addressed storage."""
 
@@ -447,13 +496,17 @@ class VRChatScraper:
             if result.success:
                 self.image_rate_limiter.on_success(request_id, self._time_source())
                 self.image_circuit_breaker.on_success()
-                logger.debug(f"Successfully downloaded image for {file_id} v{version} (SHA256: {result.sha256_hash})")
+                logger.debug(
+                    f"Successfully downloaded image for {file_id} v{version} (SHA256: {result.sha256_hash})"
+                )
 
                 # Record business metric
                 self._images_downloaded_counter.add(1, {"status": "success"})
             else:
                 self.image_rate_limiter.on_error(request_id, self._time_source())
-                logger.warning(f"Failed to download image for {file_id} v{version}: {result.error_message}")
+                logger.warning(
+                    f"Failed to download image for {file_id} v{version}: {result.error_message}"
+                )
 
                 # Record business metric
                 self._images_downloaded_counter.add(1, {"status": "error"})
@@ -477,7 +530,9 @@ class VRChatScraper:
             await self.database.update_image_download(
                 file_id, version, "ERROR", error_message=str(e)
             )
-            logger.error(f"Unexpected error downloading image for {file_id} v{version}: {e}")
+            logger.error(
+                f"Unexpected error downloading image for {file_id} v{version}: {e}"
+            )
 
             # Record business metrics
             self._images_downloaded_counter.add(1, {"status": "error"})
@@ -568,7 +623,7 @@ class VRChatScraper:
                         download.filename,
                         download.md5,
                         download.size_bytes,
-                        download.download_url
+                        download.download_url,
                     )
                 )
                 processed_count += 1

@@ -1,5 +1,6 @@
 """Main entry point for VRChat scraper."""
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -44,7 +45,7 @@ class GracefulShutdown:
         self.shutdown_event.set()
 
 
-async def async_main():
+async def async_main(mode: str = "daemon"):
     """Main application entry point."""
     # Load config
     config = Config()
@@ -96,8 +97,13 @@ async def async_main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, handle_shutdown)
 
-        # Run the scraper
-        await scraper.run_forever()
+        # Run the scraper in selected mode
+        if mode == "daemon":
+            await scraper.run_forever()
+        elif mode == "oneshot":
+            await scraper.run_oneshot()
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
     except AuthenticationError:
         logger.critical("Authentication failed - exiting")
@@ -110,7 +116,16 @@ async def async_main():
 
 
 def main():
-    asyncio.run(async_main())
+    parser = argparse.ArgumentParser(description="VRChat world metadata scraper")
+    parser.add_argument(
+        "--mode",
+        choices=["daemon", "oneshot"],
+        default="daemon",
+        help="Execution mode: daemon (continuous) or oneshot (run once and exit)",
+    )
+
+    args = parser.parse_args()
+    asyncio.run(async_main(mode=args.mode))
 
 
 if __name__ == "__main__":
