@@ -401,6 +401,7 @@ class VRChatScraper:
                 logger.info(f"World {world_id} not found (deleted?)")
                 self._worlds_scraped_counter.add(1, {"status": "deleted"})
             else:
+                # Log but continue - circuit breaker handles rate limits/server errors
                 self._worlds_scraped_counter.add(1, {"status": "error"})
                 self._api_errors_counter.add(
                     1,
@@ -409,15 +410,18 @@ class VRChatScraper:
                         "status_code": str(e.response.status_code),
                     },
                 )
-            # Other HTTP errors are already logged by _execute_api_call
-        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout):
+                logger.warning(
+                    f"HTTP error scraping world {world_id}: {e.response.status_code}"
+                )
+
+        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            # Transient network errors - safe to continue
             self._worlds_scraped_counter.add(1, {"status": "timeout"})
             self._api_errors_counter.add(1, {"error_type": "timeout"})
-            # Timeout errors are already logged by _execute_api_call
-            pass
-        except Exception:
-            logger.error(f"Unexpected error scraping world {world_id}", exc_info=True)
-            pass
+            logger.warning(f"Timeout scraping world {world_id}: {e}")
+
+        # Removed generic Exception handler to let critical errors propagate
+        # This includes AuthenticationError, database errors, and unexpected bugs
 
     @logfire.instrument("scrape_file_metadata_task")
     async def _scrape_file_metadata_task(self, file_id: str):

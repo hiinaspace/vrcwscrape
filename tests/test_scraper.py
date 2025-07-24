@@ -515,7 +515,7 @@ async def test_recent_worlds_batch_handles_timeout_errors(
 async def test_scrape_world_handles_authentication_error(
     stub_scraper, test_database, fake_api_client
 ):
-    """Test that authentication errors in world scraping are handled properly."""
+    """Test that authentication errors propagate up and trigger shutdown."""
     # Arrange
     world_id = "wrld_auth_error_test"
     await test_database.upsert_world(
