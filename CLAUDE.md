@@ -26,11 +26,9 @@ uv add --dev <dev package>
 
 **Before committing, always run:**
 ```bash
-# Format code
-uv run ruff format src/ tests/
-
-# Fix linting issues
-uv run ruff check --fix src/ tests/
+# Format and lint code
+# (pre-commit will also run this)
+uv run ruff format && uv run ruff check --fix 
 
 # Run tests
 uv run pytest
