@@ -1,0 +1,34 @@
+[Unit]
+Description=VRChat World Scraper (One-shot)
+Documentation=https://github.com/username/vrcwscrape
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=username
+Group=username
+WorkingDirectory=/home/username/code/vrcwscrape
+Environment=PATH=/home/username/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/username/code/vrcwscrape/.env
+ExecStart=/home/username/.local/bin/uv run python -m vrchat_scraper.main --mode oneshot
+
+# Resource limits
+MemoryMax=2G
+TimeoutStartSec=1800
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vrcwscrape
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/username/code/vrcwscrape
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true

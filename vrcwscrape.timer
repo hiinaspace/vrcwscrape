@@ -1,0 +1,14 @@
+[Unit]
+Description=Run VRChat World Scraper every 30 minutes
+Requires=vrcwscrape.service
+
+[Timer]
+# Run every 30 minutes
+OnCalendar=*:0/30
+# Add randomization to prevent all instances starting at the same time
+RandomizedDelaySec=300
+# Start immediately if the system was down during a scheduled run
+Persistent=true
+
+[Install]
+WantedBy=timers.target
