@@ -741,3 +741,5 @@ class VRChatScraper:
             await self.api_client.close()
         if hasattr(self.image_downloader, "close"):
             await self.image_downloader.close()
+        if hasattr(self.database, "close"):
+            await self.database.close()

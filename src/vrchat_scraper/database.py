@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import and_, or_
 
-from .models import FileReference, FileType, PendingImageDownload
+from .models import FileReference, PendingImageDownload
 
 
 class Base(DeclarativeBase):
@@ -124,7 +124,9 @@ class ImageContent(Base):
     md5: Mapped[str] = mapped_column(String(32), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[Optional[str]] = mapped_column(String(64))
-    state: Mapped[str] = mapped_column(String(20), nullable=False)  # ImageContentState enum
+    state: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )  # ImageContentState enum
     last_attempt_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     success_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
@@ -561,13 +563,19 @@ class Database:
                 file_metadata = result.scalar_one_or_none()
 
                 if file_metadata:
-                    file_metadata.file_metadata = metadata if status == "SUCCESS" else None
+                    file_metadata.file_metadata = (
+                        metadata if status == "SUCCESS" else None
+                    )
                     file_metadata.scrape_status = ScrapeStatus(status)
                     file_metadata.last_scrape_time = datetime.utcnow()
                     file_metadata.error_message = error_message
 
                     # For successful IMAGE file metadata, create/update image_content entry
-                    if status == "SUCCESS" and file_metadata.file_type == "IMAGE" and metadata:
+                    if (
+                        status == "SUCCESS"
+                        and file_metadata.file_type == "IMAGE"
+                        and metadata
+                    ):
                         # Extract metadata from VRChat file response
                         # Assume the latest version for now
                         versions = metadata.get("versions", [])
@@ -575,14 +583,14 @@ class Database:
                             latest_version = max(versions, key=lambda v: v["version"])
                             version_num = latest_version["version"]
                             file_info = latest_version.get("file", {})
-                            
+
                             if file_info:
                                 # Check if ImageContent already exists
                                 image_result = await session.execute(
                                     select(ImageContent).where(
                                         and_(
                                             ImageContent.file_id == file_id,
-                                            ImageContent.version == version_num
+                                            ImageContent.version == version_num,
                                         )
                                     )
                                 )
@@ -593,10 +601,16 @@ class Database:
                                     new_md5 = file_info.get("md5", "")
                                     if existing_image.md5 != new_md5:
                                         existing_image.md5 = new_md5
-                                        existing_image.size_bytes = file_info.get("sizeInBytes", 0)
-                                        existing_image.filename = file_info.get("fileName", "")
+                                        existing_image.size_bytes = file_info.get(
+                                            "sizeInBytes", 0
+                                        )
+                                        existing_image.filename = file_info.get(
+                                            "fileName", ""
+                                        )
                                         existing_image.state = ImageContentState.PENDING
-                                        existing_image.sha256 = None  # Reset SHA256 since content changed
+                                        existing_image.sha256 = (
+                                            None  # Reset SHA256 since content changed
+                                        )
                                         existing_image.last_attempt_time = None
                                         existing_image.success_time = None
                                         existing_image.error_message = None
@@ -640,13 +654,13 @@ class Database:
                 .limit(limit)
             )
             result = await session.execute(stmt)
-            
+
             # Extract download URL from file metadata
             downloads = []
             for row in result.fetchall():
                 file_id, version, filename, md5, size_bytes, file_metadata = row
                 download_url = ""
-                
+
                 if file_metadata and "versions" in file_metadata:
                     # Find the matching version
                     for ver in file_metadata["versions"]:
@@ -654,16 +668,18 @@ class Database:
                             file_info = ver.get("file", {})
                             download_url = file_info.get("url", "")
                             break
-                
-                downloads.append(PendingImageDownload(
-                    file_id=file_id,
-                    version=version,
-                    filename=filename,
-                    md5=md5,
-                    size_bytes=size_bytes,
-                    download_url=download_url
-                ))
-            
+
+                downloads.append(
+                    PendingImageDownload(
+                        file_id=file_id,
+                        version=version,
+                        filename=filename,
+                        md5=md5,
+                        size_bytes=size_bytes,
+                        download_url=download_url,
+                    )
+                )
+
             return downloads
 
     async def update_image_download(
@@ -679,8 +695,7 @@ class Database:
             result = await session.execute(
                 select(ImageContent).where(
                     and_(
-                        ImageContent.file_id == file_id,
-                        ImageContent.version == version
+                        ImageContent.file_id == file_id, ImageContent.version == version
                     )
                 )
             )
@@ -719,15 +734,19 @@ class Database:
             pending_files = pending_files_result.scalar() or 0
 
             # Count pending image downloads
-            pending_images_stmt = select(func.count()).select_from(ImageContent).where(
-                and_(
-                    ImageContent.state == ImageContentState.PENDING,
-                    # Only count images where file metadata is ready
-                    ImageContent.file_id.in_(
-                        select(FileMetadata.file_id).where(
-                            FileMetadata.scrape_status == ScrapeStatus.SUCCESS
-                        )
-                    ),
+            pending_images_stmt = (
+                select(func.count())
+                .select_from(ImageContent)
+                .where(
+                    and_(
+                        ImageContent.state == ImageContentState.PENDING,
+                        # Only count images where file metadata is ready
+                        ImageContent.file_id.in_(
+                            select(FileMetadata.file_id).where(
+                                FileMetadata.scrape_status == ScrapeStatus.SUCCESS
+                            )
+                        ),
+                    )
                 )
             )
             pending_images_result = await session.execute(pending_images_stmt)
@@ -738,3 +757,7 @@ class Database:
                 "pending_file_metadata": pending_files,
                 "pending_image_downloads": pending_images,
             }
+
+    async def close(self):
+        """Close the database engine and clean up connections."""
+        await self.engine.dispose()
