@@ -28,7 +28,7 @@ uv add --dev <dev package>
 ```bash
 # Format and lint code
 # (pre-commit will also run this)
-uv run ruff format && uv run ruff check --fix 
+uv run ruff check --fix && uv run ruff format 
 
 # Run tests
 uv run pytest
