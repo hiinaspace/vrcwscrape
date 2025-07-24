@@ -4,7 +4,7 @@ import base64
 import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any
 
 import httpx
 
@@ -90,7 +90,12 @@ class FileImageDownloader:
         )
 
     async def download_image(
-        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+        self,
+        file_id: str,
+        version: int,
+        download_url: str,
+        expected_md5: str,
+        expected_size: int,
     ) -> ImageDownloadResult:
         """Download and verify an image file using content-addressed storage.
 
@@ -111,8 +116,7 @@ class FileImageDownloader:
             if response.status_code == 404:
                 # File no longer exists on VRChat CDN
                 return ImageDownloadResult(
-                    success=False,
-                    error_message="Image not found on VRChat CDN (404)"
+                    success=False, error_message="Image not found on VRChat CDN (404)"
                 )
 
             response.raise_for_status()
@@ -125,14 +129,13 @@ class FileImageDownloader:
             if actual_size != expected_size:
                 return ImageDownloadResult(
                     success=False,
-                    error_message=f"Size mismatch: expected {expected_size}, got {actual_size}"
+                    error_message=f"Size mismatch: expected {expected_size}, got {actual_size}",
                 )
 
             # Verify MD5 hash (for VRChat API compatibility)
             if not self._verify_md5(content, expected_md5):
                 return ImageDownloadResult(
-                    success=False,
-                    error_message="MD5 hash verification failed"
+                    success=False, error_message="MD5 hash verification failed"
                 )
 
             # Compute SHA256 for content addressing
@@ -148,59 +151,48 @@ class FileImageDownloader:
                     logger.debug(
                         f"Image content already exists for {file_id} v{version} (SHA256: {sha256_hash})"
                     )
-                    return ImageDownloadResult(
-                        success=True,
-                        sha256_hash=sha256_hash
-                    )
+                    return ImageDownloadResult(success=True, sha256_hash=sha256_hash)
                 else:
                     logger.warning(
                         f"SHA256 collision detected for {file_id} v{version}: existing file has different content"
                     )
                     return ImageDownloadResult(
-                        success=False,
-                        error_message="SHA256 collision detected"
+                        success=False, error_message="SHA256 collision detected"
                     )
 
             # Create directory and write content
             image_path.parent.mkdir(parents=True, exist_ok=True)
             image_path.write_bytes(content)
-            
+
             logger.debug(
                 f"Successfully downloaded and verified image {file_id} v{version} ({actual_size} bytes, SHA256: {sha256_hash})"
             )
 
-            return ImageDownloadResult(
-                success=True,
-                sha256_hash=sha256_hash
-            )
+            return ImageDownloadResult(success=True, sha256_hash=sha256_hash)
 
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             error_msg = f"Timeout downloading image {file_id} v{version}: {e}"
             logger.warning(error_msg)
-            return ImageDownloadResult(
-                success=False,
-                error_message=error_msg
-            )
+            return ImageDownloadResult(success=False, error_message=error_msg)
 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP error downloading image {file_id} v{version}: {e}"
             logger.warning(error_msg)
-            return ImageDownloadResult(
-                success=False,
-                error_message=error_msg
-            )
+            return ImageDownloadResult(success=False, error_message=error_msg)
 
         except Exception as e:
             error_msg = f"Unexpected error downloading image {file_id} v{version}: {e}"
             logger.error(error_msg)
-            return ImageDownloadResult(
-                success=False,
-                error_message=error_msg
-            )
+            return ImageDownloadResult(success=False, error_message=error_msg)
 
     def _get_content_addressed_path(self, sha256_hash: str) -> Path:
         """Generate hierarchical path for content-addressed storage using SHA256."""
-        return self.storage_path / sha256_hash[0:2] / sha256_hash[2:4] / f"{sha256_hash}.png"
+        return (
+            self.storage_path
+            / sha256_hash[0:2]
+            / sha256_hash[2:4]
+            / f"{sha256_hash}.png"
+        )
 
     def _verify_md5(self, content: bytes, expected_md5_b64: str) -> bool:
         """Verify content against VRChat's base64-encoded MD5 hash."""

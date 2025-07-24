@@ -7,7 +7,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-from src.vrchat_scraper.models import WorldDetail, WorldSummary, FileMetadata, ImageDownloadResult
+from src.vrchat_scraper.models import (
+    WorldDetail,
+    WorldSummary,
+    FileMetadata,
+    ImageDownloadResult,
+)
 
 
 class FakeVRChatAPIClient:
@@ -275,7 +280,12 @@ class FakeImageDownloader:
             self.existing_images.discard(file_id)
 
     async def download_image(
-        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+        self,
+        file_id: str,
+        version: int,
+        download_url: str,
+        expected_md5: str,
+        expected_size: int,
     ) -> ImageDownloadResult:
         """Fake implementation of download_image matching new protocol."""
         now = self.time_source()
@@ -293,6 +303,7 @@ class FakeImageDownloader:
 
         # Generate a fake SHA256 hash for testing
         import hashlib
+
         fake_content = f"{file_id}_v{version}_{expected_md5}".encode()
         fake_sha256 = hashlib.sha256(fake_content).hexdigest()
 
@@ -325,7 +336,9 @@ class FakeImageDownloader:
                 self.existing_images.add(fake_sha256)
                 return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return ImageDownloadResult(success=False, error_message="Download failed")
+                return ImageDownloadResult(
+                    success=False, error_message="Download failed"
+                )
         elif file_id in self.download_futures:
             future = self.download_futures.pop(file_id)
             success = await future
@@ -333,7 +346,9 @@ class FakeImageDownloader:
                 self.existing_images.add(fake_sha256)
                 return ImageDownloadResult(success=True, sha256_hash=fake_sha256)
             else:
-                return ImageDownloadResult(success=False, error_message="Download failed")
+                return ImageDownloadResult(
+                    success=False, error_message="Download failed"
+                )
         else:
             # No configuration, default to success
             self.existing_images.add(fake_sha256)

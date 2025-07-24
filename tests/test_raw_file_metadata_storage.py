@@ -296,12 +296,12 @@ async def test_file_metadata_still_enables_image_downloads(
 
         # Execute image download task
         await stub_scraper._download_image_content_task(
-            download.file_id, 
-            download.version, 
-            download.filename, 
-            download.md5, 
-            download.size_bytes, 
-            download.download_url
+            download.file_id,
+            download.version,
+            download.filename,
+            download.md5,
+            download.size_bytes,
+            download.download_url,
         )
 
         # Verify image download succeeded

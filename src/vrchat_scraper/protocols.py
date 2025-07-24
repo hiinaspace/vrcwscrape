@@ -1,6 +1,6 @@
 """Protocol definitions for VRChat scraper abstractions."""
 
-from typing import Dict, List, Protocol, Tuple, Any
+from typing import Dict, List, Protocol, Any
 
 from .models import WorldSummary, ImageDownloadResult
 
@@ -25,7 +25,12 @@ class ImageDownloader(Protocol):
     """Protocol for image downloader implementations."""
 
     async def download_image(
-        self, file_id: str, version: int, download_url: str, expected_md5: str, expected_size: int
+        self,
+        file_id: str,
+        version: int,
+        download_url: str,
+        expected_md5: str,
+        expected_size: int,
     ) -> ImageDownloadResult:
         """Download and verify an image file using content-addressed storage.
 

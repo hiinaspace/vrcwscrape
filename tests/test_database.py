@@ -12,7 +12,6 @@ from vrchat_scraper.database import (
     FileMetadata,
     ImageContent,
     ScrapeStatus,
-    DownloadStatus,
     ImageContentState,
 )
 from vrchat_scraper.models import FileReference, FileType
@@ -537,11 +536,11 @@ async def test_get_pending_image_downloads(test_db):
             {
                 "version": 1,
                 "file": {
-                    "url": "download_url", 
+                    "url": "download_url",
                     "md5": "abc123",
                     "fileName": "test.png",
-                    "sizeInBytes": 100000
-                }
+                    "sizeInBytes": 100000,
+                },
             }
         ]
     }
@@ -593,11 +592,11 @@ async def test_update_image_download_success(test_db):
             {
                 "version": 1,
                 "file": {
-                    "url": "download_url", 
+                    "url": "download_url",
                     "md5": "abc123",
                     "fileName": "test.png",
-                    "sizeInBytes": 100000
-                }
+                    "sizeInBytes": 100000,
+                },
             }
         ]
     }
@@ -615,9 +614,7 @@ async def test_update_image_download_success(test_db):
     # Verify update
     async with test_db.async_session() as session:
         result = await session.execute(
-            select(ImageContent).where(
-                ImageContent.file_id == "file_image_1"
-            )
+            select(ImageContent).where(ImageContent.file_id == "file_image_1")
         )
         image_content = result.scalar_one()
         assert image_content.state == ImageContentState.CONFIRMED
@@ -658,11 +655,11 @@ async def test_update_image_download_error(test_db):
             {
                 "version": 1,
                 "file": {
-                    "url": "download_url", 
+                    "url": "download_url",
                     "md5": "abc123",
                     "fileName": "test.png",
-                    "sizeInBytes": 100000
-                }
+                    "sizeInBytes": 100000,
+                },
             }
         ]
     }
@@ -936,11 +933,11 @@ async def test_upsert_world_with_files_existing_world_images_not_duplicated(test
             {
                 "version": 1,
                 "file": {
-                    "url": "download_url", 
+                    "url": "download_url",
                     "md5": "abc123",
                     "fileName": "test.png",
-                    "sizeInBytes": 100000
-                }
+                    "sizeInBytes": 100000,
+                },
             }
         ]
     }
@@ -1046,11 +1043,11 @@ async def test_get_pending_image_downloads_only_success_files(test_db):
             {
                 "version": 1,
                 "file": {
-                    "url": "download_url", 
+                    "url": "download_url",
                     "md5": "abc123",
                     "fileName": "success.png",
-                    "sizeInBytes": 100000
-                }
+                    "sizeInBytes": 100000,
+                },
             }
         ]
     }
