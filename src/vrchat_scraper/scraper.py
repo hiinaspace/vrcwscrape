@@ -154,6 +154,20 @@ class VRChatScraper:
         else:
             return "unknown_http_error"
 
+    def _is_rate_limiting_error(self, status_code: int) -> bool:
+        """Determine if an HTTP status code indicates rate limiting or server congestion.
+
+        Returns True for errors that should trigger rate limiter backoff:
+        - 429: Explicit rate limit signal
+        - 500/502/503: Server errors indicating overload
+
+        Returns False for benign errors that don't indicate congestion:
+        - 404/410: Resource not found/deleted (expected in archival context)
+        - 401/403: Authentication/authorization issues
+        - Other 4xx: Client errors, not server capacity issues
+        """
+        return status_code in [429, 500, 502, 503]
+
     async def _scrape_recent_worlds_periodically(self):
         """Discover new worlds via recent API at a fixed interval."""
         while not self._shutdown_event.is_set():
@@ -292,10 +306,10 @@ class VRChatScraper:
             raise
 
         except httpx.HTTPStatusError as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-
-            # Record circuit breaker error for server errors and rate limits
-            if e.response.status_code in [429, 500, 502, 503]:
+            # Only report rate-limiting errors to rate limiter
+            # Benign errors (404, 401, 403) don't indicate API congestion
+            if self._is_rate_limiting_error(e.response.status_code):
+                self.api_rate_limiter.on_error(request_id, self._time_source())
                 self.api_circuit_breaker.on_error(self._time_source())
 
             # Enhanced error tracking with structured context

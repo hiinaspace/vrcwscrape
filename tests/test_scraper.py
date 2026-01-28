@@ -541,7 +541,7 @@ async def test_scrape_world_handles_authentication_error(
 async def test_scrape_world_handles_404_deleted_world(
     stub_scraper, test_database, fake_api_client
 ):
-    """Test that 404 errors mark world as deleted."""
+    """Test that 404 errors mark world as deleted and don't trigger rate limiter penalty."""
     # Arrange
     world_id = "wrld_deleted_test"
     await test_database.upsert_world(
@@ -549,12 +549,17 @@ async def test_scrape_world_handles_404_deleted_world(
     )
 
     import httpx
+    from unittest.mock import Mock
 
     error_response = httpx.Response(404)
     fake_api_client.set_world_detail_error(
         world_id,
         httpx.HTTPStatusError("Not found", request=None, response=error_response),
     )
+
+    # Mock the rate limiter to verify on_error is NOT called
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
 
     # Act: Should handle gracefully
     await stub_scraper._scrape_world_task(world_id)
@@ -568,13 +573,17 @@ async def test_scrape_world_handles_404_deleted_world(
         world_record = result.scalar_one()
         assert world_record.scrape_status == "DELETED"
 
+    # Assert: Rate limiter on_error should NOT be called for 404
+    stub_scraper.api_rate_limiter.on_error.assert_not_called()
+    stub_scraper.api_circuit_breaker.on_error.assert_not_called()
+
 
 @pytest.mark.asyncio
 @async_timeout(5.0)
 async def test_scrape_world_handles_other_http_errors(
     stub_scraper, test_database, fake_api_client
 ):
-    """Test that other HTTP errors are handled gracefully."""
+    """Test that rate-limiting HTTP errors (500) trigger rate limiter and circuit breaker."""
     # Arrange
     world_id = "wrld_http_error_test"
     await test_database.upsert_world(
@@ -582,6 +591,7 @@ async def test_scrape_world_handles_other_http_errors(
     )
 
     import httpx
+    from unittest.mock import Mock
 
     error_response = httpx.Response(500)
     fake_api_client.set_world_detail_error(
@@ -589,12 +599,20 @@ async def test_scrape_world_handles_other_http_errors(
         httpx.HTTPStatusError("Server error", request=None, response=error_response),
     )
 
+    # Mock the rate limiter and circuit breaker to verify on_error IS called
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
+
     # Act: Should handle gracefully
     await stub_scraper._scrape_world_task(world_id)
 
     # Assert: World should remain PENDING (not updated)
     pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
     assert world_id in pending_worlds
+
+    # Assert: Rate limiter and circuit breaker on_error SHOULD be called for 500
+    stub_scraper.api_rate_limiter.on_error.assert_called_once()
+    stub_scraper.api_circuit_breaker.on_error.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -686,3 +704,203 @@ async def test_process_pending_worlds_batch_empty_database(stub_scraper):
 
     # Assert: Should return 0 for no worlds processed
     assert processed_count == 0
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_404_does_not_trigger_rate_limiter_penalty(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 404 errors don't trigger rate limiter penalty but mark world as deleted."""
+    # Arrange
+    world_id = "wrld_404_no_penalty"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+    from unittest.mock import Mock
+
+    error_response = httpx.Response(404)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError("Not found", request=None, response=error_response),
+    )
+
+    # Mock the rate limiter to track calls
+    stub_scraper.api_rate_limiter.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: on_error should NOT have been called
+    stub_scraper.api_rate_limiter.on_error.assert_not_called()
+
+    # Verify world was marked as DELETED
+    async with test_database.async_session() as session:
+        from src.vrchat_scraper.database import World
+        from sqlalchemy import select
+
+        result = await session.execute(select(World).where(World.world_id == world_id))
+        world_record = result.scalar_one()
+        assert world_record.scrape_status == "DELETED"
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_429_triggers_rate_limiter_penalty(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 429 errors trigger both rate limiter and circuit breaker penalties."""
+    # Arrange
+    world_id = "wrld_429_penalty"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+    from unittest.mock import Mock
+
+    error_response = httpx.Response(429)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError(
+            "Too many requests", request=None, response=error_response
+        ),
+    )
+
+    # Mock both rate limiter and circuit breaker to track calls
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: both on_error methods SHOULD have been called
+    stub_scraper.api_rate_limiter.on_error.assert_called_once()
+    stub_scraper.api_circuit_breaker.on_error.assert_called_once()
+
+    # Verify world remains PENDING for retry
+    pending_worlds = await test_database.get_worlds_to_scrape(limit=10)
+    assert world_id in pending_worlds
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_401_auth_errors_dont_trigger_rate_limiter(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 401/403 auth errors don't trigger rate limiter penalty."""
+    # Arrange
+    world_id = "wrld_401_no_penalty"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+    from unittest.mock import Mock
+
+    # Test 401 error
+    error_response = httpx.Response(401)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError("Unauthorized", request=None, response=error_response),
+    )
+
+    # Mock the rate limiter to track calls
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: on_error should NOT have been called for 401
+    stub_scraper.api_rate_limiter.on_error.assert_not_called()
+    stub_scraper.api_circuit_breaker.on_error.assert_not_called()
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_403_errors_dont_trigger_rate_limiter(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 403 Forbidden errors don't trigger rate limiter penalty."""
+    # Arrange
+    world_id = "wrld_403_no_penalty"
+    await test_database.upsert_world(
+        world_id, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+    from unittest.mock import Mock
+
+    error_response = httpx.Response(403)
+    fake_api_client.set_world_detail_error(
+        world_id,
+        httpx.HTTPStatusError("Forbidden", request=None, response=error_response),
+    )
+
+    # Mock the rate limiter to track calls
+    stub_scraper.api_rate_limiter.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id)
+
+    # Assert: on_error should NOT have been called
+    stub_scraper.api_rate_limiter.on_error.assert_not_called()
+
+
+@pytest.mark.asyncio
+@async_timeout(5.0)
+async def test_502_503_trigger_rate_limiter_penalty(
+    stub_scraper, test_database, fake_api_client
+):
+    """Test that 502/503 server errors trigger rate limiter penalty."""
+    # Arrange - test 502
+    world_id_502 = "wrld_502_penalty"
+    await test_database.upsert_world(
+        world_id_502, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    import httpx
+    from unittest.mock import Mock
+
+    error_response = httpx.Response(502)
+    fake_api_client.set_world_detail_error(
+        world_id_502,
+        httpx.HTTPStatusError("Bad Gateway", request=None, response=error_response),
+    )
+
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id_502)
+
+    # Assert: both should be called for 502
+    stub_scraper.api_rate_limiter.on_error.assert_called_once()
+    stub_scraper.api_circuit_breaker.on_error.assert_called_once()
+
+    # Arrange - test 503
+    world_id_503 = "wrld_503_penalty"
+    await test_database.upsert_world(
+        world_id_503, {"discovered_at": datetime.utcnow().isoformat()}, status="PENDING"
+    )
+
+    error_response = httpx.Response(503)
+    fake_api_client.set_world_detail_error(
+        world_id_503,
+        httpx.HTTPStatusError(
+            "Service Unavailable", request=None, response=error_response
+        ),
+    )
+
+    stub_scraper.api_rate_limiter.on_error = Mock()
+    stub_scraper.api_circuit_breaker.on_error = Mock()
+
+    # Act
+    await stub_scraper._scrape_world_task(world_id_503)
+
+    # Assert: both should be called for 503
+    stub_scraper.api_rate_limiter.on_error.assert_called_once()
+    stub_scraper.api_circuit_breaker.on_error.assert_called_once()
