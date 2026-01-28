@@ -55,7 +55,7 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
 
 - **Recent Worlds**: `GET /api/1/worlds?sort=updated`
   - Returns array of recently updated worlds (up to 1000)
-  - Used hourly to discover new/updated worlds
+  - Used periodically to discover new/updated worlds (default ~10 minutes)
 
 - **World Details**: `GET /api/1/worlds/{world_id}`
   - Returns complete metadata for a single world
@@ -144,7 +144,7 @@ VRChat APIs → Rate Limiters → Multi-Phase Scraper → DoltDB
 
 ### Design Decisions
 
-- **JSON Storage**: Store mostly-raw API responses in JSON columns, removing only ephemeral fields
+- **JSON Storage**: Store raw API responses in JSON columns and separately extract metrics
 - **Ephemeral Fields**: Extract time-varying fields (favorites, heat, popularity, occupants, visits) into separate metrics table
 - **Two-Phase File Handling**: File metadata scraped separately from world metadata, enabling distributed processing
 - **Transactional Consistency**: World metadata and associated file_metadata rows updated atomically
@@ -183,7 +183,7 @@ The scraper uses two separate components for request control:
 
 ### World Discovery
 
-1. **Hourly Recent Scrape**: Query `/api/1/worlds?sort=updated` to find new/updated worlds
+1. **Periodic Recent Scrape**: Query `/api/1/worlds?sort=updated` to find new/updated worlds
 2. **Bootstrap Data**: Import ~237k existing world IDs from external dataset
 3. **Future Extensions**: Could use random endpoint or search API if needed
 
@@ -213,13 +213,15 @@ The scraper uses two separate components for request control:
 
 ### Rescrape Scheduling
 
-Heuristic based on world age and activity:
+Heuristic based on most recent metrics snapshot:
 
-- **New Worlds** (< 1 week old): Daily scrapes
-- **Recent Worlds** (1-4 weeks): Weekly scrapes
-- **Active Worlds** (< 1 year, regular visitors): Monthly scrapes
-- **Inactive Worlds** (> 1 year, few visitors): Yearly scrapes
+- **Active Worlds** (high heat/popularity or high occupants): Daily scrapes
+- **Warm Worlds** (moderate heat/popularity): Weekly scrapes
+- **Cold Worlds** (low but nonzero heat/popularity): Monthly scrapes
+- **Dormant Worlds** (near-zero heat/popularity): Every ~6 months
 - **Minimum Interval**: 24 hours between scrapes of same world
+
+Scheduling uses the latest row in `world_metrics` (per world) to determine cadence and avoids high-frequency writes to the `worlds` table. Worlds without metrics history are eligible for immediate scrape.
 
 ### File and Image Handling
 

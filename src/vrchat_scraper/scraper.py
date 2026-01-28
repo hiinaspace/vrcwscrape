@@ -155,13 +155,13 @@ class VRChatScraper:
             return "unknown_http_error"
 
     async def _scrape_recent_worlds_periodically(self):
-        """Discover new worlds via recent API every hour."""
+        """Discover new worlds via recent API at a fixed interval."""
         while not self._shutdown_event.is_set():
             try:
                 # Launch recent worlds discovery task
                 await self._scrape_recent_worlds_task()
 
-                # Wait an hour before next discovery
+                # Wait before next discovery (configurable interval)
                 # Use injected sleep function for testability
                 try:
                     await asyncio.wait_for(

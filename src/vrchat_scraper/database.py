@@ -6,15 +6,15 @@ from typing import Dict, List, Optional, Tuple
 
 import sqlalchemy
 from sqlalchemy import (
+    JSON,
     DateTime,
+    ForeignKey,
     Integer,
     String,
+    Text,
+    delete,
     func,
     select,
-    JSON,
-    Text,
-    ForeignKey,
-    delete,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -182,36 +182,51 @@ class Database:
                 # Full scrapes have rich metadata (name, description, etc.)
                 is_discovery = self._is_discovery_metadata(metadata)
 
-                if is_discovery and existing_world.world_metadata:
-                    # Merge discovery metadata with existing detailed metadata
-                    merged_metadata = existing_world.world_metadata.copy()
-                    merged_metadata.update(metadata)
-                    existing_world.world_metadata = merged_metadata
+                    if is_discovery and existing_world.world_metadata:
+                        # Merge discovery metadata with existing detailed metadata
+                        merged_metadata = existing_world.world_metadata.copy()
+                        merged_metadata.update(metadata)
+                        existing_world.world_metadata = merged_metadata
 
-                    # For discovery operations, check if we need to rescrape
-                    world_updated_at = merged_metadata.get("updated_at")
-                    if world_updated_at:
-                        # If we have updated_at info, only set status to PENDING if world was updated after our last scrape
-                        should_rescrape = self._should_rescrape_world(
-                            world_updated_at, existing_world.last_scrape_time
-                        )
-                        if should_rescrape:
+                        # For discovery operations, check if we need to rescrape
+                        world_updated_at = merged_metadata.get("updated_at")
+                        if world_updated_at:
+                            # If we have updated_at info, only set status to PENDING if world was updated after our last scrape
+                            should_rescrape = self._should_rescrape_world(
+                                world_updated_at, existing_world.last_scrape_time
+                            )
+                            if should_rescrape:
+                                existing_world.scrape_status = ScrapeStatus(status)
+                                # Don't update last_scrape_time for discovery - that's only for actual scraping
+                        else:
+                            # If no updated_at info available, fall back to old behavior (always set status)
                             existing_world.scrape_status = ScrapeStatus(status)
-                            # Don't update last_scrape_time for discovery - that's only for actual scraping
-                    else:
-                        # If no updated_at info available, fall back to old behavior (always set status)
-                        existing_world.scrape_status = ScrapeStatus(status)
+                        updated_at = self._parse_world_datetime(
+                            merged_metadata.get("updated_at")
+                        )
+                        if updated_at and existing_world.update_date != updated_at:
+                            existing_world.update_date = updated_at
 
-                else:
-                    # Full scrape or no existing metadata - replace completely and update status
-                    existing_world.world_metadata = metadata
-                    existing_world.last_scrape_time = datetime.utcnow()
-                    existing_world.scrape_status = ScrapeStatus(status)
+                    else:
+                        # Full scrape or no existing metadata - replace completely and update status
+                        existing_world.world_metadata = metadata
+                        existing_world.last_scrape_time = datetime.utcnow()
+                        existing_world.scrape_status = ScrapeStatus(status)
+                        created_at = self._parse_world_datetime(metadata.get("created_at"))
+                        updated_at = self._parse_world_datetime(metadata.get("updated_at"))
+                        if created_at:
+                            existing_world.publish_date = created_at
+                        if updated_at:
+                            existing_world.update_date = updated_at
             else:
                 # Create new world
+                created_at = self._parse_world_datetime(metadata.get("created_at"))
+                updated_at = self._parse_world_datetime(metadata.get("updated_at"))
                 new_world = World(
                     world_id=world_id,
                     world_metadata=metadata,
+                    publish_date=created_at,
+                    update_date=updated_at,
                     last_scrape_time=datetime.utcnow(),
                     scrape_status=ScrapeStatus(status),
                 )
@@ -255,17 +270,32 @@ class Database:
                         else:
                             # If no updated_at info available, fall back to old behavior (always set status)
                             existing_world.scrape_status = ScrapeStatus(status)
+                        updated_at = self._parse_world_datetime(
+                            merged_metadata.get("updated_at")
+                        )
+                        if updated_at and existing_world.update_date != updated_at:
+                            existing_world.update_date = updated_at
 
                     else:
                         # Full scrape or no existing metadata - replace completely and update status
                         existing_world.world_metadata = metadata
                         existing_world.last_scrape_time = datetime.utcnow()
                         existing_world.scrape_status = ScrapeStatus(status)
+                        created_at = self._parse_world_datetime(metadata.get("created_at"))
+                        updated_at = self._parse_world_datetime(metadata.get("updated_at"))
+                        if created_at:
+                            existing_world.publish_date = created_at
+                        if updated_at:
+                            existing_world.update_date = updated_at
                 else:
                     # Create new world
+                    created_at = self._parse_world_datetime(metadata.get("created_at"))
+                    updated_at = self._parse_world_datetime(metadata.get("updated_at"))
                     new_world = World(
                         world_id=world_id,
                         world_metadata=metadata,
+                        publish_date=created_at,
+                        update_date=updated_at,
                         last_scrape_time=datetime.utcnow(),
                         scrape_status=ScrapeStatus(status),
                     )
@@ -398,6 +428,23 @@ class Database:
 
             return days_diff, hours_diff
 
+    def _parse_world_datetime(self, value) -> Optional[datetime]:
+        """Parse world timestamps from VRChat API payloads."""
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                from dateutil import parser
+
+                dt = parser.isoparse(value)
+            except Exception:
+                return None
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+
     async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
         """Get world IDs that need scraping based on strategy."""
         async with self.async_session() as session:
@@ -419,23 +466,79 @@ class Database:
                 remaining = limit - len(world_ids)
                 now = datetime.utcnow()
 
-                # Calculate time differences and build rescrape conditions
-                age_days_expr = days_diff(now, World.publish_date)
-                hours_since_scrape_expr = hours_diff(now, World.last_scrape_time)
+                # Determine last metrics time and cadence tiers from latest metrics
+                latest_metrics_time = (
+                    select(
+                        WorldMetrics.world_id.label("world_id"),
+                        func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
+                    )
+                    .group_by(WorldMetrics.world_id)
+                    .subquery()
+                )
+                latest_metrics = (
+                    select(
+                        WorldMetrics.world_id.label("world_id"),
+                        WorldMetrics.scrape_time.label("last_metrics_time"),
+                        WorldMetrics.heat.label("heat"),
+                        WorldMetrics.popularity.label("popularity"),
+                        WorldMetrics.occupants.label("occupants"),
+                    )
+                    .join(
+                        latest_metrics_time,
+                        and_(
+                            WorldMetrics.world_id == latest_metrics_time.c.world_id,
+                            WorldMetrics.scrape_time
+                            == latest_metrics_time.c.last_metrics_time,
+                        ),
+                    )
+                    .subquery()
+                )
 
-                rescrape_conditions = or_(
-                    and_(age_days_expr < 7, hours_since_scrape_expr >= 24),
-                    and_(age_days_expr < 30, hours_since_scrape_expr >= 168),
-                    and_(age_days_expr < 365, hours_since_scrape_expr >= 720),
-                    hours_since_scrape_expr >= 8760,
+                cadence_days_expr = sqlalchemy.case(
+                    (
+                        or_(
+                            latest_metrics.c.heat >= 50,
+                            latest_metrics.c.popularity >= 50,
+                            latest_metrics.c.occupants >= 25,
+                        ),
+                        1,
+                    ),
+                    (
+                        or_(
+                            latest_metrics.c.heat >= 10,
+                            latest_metrics.c.popularity >= 10,
+                            latest_metrics.c.occupants >= 5,
+                        ),
+                        7,
+                    ),
+                    (
+                        or_(
+                            latest_metrics.c.heat > 0,
+                            latest_metrics.c.popularity > 0,
+                            latest_metrics.c.occupants > 0,
+                        ),
+                        30,
+                    ),
+                    else_=180,
+                )
+
+                days_since_metrics_expr = days_diff(
+                    now, latest_metrics.c.last_metrics_time
+                )
+                due_for_metrics = or_(
+                    latest_metrics.c.last_metrics_time.is_(None),
+                    days_since_metrics_expr >= cadence_days_expr,
                 )
 
                 rescrape_stmt = (
                     select(World.world_id)
+                    .outerjoin(
+                        latest_metrics, latest_metrics.c.world_id == World.world_id
+                    )
                     .where(
                         and_(
                             World.scrape_status == ScrapeStatus.SUCCESS,
-                            rescrape_conditions,
+                            due_for_metrics,
                         )
                     )
                     .order_by(random_func)
@@ -467,13 +570,28 @@ class Database:
                 now = datetime.utcnow()
 
                 if existing_world:
-                    existing_world.world_metadata = metadata
-                    existing_world.last_scrape_time = now
-                    existing_world.scrape_status = ScrapeStatus(status)
+                    metadata_changed = existing_world.world_metadata != metadata
+                    if metadata_changed:
+                        existing_world.world_metadata = metadata
+                        existing_world.last_scrape_time = now
+                        existing_world.scrape_status = ScrapeStatus(status)
+                    elif existing_world.scrape_status != ScrapeStatus(status):
+                        existing_world.scrape_status = ScrapeStatus(status)
+
+                    created_at = self._parse_world_datetime(metadata.get("created_at"))
+                    updated_at = self._parse_world_datetime(metadata.get("updated_at"))
+                    if created_at and existing_world.publish_date != created_at:
+                        existing_world.publish_date = created_at
+                    if updated_at and existing_world.update_date != updated_at:
+                        existing_world.update_date = updated_at
                 else:
+                    created_at = self._parse_world_datetime(metadata.get("created_at"))
+                    updated_at = self._parse_world_datetime(metadata.get("updated_at"))
                     new_world = World(
                         world_id=world_id,
                         world_metadata=metadata,
+                        publish_date=created_at,
+                        update_date=updated_at,
                         last_scrape_time=now,
                         scrape_status=ScrapeStatus(status),
                     )

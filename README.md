@@ -27,8 +27,8 @@ be a nice archival copy of the public world metadata, for when that happens.
 - `image_content`: sha256 hashes of the latest version of the full world images
   - the scraper also downloads the full images to calculate these, but they're too big to store in this database directly.
   - I'll provide some way to get copies of the full images at some point, as addressed by these hashes.
-- `world_metrics`: Append-only metrics of dynamic world metadata (visits, favorite count, popularity, etc)
-  - these are also available in the dolt history, but it seemed nice to have a separate table as well.
+- `world_metrics`: append-only metrics snapshots of dynamic world metadata (visits, favorite count, heat, popularity, etc)
+  - metrics are re-scraped on a cadence based on recent heat/popularity, with a minimum of daily and a maximum of ~6 months.
 
 ## Excludes
 
@@ -43,8 +43,8 @@ be a nice archival copy of the public world metadata, for when that happens.
 
 ## Scraper
 
-The scraper periodically fetches new or updated worlds from the [SearchWorld API](https://vrchat.community/openapi/search-worlds) and scrapes any related file metadata and images.
-It also periodically rescrapes existing worlds periodically to get updated metrics.
+The scraper periodically fetches recently updated worlds from the [Recent Worlds API](https://vrchatapi.github.io/docs/api#recent-worlds) and scrapes any related file metadata and images.
+It rescrapes existing worlds on a cadence derived from their latest metrics (heat/popularity/occupants), with a daily minimum and a multi-month maximum.
 
 The [DESIGN.md](DESIGN.md) file has more details on the design and implementation of the scraper, as
 slopped up by claude.
