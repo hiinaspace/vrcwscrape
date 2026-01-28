@@ -7,7 +7,6 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import marimo as mo
-    import polars as pl
     import plotly.express as px
     from pathlib import Path
 
@@ -195,7 +194,10 @@ def _(metrics_path, mo, weeks_back_slider, worlds_path):
 
 @app.cell
 def _(metrics_path, mo, weekly_top10_df, weeks_back_slider, worlds_path):
-    mo.stop(len(weekly_top10_df) == 0, mo.md("No weekly data available for the selected window."))
+    mo.stop(
+        len(weekly_top10_df) == 0,
+        mo.md("No weekly data available for the selected window."),
+    )
     weekly_series_df = mo.sql(
         f"""
         WITH base AS (
@@ -262,7 +264,11 @@ def _(px, weekly_series_df):
         y="weekly_visits",
         color="label",
         title="Weekly visits for worlds that made the top 10",
-        labels={"week_start": "Week", "weekly_visits": "Weekly visits", "label": "World"},
+        labels={
+            "week_start": "Week",
+            "weekly_visits": "Weekly visits",
+            "label": "World",
+        },
         markers=True,
     )
     weekly_series_fig.update_layout(
