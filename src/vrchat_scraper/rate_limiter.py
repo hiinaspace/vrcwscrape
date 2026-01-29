@@ -175,10 +175,6 @@ class BBRRateLimiter:
         Returns the seconds to wait before sending the next request. 0.0 means
         the request can be sent immediately.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         self._update_state_machine(now)
 
         time_since_last = now - self._last_send_time
@@ -195,19 +191,6 @@ class BBRRateLimiter:
         inflight_cap = max(self._min_pipe_size, inflight_target * 2)
         if self.inflight >= inflight_cap:
             delay = max(delay, self.min_latency / 2)
-            logger.debug(
-                f"[RL {self._name}] Inflight cap reached: inflight={self.inflight}, "
-                f"cap={inflight_cap:.1f}, adding delay={self.min_latency / 2:.3f}s"
-            )
-
-        # Log if delay is very small but non-zero (indicates potential busy-wait)
-        if 0 < delay < 0.02:
-            logger.debug(
-                f"[RL {self._name}] Small delay: delay={delay:.6f}s, "
-                f"time_since_last={time_since_last:.6f}s, required_delay={required_delay:.6f}s, "
-                f"pacing_rate={pacing_rate:.2f}/s, inflight={self.inflight}, "
-                f"inflight_target={inflight_target:.1f}, last_send={self._last_send_time:.6f}"
-            )
 
         # Update observability metrics
         if delay > 0:
@@ -259,10 +242,6 @@ class BBRRateLimiter:
         Records a failed request, applying a short-term brake on the rate.
         This signals transient congestion.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         if request_id in self._inflight_requests:
             self._inflight_requests.pop(request_id)
             self.inflight = max(0, self.inflight - 1)
@@ -271,15 +250,8 @@ class BBRRateLimiter:
 
         # Apply the pessimistic short-term brake.
         factor = 0.8 if self.state == BbrState.PROBING_UP else 0.9
-        old_cap = self._short_term_rate_cap
         self._short_term_rate_cap = min(
             self._short_term_rate_cap, effective_rate * factor
-        )
-
-        logger.warning(
-            f"[RL {self._name}] on_error: short_term_rate_cap {old_cap:.2f} -> {self._short_term_rate_cap:.2f}, "
-            f"effective_rate={effective_rate:.2f}, factor={factor}, state={self.state.name}, "
-            f"request_id={request_id}"
         )
 
         # Update observability metrics
@@ -303,21 +275,9 @@ class BBRRateLimiter:
 
     def _update_state_machine(self, now: float):
         if now > self._last_probe_cycle_start + self._probe_cycle_duration:
-            import logging
-
-            logger = logging.getLogger(__name__)
-
             self._last_probe_cycle_start = now
-            old_cap = self._short_term_rate_cap
             # A new probe cycle is a chance to be optimistic again. Remove the brake.
             self._short_term_rate_cap = float("inf")
-
-            if old_cap != float("inf"):
-                logger.info(
-                    f"[RL {self._name}] Probe cycle reset: "
-                    f"short_term_rate_cap {old_cap:.2f} -> inf, "
-                    f"state: {self.state.name}"
-                )
 
             if self.state == BbrState.CRUISING:
                 self._change_state(BbrState.PROBING_UP)

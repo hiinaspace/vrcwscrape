@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 import logfire
 
-from .circuit_breaker import CircuitBreaker, CircuitBreakerState
+from .circuit_breaker import CircuitBreaker
 from .database import Database
 from .http_client import AuthenticationError
 from .models import WorldDetail
@@ -245,57 +245,12 @@ class VRChatScraper:
                 f"state: {cb_state}, backoff: {cb_backoff:.1f}s)"
             )
 
-        total_wait = 0.0
-        iteration = 0
-
-        while True:
-            iteration += 1
-
-            # Atomically check delay and conditionally proceed
-            # This must be atomic to prevent race conditions
-            async with self.api_lock:
+        async with self.api_lock:
+            while True:
                 delay = await self._get_api_request_delay()
-
-                # If delay is small enough, proceed immediately
-                if delay < 0.01:
+                if delay <= 0:
                     break
-
-                # If delay is too large, give up without sleeping
-                cb_state = self.api_circuit_breaker.state
-                max_wait = 300.0 if cb_state == CircuitBreakerState.CLOSED else 60.0
-
-                if total_wait + delay > max_wait:
-                    cb_backoff = self.api_circuit_breaker._backoff_duration
-                    rl_rate = self.api_rate_limiter._get_effective_rate()
-                    rl_inflight = self.api_rate_limiter.inflight
-                    raise asyncio.TimeoutError(
-                        f"Wait time exceeded {max_wait:.0f}s: "
-                        f"total_wait={total_wait:.1f}s, next_delay={delay:.1f}s, iterations={iteration}, "
-                        f"CB[state={cb_state.name}, backoff={cb_backoff:.1f}s], "
-                        f"RL[rate={rl_rate:.2f}/s, inflight={rl_inflight}]"
-                    )
-
-                # For reasonable delays, sleep a shorter time and re-check
-                # This prevents holding the lock during sleep while avoiding race conditions
-                # Sleep for at most 100ms before re-checking
-                sleep_time = min(delay, 0.1)
-
-                # Log if we're waiting for circuit breaker OR if we're doing many iterations
-                if delay > 5.0 or (iteration > 10 and iteration % 50 == 0):
-                    cb_backoff = self.api_circuit_breaker._backoff_duration
-                    rl_rate = self.api_rate_limiter._get_effective_rate()
-                    rl_inflight = self.api_rate_limiter.inflight
-                    delay_str = f"{delay:.6f}s" if delay < 0.1 else f"{delay:.1f}s"
-                    logger.info(
-                        f"Waiting {delay_str} for API (iteration {iteration}, "
-                        f"total_wait: {total_wait:.1f}s, CB: {cb_state.name}, "
-                        f"RL rate: {rl_rate:.2f}/s, inflight: {rl_inflight})"
-                    )
-
-            # Sleep WITHOUT holding lock, but only for a short time
-            # This allows other tasks to make progress while avoiding long lock holds
-            await self._sleep_func(sleep_time)
-            total_wait += sleep_time
+                await self._sleep_func(delay)
 
     @logfire.instrument("wait_for_iamge_ready")
     async def _wait_for_image_ready(self):
@@ -312,53 +267,12 @@ class VRChatScraper:
                 f"state: {cb_state}, backoff: {cb_backoff:.1f}s)"
             )
 
-        total_wait = 0.0
-        iteration = 0
-
-        while True:
-            iteration += 1
-
-            # Atomically check delay and conditionally proceed
-            async with self.image_lock:
+        async with self.image_lock:
+            while True:
                 delay = await self._get_image_request_delay()
-
-                # If delay is small enough, proceed immediately
-                if delay < 0.01:
+                if delay <= 0:
                     break
-
-                # If delay is too large, give up without sleeping
-                cb_state = self.image_circuit_breaker.state
-                max_wait = 300.0 if cb_state == CircuitBreakerState.CLOSED else 60.0
-
-                if total_wait + delay > max_wait:
-                    cb_backoff = self.image_circuit_breaker._backoff_duration
-                    rl_rate = self.image_rate_limiter._get_effective_rate()
-                    rl_inflight = self.image_rate_limiter.inflight
-                    raise asyncio.TimeoutError(
-                        f"Wait time exceeded {max_wait:.0f}s: "
-                        f"total_wait={total_wait:.1f}s, next_delay={delay:.1f}s, "
-                        f"CB[state={cb_state.name}, backoff={cb_backoff:.1f}s], "
-                        f"RL[rate={rl_rate:.2f}/s, inflight={rl_inflight}]"
-                    )
-
-                # Sleep for at most 100ms before re-checking
-                sleep_time = min(delay, 0.1)
-
-                # Log if we're waiting for circuit breaker
-                if delay > 5.0 or (iteration > 10 and iteration % 50 == 0):
-                    cb_backoff = self.image_circuit_breaker._backoff_duration
-                    rl_rate = self.image_rate_limiter._get_effective_rate()
-                    rl_inflight = self.image_rate_limiter.inflight
-                    delay_str = f"{delay:.6f}s" if delay < 0.1 else f"{delay:.1f}s"
-                    logger.info(
-                        f"Waiting {delay_str} for image API (iteration {iteration}, "
-                        f"total_wait: {total_wait:.1f}s, CB: {cb_state.name}, "
-                        f"RL rate: {rl_rate:.2f}/s, inflight: {rl_inflight})"
-                    )
-
-            # Sleep WITHOUT holding lock, but only for a short time
-            await self._sleep_func(sleep_time)
-            total_wait += sleep_time
+                await self._sleep_func(delay)
 
     async def _execute_api_call(
         self,
