@@ -106,6 +106,10 @@ class CircuitBreaker:
 
     def on_error(self, now: float):
         """Records a failure, potentially tripping the breaker to the OPEN state."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         self._consecutive_errors += 1
         self._consecutive_errors_gauge.set(
             self._consecutive_errors, {"instance": self._name}
@@ -118,6 +122,11 @@ class CircuitBreaker:
         )
 
         if not should_trip:
+            logger.debug(
+                f"Circuit breaker [{self._name}] error recorded "
+                f"({self._consecutive_errors}/{self._error_threshold}), "
+                f"state: {self.state.name}"
+            )
             return
 
         # If we are re-tripping from HALF_OPEN, we double the backoff for the next period.
@@ -127,6 +136,17 @@ class CircuitBreaker:
             )
             self._backoff_duration_gauge.set(
                 self._backoff_duration, {"instance": self._name}
+            )
+            logger.warning(
+                f"Circuit breaker [{self._name}] TRIPPED from HALF_OPEN -> OPEN "
+                f"(backoff doubled to {self._backoff_duration:.1f}s)"
+            )
+        else:
+            logger.warning(
+                f"Circuit breaker [{self._name}] TRIPPED from {self.state.name} -> OPEN "
+                f"(consecutive errors: {self._consecutive_errors}, "
+                f"threshold: {self._error_threshold}, "
+                f"backoff: {self._backoff_duration:.1f}s)"
             )
 
         # Now, transition to OPEN state and record the time.

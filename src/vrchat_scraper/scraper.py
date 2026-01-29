@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 import logfire
 
-from .circuit_breaker import CircuitBreaker
+from .circuit_breaker import CircuitBreaker, CircuitBreakerState
 from .database import Database
 from .http_client import AuthenticationError
 from .models import WorldDetail
@@ -233,22 +233,132 @@ class VRChatScraper:
     @logfire.instrument("wait_for_api_ready")
     async def _wait_for_api_ready(self):
         """Wait until API requests are allowed by rate limiter and circuit breaker."""
-        async with self.api_lock:
-            while True:
+        # Check circuit breaker state before trying to avoid wasting time
+        # Only fail fast if backoff is very long (>60s)
+        now = self._time_source()
+        cb_delay = self.api_circuit_breaker.get_delay_until_proceed(now)
+        if cb_delay > 60.0:
+            cb_state = self.api_circuit_breaker.state.name
+            cb_backoff = self.api_circuit_breaker._backoff_duration
+            raise asyncio.TimeoutError(
+                f"Circuit breaker backoff too long ({cb_delay:.1f}s remaining, "
+                f"state: {cb_state}, backoff: {cb_backoff:.1f}s)"
+            )
+
+        total_wait = 0.0
+        iteration = 0
+
+        while True:
+            iteration += 1
+
+            # Atomically check delay and conditionally proceed
+            # This must be atomic to prevent race conditions
+            async with self.api_lock:
                 delay = await self._get_api_request_delay()
-                if delay <= 0:
+
+                # If delay is small enough, proceed immediately
+                if delay < 0.01:
                     break
-                await self._sleep_func(delay)
+
+                # If delay is too large, give up without sleeping
+                cb_state = self.api_circuit_breaker.state
+                max_wait = 300.0 if cb_state == CircuitBreakerState.CLOSED else 60.0
+
+                if total_wait + delay > max_wait:
+                    cb_backoff = self.api_circuit_breaker._backoff_duration
+                    rl_rate = self.api_rate_limiter._get_effective_rate()
+                    rl_inflight = self.api_rate_limiter.inflight
+                    raise asyncio.TimeoutError(
+                        f"Wait time exceeded {max_wait:.0f}s: "
+                        f"total_wait={total_wait:.1f}s, next_delay={delay:.1f}s, iterations={iteration}, "
+                        f"CB[state={cb_state.name}, backoff={cb_backoff:.1f}s], "
+                        f"RL[rate={rl_rate:.2f}/s, inflight={rl_inflight}]"
+                    )
+
+                # For reasonable delays, sleep a shorter time and re-check
+                # This prevents holding the lock during sleep while avoiding race conditions
+                # Sleep for at most 100ms before re-checking
+                sleep_time = min(delay, 0.1)
+
+                # Log if we're waiting for circuit breaker OR if we're doing many iterations
+                if delay > 5.0 or (iteration > 10 and iteration % 50 == 0):
+                    cb_backoff = self.api_circuit_breaker._backoff_duration
+                    rl_rate = self.api_rate_limiter._get_effective_rate()
+                    rl_inflight = self.api_rate_limiter.inflight
+                    delay_str = f"{delay:.6f}s" if delay < 0.1 else f"{delay:.1f}s"
+                    logger.info(
+                        f"Waiting {delay_str} for API (iteration {iteration}, "
+                        f"total_wait: {total_wait:.1f}s, CB: {cb_state.name}, "
+                        f"RL rate: {rl_rate:.2f}/s, inflight: {rl_inflight})"
+                    )
+
+            # Sleep WITHOUT holding lock, but only for a short time
+            # This allows other tasks to make progress while avoiding long lock holds
+            await self._sleep_func(sleep_time)
+            total_wait += sleep_time
 
     @logfire.instrument("wait_for_iamge_ready")
     async def _wait_for_image_ready(self):
         """Wait until image requests are allowed by rate limiter and circuit breaker."""
-        async with self.image_lock:
-            while True:
+        # Check circuit breaker state before trying to avoid wasting time
+        # Only fail fast if backoff is very long (>60s)
+        now = self._time_source()
+        cb_delay = self.image_circuit_breaker.get_delay_until_proceed(now)
+        if cb_delay > 60.0:
+            cb_state = self.image_circuit_breaker.state.name
+            cb_backoff = self.image_circuit_breaker._backoff_duration
+            raise asyncio.TimeoutError(
+                f"Image circuit breaker backoff too long ({cb_delay:.1f}s remaining, "
+                f"state: {cb_state}, backoff: {cb_backoff:.1f}s)"
+            )
+
+        total_wait = 0.0
+        iteration = 0
+
+        while True:
+            iteration += 1
+
+            # Atomically check delay and conditionally proceed
+            async with self.image_lock:
                 delay = await self._get_image_request_delay()
-                if delay <= 0:
+
+                # If delay is small enough, proceed immediately
+                if delay < 0.01:
                     break
-                await self._sleep_func(delay)
+
+                # If delay is too large, give up without sleeping
+                cb_state = self.image_circuit_breaker.state
+                max_wait = 300.0 if cb_state == CircuitBreakerState.CLOSED else 60.0
+
+                if total_wait + delay > max_wait:
+                    cb_backoff = self.image_circuit_breaker._backoff_duration
+                    rl_rate = self.image_rate_limiter._get_effective_rate()
+                    rl_inflight = self.image_rate_limiter.inflight
+                    raise asyncio.TimeoutError(
+                        f"Wait time exceeded {max_wait:.0f}s: "
+                        f"total_wait={total_wait:.1f}s, next_delay={delay:.1f}s, "
+                        f"CB[state={cb_state.name}, backoff={cb_backoff:.1f}s], "
+                        f"RL[rate={rl_rate:.2f}/s, inflight={rl_inflight}]"
+                    )
+
+                # Sleep for at most 100ms before re-checking
+                sleep_time = min(delay, 0.1)
+
+                # Log if we're waiting for circuit breaker
+                if delay > 5.0 or (iteration > 10 and iteration % 50 == 0):
+                    cb_backoff = self.image_circuit_breaker._backoff_duration
+                    rl_rate = self.image_rate_limiter._get_effective_rate()
+                    rl_inflight = self.image_rate_limiter.inflight
+                    delay_str = f"{delay:.6f}s" if delay < 0.1 else f"{delay:.1f}s"
+                    logger.info(
+                        f"Waiting {delay_str} for image API (iteration {iteration}, "
+                        f"total_wait: {total_wait:.1f}s, CB: {cb_state.name}, "
+                        f"RL rate: {rl_rate:.2f}/s, inflight: {rl_inflight})"
+                    )
+
+            # Sleep WITHOUT holding lock, but only for a short time
+            await self._sleep_func(sleep_time)
+            total_wait += sleep_time
 
     async def _execute_api_call(
         self,
@@ -289,8 +399,13 @@ class VRChatScraper:
             return result
 
         except AuthenticationError:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
+            now = self._time_source()
+            self.api_rate_limiter.on_error(request_id, now)
+            logger.warning(
+                f"[CB TRIGGER] Authentication error in {error_context}, "
+                f"triggering circuit breaker (request_id: {request_id})"
+            )
+            self.api_circuit_breaker.on_error(now)
 
             # Enhanced error tracking
             with logfire.span("authentication_error", error_context=error_context):
@@ -309,8 +424,25 @@ class VRChatScraper:
             # Only report rate-limiting errors to rate limiter
             # Benign errors (404, 401, 403) don't indicate API congestion
             if self._is_rate_limiting_error(e.response.status_code):
-                self.api_rate_limiter.on_error(request_id, self._time_source())
-                self.api_circuit_breaker.on_error(self._time_source())
+                now = self._time_source()
+                self.api_rate_limiter.on_error(request_id, now)
+                try:
+                    url = str(e.request.url)
+                except (AttributeError, RuntimeError):
+                    url = "unknown"
+                logger.warning(
+                    f"[CB TRIGGER] HTTP {e.response.status_code} in {error_context}, "
+                    f"triggering circuit breaker (request_id: {request_id}, url: {url})"
+                )
+                self.api_circuit_breaker.on_error(now)
+            else:
+                # Benign error (404, 401, 403) - request completed successfully from rate limiter perspective
+                # Record as success so inflight decrements properly
+                self.api_rate_limiter.on_success(request_id, self._time_source())
+                logger.debug(
+                    f"[CB SKIP] HTTP {e.response.status_code} in {error_context}, "
+                    f"NOT triggering circuit breaker (benign error, marked as success for rate limiter)"
+                )
 
             # Enhanced error tracking with structured context
             error_type = self._classify_http_error(e.response.status_code)
@@ -328,11 +460,16 @@ class VRChatScraper:
             raise
 
         except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            self.api_rate_limiter.on_error(request_id, self._time_source())
-            self.api_circuit_breaker.on_error(self._time_source())
+            now = self._time_source()
+            self.api_rate_limiter.on_error(request_id, now)
 
             # Enhanced error tracking
             timeout_type = type(e).__name__
+            logger.warning(
+                f"[CB TRIGGER] {timeout_type} in {error_context}, "
+                f"triggering circuit breaker (request_id: {request_id})"
+            )
+            self.api_circuit_breaker.on_error(now)
             with logfire.span("timeout_error", error_context=error_context):
                 logfire.error(
                     f"Timeout in {error_context}",
@@ -394,14 +531,27 @@ class VRChatScraper:
         """Handle complete world scraping: metadata + image."""
         try:
             await self._wait_for_api_ready()
+
             world_details = await self._execute_api_call(
                 request_prefix=f"world-{world_id}",
                 api_call=lambda: self.api_client.get_world_details(world_id),
                 error_context=f"world {world_id} scraping",
             )
 
-            # Update database immediately
-            await self._update_database_with_world(world_id, world_details)
+            # Update database immediately with timeout
+            try:
+                await asyncio.wait_for(
+                    self._update_database_with_world(world_id, world_details),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Database operation timed out updating world {world_id}, "
+                    "will retry on next scrape cycle"
+                )
+                self._worlds_scraped_counter.add(1, {"status": "db_timeout"})
+                return
+
             # Note: Image downloads are now handled through the file metadata workflow
             # Files are queued as PENDING in the database, then processed separately
             logger.debug(f"Successfully scraped world {world_id}")
@@ -411,9 +561,26 @@ class VRChatScraper:
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                await self._mark_world_deleted(world_id)
-                logger.info(f"World {world_id} not found (deleted?)")
-                self._worlds_scraped_counter.add(1, {"status": "deleted"})
+                # Mark world as deleted with timeout protection
+                try:
+                    await asyncio.wait_for(
+                        self._mark_world_deleted(world_id),
+                        timeout=30.0,
+                    )
+                    logger.info(f"World {world_id} not found (deleted?)")
+                    self._worlds_scraped_counter.add(1, {"status": "deleted"})
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Database operation timed out marking world {world_id} as deleted, "
+                        "will retry on next scrape cycle"
+                    )
+                    self._worlds_scraped_counter.add(1, {"status": "db_timeout"})
+                except Exception as db_error:
+                    logger.error(
+                        f"Database error marking world {world_id} as deleted: {db_error}",
+                        exc_info=True,
+                    )
+                    self._worlds_scraped_counter.add(1, {"status": "db_error"})
             else:
                 # Log but continue - circuit breaker handles rate limits/server errors
                 self._worlds_scraped_counter.add(1, {"status": "error"})
@@ -434,38 +601,75 @@ class VRChatScraper:
             self._api_errors_counter.add(1, {"error_type": "timeout"})
             logger.warning(f"Timeout scraping world {world_id}: {e}")
 
-        # Removed generic Exception handler to let critical errors propagate
-        # This includes AuthenticationError, database errors, and unexpected bugs
+        except asyncio.TimeoutError as e:
+            # Circuit breaker backoff too long or other timeout
+            self._worlds_scraped_counter.add(1, {"status": "wait_timeout"})
+            logger.warning(
+                f"Timed out waiting for API to be ready for world {world_id}: {e}"
+            )
+
+        except AuthenticationError:
+            # Re-raise authentication errors - they should propagate to trigger shutdown
+            raise
+
+        except Exception as e:
+            # Catch any database errors or other unexpected exceptions
+            # Log but don't let them crash the entire batch
+            logger.error(
+                f"Unexpected error scraping world {world_id}: {e}", exc_info=True
+            )
+            self._worlds_scraped_counter.add(1, {"status": "unexpected_error"})
+            self._api_errors_counter.add(
+                1, {"error_type": "unexpected_error", "exception": type(e).__name__}
+            )
 
     @logfire.instrument("scrape_file_metadata_task")
     async def _scrape_file_metadata_task(self, file_id: str):
         """Handle file metadata scraping for a specific file."""
         try:
             await self._wait_for_api_ready()
+
             file_metadata = await self._execute_api_call(
                 request_prefix=f"file-{file_id}",
                 api_call=lambda: self.api_client.get_file_metadata(file_id),
                 error_context=f"file metadata {file_id} scraping",
             )
 
-            # Store raw file metadata directly
-            await self.database.update_file_metadata(
-                file_id,
-                file_metadata,
-                status="SUCCESS",
-            )
-            logger.debug(f"Successfully scraped file metadata for {file_id}")
-
-            # Record business metric
-            self._files_processed_counter.add(1, {"status": "success"})
+            # Store raw file metadata directly with timeout protection
+            try:
+                await asyncio.wait_for(
+                    self.database.update_file_metadata(
+                        file_id,
+                        file_metadata,
+                        status="SUCCESS",
+                    ),
+                    timeout=30.0,
+                )
+                logger.debug(f"Successfully scraped file metadata for {file_id}")
+                self._files_processed_counter.add(1, {"status": "success"})
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Database operation timed out updating file {file_id}, "
+                    "will retry on next scrape cycle"
+                )
+                self._files_processed_counter.add(1, {"status": "db_timeout"})
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                await self.database.update_file_metadata(
-                    file_id, {}, status="ERROR", error_message="File not found"
-                )
-                logger.info(f"File {file_id} not found (deleted?)")
-                self._files_processed_counter.add(1, {"status": "not_found"})
+                try:
+                    await asyncio.wait_for(
+                        self.database.update_file_metadata(
+                            file_id, {}, status="ERROR", error_message="File not found"
+                        ),
+                        timeout=30.0,
+                    )
+                    logger.info(f"File {file_id} not found (deleted?)")
+                    self._files_processed_counter.add(1, {"status": "not_found"})
+                except (asyncio.TimeoutError, Exception) as db_error:
+                    logger.error(
+                        f"Database error marking file {file_id} as not found: {db_error}"
+                    )
+                    self._files_processed_counter.add(1, {"status": "db_error"})
             else:
                 self._files_processed_counter.add(1, {"status": "error"})
                 self._api_errors_counter.add(
@@ -480,10 +684,17 @@ class VRChatScraper:
             self._files_processed_counter.add(1, {"status": "timeout"})
             self._api_errors_counter.add(1, {"error_type": "timeout"})
             # Timeout errors are already logged by _execute_api_call
-            pass
-        except Exception:
-            logger.error(f"Unexpected error scraping file {file_id}", exc_info=True)
-            pass
+        except asyncio.TimeoutError as e:
+            # Circuit breaker backoff too long
+            self._files_processed_counter.add(1, {"status": "wait_timeout"})
+            logger.warning(
+                f"Timed out waiting for API to be ready for file {file_id}: {e}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error scraping file {file_id}: {e}", exc_info=True
+            )
+            self._files_processed_counter.add(1, {"status": "unexpected_error"})
 
     @logfire.instrument("download_image_content_task")
     async def _download_image_content_task(
@@ -501,7 +712,6 @@ class VRChatScraper:
         now = self._time_source()
 
         try:
-            # Wait until we can make an image request
             await self._wait_for_image_ready()
             self.image_rate_limiter.on_request_sent(request_id, now)
 
@@ -530,24 +740,55 @@ class VRChatScraper:
                 self._images_downloaded_counter.add(1, {"status": "error"})
                 self._image_errors_counter.add(1, {"error_type": "download_failed"})
 
-            # Update database with download result
-            if result.success:
-                await self.database.update_image_download(
-                    file_id,
-                    version,
-                    "CONFIRMED",
-                    sha256=result.sha256_hash,
+            # Update database with download result (with timeout protection)
+            try:
+                if result.success:
+                    await asyncio.wait_for(
+                        self.database.update_image_download(
+                            file_id,
+                            version,
+                            "CONFIRMED",
+                            sha256=result.sha256_hash,
+                        ),
+                        timeout=30.0,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self.database.update_image_download(
+                            file_id,
+                            version,
+                            "ERROR",
+                            error_message=result.error_message,
+                        ),
+                        timeout=30.0,
+                    )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Database operation timed out updating image {file_id} v{version}, "
+                    "will retry on next scrape cycle"
                 )
-            else:
-                await self.database.update_image_download(
-                    file_id, version, "ERROR", error_message=result.error_message
-                )
+
+        except asyncio.TimeoutError as e:
+            # Circuit breaker backoff too long
+            self._images_downloaded_counter.add(1, {"status": "wait_timeout"})
+            logger.warning(
+                f"Timed out waiting for image API to be ready for {file_id} v{version}: {e}"
+            )
 
         except Exception as e:
             self.image_rate_limiter.on_error(request_id, self._time_source())
-            await self.database.update_image_download(
-                file_id, version, "ERROR", error_message=str(e)
-            )
+            try:
+                await asyncio.wait_for(
+                    self.database.update_image_download(
+                        file_id, version, "ERROR", error_message=str(e)
+                    ),
+                    timeout=30.0,
+                )
+            except (asyncio.TimeoutError, Exception) as db_error:
+                logger.error(
+                    f"Database error recording image download failure for {file_id} v{version}: {db_error}"
+                )
+
             logger.error(
                 f"Unexpected error downloading image for {file_id} v{version}: {e}"
             )

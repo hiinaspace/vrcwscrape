@@ -147,7 +147,16 @@ class Database:
         if connection_string.startswith("sqlite"):
             self.engine = create_async_engine(converted_connection_string)
         else:
-            self.engine = create_async_engine(converted_connection_string, pool_size=10)
+            # pool_timeout: raise error if no connection available within 30s
+            # pool_pre_ping: verify connections are alive before using them
+            self.engine = create_async_engine(
+                converted_connection_string,
+                # database for dolt uses a lot of memory with too many connections
+                pool_size=5,
+                max_overflow=10,
+                pool_timeout=30.0,
+                pool_pre_ping=True,
+            )
 
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
 
