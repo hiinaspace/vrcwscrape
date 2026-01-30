@@ -14,6 +14,10 @@ class Config(BaseSettings):
     oneshot_max_worlds: int = Field(
         2500, description="Maximum number of worlds to scrape in oneshot mode"
     )
+    oneshot_manage_dolt: bool = Field(
+        False,
+        description="Whether to start/stop Dolt SQL server in oneshot mode (useful for working around memory leaks during large backlogs)",
+    )
 
     model_config = {
         "env_file": ".env",

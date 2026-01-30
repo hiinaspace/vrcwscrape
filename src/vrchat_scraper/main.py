@@ -120,9 +120,11 @@ async def async_main(mode: str = "daemon"):
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown.handle_signal)
 
-    # For oneshot mode, start the Dolt SQL server before database initialization
+    # For oneshot mode with Dolt management enabled, start the Dolt SQL server
     # This works around memory leaks by giving each run a fresh server instance
-    if mode == "oneshot":
+    # (only needed when processing large backlogs; disable for normal operation)
+    manage_dolt = mode == "oneshot" and config.oneshot_manage_dolt
+    if manage_dolt:
         # Create database object but don't initialize yet
         db = Database(config.database_url)
         await start_dolt_service(db)
@@ -192,8 +194,8 @@ async def async_main(mode: str = "daemon"):
             logger.info("Shutdown complete")
 
     finally:
-        # For oneshot mode, stop the Dolt SQL server to prevent memory leaks
-        if mode == "oneshot":
+        # Stop the Dolt SQL server if we started it
+        if manage_dolt:
             await stop_dolt_service()
 
 
