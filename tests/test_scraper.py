@@ -904,3 +904,82 @@ async def test_502_503_trigger_rate_limiter_penalty(
     # Assert: both should be called for 503
     stub_scraper.api_rate_limiter.on_error.assert_called_once()
     stub_scraper.api_circuit_breaker.on_error.assert_called_once()
+
+
+@pytest.mark.asyncio
+@async_timeout(10.0)
+async def test_oneshot_respects_max_worlds_limit(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_time,
+    mock_sleep,
+):
+    """Test that oneshot mode respects the max worlds limit."""
+    # Arrange: Create a scraper with a low max worlds limit
+    max_worlds = 5
+    scraper = VRChatScraper(
+        database=test_database,
+        api_client=fake_api_client,
+        image_downloader=fake_image_downloader,
+        api_rate_limiter=stub_api_rate_limiter,
+        image_rate_limiter=stub_image_rate_limiter,
+        api_circuit_breaker=stub_api_circuit_breaker,
+        image_circuit_breaker=stub_image_circuit_breaker,
+        time_source=mock_time.now,
+        sleep_func=mock_sleep.sleep,
+        oneshot_max_worlds=max_worlds,
+        manage_dolt_service=False,  # Disable service management in tests
+    )
+
+    # Add 10 pending worlds to the database
+    num_worlds = 10
+    for i in range(num_worlds):
+        world_id = f"wrld_test_{i:03d}"
+        await test_database.upsert_world(
+            world_id,
+            {"discovered_at": datetime.utcnow().isoformat()},
+            status="PENDING",
+        )
+
+        # Set up API responses for all worlds
+        test_world = create_test_world_detail(
+            world_id=world_id,
+            name=f"Test World {i}",
+            favorites=100 + i,
+            visits=1000 + i * 100,
+        )
+        test_world_raw = test_world.model_dump(mode="json", by_alias=True)
+        fake_api_client.set_world_detail_response(world_id, test_world_raw)
+
+    # Act: Run oneshot mode
+    await scraper.run_oneshot()
+
+    # Assert: Only max_worlds should have been processed
+    # Check how many worlds have SUCCESS status
+    from sqlalchemy import text
+
+    async with test_database.engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM worlds WHERE scrape_status = 'SUCCESS'")
+        )
+        count = result.scalar()
+
+    assert count == max_worlds, (
+        f"Expected {max_worlds} worlds to be scraped, but {count} were scraped"
+    )
+
+    # Check that there are still pending worlds
+    async with test_database.engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM worlds WHERE scrape_status = 'PENDING'")
+        )
+        pending_count = result.scalar()
+
+    assert pending_count == num_worlds - max_worlds, (
+        f"Expected {num_worlds - max_worlds} pending worlds, but got {pending_count}"
+    )

@@ -195,11 +195,27 @@ async def test_get_worlds_to_scrape_pending(test_db):
     # Insert worlds in different states
     await test_db.upsert_world("wrld_pending_1", {"name": "Pending 1"}, "PENDING")
     await test_db.upsert_world("wrld_pending_2", {"name": "Pending 2"}, "PENDING")
-    await test_db.upsert_world("wrld_success_1", {"name": "Success 1"}, "SUCCESS")
+
+    # Create a SUCCESS world with recent metrics so it won't be due for rescrape
+    await test_db.upsert_world_with_files(
+        "wrld_success_1",
+        {"name": "Success 1"},
+        {
+            "heat": 5,
+            "popularity": 5,
+            "occupants": 1,
+            "private_occupants": 0,
+            "public_occupants": 1,
+            "favorites": 10,
+            "visits": 100,
+        },
+        [],
+        "SUCCESS",
+    )
 
     world_ids = await test_db.get_worlds_to_scrape(limit=10)
 
-    # Should return only pending worlds
+    # Should return only pending worlds (SUCCESS world has recent metrics, not due yet)
     assert len(world_ids) == 2
     assert "wrld_pending_1" in world_ids
     assert "wrld_pending_2" in world_ids

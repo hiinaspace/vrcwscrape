@@ -152,8 +152,8 @@ class Database:
             self.engine = create_async_engine(
                 converted_connection_string,
                 # database for dolt uses a lot of memory with too many connections
-                pool_size=5,
-                max_overflow=10,
+                pool_size=1,
+                max_overflow=0,
                 pool_timeout=30.0,
                 pool_pre_ping=True,
             )
@@ -174,6 +174,38 @@ class Database:
         """Create tables if they don't exist."""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+    async def update_world_status(
+        self, world_id: str, status: str, update_scrape_time: bool = True
+    ):
+        """Update just the status of a world, without touching metadata.
+
+        Args:
+            world_id: The world ID to update
+            status: The new status (PENDING, SUCCESS, DELETED, ERROR)
+            update_scrape_time: Whether to update last_scrape_time (default True)
+        """
+        async with self.async_session() as session:
+            stmt = select(World).where(World.world_id == world_id)
+            result = await session.execute(stmt)
+            existing_world = result.scalar_one_or_none()
+
+            if existing_world:
+                existing_world.scrape_status = ScrapeStatus(status)
+                if update_scrape_time:
+                    existing_world.last_scrape_time = datetime.utcnow()
+                await session.commit()
+            else:
+                # World doesn't exist - this shouldn't happen for status updates
+                # but handle gracefully by creating a minimal record
+                new_world = World(
+                    world_id=world_id,
+                    world_metadata={},
+                    last_scrape_time=datetime.utcnow(),
+                    scrape_status=ScrapeStatus(status),
+                )
+                session.add(new_world)
+                await session.commit()
 
     async def upsert_world(
         self, world_id: str, metadata: dict, status: str = "SUCCESS"
@@ -457,6 +489,124 @@ class Database:
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
         return dt
+
+    async def count_worlds_due_for_scraping(self) -> dict:
+        """Count how many worlds are due for scraping, broken down by category.
+
+        Returns:
+            dict with counts:
+                - pending: Worlds with PENDING status
+                - due_for_rescrape: Worlds that need rescraping based on activity cadence
+                - total: Total worlds due for scraping
+                - deleted: Worlds marked as DELETED (for visibility)
+                - success: Worlds marked as SUCCESS (for visibility)
+                - error: Worlds marked as ERROR (for visibility)
+        """
+        async with self.async_session() as session:
+            days_diff, hours_diff = self._get_time_diff_funcs()
+
+            # Count worlds by status for visibility
+            status_counts = {}
+            for status in ScrapeStatus:
+                stmt = (
+                    select(func.count())
+                    .select_from(World)
+                    .where(World.scrape_status == status)
+                )
+                result = await session.execute(stmt)
+                status_counts[status.value.lower()] = result.scalar()
+
+            # Count PENDING worlds
+            pending_count = status_counts["pending"]
+
+            # Count worlds due for rescraping
+            now = datetime.utcnow()
+
+            # Same logic as get_worlds_to_scrape
+            latest_metrics_time = (
+                select(
+                    WorldMetrics.world_id.label("world_id"),
+                    func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
+                )
+                .group_by(WorldMetrics.world_id)
+                .subquery()
+            )
+            latest_metrics = (
+                select(
+                    WorldMetrics.world_id.label("world_id"),
+                    WorldMetrics.scrape_time.label("last_metrics_time"),
+                    WorldMetrics.heat.label("heat"),
+                    WorldMetrics.popularity.label("popularity"),
+                    WorldMetrics.occupants.label("occupants"),
+                )
+                .join(
+                    latest_metrics_time,
+                    and_(
+                        WorldMetrics.world_id == latest_metrics_time.c.world_id,
+                        WorldMetrics.scrape_time
+                        == latest_metrics_time.c.last_metrics_time,
+                    ),
+                )
+                .subquery()
+            )
+
+            cadence_days_expr = sqlalchemy.case(
+                (
+                    or_(
+                        latest_metrics.c.heat >= 50,
+                        latest_metrics.c.popularity >= 50,
+                        latest_metrics.c.occupants >= 25,
+                    ),
+                    1,
+                ),
+                (
+                    or_(
+                        latest_metrics.c.heat >= 10,
+                        latest_metrics.c.popularity >= 10,
+                        latest_metrics.c.occupants >= 5,
+                    ),
+                    7,
+                ),
+                (
+                    or_(
+                        latest_metrics.c.heat > 0,
+                        latest_metrics.c.popularity > 0,
+                        latest_metrics.c.occupants > 0,
+                    ),
+                    30,
+                ),
+                else_=180,
+            )
+
+            days_since_metrics_expr = days_diff(now, latest_metrics.c.last_metrics_time)
+            due_for_metrics = or_(
+                latest_metrics.c.last_metrics_time.is_(None),
+                days_since_metrics_expr >= cadence_days_expr,
+            )
+
+            rescrape_stmt = (
+                select(func.count())
+                .select_from(World)
+                .outerjoin(latest_metrics, latest_metrics.c.world_id == World.world_id)
+                .where(
+                    and_(
+                        World.scrape_status == ScrapeStatus.SUCCESS,
+                        due_for_metrics,
+                    )
+                )
+            )
+
+            result = await session.execute(rescrape_stmt)
+            rescrape_count = result.scalar()
+
+            return {
+                "pending": pending_count,
+                "due_for_rescrape": rescrape_count,
+                "total": pending_count + rescrape_count,
+                "deleted": status_counts["deleted"],
+                "success": status_counts["success"],
+                "error": status_counts["error"],
+            }
 
     async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
         """Get world IDs that need scraping based on strategy."""

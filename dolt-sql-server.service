@@ -1,0 +1,18 @@
+[Unit]
+Description=Dolt SQL Server for VRChat World Scraper
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/nvme/vrcw-scrape/vrcwdolt
+ExecStart=/usr/local/bin/dolt sql-server --port 13306 --config config.yaml
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits to help contain memory leaks
+MemoryMax=8G
+MemoryHigh=6G
+
+[Install]
+WantedBy=default.target

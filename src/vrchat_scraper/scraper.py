@@ -36,6 +36,8 @@ class VRChatScraper:
         recent_worlds_interval: float = 600,
         idle_wait_time: float = 60,  # 1 minute
         error_backoff_time: float = 60,  # 1 minute
+        oneshot_max_worlds: int = 5000,
+        manage_dolt_service: bool = True,
     ):
         """Initialize scraper with all dependencies."""
         self.database = database
@@ -54,6 +56,8 @@ class VRChatScraper:
         self._recent_worlds_interval = recent_worlds_interval
         self._idle_wait_time = idle_wait_time
         self._error_backoff_time = error_backoff_time
+        self._oneshot_max_worlds = oneshot_max_worlds
+        self._manage_dolt_service = manage_dolt_service
         self._shutdown_event = asyncio.Event()
 
         # --- Phase 2 Observability: Business Metrics ---
@@ -92,20 +96,49 @@ class VRChatScraper:
 
     async def run_oneshot(self):
         """One-shot execution - process all pending work and exit."""
-        logger.info("Starting one-shot scraping run")
+        logger.info(
+            f"Starting one-shot scraping run (max {self._oneshot_max_worlds} worlds)"
+        )
 
         try:
+            # Log how many worlds are due for scraping before we start
+            try:
+                counts = await self.database.count_worlds_due_for_scraping()
+                logger.info(
+                    f"Worlds due for scraping: {counts['total']} total "
+                    f"({counts['pending']} pending, {counts['due_for_rescrape']} due for rescrape)"
+                )
+                logger.info(
+                    f"World status breakdown: {counts['success']} success, "
+                    f"{counts['deleted']} deleted, {counts['error']} error"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to count worlds due for scraping: {e}")
+
             # Step 1: Scrape recent worlds to discover new ones
             logger.info("Scraping recent worlds...")
             await self._scrape_recent_worlds_batch()
 
-            # Step 2: Process all pending worlds until queue is empty
+            # Step 2: Process pending worlds until queue is empty or limit reached
             logger.info("Processing pending worlds...")
-            while True:
-                processed_count = await self._process_pending_worlds_batch(limit=100)
+            total_worlds_processed = 0
+            while total_worlds_processed < self._oneshot_max_worlds:
+                remaining = self._oneshot_max_worlds - total_worlds_processed
+                batch_limit = min(100, remaining)
+                processed_count = await self._process_pending_worlds_batch(
+                    limit=batch_limit
+                )
                 if processed_count == 0:
                     break
-                logger.info(f"Processed {processed_count} worlds")
+                total_worlds_processed += processed_count
+                logger.info(
+                    f"Processed {processed_count} worlds (total: {total_worlds_processed}/{self._oneshot_max_worlds})"
+                )
+
+            if total_worlds_processed >= self._oneshot_max_worlds:
+                logger.info(
+                    f"Reached oneshot limit of {self._oneshot_max_worlds} worlds"
+                )
 
             # Step 3: Process all pending file metadata until queue is empty
             logger.info("Processing pending file metadata...")
@@ -895,7 +928,7 @@ class VRChatScraper:
 
     async def _mark_world_deleted(self, world_id: str):
         """Mark a world as deleted in the database."""
-        await self.database.upsert_world(world_id, {}, status="DELETED")
+        await self.database.update_world_status(world_id, "DELETED")
 
     async def _image_exists(self, world_id: str) -> bool:
         """Check if image already exists for a world."""
