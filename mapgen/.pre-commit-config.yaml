@@ -1,0 +1,27 @@
+# mapgen-scoped hooks (ruff + ty via mapgen's own uv venv).
+# This project is nested in the parent repo, which has its own root
+# .pre-commit-config.yaml. Run these from within mapgen:
+#   uv run pre-commit run -a -c .pre-commit-config.yaml
+# Hooks cd into mapgen and use pass_filenames:false so they lint the whole
+# mapgen project regardless of the invoking CWD.
+repos:
+  - repo: local
+    hooks:
+      - id: mapgen-ruff-format
+        name: ruff format (mapgen)
+        entry: bash -c 'cd mapgen && uv run ruff format'
+        language: system
+        files: ^mapgen/.*\.py$
+        pass_filenames: false
+      - id: mapgen-ruff-check
+        name: ruff check (mapgen)
+        entry: bash -c 'cd mapgen && uv run ruff check --fix'
+        language: system
+        files: ^mapgen/.*\.py$
+        pass_filenames: false
+      - id: mapgen-ty
+        name: ty typecheck (mapgen)
+        entry: bash -c 'cd mapgen && uv run ty check'
+        language: system
+        files: ^mapgen/.*\.py$
+        pass_filenames: false

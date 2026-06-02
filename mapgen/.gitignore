@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+# pipeline data + artifacts (regenerated; not source)
+data/
+artifacts/
+*.npy
+*.npz
