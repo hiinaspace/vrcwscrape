@@ -6,11 +6,11 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { BROWSE } from "./config.js";
 import { hexToRgb } from "./util.js";
 
-// Dataset switch: `?data=full` loads the 218k assets from public/full/; default is
-// the live 20k set in public/. Kept separate so the full set can be tried without
-// disturbing the working viewer. DATA_DIR is also used by Map.jsx for the geojson.
+// Dataset switch: the full 218k set (public/full/) is the default; `?data=20k` loads
+// the smaller set from public/ for comparison. DATA_DIR is also used by Map.jsx for
+// the geojson assets.
 const _params = new URLSearchParams(location.search);
-export const DATA_DIR = _params.get("data") === "full" ? "full/" : "";
+export const DATA_DIR = _params.get("data") === "20k" ? "" : "full/";
 const asset = (f) => new URL(import.meta.env.BASE_URL + DATA_DIR + f, location.href).href;
 
 let _dbPromise;

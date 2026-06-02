@@ -99,7 +99,7 @@ export default function Sidebar({
         <h1>VRChat Worlds</h1>
         {!node && (
           <p className="hint">
-            A latent map of ~20k worlds. Drill into a region below, or click any world
+            A latent map of VRChat worlds. Drill into a region below, or click any world
             on the map. Zoom in until worlds become individual plots.
           </p>
         )}
