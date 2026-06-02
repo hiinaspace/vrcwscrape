@@ -38,7 +38,7 @@ Assets:
 - `app_points.parquet` — per-world: `x,y`, hierarchy ids/names `l0..lN`, soft-assigned
   `region` (continent) + `color`, `name`, `visits`.
 - `manifest.json` — lightweight level/asset metadata used before DuckDB starts.
-- `land.geojson` — precomputed Delaunay alpha-shape landmass from all world coords.
+- `land.geojson` — precomputed rasterized/dilated landmass from all world coords.
 - `regions_l2.geojson`, `regions_l3.geojson` — background polygons per cluster,
   colored by parent continent.
 - `worlds_meta.parquet` — sidebar fields (description, tags, author, dates, sizes…).

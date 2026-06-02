@@ -1,8 +1,9 @@
 """Build a static land polygon from exported map points.
 
 The web map can render one precomputed filled polygon much more cheaply than a
-full-dataset scatter layer. The shape is a Delaunay alpha shape: nearby worlds
-merge into continuous land, and sparse groups become islands.
+full-dataset scatter layer. The default shape rasterizes the point cloud, dilates
+occupied cells, and polygonizes the mask so every world has land under it. The
+older Delaunay alpha-shape method is still available for comparison.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from shapely import (
     Polygon,
 )
 from shapely.ops import polygonize
+
+from mapgen.raster_poly import build_raster_geometry
 
 
 def _median_nn(xy: np.ndarray, sample: int = 8000) -> float:
@@ -63,7 +66,7 @@ def _edge_key(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)
 
 
-def build_land_geometry(
+def build_alpha_land_geometry(
     xy: np.ndarray,
     *,
     edge_quantile: float = 0.99,
@@ -74,7 +77,7 @@ def build_land_geometry(
     expand_scale: float = 0.25,
     expand_quad_segs: int = 2,
 ):
-    """Return `(geometry, info)` for the landmass covering `xy` points."""
+    """Return `(geometry, info)` for an alpha-shape landmass covering `xy`."""
     if len(xy) < 3:
         raise ValueError("need at least 3 points to build a land polygon")
     from scipy.spatial import Delaunay
@@ -122,6 +125,7 @@ def build_land_geometry(
     geom = _filter_small_islands(geom, (threshold * threshold) * min_area_scale)
     parts = list(_iter_polygons(geom))
     return geom, {
+        "method": "alpha",
         "point_count": int(len(xy)),
         "triangle_count": int(len(tri)),
         "kept_triangle_count": int(keep.sum()),
@@ -139,10 +143,10 @@ def build_land_geometry(
     }
 
 
-def write_land_geojson(
+def build_land_geometry(
     xy: np.ndarray,
-    out_path: Path,
     *,
+    method: str = "raster",
     edge_quantile: float = 0.99,
     max_edge: float | None = None,
     simplify_scale: float = 0.35,
@@ -150,9 +154,65 @@ def write_land_geojson(
     fill_holes: bool = True,
     expand_scale: float = 0.25,
     expand_quad_segs: int = 2,
+    raster_max_dim: int = 2048,
+    raster_nn_cells: float = 2.0,
+    raster_dilate_cells: int = 5,
+    raster_close_cells: int = 2,
+    raster_simplify_cells: float = 0.75,
+    raster_smooth_cells: float = 0.0,
+    raster_min_area_cells: float = 4.0,
+):
+    """Return `(geometry, info)` for the landmass covering `xy` points."""
+    if method == "alpha":
+        return build_alpha_land_geometry(
+            xy,
+            edge_quantile=edge_quantile,
+            max_edge=max_edge,
+            simplify_scale=simplify_scale,
+            min_area_scale=min_area_scale,
+            fill_holes=fill_holes,
+            expand_scale=expand_scale,
+            expand_quad_segs=expand_quad_segs,
+        )
+    if method != "raster":
+        raise ValueError(f"unknown land method {method!r}")
+    return build_raster_geometry(
+        xy,
+        max_dim=raster_max_dim,
+        median_nn=_median_nn(xy),
+        nn_cells=raster_nn_cells,
+        dilate_cells=raster_dilate_cells,
+        close_cells=raster_close_cells,
+        fill_holes=fill_holes,
+        simplify_cells=raster_simplify_cells,
+        smooth_cells=raster_smooth_cells,
+        min_area_cells=raster_min_area_cells,
+    )
+
+
+def write_land_geojson(
+    xy: np.ndarray,
+    out_path: Path,
+    *,
+    method: str = "raster",
+    edge_quantile: float = 0.99,
+    max_edge: float | None = None,
+    simplify_scale: float = 0.35,
+    min_area_scale: float = 0.0,
+    fill_holes: bool = True,
+    expand_scale: float = 0.25,
+    expand_quad_segs: int = 2,
+    raster_max_dim: int = 2048,
+    raster_nn_cells: float = 2.0,
+    raster_dilate_cells: int = 5,
+    raster_close_cells: int = 2,
+    raster_simplify_cells: float = 0.75,
+    raster_smooth_cells: float = 0.0,
+    raster_min_area_cells: float = 4.0,
 ) -> None:
     geom, info = build_land_geometry(
         xy,
+        method=method,
         edge_quantile=edge_quantile,
         max_edge=max_edge,
         simplify_scale=simplify_scale,
@@ -160,6 +220,13 @@ def write_land_geojson(
         fill_holes=fill_holes,
         expand_scale=expand_scale,
         expand_quad_segs=expand_quad_segs,
+        raster_max_dim=raster_max_dim,
+        raster_nn_cells=raster_nn_cells,
+        raster_dilate_cells=raster_dilate_cells,
+        raster_close_cells=raster_close_cells,
+        raster_simplify_cells=raster_simplify_cells,
+        raster_smooth_cells=raster_smooth_cells,
+        raster_min_area_cells=raster_min_area_cells,
     )
     feature = {
         "type": "Feature",
@@ -171,7 +238,7 @@ def write_land_geojson(
     )
     print(
         f"  wrote {out_path} "
-        f"({info['point_count']:,} points, max_edge={info['max_edge']:.5f}, "
+        f"({info['point_count']:,} points, method={info['method']}, "
         f"{info['polygon_count']:,} polygons)"
     )
 
@@ -180,6 +247,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--points", type=Path, required=True, help="app_points.parquet")
     ap.add_argument("--out", type=Path, required=True, help="destination land.geojson")
+    ap.add_argument("--method", choices=("raster", "alpha"), default="raster")
     ap.add_argument("--edge-quantile", type=float, default=0.99)
     ap.add_argument("--max-edge", type=float, default=None)
     ap.add_argument("--simplify-scale", type=float, default=0.35)
@@ -197,6 +265,13 @@ def main() -> None:
         default=0.0,
         help="drop islands smaller than this * max_edge^2; 0 keeps all islands",
     )
+    ap.add_argument("--raster-max-dim", type=int, default=2048)
+    ap.add_argument("--raster-nn-cells", type=float, default=2.0)
+    ap.add_argument("--raster-dilate-cells", type=int, default=5)
+    ap.add_argument("--raster-close-cells", type=int, default=2)
+    ap.add_argument("--raster-simplify-cells", type=float, default=0.75)
+    ap.add_argument("--raster-smooth-cells", type=float, default=0.0)
+    ap.add_argument("--raster-min-area-cells", type=float, default=4.0)
     args = ap.parse_args()
 
     xy = (
@@ -209,6 +284,7 @@ def main() -> None:
     write_land_geojson(
         xy,
         args.out,
+        method=args.method,
         edge_quantile=args.edge_quantile,
         max_edge=args.max_edge,
         simplify_scale=args.simplify_scale,
@@ -216,6 +292,13 @@ def main() -> None:
         fill_holes=not args.keep_holes,
         expand_scale=args.expand_scale,
         expand_quad_segs=args.expand_quad_segs,
+        raster_max_dim=args.raster_max_dim,
+        raster_nn_cells=args.raster_nn_cells,
+        raster_dilate_cells=args.raster_dilate_cells,
+        raster_close_cells=args.raster_close_cells,
+        raster_simplify_cells=args.raster_simplify_cells,
+        raster_smooth_cells=args.raster_smooth_cells,
+        raster_min_area_cells=args.raster_min_area_cells,
     )
 
 

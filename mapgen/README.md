@@ -39,7 +39,7 @@ uv run mapgen-reduce --embeddings artifacts/embeddings.npy --meta artifacts/embe
 uv run mapgen-relax --coords artifacts/coords_umap.parquet --out artifacts/coords_umap_relaxed.parquet
 # D: HDBSCAN clusters + gemma4 labels + per-cluster exemplar report
 uv run mapgen-cluster --embeddings artifacts/embeddings.npy --meta artifacts/embed_meta.parquet --out-dir artifacts --min-samples 5
-# E: labeled region map (PNG + GeoJSON; noise soft-assigned to nearest region) + interactive HTML + NN report
+# E: labeled region map (PNG + GeoJSON; raster land/region polygons for the web app)
 uv run mapgen-regions --embeddings artifacts/embeddings.npy --meta artifacts/embed_meta.parquet \
   --clusters artifacts/clusters.parquet --labels artifacts/cluster_labels.json --coords-dir artifacts --out-dir artifacts
 uv run mapgen-render --embeddings artifacts/embeddings.npy --meta artifacts/embed_meta.parquet \

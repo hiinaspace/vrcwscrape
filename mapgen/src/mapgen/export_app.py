@@ -6,14 +6,14 @@ the `web/` React app loads:
   * app_points.parquet  -- one row per world: world_id, x, y, l{0..N}_id/_name,
     an integer `region` (the coarsest/continent cluster) and a stable hex `color`.
   * regions_l{lvl}.geojson  -- background polygons per cluster at a hierarchy
-    level (buffer-union of member points), colored by their parent continent so
-    sub-regions share the continent hue.  Defaults to the two coarsest levels.
+    level, colored by their parent continent so sub-regions share the continent
+    hue. Defaults to rasterized masks for speed, with exact Shapely unions still
+    available for comparison.
   * worlds_meta.parquet  -- the subset of worlds_search.parquet restricted to the
     sidebar fields, with tags cleaned for display.
 
-The 2D coords are emitted as-is (no relaxation): a layout transform for deep-zoom
-de-overlap is a deliberately deferred step.  Run on <gpu-host> where the artifacts live,
-then copy web/public/* back locally.
+Run on the GPU/ollama host where the artifacts live, then copy web/public/* back
+locally.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import shapely
 
 from mapgen.common import clean_tags
 from mapgen.land import write_land_geojson
+from mapgen.raster_poly import estimate_cell_size, raster_region_polys
 from mapgen.regions import _distinct_colors, _median_nn, _region_polys
 
 # Sidebar fields pulled from worlds_search.parquet (first-pass; no visits-over-time
@@ -106,8 +107,32 @@ def _export_geojson(
     region_by_cid: dict[int, int],
     buffer_r: float,
     out_path: Path,
+    *,
+    method: str = "raster",
+    raster_cell_size: float | None = None,
+    raster_close_cells: int = 1,
+    raster_simplify_cells: float = 0.75,
+    raster_smooth_cells: float = 0.0,
+    raster_min_area_cells: float = 4.0,
 ) -> None:
-    polys = _region_polys(xy, cluster_id, cids, buffer_r=buffer_r)
+    if method == "union":
+        polys = _region_polys(xy, cluster_id, cids, buffer_r=buffer_r)
+    elif method == "raster":
+        if raster_cell_size is None:
+            raise ValueError("raster_cell_size is required for raster regions")
+        polys = raster_region_polys(
+            xy,
+            cluster_id,
+            cids,
+            cell_size=raster_cell_size,
+            radius=buffer_r,
+            close_cells=raster_close_cells,
+            simplify_cells=raster_simplify_cells,
+            smooth_cells=raster_smooth_cells,
+            min_area_cells=raster_min_area_cells,
+        )
+    else:
+        raise ValueError(f"unknown region polygon method {method!r}")
     feats = []
     for c, geom in polys.items():
         feats.append(
@@ -164,6 +189,19 @@ def main() -> None:
     )
     ap.add_argument("--buffer-scale", type=float, default=3.5)
     ap.add_argument(
+        "--region-polygon-method",
+        choices=("raster", "union"),
+        default="raster",
+        help="raster is approximate and fast; union is exact Shapely point buffers",
+    )
+    ap.add_argument("--region-raster-max-dim", type=int, default=2048)
+    ap.add_argument("--region-raster-nn-cells", type=float, default=2.0)
+    ap.add_argument("--region-raster-close-cells", type=int, default=1)
+    ap.add_argument("--region-raster-simplify-cells", type=float, default=0.75)
+    ap.add_argument("--region-raster-smooth-cells", type=float, default=0.0)
+    ap.add_argument("--region-raster-min-area-cells", type=float, default=4.0)
+    ap.add_argument("--land-method", choices=("raster", "alpha"), default="raster")
+    ap.add_argument(
         "--land-edge-quantile",
         type=float,
         default=0.99,
@@ -194,6 +232,13 @@ def main() -> None:
         help="buffer final land polygons by this fraction of max edge",
     )
     ap.add_argument("--land-expand-quad-segs", type=int, default=2)
+    ap.add_argument("--land-raster-max-dim", type=int, default=2048)
+    ap.add_argument("--land-raster-nn-cells", type=float, default=2.0)
+    ap.add_argument("--land-raster-dilate-cells", type=int, default=5)
+    ap.add_argument("--land-raster-close-cells", type=int, default=2)
+    ap.add_argument("--land-raster-simplify-cells", type=float, default=0.75)
+    ap.add_argument("--land-raster-smooth-cells", type=float, default=0.0)
+    ap.add_argument("--land-raster-min-area-cells", type=float, default=4.0)
     ap.add_argument(
         "--embeddings",
         type=Path,
@@ -345,17 +390,36 @@ def main() -> None:
     write_land_geojson(
         xy,
         args.out_dir / "land.geojson",
+        method=args.land_method,
         edge_quantile=args.land_edge_quantile,
         max_edge=args.land_max_edge,
         simplify_scale=args.land_simplify_scale,
         min_area_scale=args.land_min_area_scale,
         expand_scale=args.land_expand_scale,
         expand_quad_segs=args.land_expand_quad_segs,
+        raster_max_dim=args.land_raster_max_dim,
+        raster_nn_cells=args.land_raster_nn_cells,
+        raster_dilate_cells=args.land_raster_dilate_cells,
+        raster_close_cells=args.land_raster_close_cells,
+        raster_simplify_cells=args.land_raster_simplify_cells,
+        raster_smooth_cells=args.land_raster_smooth_cells,
+        raster_min_area_cells=args.land_raster_min_area_cells,
     )
 
     # --- region polygons per requested level (from soft ids = full coverage) ---
     nn = _median_nn(xy)
     buffer_r = nn * args.buffer_scale
+    region_raster_cell = estimate_cell_size(
+        xy,
+        max_dim=args.region_raster_max_dim,
+        median_nn=nn,
+        nn_cells=args.region_raster_nn_cells,
+    )
+    if args.region_polygon_method == "raster":
+        print(
+            f"  region raster: cell_size={region_raster_cell:.5f}, "
+            f"buffer={buffer_r:.5f}"
+        )
     region_soft = points["region"].to_numpy()
     for lvl in geojson_levels:
         # polygons from CORE (raw) cluster ids only -> coherent 2D blobs for clean
@@ -388,6 +452,12 @@ def main() -> None:
             region_by_cid,
             buffer_r,
             args.out_dir / f"regions_l{lvl}.geojson",
+            method=args.region_polygon_method,
+            raster_cell_size=region_raster_cell,
+            raster_close_cells=args.region_raster_close_cells,
+            raster_simplify_cells=args.region_raster_simplify_cells,
+            raster_smooth_cells=args.region_raster_smooth_cells,
+            raster_min_area_cells=args.region_raster_min_area_cells,
         )
 
     # --- worlds_meta for the sidebar ----------------------------------------
