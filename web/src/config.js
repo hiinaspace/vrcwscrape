@@ -27,6 +27,18 @@ export const CELLS = {
   renderFromTier: "near", // "far" | "mid" | "near"
 };
 
+// "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). Because the
+// per-world cells only draw up close, the land layer lets you see the occupied area —
+// and any worlds UMAP scattered off on their own — as landmass/islands over water.
+export const OCEAN = "#28323f"; // viewport background (any CSS color)
+export const LAND = {
+  color: [226, 229, 231], // neutral light-grey landmass
+  radius: 2.4, // px dot radius; in dense areas dots merge into solid land
+  minPixels: 1.4, // keep far-flung outliers visible as specks/islands
+  maxPixels: 6,
+  hideAtNear: true, // hide once individual cells take over (cells are the plots)
+};
+
 // Region "background" fills (continent l3 + sub-region l2), drawn under the cells
 // to give the space an underlying color field even where cells leave gaps.
 export const REGION_BG = {
