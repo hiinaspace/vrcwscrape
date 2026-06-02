@@ -78,8 +78,9 @@ export const LABELS = {
   background: true, // white rounded rectangle behind label text for contrast
   backgroundColor: [255, 255, 255, 125],
   backgroundPadding: [4, 1, 4, 1], // [left, top, right, bottom] px
-  // Lower = labels packed tighter (more survive collisions); higher = more spacing.
-  collisionSizeScale: 1.35,
+  // Extra px of clearance enforced around each label by the greedy declutter — higher
+  // = more breathing room between labels (fewer shown), lower = tighter packing.
+  labelGap: 3,
   // Debounce (ms) before recomputing the viewport-culled cell/label sets — a zoom or
   // pan gesture won't rebuild thousands of objects mid-gesture, only once it settles.
   settleMs: 130,
