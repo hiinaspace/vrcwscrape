@@ -67,6 +67,9 @@ export const LABELS = {
   backgroundPadding: [4, 1, 4, 1], // [left, top, right, bottom] px
   // Lower = labels packed tighter (more survive collisions); higher = more spacing.
   collisionSizeScale: 1.35,
+  // Debounce (ms) before recomputing the viewport-culled cell/label sets — a zoom or
+  // pan gesture won't rebuild thousands of objects mid-gesture, only once it settles.
+  settleMs: 130,
   // SDF font-atlas resolution (a CEILING — auto-reduced for datasets with many
   // unique glyphs so the atlas never overflows the GPU texture; see atlasFor in
   // Map.jsx). At 64 deck.gl captures tall-letter descenders ("J", j/g/y/p) that get
