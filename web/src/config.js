@@ -86,9 +86,11 @@ export const LABELS = {
   // unique glyphs so the atlas never overflows the GPU texture; see atlasFor in
   // Map.jsx). At 64 deck.gl captures tall-letter descenders ("J", j/g/y/p) that get
   // clipped at <=48; big CJK-heavy sets (218k) fall back to a smaller size to fit.
-  // radius is the SDF spread (>= outlineWidth).
+  // sdfBuffer is the atlas padding ceiling — kept small: a large buffer both wastes
+  // atlas room (forcing a smaller fontSize) and triggers deck.gl's buffer-driven
+  // glyph clipping (visgl/deck.gl#7211). radius is the SDF spread (>= outlineWidth).
   sdfFontSize: 64,
-  sdfBuffer: 12,
+  sdfBuffer: 4,
   sdfRadius: 8,
 };
 
