@@ -33,10 +33,11 @@ export const CELLS = {
 export const OCEAN = "#28323f"; // viewport background (any CSS color)
 export const LAND = {
   color: [226, 229, 231], // neutral light-grey landmass
-  radius: 2.4, // px dot radius; in dense areas dots merge into solid land
-  minPixels: 1.4, // keep far-flung outliers visible as specks/islands
-  maxPixels: 6,
-  hideAtNear: true, // hide once individual cells take over (cells are the plots)
+  // Radius in WORLD units = radiusK * typical world spacing, so dots scale with zoom
+  // and stay merged into continuous land instead of breaking apart as you zoom in.
+  radiusK: 0.85,
+  minPixels: 1.0, // floor so the land stays visible when zoomed all the way out
+  maxPixels: 60, // ceiling so a lone outlier island isn't absurdly large up close
 };
 
 // Region "background" fills (continent l3 + sub-region l2), drawn under the cells
@@ -69,8 +70,8 @@ export const REGION_PALETTE = [
 export const LABELS = {
   sizeL3: 12,
   sizeL2: 12,
-  sizeCapitol: 9,
-  sizeWorld: 9,
+  sizeCapitol: 10,
+  sizeWorld: 10,
   color: [25, 25, 25],
   outlineWidth: 1, // deck SDF outline is thin; the background box does the contrast
   outlineColor: [255, 255, 255, 230],
