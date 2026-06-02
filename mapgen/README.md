@@ -48,6 +48,14 @@ uv run mapgen-render --embeddings artifacts/embeddings.npy --meta artifacts/embe
 
 Copy `artifacts/regions_*.png`, `cluster_exemplars.md`, `map_*.html`, `nn_report.md` back and eyeball.
 
+For the full 218k app export and layout comparison, use the scripts in
+`mapgen/scripts/` inside the FHS shell:
+
+```bash
+$FHS/bin/mapgen-fhs run_full.sh              # UMAP baseline
+$FHS/bin/mapgen-fhs run_layout_variants.sh   # refresh UMAP, build PaCMAP/LocalMAP
+```
+
 ## Image-caption enrichment (optional)
 
 Caption thin-description worlds' thumbnails with gemma4 (vision) and fold the
