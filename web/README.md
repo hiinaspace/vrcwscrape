@@ -1,0 +1,54 @@
+# VRChat Worlds — Latent Map (web)
+
+Interactive map of ~20k VRChat worlds laid out by text-embedding similarity, with
+zoom-LOD neighborhood labels, region backgrounds, and a click-to-inspect sidebar.
+
+Stack: React + Vite, deck.gl (`OrthographicView`), DuckDB-WASM (parquet in the
+browser). Supersedes the vanilla `web-prototype/`.
+
+## Run
+
+```bash
+npm install
+npm run dev      # http://localhost:5173
+```
+
+## Data
+
+Static assets in `public/` are produced offline by `mapgen-app-export` (see
+`../mapgen`), which runs on `<gpu-host>` against the toponymy artifacts and copies the
+output here:
+
+```bash
+# on <gpu-host>, in ~/mapgen-run
+mapgen-fhs -c "uv run python -m mapgen.export_app \
+  --coords artifacts/coords_umap.parquet \
+  --topo-dir artifacts_topo \
+  --worlds data/worlds_search.parquet \
+  --embeddings artifacts/embeddings.npy \
+  --embed-meta artifacts/embed_meta.parquet \
+  --out-dir app_export"
+# then locally:
+rsync -av <gpu-host>:mapgen-run/app_export/ web/public/
+```
+
+Assets:
+- `app_points.parquet` — per-world: `x,y`, hierarchy ids/names `l0..l3`, soft-assigned
+  `region` (continent) + `color`, `name`, `visits`.
+- `regions_l2.geojson`, `regions_l3.geojson` — background polygons per cluster,
+  colored by parent continent.
+- `worlds_meta.parquet` — sidebar fields (description, tags, author, dates, sizes…).
+
+## How the LOD labels work
+
+One `TextLayer` holds continent + sub-region + world-title labels, resolved by
+`CollisionFilterExtension`. Priority brackets (continent ≫ sub-region ≫ world-by-
+visits) guarantee coarse labels win when space is tight; as you zoom in, freed
+screen space reveals finer labels and finally individual world titles. World
+titles are only added to the layer past a zoom threshold to keep the text atlas
+light. Region backgrounds switch from l3 (continents) to l2 (sub-regions) by zoom.
+
+## Deferred
+
+Faceted search/list (salvage the Mosaic crossfilter from `web-prototype`), a
+deep-zoom layout transform (de-overlap/grid), thumbnails, and a date scrubber.
