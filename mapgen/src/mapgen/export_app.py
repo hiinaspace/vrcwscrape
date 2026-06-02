@@ -27,6 +27,7 @@ import polars as pl
 import shapely
 
 from mapgen.common import clean_tags
+from mapgen.land import write_land_geojson
 from mapgen.regions import _distinct_colors, _median_nn, _region_polys
 
 # Sidebar fields pulled from worlds_search.parquet (first-pass; no visits-over-time
@@ -163,6 +164,37 @@ def main() -> None:
     )
     ap.add_argument("--buffer-scale", type=float, default=3.5)
     ap.add_argument(
+        "--land-edge-quantile",
+        type=float,
+        default=0.99,
+        help="Delaunay edge quantile used as land.geojson alpha-shape threshold",
+    )
+    ap.add_argument(
+        "--land-max-edge",
+        type=float,
+        default=None,
+        help="explicit land.geojson alpha-shape edge threshold; overrides quantile",
+    )
+    ap.add_argument(
+        "--land-simplify-scale",
+        type=float,
+        default=0.35,
+        help="land.geojson simplification tolerance as a fraction of max edge",
+    )
+    ap.add_argument(
+        "--land-min-area-scale",
+        type=float,
+        default=0.0,
+        help="drop land islands smaller than this * max_edge^2; 0 keeps all",
+    )
+    ap.add_argument(
+        "--land-expand-scale",
+        type=float,
+        default=0.25,
+        help="buffer final land polygons by this fraction of max edge",
+    )
+    ap.add_argument("--land-expand-quad-segs", type=int, default=2)
+    ap.add_argument(
         "--embeddings",
         type=Path,
         default=None,
@@ -287,9 +319,41 @@ def main() -> None:
     points.write_parquet(out_points)
     n = points.height
     print(f"  wrote {out_points} ({n:,} points, {len(region_ids)} regions)")
+    levels_out = [li for li in range(n_layers) if f"l{li}_sid" in points.columns]
+    out_manifest = args.out_dir / "manifest.json"
+    out_manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "point_count": n,
+                "levels": levels_out,
+                "top": levels_out[-1],
+                "sub": levels_out[-2] if len(levels_out) >= 2 else levels_out[-1],
+                "assets": {
+                    "points": "app_points.parquet",
+                    "meta": "worlds_meta.parquet",
+                    "land": "land.geojson",
+                    "regions": [f"regions_l{lvl}.geojson" for lvl in geojson_levels],
+                },
+            }
+        )
+    )
+    print(f"  wrote {out_manifest}")
+
+    # --- land polygon: static alpha shape of all worlds ----------------------
+    xy = points.select("x", "y").to_numpy().astype("float64")
+    write_land_geojson(
+        xy,
+        args.out_dir / "land.geojson",
+        edge_quantile=args.land_edge_quantile,
+        max_edge=args.land_max_edge,
+        simplify_scale=args.land_simplify_scale,
+        min_area_scale=args.land_min_area_scale,
+        expand_scale=args.land_expand_scale,
+        expand_quad_segs=args.land_expand_quad_segs,
+    )
 
     # --- region polygons per requested level (from soft ids = full coverage) ---
-    xy = points.select("x", "y").to_numpy().astype("float64")
     nn = _median_nn(xy)
     buffer_r = nn * args.buffer_scale
     region_soft = points["region"].to_numpy()

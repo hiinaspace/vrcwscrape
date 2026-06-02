@@ -34,6 +34,9 @@ Stages (top-20k-by-visits subset shown):
 uv run mapgen-embed --input data/worlds_search.parquet --out-dir artifacts --top-by visits --limit 20000
 # C: dimensionality reduction (UMAP / PaCMAP / LocalMAP)
 uv run mapgen-reduce --embeddings artifacts/embeddings.npy --meta artifacts/embed_meta.parquet --out-dir artifacts
+# C2: local coordinate relaxation for deep-zoom legibility; preserves global shape,
+# but opens up ultra-dense piles so Voronoi cells and labels have room.
+uv run mapgen-relax --coords artifacts/coords_umap.parquet --out artifacts/coords_umap_relaxed.parquet
 # D: HDBSCAN clusters + gemma4 labels + per-cluster exemplar report
 uv run mapgen-cluster --embeddings artifacts/embeddings.npy --meta artifacts/embed_meta.parquet --out-dir artifacts --min-samples 5
 # E: labeled region map (PNG + GeoJSON; noise soft-assigned to nearest region) + interactive HTML + NN report

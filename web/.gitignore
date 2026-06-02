@@ -7,4 +7,5 @@ dist
 # Kept out of git to avoid binary bloat; the app loads them from public/ at runtime.
 public/*.parquet
 public/*.geojson
+public/manifest.json
 public/full/

@@ -1,7 +1,9 @@
 # VRChat Worlds — Latent Map (web)
 
-Interactive map of ~20k VRChat worlds laid out by text-embedding similarity, with
-zoom-LOD neighborhood labels, region backgrounds, and a click-to-inspect sidebar.
+Interactive map of VRChat worlds laid out by text-embedding similarity, with a
+precomputed land polygon, zoom-LOD neighborhood labels, region backgrounds, and a
+click-to-inspect sidebar. The full 218k export is the default; `?data=20k` loads the
+smaller comparison export.
 
 Stack: React + Vite, deck.gl (`OrthographicView`), DuckDB-WASM (parquet in the
 browser). Supersedes the vanilla `web-prototype/`.
@@ -22,7 +24,7 @@ output here:
 ```bash
 # on <gpu-host>, in ~/mapgen-run
 mapgen-fhs -c "uv run python -m mapgen.export_app \
-  --coords artifacts/coords_umap.parquet \
+  --coords artifacts/coords_umap_relaxed.parquet \
   --topo-dir artifacts_topo \
   --worlds data/worlds_search.parquet \
   --embeddings artifacts/embeddings.npy \
@@ -33,20 +35,21 @@ rsync -av <gpu-host>:mapgen-run/app_export/ web/public/
 ```
 
 Assets:
-- `app_points.parquet` — per-world: `x,y`, hierarchy ids/names `l0..l3`, soft-assigned
+- `app_points.parquet` — per-world: `x,y`, hierarchy ids/names `l0..lN`, soft-assigned
   `region` (continent) + `color`, `name`, `visits`.
+- `manifest.json` — lightweight level/asset metadata used before DuckDB starts.
+- `land.geojson` — precomputed Delaunay alpha-shape landmass from all world coords.
 - `regions_l2.geojson`, `regions_l3.geojson` — background polygons per cluster,
   colored by parent continent.
 - `worlds_meta.parquet` — sidebar fields (description, tags, author, dates, sizes…).
 
 ## How the LOD labels work
 
-One `TextLayer` holds continent + sub-region + world-title labels, resolved by
-`CollisionFilterExtension`. Priority brackets (continent ≫ sub-region ≫ world-by-
-visits) guarantee coarse labels win when space is tight; as you zoom in, freed
-screen space reveals finer labels and finally individual world titles. World
-titles are only added to the layer past a zoom threshold to keep the text atlas
-light. Region backgrounds switch from l3 (continents) to l2 (sub-regions) by zoom.
+Region + world-title label candidates are projected and greedily decluttered in JS
+before deck.gl renders them. Priority brackets (continent ≫ sub-region ≫ world-by-
+visits) guarantee coarse labels win when space is tight; as you zoom in, freed screen
+space reveals finer labels and finally individual world titles. World-title candidates
+are viewport-culled and capped before they reach `TextLayer`.
 
 ## Deferred
 

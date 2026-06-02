@@ -13,6 +13,21 @@ const _params = new URLSearchParams(location.search);
 export const DATA_DIR = _params.get("data") === "20k" ? "" : "full/";
 const asset = (f) => new URL(import.meta.env.BASE_URL + DATA_DIR + f, location.href).href;
 
+let _manifestPromise;
+async function getManifest() {
+  if (_manifestPromise) return _manifestPromise;
+  _manifestPromise = (async () => {
+    try {
+      const res = await fetch(asset("manifest.json"));
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  })();
+  return _manifestPromise;
+}
+
 let _dbPromise;
 async function getDB() {
   if (_dbPromise) return _dbPromise;
@@ -55,6 +70,16 @@ async function getConn() {
 let _levels;
 export async function getLevels() {
   if (_levels) return _levels;
+  const manifest = await getManifest();
+  if (manifest?.levels?.length) {
+    const levels = manifest.levels.map(Number).sort((a, b) => a - b);
+    _levels = {
+      levels,
+      top: Number(manifest.top ?? levels[levels.length - 1]),
+      sub: Number(manifest.sub ?? levels[levels.length - 2]),
+    };
+    return _levels;
+  }
   const conn = await getConn();
   const res = await conn.query(
     `DESCRIBE SELECT * FROM read_parquet('app_points.parquet')`,

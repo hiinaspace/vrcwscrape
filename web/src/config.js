@@ -27,17 +27,12 @@ export const CELLS = {
   renderFromTier: "near", // "far" | "mid" | "near"
 };
 
-// "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). Because the
-// per-world cells only draw up close, the land layer lets you see the occupied area —
-// and any worlds UMAP scattered off on their own — as landmass/islands over water.
+// "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). The land is
+// a precomputed alpha-shape polygon over the world coordinates, so it stays solid at
+// any zoom without drawing every world as an overlapping scatter point.
 export const OCEAN = "#28323f"; // viewport background (any CSS color)
 export const LAND = {
   color: [226, 229, 231], // neutral light-grey landmass
-  // Radius in WORLD units = radiusK * typical world spacing, so dots scale with zoom
-  // and stay merged into continuous land instead of breaking apart as you zoom in.
-  radiusK: 0.85,
-  minPixels: 1.0, // floor so the land stays visible when zoomed all the way out
-  maxPixels: 60, // ceiling so a lone outlier island isn't absurdly large up close
 };
 
 // Region "background" fills (continent l3 + sub-region l2), drawn under the cells
