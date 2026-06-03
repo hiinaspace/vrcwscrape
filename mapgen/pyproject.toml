@@ -48,6 +48,7 @@ mapgen-embed-image = "mapgen.embed_image:main"
 mapgen-fuse = "mapgen.fuse:main"
 mapgen-toponymy = "mapgen.hierarchy:main"
 mapgen-physical-hierarchy = "mapgen.physical_hierarchy:main"
+mapgen-island-toponymy = "mapgen.island_toponymy:main"
 mapgen-app-export = "mapgen.export_app:main"
 mapgen-land = "mapgen.land:main"
 
