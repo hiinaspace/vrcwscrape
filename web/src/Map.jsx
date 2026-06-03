@@ -265,6 +265,10 @@ export default function WorldMap({
     setViewState({ ...v, minZoom: v.zoom - 2, maxZoom: v.zoom + 13 });
   }, [land, points, viewState, size]);
 
+  useEffect(() => {
+    if (import.meta.env.DEV) window.__vs = viewState;
+  }, [viewState]);
+
   // region id -> palette color (regions colored by index, see config REGION_PALETTE)
   const regionRGB = useMemo(() => {
     const regionIds = points.length

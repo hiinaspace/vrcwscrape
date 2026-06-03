@@ -5,12 +5,6 @@ import Sidebar from "./Sidebar.jsx";
 export default function App() {
   const [selected, setSelected] = useState(null);
   const [searchResults, setSearchResults] = useState([]);
-
-  // dev-only hook so the headless smoke test can drive selection (mjolnir's tap
-  // recognizer ignores some synthetic clicks)
-  useEffect(() => {
-    if (import.meta.env.DEV) window.__select = setSelected;
-  }, []);
   // focus = fly the map to a world or cluster; highlight = outline a cluster.
   // browseReq = ask the sidebar to open browse mode at a given cluster.
   const [focus, setFocus] = useState(null);
@@ -20,10 +14,16 @@ export default function App() {
   // sidebar uses it to only offer navigation into clusters with a visible region.
   const [regionSets, setRegionSets] = useState(null);
 
-  const focusWorld = (world_id) => {
+  const focusWorld = useCallback((world_id) => {
     setSelected(world_id);
     setFocus({ world_id, nonce: Date.now() });
-  };
+  }, []);
+
+  // dev-only hook so the headless smoke test can drive selection (mjolnir's tap
+  // recognizer ignores some synthetic clicks)
+  useEffect(() => {
+    if (import.meta.env.DEV) window.__select = focusWorld;
+  }, [focusWorld]);
   const focusCluster = (level, sid) => {
     setHighlight({ level, sid });
     setFocus({ level, sid, nonce: Date.now() });
@@ -60,7 +60,7 @@ export default function App() {
       />
       <div className="map-pane">
         <WorldMap
-          onSelect={setSelected}
+          onSelect={focusWorld}
           onPickRegion={browseCluster}
           onRegions={setRegionSets}
           selected={selected}

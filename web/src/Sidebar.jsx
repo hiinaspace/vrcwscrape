@@ -130,30 +130,23 @@ export default function Sidebar({
     setPath(path.slice(0, i + 1));
     if (c) onFocusCluster?.(c.level, c.sid);
   };
+  const backToSearch = () => onClose?.();
   // ============================ BROWSE (no world) ============================
   if (!worldId) {
     const node = path[path.length - 1];
     return (
       <aside className="sidebar sidebar-empty">
         <h1>VRChat Worlds</h1>
-        <SearchBox
-          value={searchQuery}
-          onChange={setSearchQuery}
-          loading={searchLoading}
-        />
+        <SearchBox value={searchQuery} onChange={setSearchQuery} loading={searchLoading} />
         {searchActive ? (
-          <SearchResults
-            results={results}
-            loading={searchLoading}
-            onPick={onFocusWorld}
-          />
+          <SearchResults results={results} loading={searchLoading} onPick={onFocusWorld} />
         ) : (
           <>
             {!node && (
-          <p className="hint">
-            A latent map of VRChat worlds. Drill into a region below, or click any world
-            on the map. Zoom in until worlds become individual plots.
-          </p>
+              <p className="hint">
+                A latent map of VRChat worlds. Drill into a region below, or click any
+                world on the map. Zoom in until worlds become individual plots.
+              </p>
             )}
             <nav className="breadcrumb">
               <button className="crumb" onClick={() => setPath([])}>
@@ -200,24 +193,33 @@ export default function Sidebar({
     );
   }
 
-  if (loading || !world) return <aside className="sidebar">Loading…</aside>;
+  if (loading || !world) {
+    return (
+      <aside className="sidebar">
+        {searchActive ? (
+          <button className="back search-back" onClick={backToSearch}>
+            ← Search results
+          </button>
+        ) : null}
+        Loading…
+      </aside>
+    );
+  }
 
   // ============================ WORLD DETAIL ============================
   return (
     <aside className="sidebar">
-      <button className="close" onClick={onClose} title="Close">
-        ×
-      </button>
+      {searchActive ? (
+        <button className="back search-back" onClick={backToSearch}>
+          ← Search results
+        </button>
+      ) : (
+        <button className="close" onClick={onClose} title="Close">
+          ×
+        </button>
+      )}
       <h2 className="title">{world.name}</h2>
       <div className="author">by {world.author_name || "unknown"}</div>
-      <SearchBox
-        value={searchQuery}
-        onChange={setSearchQuery}
-        loading={searchLoading}
-      />
-      {searchActive && (
-        <SearchResults results={results} loading={searchLoading} onPick={onFocusWorld} />
-      )}
       <a className="vrc-link" href={vrchatUrl(world.world_id)} target="_blank" rel="noreferrer">
         Open on VRChat ↗
       </a>
