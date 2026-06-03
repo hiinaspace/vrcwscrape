@@ -8,7 +8,8 @@ import { hexToRgb } from "./util.js";
 
 // Dataset switch: the full LocalMAP export is the default. `?data=20k` loads the
 // smaller root export. `?layout=umap`, `?layout=pacmap`, and `?layout=localmap`
-// select full-size comparison exports once copied into public/.
+// select full-size comparison exports. No-labs exports are explicit query-param
+// choices so the old full-data views remain available for A/B inspection.
 // DATA_DIR is also used by Map.jsx for the geojson assets.
 const _params = new URLSearchParams(location.search);
 const _data = (_params.get("data") || "").toLowerCase();
@@ -16,6 +17,50 @@ const _layout = (_params.get("layout") || "").toLowerCase();
 
 function datasetFromParams(data, layout) {
   if (data === "20k") return { key: "20k", dir: "", label: "20k UMAP" };
+  if (
+    data === "nolabs-umap" ||
+    data === "full-nolabs" ||
+    data === "full-nolabs-umap" ||
+    (data === "nolabs" && layout === "umap")
+  ) {
+    return { key: "nolabs-umap", dir: "full-nolabs/", label: "No-Labs UMAP" };
+  }
+  if (
+    data === "nolabs-pacmap" ||
+    data === "full-nolabs-pacmap" ||
+    (data === "nolabs" && layout === "pacmap")
+  ) {
+    return {
+      key: "nolabs-pacmap",
+      dir: "full-nolabs-pacmap/",
+      label: "No-Labs PaCMAP",
+    };
+  }
+  if (
+    data === "nolabs-localmap" ||
+    data === "full-nolabs-localmap" ||
+    (data === "nolabs" && layout === "localmap")
+  ) {
+    return {
+      key: "nolabs-localmap",
+      dir: "full-nolabs-localmap/",
+      label: "No-Labs LocalMAP",
+    };
+  }
+  if (
+    data === "nolabs" ||
+    data === "nolabs-physical" ||
+    data === "nolabs-localmap-physical" ||
+    data === "full-nolabs-localmap-physical" ||
+    layout === "localmap-physical" ||
+    (data === "nolabs" && layout === "physical")
+  ) {
+    return {
+      key: "nolabs-localmap-physical",
+      dir: "full-nolabs-localmap-physical/",
+      label: "No-Labs LocalMAP Physical",
+    };
+  }
   if (data === "umap" || data === "full" || data === "full-umap" || layout === "umap") {
     return { key: "full", dir: "full/", label: "Full UMAP" };
   }
