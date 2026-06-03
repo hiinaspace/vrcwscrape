@@ -50,6 +50,14 @@ class LayerSpec:
 
 FALLBACK_LABEL_RE = re.compile(r"^(?:Island|Neighborhood|District) \d+$")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'_-]{2,}|[\u3040-\u30ff\u3400-\u9fff]{2,}")
+BAD_LABELS = {
+    "misc",
+    "miscellaneous",
+    "unknown",
+    "unlabeled",
+    "unlabelled",
+    "untitled",
+}
 STOPWORDS = {
     "and",
     "are",
@@ -345,9 +353,14 @@ def _top_hint_labels(
     for layer in hint_layers:
         for i in members:
             label = layer[int(i)].strip()
-            if label and not FALLBACK_LABEL_RE.match(label):
+            if label and not _is_bad_label(label):
                 counts[label] += 1
     return counts.most_common(max_hints)
+
+
+def _is_bad_label(label: str) -> bool:
+    key = _label_key(label)
+    return not key or key in BAD_LABELS or bool(FALLBACK_LABEL_RE.match(label))
 
 
 def _label_key(label: str) -> str:
@@ -367,7 +380,11 @@ def _hint_candidate(
             hint, fallback, max_words=max_words, max_chars=max_chars
         )
         key = _label_key(candidate)
-        if candidate != fallback and key and key not in seen_keys:
+        if (
+            candidate != fallback
+            and not _is_bad_label(candidate)
+            and key not in seen_keys
+        ):
             return candidate
     return None
 
@@ -408,6 +425,8 @@ def _clean_label(raw: str, fallback: str, max_words: int, max_chars: int) -> str
     label = (raw or "").strip().strip("\"'`")
     label = re.sub(r"[\r\n\t]+", " ", label)
     label = re.sub(r"[,;:]+", " ", label)
+    if _is_bad_label(label):
+        return fallback
     words = [w for w in label.split() if w.lower() not in FORBIDDEN_LABEL_WORDS]
     if not words:
         return fallback
