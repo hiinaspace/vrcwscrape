@@ -48,6 +48,20 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "nolabs-v2" ||
+    data === "nolabs-physical-v2" ||
+    data === "nolabs-localmap-physical-v2" ||
+    data === "full-nolabs-localmap-physical-v2" ||
+    layout === "localmap-physical-v2" ||
+    (data === "nolabs" && layout === "physical-v2")
+  ) {
+    return {
+      key: "nolabs-localmap-physical-v2",
+      dir: "full-nolabs-localmap-physical-v2/",
+      label: "No-Labs LocalMAP Physical v2",
+    };
+  }
+  if (
     data === "nolabs" ||
     data === "nolabs-physical" ||
     data === "nolabs-localmap-physical" ||
