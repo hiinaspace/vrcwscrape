@@ -36,6 +36,18 @@ def main() -> None:
         help="optional captions.parquet (world_id, caption) to append to the "
         "embedding text (image-caption enrichment)",
     )
+    ap.add_argument(
+        "--exclude-tag",
+        action="append",
+        default=["system_labs"],
+        help="exclude worlds containing this raw VRChat tag; repeatable "
+        "(default: system_labs)",
+    )
+    ap.add_argument(
+        "--include-labs",
+        action="store_true",
+        help="do not apply the default system_labs exclusion",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -44,6 +56,17 @@ def main() -> None:
     if args.top_by and args.top_by not in cols:
         cols.append(args.top_by)
     df = pl.read_parquet(args.input).select(cols)
+    exclude_tags = [] if args.include_labs else args.exclude_tag
+    if exclude_tags:
+        before = df.height
+        has_excluded = pl.any_horizontal(
+            [pl.col("tags").list.contains(tag) for tag in exclude_tags]
+        ).fill_null(False)
+        df = df.filter(~has_excluded)
+        print(
+            f"Excluded {before - df.height:,} worlds with tags "
+            f"{', '.join(exclude_tags)}"
+        )
     if args.top_by:
         df = df.sort(args.top_by, descending=True, nulls_last=True)
     if args.limit:
