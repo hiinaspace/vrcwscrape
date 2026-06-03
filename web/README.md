@@ -2,10 +2,10 @@
 
 Interactive map of VRChat worlds laid out by text-embedding similarity, with a
 precomputed land polygon, zoom-LOD neighborhood labels, region backgrounds, and a
-click-to-inspect sidebar. The full 218k UMAP export is the default; `?data=20k`
+click-to-inspect sidebar. The full LocalMAP export is the default; `?data=20k`
 loads the smaller comparison export. Full-layout comparisons load with
-`?layout=pacmap` or `?layout=localmap` once copied into `public/full-pacmap/` and
-`public/full-localmap/`.
+`?layout=umap`, `?layout=pacmap`, or `?layout=localmap` once copied into `public/full/`,
+`public/full-pacmap/`, and `public/full-localmap/`.
 
 Stack: React + Vite, deck.gl (`OrthographicView`), DuckDB-WASM (parquet in the
 browser). Supersedes the vanilla `web-prototype/`.

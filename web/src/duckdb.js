@@ -6,9 +6,9 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { BROWSE } from "./config.js";
 import { hexToRgb } from "./util.js";
 
-// Dataset switch: the full 218k UMAP set (public/full/) is the default.
-// `?data=20k` loads the smaller root export. `?layout=pacmap` and
-// `?layout=localmap` load full-size comparison exports once copied into public/.
+// Dataset switch: the full LocalMAP export is the default. `?data=20k` loads the
+// smaller root export. `?layout=umap`, `?layout=pacmap`, and `?layout=localmap`
+// select full-size comparison exports once copied into public/.
 // DATA_DIR is also used by Map.jsx for the geojson assets.
 const _params = new URLSearchParams(location.search);
 const _data = (_params.get("data") || "").toLowerCase();
@@ -16,6 +16,9 @@ const _layout = (_params.get("layout") || "").toLowerCase();
 
 function datasetFromParams(data, layout) {
   if (data === "20k") return { key: "20k", dir: "", label: "20k UMAP" };
+  if (data === "umap" || data === "full" || data === "full-umap" || layout === "umap") {
+    return { key: "full", dir: "full/", label: "Full UMAP" };
+  }
   if (data === "pacmap" || data === "full-pacmap" || layout === "pacmap") {
     return { key: "pacmap", dir: "full-pacmap/", label: "Full PaCMAP" };
   }
@@ -26,7 +29,7 @@ function datasetFromParams(data, layout) {
   ) {
     return { key: "localmap", dir: "full-localmap/", label: "Full LocalMAP" };
   }
-  return { key: "full", dir: "full/", label: "Full UMAP" };
+  return { key: "localmap", dir: "full-localmap/", label: "Full LocalMAP" };
 }
 
 export const DATASET = datasetFromParams(_data, _layout);

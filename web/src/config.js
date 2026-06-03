@@ -153,6 +153,3 @@ export const SELECTED = {
   outline: [20, 20, 20, 120],
   outlineWidth: 3,
 };
-
-// Hover tooltip: ms the cursor must dwell before it appears (fewer flickers).
-export const HOVER = { dwellMs: 350 };

@@ -9,7 +9,6 @@ import {
   CAPITOL_DOT,
   CAPITOLS_PER_REGION,
   CELLS,
-  HOVER,
   LABEL_STYLE,
   LABELS,
   LAND,
@@ -30,6 +29,8 @@ const priL2 = (size) => 500 + Math.min(99, Math.round(size / 4));
 const priWorld = (visits) => Math.min(400, Math.round(Math.log10(visits + 1) * 60));
 
 const TIER_RANK = { far: 0, mid: 1, near: 2 };
+const FOCUS_ANIMATION_MS = 650;
+const easeOutCubic = (t) => 1 - (1 - t) ** 3;
 
 // A label is "wide" if it contains any non-Latin code unit (CJK/kana/hangul/symbols,
 // or a surrogate half from an emoji). Wide labels use the big atlas; the rest use a
@@ -65,6 +66,66 @@ function fitBounds([minX, minY, maxX, maxY], size, pad = 0.85) {
     target: [(minX + maxX) / 2, (minY + maxY) / 2, 0],
     zoom: Math.log2(Math.min((size.width * pad) / dx, (size.height * pad) / dy)),
   };
+}
+
+function clampZoom(vs, zoom) {
+  return Math.max(vs?.minZoom ?? -Infinity, Math.min(vs?.maxZoom ?? Infinity, zoom));
+}
+
+function zoomValue(vs) {
+  if (Array.isArray(vs?.zoom)) return Math.min(vs.zoom[0], vs.zoom[1]);
+  return vs?.zoom ?? vs?.zoomX ?? vs?.zoomY ?? 0;
+}
+
+function withZoom(vs, zoom) {
+  return { ...vs, zoom, zoomX: zoom, zoomY: zoom };
+}
+
+function focusView(vs, next) {
+  if (!vs) return vs;
+  const zoom = next.zoom == null ? null : clampZoom(vs, next.zoom);
+  const out = { ...vs, ...next };
+  return zoom == null ? out : withZoom(out, zoom);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpTarget(a, b, t) {
+  return [
+    lerp(a?.[0] ?? 0, b?.[0] ?? 0, t),
+    lerp(a?.[1] ?? 0, b?.[1] ?? 0, t),
+    lerp(a?.[2] ?? 0, b?.[2] ?? 0, t),
+  ];
+}
+
+function interpolateView(start, end, t) {
+  const zoom = lerp(zoomValue(start), zoomValue(end), t);
+  return withZoom(
+    {
+      ...end,
+      target: lerpTarget(start.target, end.target, t),
+    },
+    zoom,
+  );
+}
+
+function withViewConstraints(prev, next) {
+  const out = { ...next };
+  const minZoom = next.minZoom ?? prev?.minZoom;
+  const maxZoom = next.maxZoom ?? prev?.maxZoom;
+  if (minZoom != null) {
+    out.minZoom = minZoom;
+    out.minZoomX = next.minZoomX ?? prev?.minZoomX ?? minZoom;
+    out.minZoomY = next.minZoomY ?? prev?.minZoomY ?? minZoom;
+  }
+  if (maxZoom != null) {
+    out.maxZoom = maxZoom;
+    out.maxZoomX = next.maxZoomX ?? prev?.maxZoomX ?? maxZoom;
+    out.maxZoomY = next.maxZoomY ?? prev?.maxZoomY ?? maxZoom;
+  }
+  return out;
 }
 
 function dataBounds(points) {
@@ -182,28 +243,41 @@ export default function WorldMap({
   const [regionsSub, setRegionsSub] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
-  const [hover, setHover] = useState(null);
   // Hold label rendering until Inter is loaded, so deck builds the SDF atlas from the
   // self-hosted font (its glyph cache is keyed by settings, not rebuilt on font load).
   const [fontReady, setFontReady] = useState(false);
   const baseZoom = useRef(0);
   const wrapRef = useRef(null);
-  const hoverTimer = useRef(null);
-  const dragging = useRef(false);
+  const focusAnimation = useRef(null);
 
-  // tooltip appears only after the cursor dwells (config HOVER.dwellMs); leaving a
-  // feature hides it immediately. Fewer flickers while sweeping the mouse around.
-  // While panning we suppress it entirely (it would otherwise pop at a stale spot).
-  const showHover = (info) => {
-    clearTimeout(hoverTimer.current);
-    if (dragging.current || !info.object) {
-      setHover(null);
-      return;
-    }
-    const p = info.object.point || info.object;
-    const at = { x: info.x, y: info.y, p };
-    hoverTimer.current = setTimeout(() => setHover(at), HOVER.dwellMs);
+  const cancelFocusAnimation = () => {
+    if (focusAnimation.current != null) cancelAnimationFrame(focusAnimation.current);
+    focusAnimation.current = null;
   };
+
+  const animateFocus = (next) => {
+    setViewState((vs) => {
+      if (!vs) return vs;
+      cancelFocusAnimation();
+      const start = { ...vs };
+      const end = focusView(vs, next);
+      const t0 = performance.now();
+      const step = (now) => {
+        const k = Math.min(1, (now - t0) / FOCUS_ANIMATION_MS);
+        const frame = interpolateView(start, end, easeOutCubic(k));
+        setViewState((cur) => withViewConstraints(cur, frame));
+        if (k < 1) {
+          focusAnimation.current = requestAnimationFrame(step);
+        } else {
+          focusAnimation.current = null;
+        }
+      };
+      focusAnimation.current = requestAnimationFrame(step);
+      return start;
+    });
+  };
+
+  useEffect(() => () => cancelFocusAnimation(), []);
 
   useEffect(() => {
     const base = import.meta.env.BASE_URL + DATA_DIR;
@@ -262,11 +336,22 @@ export default function WorldMap({
     if (!bounds) return;
     const v = fitBounds(bounds, size);
     baseZoom.current = v.zoom;
-    setViewState({ ...v, minZoom: v.zoom - 2, maxZoom: v.zoom + 13 });
+    setViewState({
+      ...v,
+      minZoom: v.zoom - 2,
+      maxZoom: v.zoom + 13,
+      minZoomX: v.zoom - 2,
+      minZoomY: v.zoom - 2,
+      maxZoomX: v.zoom + 13,
+      maxZoomY: v.zoom + 13,
+    });
   }, [land, points, viewState, size]);
 
   useEffect(() => {
-    if (import.meta.env.DEV) window.__vs = viewState;
+    if (import.meta.env.DEV) {
+      window.__vs = viewState;
+      window.__baseZoom = baseZoom.current;
+    }
   }, [viewState]);
 
   // region id -> palette color (regions colored by index, see config REGION_PALETTE)
@@ -386,23 +471,18 @@ export default function WorldMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renderCells, cells, settle]);
 
-  // focus: jump to a world or a cluster's extent (instant; deck transitions on a
-  // controlled viewState get interrupted by onViewStateChange)
+  // focus: smoothly frame a world, result set, or cluster extent.
   useEffect(() => {
     if (!focus || size.width < 2) return;
     if (focus.results?.length) {
       if (focus.results.length === 1) {
         const p = focus.results[0];
-        setViewState((vs) => ({
-          ...vs,
+        animateFocus({
           target: [p.position[0], p.position[1], 0],
-          zoom: Math.max(vs.zoom, baseZoom.current + ZOOM.midOffset + 1),
-        }));
+          zoom: baseZoom.current + ZOOM.nearOffset + 1,
+        });
       } else {
-        setViewState((vs) => ({
-          ...vs,
-          ...fitBounds(dataBounds(focus.results), size, 0.6),
-        }));
+        animateFocus(fitBounds(dataBounds(focus.results), size, 0.6));
       }
       return;
     }
@@ -410,11 +490,10 @@ export default function WorldMap({
     if (focus.world_id) {
       const p = points.find((q) => q.world_id === focus.world_id);
       if (p)
-        setViewState((vs) => ({
-          ...vs,
+        animateFocus({
           target: [p.position[0], p.position[1], 0],
-          zoom: Math.max(vs.zoom, baseZoom.current + ZOOM.nearOffset + 1),
-        }));
+          zoom: baseZoom.current + ZOOM.nearOffset + 1,
+        });
       return;
     }
     if (focus.level != null && focus.sid != null) {
@@ -424,11 +503,10 @@ export default function WorldMap({
         focus.level === lvl?.top ? regionsTop : focus.level === lvl?.sub ? regionsSub : null;
       const f = gj?.features?.find((ft) => ft.properties.cluster_id === focus.sid);
       if (f) {
-        setViewState((vs) => ({ ...vs, ...fitBounds(featureBounds(f), size, 0.6) }));
+        animateFocus(fitBounds(featureBounds(f), size, 0.6));
       } else {
         const members = points.filter((p) => p.sid[focus.level] === focus.sid);
-        if (members.length)
-          setViewState((vs) => ({ ...vs, ...fitBounds(robustBounds(members), size, 0.6) }));
+        if (members.length) animateFocus(fitBounds(robustBounds(members), size, 0.6));
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -610,7 +688,6 @@ export default function WorldMap({
       getBackgroundColor: LABELS.backgroundColor,
       backgroundPadding: LABELS.backgroundPadding,
       pickable: true,
-      onHover: showHover,
       // clicking a region label frames+browses that region (gmaps "click a city");
       // clicking a world/capitol label selects that world.
       onClick: (info) => {
@@ -668,7 +745,6 @@ export default function WorldMap({
       filled: true,
       pickable: true,
       onClick: (info) => info.object && onSelect(info.object.point.world_id),
-      onHover: showHover,
       updateTriggers: {
         getFillColor: selected,
         getLineColor: selected,
@@ -703,7 +779,6 @@ export default function WorldMap({
       getLineColor: [255, 255, 255, 230],
       pickable: true,
       onClick: (info) => info.object && onSelect(info.object.world_id),
-      onHover: showHover,
       updateTriggers: { getFillColor: selected },
     }),
     new ScatterplotLayer({
@@ -722,7 +797,6 @@ export default function WorldMap({
       getLineColor: SEARCH_PIN.outline,
       pickable: true,
       onClick: (info) => info.object && onSelect(info.object.world_id),
-      onHover: showHover,
     }),
     highlightFeature &&
       new GeoJsonLayer({
@@ -744,53 +818,27 @@ export default function WorldMap({
   ];
 
   return (
-    <div
-      ref={wrapRef}
-      className="map-wrap"
-      style={{ background: OCEAN }}
-      onPointerDown={() => {
-        dragging.current = true;
-        clearTimeout(hoverTimer.current);
-        setHover(null);
-      }}
-      onPointerUp={() => {
-        dragging.current = false;
-      }}
-      onPointerLeave={() => {
-        dragging.current = false;
-        clearTimeout(hoverTimer.current);
-        setHover(null);
-      }}
-    >
+    <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
       <DeckGL
         views={new OrthographicView({ flipY: false })}
         viewState={viewState}
         controller={true}
         pickingRadius={6}
         layers={layers}
-        onViewStateChange={({ viewState: vs }) => setViewState(vs)}
-        getCursor={({ isHovering }) => (isHovering ? "pointer" : "grab")}
+        onViewStateChange={({ viewState: vs, interactionState }) => {
+          if (
+            interactionState?.isDragging ||
+            interactionState?.isPanning ||
+            interactionState?.isZooming
+          ) {
+            cancelFocusAnimation();
+          }
+          setViewState((prev) => withViewConstraints(prev, vs));
+        }}
+        getCursor={({ isDragging, isHovering }) =>
+          isDragging ? "grabbing" : isHovering ? "pointer" : "grab"
+        }
       />
-      {hover && <HoverCard hover={hover} size={size} />}
-    </div>
-  );
-}
-
-// edge-aware tooltip: offset from the cursor, flip near the right/bottom edges
-function HoverCard({ hover, size }) {
-  const PAD = 14;
-  const flipX = hover.x > size.width - 240;
-  const flipY = hover.y > size.height - 90;
-  const style = {
-    left: flipX ? undefined : hover.x + PAD,
-    right: flipX ? size.width - hover.x + PAD : undefined,
-    top: flipY ? undefined : hover.y + PAD,
-    bottom: flipY ? size.height - hover.y + PAD : undefined,
-  };
-  return (
-    <div className="hovercard" style={style}>
-      <div className="hovercard-name">{hover.p.name || "(untitled)"}</div>
-      <div className="hovercard-region">{hover.p.region_name}</div>
     </div>
   );
 }
