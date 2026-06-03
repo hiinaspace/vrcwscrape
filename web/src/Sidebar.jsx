@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import {
+  DATASET,
   queryChildClusters,
   queryClusterWorlds,
   queryTopClusters,
   queryWorld,
+  searchWorlds,
 } from "./duckdb.js";
 
 function vrchatUrl(id) {
@@ -18,11 +20,15 @@ export default function Sidebar({
   onFocusWorld,
   onFocusCluster,
   onBrowseCluster,
+  onSearchResults,
 }) {
   // a cluster is navigable only if it has a region polygon on the map at that level
   const navigable = (level, sid) => !!regionSets?.[level]?.has(sid);
   const [world, setWorld] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [results, setResults] = useState([]);
   // world-detail "area" list (the world's sub-region)
   const [cluster, setCluster] = useState(null);
   const [clusterWorlds, setClusterWorlds] = useState([]);
@@ -30,6 +36,39 @@ export default function Sidebar({
   const [path, setPath] = useState([]); // [{level,sid,name}], last = current node
   const [children, setChildren] = useState([]); // sub-clusters of the current node
   const [browseWorlds, setBrowseWorlds] = useState([]); // top worlds of current node
+  const searchActive = searchQuery.trim().length >= 2;
+
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (q.length < 2) {
+      setResults([]);
+      setSearchLoading(false);
+      onSearchResults?.([]);
+      return;
+    }
+    let live = true;
+    setSearchLoading(true);
+    const t = setTimeout(() => {
+      searchWorlds(q, 40).then(
+        (rows) => {
+          if (!live) return;
+          setResults(rows);
+          setSearchLoading(false);
+          onSearchResults?.(rows);
+        },
+        () => {
+          if (!live) return;
+          setResults([]);
+          setSearchLoading(false);
+          onSearchResults?.([]);
+        },
+      );
+    }, 180);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [searchQuery, onSearchResults]);
 
   // ---------- world-detail loading ----------
   useEffect(() => {
@@ -97,50 +136,65 @@ export default function Sidebar({
     return (
       <aside className="sidebar sidebar-empty">
         <h1>VRChat Worlds</h1>
-        {!node && (
+        <SearchBox
+          value={searchQuery}
+          onChange={setSearchQuery}
+          loading={searchLoading}
+        />
+        {searchActive ? (
+          <SearchResults
+            results={results}
+            loading={searchLoading}
+            onPick={onFocusWorld}
+          />
+        ) : (
+          <>
+            {!node && (
           <p className="hint">
             A latent map of VRChat worlds. Drill into a region below, or click any world
             on the map. Zoom in until worlds become individual plots.
           </p>
-        )}
-        <nav className="breadcrumb">
-          <button className="crumb" onClick={() => setPath([])}>
-            All regions
-          </button>
-          {path.map((c, i) => (
-            <span key={`${c.level}-${c.sid}`}>
-              <span className="sep">›</span>
-              <button
-                className={"crumb" + (i === path.length - 1 ? " active" : "")}
-                onClick={() => breadcrumbTo(i)}
-              >
-                {c.name}
+            )}
+            <nav className="breadcrumb">
+              <button className="crumb" onClick={() => setPath([])}>
+                All regions
               </button>
-            </span>
-          ))}
-        </nav>
-
-        {children.length > 0 && (
-          <>
-            <h3 className="area-title">{node ? "Sub-areas" : "Regions"}</h3>
-            <ol className="area-list">
-              {children.map((c) => (
-                <li key={`${c.level}-${c.sid}`}>
-                  <button className="area-world drill" onClick={() => drillTo(c)}>
-                    <span className="area-name">{c.name}</span>
-                    <span className="area-visits">{c.n.toLocaleString()} ›</span>
+              {path.map((c, i) => (
+                <span key={`${c.level}-${c.sid}`}>
+                  <span className="sep">›</span>
+                  <button
+                    className={"crumb" + (i === path.length - 1 ? " active" : "")}
+                    onClick={() => breadcrumbTo(i)}
+                  >
+                    {c.name}
                   </button>
-                </li>
+                </span>
               ))}
-            </ol>
-          </>
-        )}
+            </nav>
 
-        {node && browseWorlds.length > 0 && (
-          <div className="area">
-            <h3 className="area-title">Top worlds here</h3>
-            <WorldList worlds={browseWorlds} onPick={onFocusWorld} currentId={null} />
-          </div>
+            {children.length > 0 && (
+              <>
+                <h3 className="area-title">{node ? "Sub-areas" : "Regions"}</h3>
+                <ol className="area-list">
+                  {children.map((c) => (
+                    <li key={`${c.level}-${c.sid}`}>
+                      <button className="area-world drill" onClick={() => drillTo(c)}>
+                        <span className="area-name">{c.name}</span>
+                        <span className="area-visits">{c.n.toLocaleString()} ›</span>
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )}
+
+            {node && browseWorlds.length > 0 && (
+              <div className="area">
+                <h3 className="area-title">Top worlds here</h3>
+                <WorldList worlds={browseWorlds} onPick={onFocusWorld} currentId={null} />
+              </div>
+            )}
+          </>
         )}
       </aside>
     );
@@ -156,6 +210,14 @@ export default function Sidebar({
       </button>
       <h2 className="title">{world.name}</h2>
       <div className="author">by {world.author_name || "unknown"}</div>
+      <SearchBox
+        value={searchQuery}
+        onChange={setSearchQuery}
+        loading={searchLoading}
+      />
+      {searchActive && (
+        <SearchResults results={results} loading={searchLoading} onPick={onFocusWorld} />
+      )}
       <a className="vrc-link" href={vrchatUrl(world.world_id)} target="_blank" rel="noreferrer">
         Open on VRChat ↗
       </a>
@@ -221,6 +283,53 @@ export default function Sidebar({
         </div>
       )}
     </aside>
+  );
+}
+
+function SearchBox({ value, onChange, loading }) {
+  return (
+    <div className="searchbox">
+      <input
+        type="search"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Search worlds"
+        aria-label="Search worlds"
+      />
+      <div className="search-meta">
+        <span>{DATASET.label}</span>
+        {loading && <span>Searching…</span>}
+      </div>
+    </div>
+  );
+}
+
+function SearchResults({ results, loading, onPick }) {
+  if (loading && !results.length) {
+    return <div className="search-empty">Searching…</div>;
+  }
+  if (!loading && !results.length) {
+    return <div className="search-empty">No matches</div>;
+  }
+  return (
+    <div className="search-results">
+      <h3 className="area-title">Search results</h3>
+      <ol className="area-list">
+        {results.map((w) => (
+          <li key={w.world_id}>
+            <button className="search-result" onClick={() => onPick?.(w.world_id)} title={w.name}>
+              <span className="search-rank">{w.rank}</span>
+              <span className="search-main">
+                <span className="search-name">{w.name}</span>
+                <span className="search-sub">
+                  {w.author_name || "unknown"} · {w.visits.toLocaleString()} visits
+                </span>
+              </span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 

@@ -16,6 +16,7 @@ import {
   OCEAN,
   REGION_BG,
   REGION_PALETTE,
+  SEARCH_PIN,
   SELECTED,
   WORLD_LABELS,
   ZOOM,
@@ -170,6 +171,7 @@ export default function WorldMap({
   selected,
   focus,
   highlight,
+  searchResults = [],
 }) {
   const [points, setPoints] = useState([]);
   // "top" = coarsest hierarchy level (continents), "sub" = next (sub-regions).
@@ -383,7 +385,24 @@ export default function WorldMap({
   // focus: jump to a world or a cluster's extent (instant; deck transitions on a
   // controlled viewState get interrupted by onViewStateChange)
   useEffect(() => {
-    if (!focus || !points.length || size.width < 2) return;
+    if (!focus || size.width < 2) return;
+    if (focus.results?.length) {
+      if (focus.results.length === 1) {
+        const p = focus.results[0];
+        setViewState((vs) => ({
+          ...vs,
+          target: [p.position[0], p.position[1], 0],
+          zoom: Math.max(vs.zoom, baseZoom.current + ZOOM.midOffset + 1),
+        }));
+      } else {
+        setViewState((vs) => ({
+          ...vs,
+          ...fitBounds(dataBounds(focus.results), size, 0.6),
+        }));
+      }
+      return;
+    }
+    if (!points.length) return;
     if (focus.world_id) {
       const p = points.find((q) => q.world_id === focus.world_id);
       if (p)
@@ -599,7 +618,7 @@ export default function WorldMap({
     });
 
   const layers = [
-    // "land": a precomputed alpha-shape polygon over all world coordinates. This
+    // "land": a precomputed rasterized/dilated polygon over all world coordinates. This
     // keeps the occupied area solid at close zoom without drawing every world as a
     // large overlapping scatter point during pan/zoom.
     new GeoJsonLayer({
@@ -682,6 +701,24 @@ export default function WorldMap({
       onClick: (info) => info.object && onSelect(info.object.world_id),
       onHover: showHover,
       updateTriggers: { getFillColor: selected },
+    }),
+    new ScatterplotLayer({
+      id: "search-results",
+      data: searchResults,
+      visible: searchResults.length > 0,
+      getPosition: (d) => d.position,
+      getFillColor: SEARCH_PIN.fill,
+      getRadius: SEARCH_PIN.radius,
+      radiusUnits: "pixels",
+      radiusMinPixels: SEARCH_PIN.minPixels,
+      radiusMaxPixels: SEARCH_PIN.maxPixels,
+      stroked: true,
+      lineWidthUnits: "pixels",
+      getLineWidth: SEARCH_PIN.outlineWidth,
+      getLineColor: SEARCH_PIN.outline,
+      pickable: true,
+      onClick: (info) => info.object && onSelect(info.object.world_id),
+      onHover: showHover,
     }),
     highlightFeature &&
       new GeoJsonLayer({

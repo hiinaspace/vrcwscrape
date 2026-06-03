@@ -9,3 +9,4 @@ public/*.parquet
 public/*.geojson
 public/manifest.json
 public/full/
+public/full-*/

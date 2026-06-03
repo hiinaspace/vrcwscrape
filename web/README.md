@@ -2,8 +2,10 @@
 
 Interactive map of VRChat worlds laid out by text-embedding similarity, with a
 precomputed land polygon, zoom-LOD neighborhood labels, region backgrounds, and a
-click-to-inspect sidebar. The full 218k export is the default; `?data=20k` loads the
-smaller comparison export.
+click-to-inspect sidebar. The full 218k UMAP export is the default; `?data=20k`
+loads the smaller comparison export. Full-layout comparisons load with
+`?layout=pacmap` or `?layout=localmap` once copied into `public/full-pacmap/` and
+`public/full-localmap/`.
 
 Stack: React + Vite, deck.gl (`OrthographicView`), DuckDB-WASM (parquet in the
 browser). Supersedes the vanilla `web-prototype/`.
@@ -32,6 +34,8 @@ mapgen-fhs -c "uv run python -m mapgen.export_app \
   --out-dir app_export"
 # then locally:
 rsync -av <gpu-host>:mapgen-run/app_export/ web/public/
+rsync -av <gpu-host>:mapgen-run/app_export_full_pacmap/ web/public/full-pacmap/
+rsync -av <gpu-host>:mapgen-run/app_export_full_localmap/ web/public/full-localmap/
 ```
 
 Assets:
@@ -50,6 +54,12 @@ before deck.gl renders them. Priority brackets (continent ≫ sub-region ≫ wor
 visits) guarantee coarse labels win when space is tight; as you zoom in, freed screen
 space reveals finer labels and finally individual world titles. World-title candidates
 are viewport-culled and capped before they reach `TextLayer`.
+
+## Search
+
+The sidebar search runs a weighted DuckDB-WASM metadata scan over
+`worlds_meta.parquet` joined to `app_points.parquet`, then displays the top matches
+as red map pins and a result list.
 
 ## Deferred
 

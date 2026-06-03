@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import WorldMap from "./Map.jsx";
 import Sidebar from "./Sidebar.jsx";
 
 export default function App() {
   const [selected, setSelected] = useState(null);
+  const [searchResults, setSearchResults] = useState([]);
 
   // dev-only hook so the headless smoke test can drive selection (mjolnir's tap
   // recognizer ignores some synthetic clicks)
@@ -35,6 +36,12 @@ export default function App() {
     setFocus({ level, sid, nonce: Date.now() });
     setBrowseReq({ level, sid, name, nonce: Date.now() });
   };
+  const updateSearchResults = useCallback((results) => {
+    setSearchResults(results);
+    if (results.length) {
+      setFocus({ results: results.slice(0, 40), nonce: Date.now() });
+    }
+  }, []);
 
   return (
     <div className="app">
@@ -49,6 +56,7 @@ export default function App() {
         onFocusWorld={focusWorld}
         onFocusCluster={focusCluster}
         onBrowseCluster={browseCluster}
+        onSearchResults={updateSearchResults}
       />
       <div className="map-pane">
         <WorldMap
@@ -58,6 +66,7 @@ export default function App() {
           selected={selected}
           focus={focus}
           highlight={highlight}
+          searchResults={searchResults}
         />
       </div>
     </div>

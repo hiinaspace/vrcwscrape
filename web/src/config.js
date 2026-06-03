@@ -100,6 +100,15 @@ export const CAPITOL_DOT = {
   maxPixels: 6,
 };
 
+export const SEARCH_PIN = {
+  radius: 7,
+  minPixels: 6,
+  maxPixels: 11,
+  fill: [222, 54, 54, 245],
+  outline: [255, 255, 255, 245],
+  outlineWidth: 2,
+};
+
 // Per-kind label color / offset / wrapping. (Sizes, bg box, collision in LABELS.)
 export const LABEL_STYLE = {
   worldColor: [30, 30, 30],

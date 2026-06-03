@@ -6,12 +6,43 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { BROWSE } from "./config.js";
 import { hexToRgb } from "./util.js";
 
-// Dataset switch: the full 218k set (public/full/) is the default; `?data=20k` loads
-// the smaller set from public/ for comparison. DATA_DIR is also used by Map.jsx for
-// the geojson assets.
+// Dataset switch: the full 218k UMAP set (public/full/) is the default.
+// `?data=20k` loads the smaller root export. `?layout=pacmap` and
+// `?layout=localmap` load full-size comparison exports once copied into public/.
+// DATA_DIR is also used by Map.jsx for the geojson assets.
 const _params = new URLSearchParams(location.search);
-export const DATA_DIR = _params.get("data") === "20k" ? "" : "full/";
+const _data = (_params.get("data") || "").toLowerCase();
+const _layout = (_params.get("layout") || "").toLowerCase();
+
+function datasetFromParams(data, layout) {
+  if (data === "20k") return { key: "20k", dir: "", label: "20k UMAP" };
+  if (data === "pacmap" || data === "full-pacmap" || layout === "pacmap") {
+    return { key: "pacmap", dir: "full-pacmap/", label: "Full PaCMAP" };
+  }
+  if (
+    data === "localmap" ||
+    data === "full-localmap" ||
+    layout === "localmap"
+  ) {
+    return { key: "localmap", dir: "full-localmap/", label: "Full LocalMAP" };
+  }
+  return { key: "full", dir: "full/", label: "Full UMAP" };
+}
+
+export const DATASET = datasetFromParams(_data, _layout);
+export const DATA_DIR = DATASET.dir;
 const asset = (f) => new URL(import.meta.env.BASE_URL + DATA_DIR + f, location.href).href;
+
+function searchTerms(query) {
+  return query
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[%_]/g, " ")
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2)
+    .slice(0, 6);
+}
 
 let _manifestPromise;
 async function getManifest() {
@@ -239,5 +270,75 @@ export async function queryClusterWorlds(level, sid, limit = 12) {
     world_id: r.world_id,
     name: r.name ?? "(untitled)",
     visits: Number(r.visits ?? 0),
+  }));
+}
+
+/** Weighted metadata search with coordinates for map result pins. */
+export async function searchWorlds(query, limit = 40) {
+  const terms = searchTerms(query);
+  if (!terms.length) return [];
+  const conn = await getConn();
+  const q = terms.join(" ");
+  const needle = `%${q}%`;
+  const where = terms.map(() => "haystack LIKE ?").join(" AND ");
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 40));
+  const stmt = await conn.prepare(`
+    WITH docs AS (
+      SELECT
+        m.world_id,
+        m.name,
+        m.author_name,
+        m.visits,
+        m.favorites,
+        strftime(m.created_at, '%Y-%m-%d') AS created,
+        strftime(m.updated_at, '%Y-%m-%d') AS updated,
+        m.pc_size_mb,
+        m.quest_size_mb,
+        p.x,
+        p.y,
+        p.region_name,
+        lower(coalesce(m.name, '')) AS lname,
+        lower(coalesce(m.author_name, '')) AS lauthor,
+        lower(concat_ws(
+          ' ',
+          coalesce(m.name, ''),
+          coalesce(m.description, ''),
+          coalesce(m.author_name, ''),
+          coalesce(cast(m.tags AS varchar), '')
+        )) AS haystack
+      FROM read_parquet('worlds_meta.parquet') m
+      JOIN read_parquet('app_points.parquet') p USING (world_id)
+    )
+    SELECT
+      world_id, name, author_name, visits, favorites, created, updated,
+      pc_size_mb, quest_size_mb, x, y, region_name,
+      (
+        CASE WHEN lname = ? THEN 120 ELSE 0 END +
+        CASE WHEN lname LIKE ? THEN 80 ELSE 0 END +
+        CASE WHEN lname LIKE ? THEN 45 ELSE 0 END +
+        CASE WHEN lauthor LIKE ? THEN 18 ELSE 0 END +
+        ln(cast(coalesce(visits, 0) AS double) + 1)
+      ) AS score
+    FROM docs
+    WHERE ${where}
+    ORDER BY score DESC, visits DESC NULLS LAST
+    LIMIT ${safeLimit}
+  `);
+  const res = await stmt.query(q, `${q}%`, needle, needle, ...terms.map((t) => `%${t}%`));
+  await stmt.close();
+  return res.toArray().map((r, i) => ({
+    rank: i + 1,
+    world_id: r.world_id,
+    name: r.name ?? "(untitled)",
+    author_name: r.author_name ?? "",
+    visits: Number(r.visits ?? 0),
+    favorites: Number(r.favorites ?? 0),
+    created: r.created ?? "",
+    updated: r.updated ?? "",
+    pc_size_mb: r.pc_size_mb == null ? null : Number(r.pc_size_mb),
+    quest_size_mb: r.quest_size_mb == null ? null : Number(r.quest_size_mb),
+    position: [Number(r.x), Number(r.y)],
+    region_name: r.region_name ?? "",
+    score: Number(r.score ?? 0),
   }));
 }
