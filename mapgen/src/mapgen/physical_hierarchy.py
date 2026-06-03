@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +45,34 @@ class LayerSpec:
     index: int
     name: str
     cluster_id: np.ndarray
+    parent_id: np.ndarray | None = None
+
+
+FALLBACK_LABEL_RE = re.compile(r"^(?:Island|Neighborhood|District) \d+$")
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'_-]{2,}|[\u3040-\u30ff\u3400-\u9fff]{2,}")
+STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "has",
+    "have",
+    "https",
+    "into",
+    "just",
+    "like",
+    "new",
+    "not",
+    "official",
+    "the",
+    "this",
+    "that",
+    "with",
+    "world",
+    "worlds",
+    "vrchat",
+    "www",
+}
 
 
 def _point_cells(
@@ -234,6 +263,115 @@ def _representative_idx(emb: np.ndarray, members: np.ndarray, k: int) -> list[in
     return members[order].tolist()
 
 
+def _tokens(text: str) -> list[str]:
+    return [
+        tok
+        for tok in TOKEN_RE.findall((text or "").lower())
+        if tok not in STOPWORDS and not tok.isdigit()
+    ]
+
+
+def _cluster_keyphrases(
+    texts: list[str],
+    members: np.ndarray,
+    *,
+    max_terms: int,
+    max_docs: int = 700,
+) -> list[str]:
+    if len(members) > max_docs:
+        take = np.linspace(0, len(members) - 1, max_docs).astype(np.int64)
+        docs = [texts[int(members[i])] for i in take]
+    else:
+        docs = [texts[int(i)] for i in members]
+    unigram: Counter[str] = Counter()
+    bigram: Counter[str] = Counter()
+    for doc in docs:
+        toks = _tokens(doc)[:80]
+        unigram.update(toks)
+        bigram.update(
+            f"{a} {b}" for a, b in zip(toks, toks[1:], strict=False) if a != b
+        )
+
+    scored: list[tuple[str, float]] = []
+    scored.extend((term, count * 1.6) for term, count in bigram.items() if count >= 2)
+    scored.extend((term, float(count)) for term, count in unigram.items() if count >= 2)
+    scored.sort(key=lambda kv: (-kv[1], kv[0]))
+    out: list[str] = []
+    seen_words: set[str] = set()
+    for term, _ in scored:
+        key = term.lower()
+        if key in seen_words:
+            continue
+        out.append(term)
+        seen_words.add(key)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _load_hint_layers(
+    hint_topo_dir: Path | None, world_ids: list[str]
+) -> list[list[str]]:
+    if hint_topo_dir is None:
+        return []
+    layer_paths = sorted(
+        hint_topo_dir.glob("layer_*.parquet"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    if not layer_paths:
+        print(f"  note: no hint layer_*.parquet in {hint_topo_dir}")
+        return []
+    base = pl.DataFrame({"world_id": world_ids})
+    layers: list[list[str]] = []
+    for lp in layer_paths:
+        layer = pl.read_parquet(lp)
+        if "topic_name" not in layer.columns:
+            continue
+        aligned = base.join(
+            layer.select("world_id", "topic_name"), on="world_id", how="left"
+        )
+        layers.append([str(v or "") for v in aligned["topic_name"].to_list()])
+    print(f"loaded {len(layers)} Toponymy hint layers from {hint_topo_dir}")
+    return layers
+
+
+def _top_hint_labels(
+    hint_layers: list[list[str]],
+    members: np.ndarray,
+    *,
+    max_hints: int,
+) -> list[tuple[str, int]]:
+    counts: Counter[str] = Counter()
+    for layer in hint_layers:
+        for i in members:
+            label = layer[int(i)].strip()
+            if label and not FALLBACK_LABEL_RE.match(label):
+                counts[label] += 1
+    return counts.most_common(max_hints)
+
+
+def _label_key(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+
+
+def _hint_candidate(
+    hints: list[tuple[str, int]],
+    fallback: str,
+    seen_keys: set[str],
+    *,
+    max_words: int,
+    max_chars: int,
+) -> str | None:
+    for hint, _ in hints:
+        candidate = _clean_label(
+            hint, fallback, max_words=max_words, max_chars=max_chars
+        )
+        key = _label_key(candidate)
+        if candidate != fallback and key and key not in seen_keys:
+            return candidate
+    return None
+
+
 def _parse_label(raw: str) -> tuple[str, str]:
     text = raw.strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
@@ -285,17 +423,39 @@ def _label_prompt(
     level_name: str,
     samples: str,
     parent_hint: str,
+    keyphrases: list[str],
+    topo_hints: list[tuple[str, int]],
+    sibling_labels: list[str],
     name_instructions: str,
 ) -> str:
     parent_line = f"\nParent region: {parent_hint}" if parent_hint else ""
-    return f"""You are naming one {level_name} in a VRChat world map.
-The cluster is physically local in the 2D map.
-Name the shared theme of these worlds, not the algorithm.
+    keyword_line = ""
+    if keyphrases:
+        keyword_line = "\nKeywords for this group: " + ", ".join(keyphrases)
+    hint_line = ""
+    if topo_hints:
+        hints = ", ".join(f"{name} ({count})" for name, count in topo_hints)
+        hint_line = "\nExisting topic labels inside this area: " + hints
+    avoid_line = ""
+    if sibling_labels:
+        avoid_line = "\nAlready-used sibling map labels to avoid: " + ", ".join(
+            sibling_labels
+        )
+    return f"""You are an expert at classifying VRChat worlds into map regions.
+You are naming one physically local {level_name} in a Google-Maps-like latent map.
+Name the shared theme of these worlds, not the algorithm or the map shape.
 {parent_line}
+{keyword_line}
+{hint_line}
+{avoid_line}
 
 Representative worlds:
 {samples}
 
+Use existing topic labels and keywords as stronger evidence than generic titles
+like "world", "my world", or "test".
+If this is a broad island, choose a broad place-like label. If this is inside a
+parent region, choose a more specific label that distinguishes it from siblings.
 Return one JSON object with keys "topic_name" and "category".
 {name_instructions}"""
 
@@ -307,6 +467,7 @@ def _cluster_labels(
     names: list[str],
     texts: list[str],
     parent_names: list[str] | None,
+    hint_layers: list[list[str]],
     args: argparse.Namespace,
 ) -> tuple[dict[int, str], dict[int, dict[str, object]], dict[int, list[str]]]:
     labels: dict[int, str] = {}
@@ -321,6 +482,7 @@ def _cluster_labels(
         if int(cid) >= 0
     ]
     labeled = 0
+    seen_by_parent: dict[int, list[str]] = defaultdict(list)
     client = None if args.no_label else httpx.Client(timeout=args.llm_timeout)
     try:
         for cid, size in ordered:
@@ -330,6 +492,19 @@ def _cluster_labels(
             fallback = _fallback_label(layer.name, cid)
             topic_name = fallback
             category = "misc"
+            parent_key = (
+                int(layer.parent_id[members[0]])
+                if layer.parent_id is not None and len(members)
+                else -1
+            )
+            sibling_labels = seen_by_parent[parent_key][-12:]
+            sibling_keys = {_label_key(label) for label in seen_by_parent[parent_key]}
+            keyphrases = _cluster_keyphrases(
+                texts, members, max_terms=args.max_keyphrases
+            )
+            topo_hints = _top_hint_labels(
+                hint_layers, members, max_hints=args.max_hint_labels
+            )
             should_label = (
                 not args.no_label
                 and size >= args.min_label_size
@@ -348,6 +523,9 @@ def _cluster_labels(
                             level_name=layer.name,
                             samples=samples,
                             parent_hint=parent_hint,
+                            keyphrases=keyphrases,
+                            topo_hints=topo_hints,
+                            sibling_labels=sibling_labels,
                             name_instructions=args.name_instructions,
                         ),
                         model=args.llm_model,
@@ -364,11 +542,32 @@ def _cluster_labels(
                         max_words=args.max_label_words,
                         max_chars=args.max_label_chars,
                     )
+                    if _label_key(topic_name) in sibling_keys:
+                        hint_candidate = _hint_candidate(
+                            topo_hints,
+                            fallback,
+                            sibling_keys,
+                            max_words=args.max_label_words,
+                            max_chars=args.max_label_chars,
+                        )
+                        if hint_candidate:
+                            topic_name = hint_candidate
                     labeled += 1
                 except Exception as err:  # noqa: BLE001
                     print(f"  !! label failed for {layer.name} {cid}: {err}")
                     topic_name = fallback
+            elif topo_hints:
+                hint_candidate = _hint_candidate(
+                    topo_hints,
+                    fallback,
+                    sibling_keys,
+                    max_words=args.max_label_words,
+                    max_chars=args.max_label_chars,
+                )
+                if hint_candidate:
+                    topic_name = hint_candidate
             labels[cid] = topic_name
+            seen_by_parent[parent_key].append(topic_name)
             entries[cid] = {
                 "label": topic_name,
                 "category": category or "misc",
@@ -467,6 +666,15 @@ def main() -> None:
     ap.add_argument("--embeddings", type=Path, required=True)
     ap.add_argument("--meta", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument(
+        "--hint-topo-dir",
+        type=Path,
+        default=None,
+        help=(
+            "optional existing Toponymy layer directory; its labels are used as "
+            "semantic hints when naming physical clusters"
+        ),
+    )
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--seed", type=int, default=42)
 
@@ -489,14 +697,16 @@ def main() -> None:
     ap.add_argument("--min-child-size", type=int, default=120)
     ap.add_argument("--max-children", type=int, default=24)
     ap.add_argument("--latent-dim", type=int, default=16)
-    ap.add_argument("--spatial-weight", type=float, default=4.0)
-    ap.add_argument("--latent-weight", type=float, default=0.75)
+    ap.add_argument("--spatial-weight", type=float, default=2.5)
+    ap.add_argument("--latent-weight", type=float, default=2.0)
 
     ap.add_argument("--samples-per-cluster", type=int, default=24)
-    ap.add_argument("--max-label-clusters", type=int, default=360)
-    ap.add_argument("--min-label-size", type=int, default=20)
+    ap.add_argument("--max-keyphrases", type=int, default=18)
+    ap.add_argument("--max-hint-labels", type=int, default=12)
+    ap.add_argument("--max-label-clusters", type=int, default=500)
+    ap.add_argument("--min-label-size", type=int, default=3)
     ap.add_argument("--max-label-words", type=int, default=3)
-    ap.add_argument("--max-label-chars", type=int, default=24)
+    ap.add_argument("--max-label-chars", type=int, default=28)
     ap.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
     ap.add_argument("--ollama-url", default=None)
     ap.add_argument("--llm-timeout", type=float, default=300.0)
@@ -505,8 +715,9 @@ def main() -> None:
         "--name-instructions",
         default=(
             "Make topic_name a terse map label: 2-3 words, Title Case, at most "
-            "24 characters. Output only the short label as the topic_name value. "
-            "Never a sentence. Do not use and, for, with, or commas."
+            "28 characters. Output only the short label as the topic_name value. "
+            "Never a sentence. Do not use and, for, with, commas, or generic "
+            "words like Worlds unless no better label exists."
         ),
     )
     args = ap.parse_args()
@@ -523,6 +734,7 @@ def main() -> None:
     if n == 0:
         raise SystemExit("no points after aligning coords and metadata")
     print(f"physical hierarchy on {n:,} worlds (coords={args.coords.name})")
+    hint_layers = _load_hint_layers(args.hint_topo_dir, world_ids)
 
     island_id, component_info = _component_labels(
         xy,
@@ -570,8 +782,8 @@ def main() -> None:
     # layer_0 is deepest/fine, last layer is coarsest. This matches
     # mapgen-app-export's default of using the two coarsest layers for polygons.
     layers = [
-        LayerSpec(0, "district", district_id),
-        LayerSpec(1, "neighborhood", neighborhood_id),
+        LayerSpec(0, "district", district_id, parent_id=neighborhood_id),
+        LayerSpec(1, "neighborhood", neighborhood_id, parent_id=island_id),
         LayerSpec(2, "island", island_id),
     ]
 
@@ -587,6 +799,7 @@ def main() -> None:
             names=names,
             texts=texts,
             parent_names=parent_names,
+            hint_layers=hint_layers,
             args=args,
         )
         layer_labels[layer.index] = labels
@@ -626,6 +839,7 @@ def main() -> None:
             "latent_dim": args.latent_dim,
             "spatial_weight": args.spatial_weight,
             "latent_weight": args.latent_weight,
+            "hint_topo_dir": str(args.hint_topo_dir) if args.hint_topo_dir else None,
         },
     }
     (args.out_dir / "hierarchy_summary.json").write_text(
