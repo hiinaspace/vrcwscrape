@@ -730,15 +730,17 @@ export default function WorldMap({
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
       : f.properties.kind === "minor" || f.properties.kind === "service"
-        ? (ROADS.minorWidth ?? ROADS.localWidth * 0.55)
+        ? Math.max(ROADS.minorWidth ?? ROADS.localWidth * 0.55, 0.9)
         : f.properties.kind === "collector"
-          ? (ROADS.collectorWidth ?? ROADS.localWidth * 1.25)
-        : ROADS.localWidth;
+          ? (ROADS.collectorWidth ?? Math.max(ROADS.localWidth * 1.45, 2.05))
+          : ROADS.localWidth;
   const roadColor = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialColor
       : f.properties.kind === "minor" || f.properties.kind === "service"
         ? (ROADS.minorColor ?? ROADS.localColor)
+        : f.properties.kind === "collector"
+          ? (ROADS.collectorColor ?? [251, 248, 238, 230])
         : ROADS.localColor;
   const roadCasingExtra = (f) =>
     f.properties.kind === "minor" || f.properties.kind === "service"

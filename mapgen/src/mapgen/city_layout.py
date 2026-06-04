@@ -69,6 +69,7 @@ class RoadSpec:
     island_id: int
     width: float
     family: int
+    depth: int = -1
 
 
 @dataclass
@@ -231,6 +232,80 @@ def _chaikin_ring(coords, iterations: int) -> list[tuple[float, float]]:
         arr = out
     closed = np.vstack([arr, arr[0]])
     return [(float(x), float(y)) for x, y in closed]
+
+
+def _chaikin_line_coords(
+    coords: np.ndarray,
+    *,
+    iterations: int,
+    closed: bool,
+) -> np.ndarray:
+    if len(coords) < 3 or iterations <= 0:
+        return coords
+    arr = np.asarray(coords, dtype=np.float64)
+    if closed and np.linalg.norm(arr[0] - arr[-1]) <= 1e-9:
+        arr = arr[:-1]
+    for _ in range(iterations):
+        if closed:
+            nxt = np.roll(arr, -1, axis=0)
+            q = arr * 0.75 + nxt * 0.25
+            r = arr * 0.25 + nxt * 0.75
+            out = np.empty((len(arr) * 2, 2), dtype=np.float64)
+            out[0::2] = q
+            out[1::2] = r
+            arr = out
+        else:
+            seg_a = arr[:-1]
+            seg_b = arr[1:]
+            q = seg_a * 0.75 + seg_b * 0.25
+            r = seg_a * 0.25 + seg_b * 0.75
+            out = np.empty((2 * (len(arr) - 1) + 2, 2), dtype=np.float64)
+            out[0] = arr[0]
+            out[-1] = arr[-1]
+            out[1:-1:2] = q
+            out[2:-1:2] = r
+            arr = out
+    if closed:
+        arr = np.vstack([arr, arr[0]])
+    return arr
+
+
+def _resample_line_coords(
+    coords: np.ndarray,
+    *,
+    step: float,
+    closed: bool,
+) -> np.ndarray:
+    if len(coords) < 2 or step <= 0:
+        return coords
+    arr = np.asarray(coords, dtype=np.float64)
+    if closed and np.linalg.norm(arr[0] - arr[-1]) > 1e-9:
+        arr = np.vstack([arr, arr[0]])
+    seg = arr[1:] - arr[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    good = seg_len > 1e-9
+    if not np.any(good):
+        return coords
+    seg = seg[good]
+    starts = arr[:-1][good]
+    seg_len = seg_len[good]
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total = float(cum[-1])
+    if total <= step:
+        return arr
+    if closed:
+        n = max(8, int(math.ceil(total / step)))
+        dist = np.linspace(0.0, total, n, endpoint=False)
+    else:
+        n = max(2, int(math.ceil(total / step)) + 1)
+        dist = np.linspace(0.0, total, n)
+    si = np.searchsorted(cum, dist, side="right") - 1
+    si = np.clip(si, 0, len(seg_len) - 1)
+    t = (dist - cum[si]) / seg_len[si]
+    out = starts[si] + seg[si] * t[:, None]
+    if closed:
+        out = np.vstack([out, out[0]])
+    return out
 
 
 def _smooth_coastline_geom(geom, *, iterations: int, simplify: float):
@@ -587,6 +662,7 @@ def _line_specs_from_geom(
     width: float,
     family: int,
     min_length: float,
+    depth: int = -1,
 ) -> list[RoadSpec]:
     specs = []
     for line in _iter_lines(geom):
@@ -599,6 +675,148 @@ def _line_specs_from_geom(
                 island_id=island_id,
                 width=width,
                 family=family,
+                depth=depth,
+            )
+        )
+    return specs
+
+
+def _road_smooth_iterations(kind: str, args) -> int:
+    if kind == "arterial":
+        return args.road_smooth_arterial_iterations
+    if kind == "collector":
+        return args.road_smooth_collector_iterations
+    if kind == "local":
+        return args.road_smooth_local_iterations
+    return args.road_smooth_service_iterations
+
+
+def _smooth_road_line(
+    line: LineString,
+    *,
+    land_geom,
+    global_nn: float,
+    kind: str,
+    min_length: float,
+    args,
+) -> list[LineString]:
+    coords = np.asarray(line.coords, dtype=np.float64)
+    if len(coords) < 2 or line.length < min_length:
+        return []
+    closed = float(np.linalg.norm(coords[0] - coords[-1])) <= 1e-9
+    iterations = max(0, int(_road_smooth_iterations(kind, args)))
+    if iterations > 0:
+        target_vertices = max(
+            12,
+            int(args.road_smooth_max_vertices) // max(1, 2**iterations),
+        )
+        step = max(
+            global_nn * args.road_smooth_resample_scale,
+            float(line.length) / max(target_vertices, 1),
+        )
+        coords = _resample_line_coords(coords, step=step, closed=closed)
+        coords = _chaikin_line_coords(coords, iterations=iterations, closed=closed)
+    smoothed = LineString(coords)
+    if (
+        iterations > 0
+        and args.road_smooth_simplify_scale > 0
+        and len(smoothed.coords) > 3
+    ):
+        smoothed = smoothed.simplify(
+            global_nn * args.road_smooth_simplify_scale,
+            preserve_topology=False,
+        )
+    smoothed = _safe_geom(smoothed)
+    if land_geom is not None and not smoothed.is_empty:
+        smoothed = smoothed.intersection(land_geom)
+    return [seg for seg in _iter_lines(smoothed) if seg.length >= min_length]
+
+
+def _postprocess_road_specs(
+    specs: list[RoadSpec],
+    *,
+    land_geom,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    out: list[RoadSpec] = []
+    for spec in specs:
+        min_length = (
+            slot_step * args.boundary_road_min_length_slots
+            if spec.kind in {"local", "service"}
+            else slot_step * args.min_road_length_slots
+        )
+        lines = _smooth_road_line(
+            LineString(spec.coords),
+            land_geom=land_geom,
+            global_nn=global_nn,
+            kind=spec.kind,
+            min_length=min_length,
+            args=args,
+        )
+        for line in lines:
+            out.append(
+                RoadSpec(
+                    coords=[(float(x), float(y)) for x, y in line.coords],
+                    kind=spec.kind,
+                    island_id=spec.island_id,
+                    width=spec.width,
+                    family=spec.family,
+                    depth=spec.depth,
+                )
+            )
+    return out
+
+
+def _boundary_road_specs(
+    boundary,
+    *,
+    trunk_specs: list[RoadSpec],
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    min_length = slot_step * args.boundary_road_min_length_slots
+    trunk_lines = [
+        LineString(spec.coords)
+        for spec in trunk_specs
+        if spec.kind == "collector" and spec.depth <= args.recursive_collector_depth
+    ]
+    trunk_geom = (
+        shapely.unary_union(trunk_lines) if trunk_lines else GeometryCollection()
+    )
+    trunk_band = (
+        trunk_geom.buffer(
+            max(global_nn * args.boundary_trunk_snap_scale, slot_step * 0.25),
+            cap_style="flat",
+            join_style="round",
+        )
+        if not trunk_geom.is_empty
+        else GeometryCollection()
+    )
+    specs: list[RoadSpec] = []
+    for line in _iter_lines(boundary):
+        if line.length < min_length:
+            continue
+        kind = "local"
+        width = args.local_road_width
+        depth = -1
+        if not trunk_band.is_empty:
+            overlap = line.intersection(trunk_band).length / max(line.length, 1e-9)
+            if overlap >= args.boundary_trunk_overlap_frac:
+                kind = "collector"
+                width = args.collector_road_width
+                depth = 0
+        specs.append(
+            RoadSpec(
+                coords=[(float(x), float(y)) for x, y in line.coords],
+                kind=kind,
+                island_id=island_id,
+                width=width,
+                family=-3,
+                depth=depth,
             )
         )
     return specs
@@ -608,6 +826,8 @@ def _coastal_road_specs(
     poly: Polygon,
     *,
     island_id: int,
+    kind: str,
+    width: float,
     offset: float,
     min_length: float,
     args,
@@ -621,16 +841,15 @@ def _coastal_road_specs(
         lines = [LineString(poly.exterior.coords)]
     specs = []
     for line in lines:
-        if args.road_simplify_scale > 0:
-            line = line.simplify(offset * 0.35, preserve_topology=False)
         specs.extend(
             _line_specs_from_geom(
                 line,
                 island_id=island_id,
-                kind="arterial",
-                width=args.collector_road_width,
+                kind=kind,
+                width=width,
                 family=-2,
                 min_length=min_length,
+                depth=0,
             )
         )
     return specs
@@ -773,6 +992,7 @@ def _try_split_parcel(
             ),
             family=parcel.depth,
             min_length=slot_step * args.min_road_length_slots,
+            depth=parcel.depth,
         )
         if not road_specs:
             continue
@@ -812,15 +1032,23 @@ def _generate_recursive_streets(
     coastal_offset = max(global_nn * args.coastal_road_offset_scale, slot_step * 1.4)
     min_road_length = slot_step * args.min_road_length_slots
     for leaf in leaves:
-        coastal_specs.extend(
-            _coastal_road_specs(
-                leaf.geom,
-                island_id=island_id,
-                offset=coastal_offset,
-                min_length=min_road_length,
-                args=args,
-            )
+        large_enough_for_ring = (
+            len(leaf.point_idx) >= args.coastal_arterial_min_worlds
+            and leaf.geom.area
+            >= (global_nn * global_nn) * args.coastal_arterial_min_area_scale
         )
+        if large_enough_for_ring:
+            coastal_specs.extend(
+                _coastal_road_specs(
+                    leaf.geom,
+                    island_id=island_id,
+                    kind="arterial",
+                    width=args.arterial_road_width,
+                    offset=coastal_offset,
+                    min_length=min_road_length,
+                    args=args,
+                )
+            )
     planning_specs.extend(coastal_specs)
 
     rng = np.random.default_rng(args.seed + island_id * 7919)
@@ -878,13 +1106,13 @@ def _generate_recursive_streets(
             break
 
     boundary = shapely.unary_union([leaf.geom.boundary for leaf in leaves])
-    boundary_specs = _line_specs_from_geom(
+    boundary_specs = _boundary_road_specs(
         boundary,
         island_id=island_id,
-        kind="local",
-        width=args.local_road_width,
-        family=-3,
-        min_length=slot_step * args.boundary_road_min_length_slots,
+        trunk_specs=planning_specs,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
     )
     access_specs = _leaf_access_lane_specs(
         leaves,
@@ -894,7 +1122,14 @@ def _generate_recursive_streets(
         slot_step=slot_step,
         args=args,
     )
-    return coastal_specs + boundary_specs + access_specs, leaves, float(splits)
+    road_specs = _postprocess_road_specs(
+        coastal_specs + boundary_specs + access_specs,
+        land_geom=land_geom,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    return road_specs, leaves, float(splits)
 
 
 def _leaf_access_lane_specs(
@@ -1992,6 +2227,7 @@ def main() -> None:
     ap.add_argument("--sparse-building-max-scale", type=float, default=3.0)
     ap.add_argument("--fallback-building-scale", type=float, default=0.85)
     ap.add_argument("--default-building-height", type=float, default=0.08)
+    ap.add_argument("--arterial-road-width", type=float, default=2.2)
     ap.add_argument("--local-road-width", type=float, default=1.0)
     ap.add_argument("--collector-road-width", type=float, default=1.6)
     ap.add_argument("--service-road-width", type=float, default=0.6)
@@ -2015,6 +2251,13 @@ def main() -> None:
     ap.add_argument("--road-curve-wavelength-scale", type=float, default=18.0)
     ap.add_argument("--road-curve-max-vertices", type=int, default=180)
     ap.add_argument("--road-simplify-scale", type=float, default=1.2)
+    ap.add_argument("--road-smooth-resample-scale", type=float, default=1.15)
+    ap.add_argument("--road-smooth-max-vertices", type=int, default=420)
+    ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.18)
+    ap.add_argument("--road-smooth-arterial-iterations", type=int, default=3)
+    ap.add_argument("--road-smooth-collector-iterations", type=int, default=2)
+    ap.add_argument("--road-smooth-local-iterations", type=int, default=0)
+    ap.add_argument("--road-smooth-service-iterations", type=int, default=0)
     ap.add_argument("--min-road-length-slots", type=float, default=6.0)
     ap.add_argument("--service-chunk-worlds", type=int, default=48)
     ap.add_argument("--block-target-worlds", type=int, default=96)
@@ -2038,7 +2281,11 @@ def main() -> None:
     ap.add_argument("--recursive-curve-global-scale", type=float, default=3.5)
     ap.add_argument("--recursive-curve-wavelength-scale", type=float, default=0.65)
     ap.add_argument("--coastal-road-offset-scale", type=float, default=4.2)
+    ap.add_argument("--coastal-arterial-min-worlds", type=int, default=350)
+    ap.add_argument("--coastal-arterial-min-area-scale", type=float, default=900.0)
     ap.add_argument("--boundary-road-min-length-slots", type=float, default=2.2)
+    ap.add_argument("--boundary-trunk-snap-scale", type=float, default=1.4)
+    ap.add_argument("--boundary-trunk-overlap-frac", type=float, default=0.42)
     ap.add_argument("--access-lane-trigger-scale", type=float, default=0.50)
     ap.add_argument("--access-lane-max-per-block", type=int, default=40)
     ap.add_argument("--access-lane-margin-frac", type=float, default=0.18)
@@ -2051,8 +2298,8 @@ def main() -> None:
     ap.add_argument("--land-raster-close-cells", type=int, default=3)
     ap.add_argument("--land-raster-simplify-cells", type=float, default=0.75)
     ap.add_argument("--land-raster-smooth-cells", type=float, default=1.0)
-    ap.add_argument("--land-chaikin-iterations", type=int, default=2)
-    ap.add_argument("--land-chaikin-simplify-scale", type=float, default=0.85)
+    ap.add_argument("--land-chaikin-iterations", type=int, default=3)
+    ap.add_argument("--land-chaikin-simplify-scale", type=float, default=0.55)
     ap.add_argument("--land-union-min-area-scale", type=float, default=80.0)
     ap.add_argument("--landuse-min-area-scale", type=float, default=20.0)
     ap.add_argument("--landuse-simplify-scale", type=float, default=3.0)
@@ -2187,7 +2434,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-hierarchical-v5",
+        "layout": "city-hierarchical-v6",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
