@@ -1184,14 +1184,19 @@ def _generate_recursive_streets(
         if not progressed:
             break
 
+    collector_specs = [
+        spec
+        for spec in planning_specs
+        if spec.kind == "collector" and spec.depth < args.recursive_collector_depth
+    ]
     boundary = shapely.unary_union([leaf.geom.boundary for leaf in leaves])
-    boundary_specs = _boundary_road_specs(
+    boundary_specs = _line_specs_from_geom(
         boundary,
         island_id=island_id,
-        trunk_specs=planning_specs,
-        global_nn=global_nn,
-        slot_step=slot_step,
-        args=args,
+        kind="local",
+        width=args.local_road_width,
+        family=-3,
+        min_length=slot_step * args.boundary_road_min_length_slots,
     )
     access_specs = _leaf_access_lane_specs(
         leaves,
@@ -1202,7 +1207,7 @@ def _generate_recursive_streets(
         args=args,
     )
     road_specs = coastal_specs + _postprocess_road_specs(
-        boundary_specs + access_specs,
+        collector_specs + boundary_specs + access_specs,
         land_geom=land_geom,
         global_nn=global_nn,
         slot_step=slot_step,
@@ -1558,17 +1563,17 @@ def _layout_streamline_island(
 
     active_counts = np.bincount(selected_road, minlength=len(road_specs))
     road_id_by_temp: dict[int, int] = {}
-    for temp_id, count in enumerate(active_counts.tolist()):
-        if count <= 0:
+    for temp_id, spec in enumerate(road_specs):
+        count = int(active_counts[temp_id]) if temp_id < len(active_counts) else 0
+        if count <= 0 and spec.kind not in {"arterial", "collector"}:
             continue
-        spec = road_specs[temp_id]
         road_id_by_temp[temp_id] = _add_road(
             roads,
             ids,
             coords=spec.coords,
             kind=spec.kind,
             island_id=island_id,
-            world_count=int(count),
+            world_count=count,
             width=spec.width,
         )
 
@@ -2368,13 +2373,14 @@ def main() -> None:
     ap.add_argument("--road-curve-max-vertices", type=int, default=420)
     ap.add_argument("--road-simplify-scale", type=float, default=1.2)
     ap.add_argument("--road-smooth-resample-scale", type=float, default=1.15)
-    ap.add_argument("--road-smooth-max-vertices", type=int, default=900)
-    ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.05)
-    ap.add_argument("--road-smooth-arterial-iterations", type=int, default=3)
+    ap.add_argument("--road-smooth-max-vertices", type=int, default=2200)
+    ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.0)
+    ap.add_argument("--road-smooth-arterial-iterations", type=int, default=4)
     ap.add_argument("--road-smooth-collector-iterations", type=int, default=0)
     ap.add_argument("--road-smooth-local-iterations", type=int, default=0)
     ap.add_argument("--road-smooth-service-iterations", type=int, default=0)
-    ap.add_argument("--road-lod-simplify-scale", type=float, default=0.65)
+    ap.add_argument("--road-lod-simplify-scale", type=float, default=0.95)
+    ap.add_argument("--road-lod-mid-simplify-scale", type=float, default=0.28)
     ap.add_argument("--major-road-bridge-scale", type=float, default=8.0)
     ap.add_argument("--major-corridor-clearance-scale", type=float, default=0.30)
     ap.add_argument(
@@ -2547,6 +2553,10 @@ def main() -> None:
         _road_features(roads, simplify=global_nn * args.road_lod_simplify_scale),
         args.out_dir / "roads.geojson",
     )
+    _write_geojson(
+        _road_features(roads, simplify=global_nn * args.road_lod_mid_simplify_scale),
+        args.out_dir / "roads_mid.geojson",
+    )
     _write_geojson(_road_features(roads), args.out_dir / "roads_near.geojson")
     _write_geojson(_block_features(blocks), args.out_dir / "blocks.geojson")
     _write_regions(
@@ -2564,7 +2574,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-hierarchical-v7",
+        "layout": "city-hierarchical-v8",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
@@ -2574,6 +2584,7 @@ def main() -> None:
             "land": "land.geojson",
             "landuse": "landuse.geojson",
             "roads": "roads.geojson",
+            "roads_mid": "roads_mid.geojson",
             "roads_near": "roads_near.geojson",
             "blocks": "blocks.geojson",
             "regions": [

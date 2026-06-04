@@ -277,6 +277,7 @@ export default function WorldMap({
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
   const [roads, setRoads] = useState(null);
+  const [roadsMid, setRoadsMid] = useState(null);
   const [roadsNear, setRoadsNear] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
@@ -327,6 +328,9 @@ export default function WorldMap({
         fetch(base + "roads.geojson")
           .then((r) => (r.ok ? r.json() : null))
           .then(setRoads, () => setRoads(null));
+        fetch(base + "roads_mid.geojson")
+          .then((r) => (r.ok ? r.json() : null))
+          .then(setRoadsMid, () => setRoadsMid(null));
         fetch(base + "roads_near.geojson")
           .then((r) => (r.ok ? r.json() : null))
           .then(setRoadsNear, () => setRoadsNear(null));
@@ -708,7 +712,8 @@ export default function WorldMap({
   }, [highlight, regionsTop, regionsSub, lvl]);
 
   const roadFeatures = useMemo(() => {
-    const source = tier === "near" && roadsNear ? roadsNear : roads;
+    const source =
+      tier === "near" && roadsNear ? roadsNear : tier === "mid" && roadsMid ? roadsMid : roads;
     const features = source?.features ?? [];
     if (tier === "far") return features.filter((f) => f.properties.kind === "arterial");
     if (tier === "mid") {
@@ -717,7 +722,7 @@ export default function WorldMap({
       );
     }
     return features;
-  }, [roads, roadsNear, tier]);
+  }, [roads, roadsMid, roadsNear, tier]);
 
   if (!viewState) {
     return (
@@ -735,7 +740,7 @@ export default function WorldMap({
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
       : f.properties.kind === "minor" || f.properties.kind === "service"
-        ? (tier === "near" ? 1.35 : 1.0)
+        ? (ROADS.minorWidth ?? ROADS.localWidth * 0.55)
         : f.properties.kind === "collector"
           ? (ROADS.collectorWidth ?? Math.max(ROADS.localWidth * 1.45, 2.05))
           : ROADS.localWidth;
@@ -743,13 +748,13 @@ export default function WorldMap({
     f.properties.kind === "arterial"
       ? ROADS.arterialColor
       : f.properties.kind === "minor" || f.properties.kind === "service"
-        ? [255, 255, 255, tier === "near" ? 235 : 205]
+        ? (ROADS.minorColor ?? ROADS.localColor)
         : f.properties.kind === "collector"
-          ? (ROADS.collectorColor ?? [251, 248, 238, 230])
-        : ROADS.localColor;
+          ? (ROADS.collectorColor ?? ROADS.localColor)
+          : ROADS.localColor;
   const roadCasingExtra = (f) =>
     f.properties.kind === "minor" || f.properties.kind === "service"
-      ? (tier === "near" ? 0.8 : 0.45)
+      ? (ROADS.minorCasingExtraWidth ?? 0.25)
       : ROADS.casingExtraWidth;
 
   // one TextLayer per atlas (Latin / wide). Data is pre-decluttered in JS, so no
