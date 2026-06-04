@@ -1235,8 +1235,8 @@ def _polygon_irregularity(poly: Polygon) -> float:
     if len(coords) >= 4:
         edges = np.roll(coords, -1, axis=0) - coords
         lens = np.linalg.norm(edges, axis=1)
-        long = float(lens.max(initial=1e-12))
-        short = float(max(lens.min(initial=1e-12), 1e-12))
+        long = float(max(lens.max(), 1e-12))
+        short = float(max(lens.min(), 1e-12))
         aspect_penalty = abs(math.log(np.clip(long / short, 1.0, 1e6))) * 0.18
         rect_perimeter = max(float(lens.sum()), 1e-12)
     else:
@@ -1244,6 +1244,36 @@ def _polygon_irregularity(poly: Polygon) -> float:
         rect_perimeter = max(math.sqrt(rect_area) * 4.0, 1e-12)
     perimeter_penalty = max(0.0, float(poly.length) / rect_perimeter - 1.0) * 0.35
     return fill_penalty + aspect_penalty + perimeter_penalty
+
+
+def _polygon_aspect_ratio(poly: Polygon) -> float:
+    if poly.is_empty or poly.area <= 1e-12:
+        return 1e6
+    rect = poly.minimum_rotated_rectangle
+    coords = np.asarray(rect.exterior.coords[:-1], dtype=np.float64)
+    if len(coords) < 4:
+        return 1.0
+    edges = np.roll(coords, -1, axis=0) - coords
+    lens = np.linalg.norm(edges, axis=1)
+    short = float(max(lens.min(), 1e-12))
+    return float(max(lens.max(), short) / short)
+
+
+def _parcel_shape_axes(poly: Polygon) -> tuple[np.ndarray, np.ndarray]:
+    rect = poly.minimum_rotated_rectangle
+    coords = np.asarray(rect.exterior.coords[:-1], dtype=np.float64)
+    if len(coords) < 4:
+        c = np.array([poly.centroid.x, poly.centroid.y], dtype=np.float64)
+        return c, np.eye(2)
+    edges = np.roll(coords, -1, axis=0) - coords
+    lens = np.linalg.norm(edges, axis=1)
+    i = int(np.argmax(lens))
+    axis0 = edges[i] / max(float(lens[i]), 1e-12)
+    axis1 = np.array([-axis0[1], axis0[0]], dtype=np.float64)
+    axes = np.column_stack([axis0, axis1])
+    if np.linalg.det(axes) < 0:
+        axes[:, 1] *= -1
+    return coords.mean(axis=0), axes
 
 
 def _split_road_kind(depth: int, args) -> tuple[str, float]:
@@ -1263,16 +1293,20 @@ def _planar_split_candidate_lines(
     rng: np.random.Generator,
 ) -> list[LineString]:
     pts = xy[parcel.point_idx]
-    center, axes = _polygon_axes(parcel.geom, pts)
+    center, axes = _parcel_shape_axes(parcel.geom)
     lo, hi = _project_poly_bounds(parcel.geom, center, axes)
     span = np.maximum(hi - lo, 1e-9)
     if span.min() < global_nn * args.planar_min_split_width_scale:
         return []
 
     local_pts = (pts - center) @ axes if len(pts) else np.empty((0, 2))
-    order = [int(np.argmax(span)), int(np.argmin(span))]
-    if span.max() / max(span.min(), 1e-9) < args.recursive_alternate_ratio:
+    shape_ratio = float(span.max() / max(span.min(), 1e-9))
+    if shape_ratio >= args.planar_force_crosscut_ratio:
+        order = [int(np.argmax(span))]
+    else:
         order = [parcel.depth % 2, 1 - (parcel.depth % 2)]
+        if shape_ratio >= args.recursive_alternate_ratio:
+            order = [int(np.argmax(span)), int(np.argmin(span))]
     quantiles = [0.5, 0.44, 0.56, 0.38, 0.62, 0.32, 0.68]
     quantiles = quantiles[: args.planar_split_candidates_per_family]
     candidates: list[LineString] = []
@@ -1382,13 +1416,21 @@ def _try_split_planar_parcel(
             continue
         if (
             counts.max(initial=0)
-            >= len(parcel.point_idx) * args.recursive_max_child_frac
+            >= len(parcel.point_idx) * args.planar_max_child_frac
         ):
             continue
         areas = np.array([p.area for p in parts], dtype=np.float64)
         area_balance = float(areas.min() / max(areas.max(), 1e-12))
         count_balance = float(counts.min() / max(counts.max(), 1))
         regularity = 1.0 / (1.0 + sum(_polygon_irregularity(p) for p in parts))
+        max_aspect = max(_polygon_aspect_ratio(p) for p in parts)
+        aspect_score = 1.0 / (
+            1.0
+            + max(
+                0.0,
+                math.log(max_aspect / max(args.planar_target_child_aspect, 1e-9)),
+            )
+        )
         split_geom_line = line.intersection(parcel.geom)
         split_len = sum(seg.length for seg in _iter_lines(split_geom_line))
         length_score = math.sqrt(float(parcel.geom.area)) / max(split_len, 1e-9)
@@ -1396,6 +1438,7 @@ def _try_split_planar_parcel(
             args.planar_quality_size_weight * area_balance
             + args.planar_quality_count_weight * count_balance
             + args.planar_quality_regular_weight * regularity
+            + args.planar_quality_aspect_weight * aspect_score
             + args.planar_quality_length_weight * min(length_score, 1.0)
         )
         if best is None or score > best[0]:
@@ -2182,7 +2225,10 @@ def _layout_streamline_island(
         iterations=args.land_chaikin_iterations,
         simplify=global_nn * args.land_chaikin_simplify_scale,
     )
-    slot_step = max(global_nn * args.frontage_spacing_scale, global_nn * 0.75)
+    slot_step = max(
+        global_nn * args.frontage_spacing_scale,
+        global_nn * args.frontage_spacing_min_scale,
+    )
     road_spacing = max(
         global_nn * args.road_spacing_min_scale,
         slot_step * args.recursive_road_spacing_slot_scale,
@@ -2211,18 +2257,6 @@ def _layout_streamline_island(
     )
     generated_slots = int(len(slots.xy))
     fallback_slots = 0
-
-    if len(slots.xy) < len(xy):
-        fallback_roads, fallback_slots = _fallback_service_slots(
-            xy=xy,
-            island_id=island_id,
-            global_nn=global_nn,
-            road_index_offset=len(road_specs),
-            args=args,
-        )
-        road_specs.extend(fallback_roads)
-        slots = _concat_slots([slots, fallback_slots])
-        fallback_slots = int(len(fallback_slots.xy))
 
     local_block_ids = np.full(len(xy), -1, dtype=np.int64)
     for leaf in leaves:
@@ -2253,13 +2287,41 @@ def _layout_streamline_island(
             )
         )
 
-    assigned = _assign_slots_by_leaves(
-        xy,
-        slots.xy,
-        leaves,
-        global_nn=global_nn,
-        args=args,
-    )
+    if len(slots.xy) >= len(xy):
+        assigned = _assign_slots_by_leaves(
+            xy,
+            slots.xy,
+            leaves,
+            global_nn=global_nn,
+            args=args,
+        )
+    else:
+        assigned = _assign_slots_by_leaves_partial(
+            xy,
+            slots.xy,
+            leaves,
+            global_nn=global_nn,
+            args=args,
+        )
+        missing = np.flatnonzero(assigned < 0)
+        if len(missing):
+            fallback_roads, fallback_slotset = _fallback_service_slots(
+                xy=xy[missing],
+                island_id=island_id,
+                global_nn=global_nn,
+                road_index_offset=len(road_specs),
+                args=args,
+            )
+            road_specs.extend(fallback_roads)
+            offset = len(slots.xy)
+            fallback_assign = _assign_slots(
+                xy[missing],
+                fallback_slotset.xy,
+                args.max_hungarian,
+            )
+            slots = _concat_slots([slots, fallback_slotset])
+            assigned[missing] = offset + fallback_assign
+            fallback_slots = int(len(fallback_slotset.xy))
     selected_xy = slots.xy[assigned]
     selected_frontage = slots.frontage[assigned]
     selected_road = slots.road_index[assigned]
@@ -2448,6 +2510,52 @@ def _assign_slots_by_leaves(
     return out
 
 
+def _assign_slots_by_leaves_partial(
+    xy: np.ndarray,
+    slots_xy: np.ndarray,
+    leaves: list[SplitParcel],
+    *,
+    global_nn: float,
+    args,
+) -> np.ndarray:
+    out = np.full(len(xy), -1, dtype=np.int64)
+    if len(slots_xy) == 0:
+        return out
+    used = np.zeros(len(slots_xy), dtype=bool)
+    buffer = global_nn * args.local_assignment_buffer_scale
+    for leaf in sorted(leaves, key=lambda p: len(p.point_idx), reverse=True):
+        members = leaf.point_idx
+        if len(members) == 0:
+            continue
+        cand = _slot_candidates_for_leaf(leaf, slots_xy, ~used, buffer=buffer)
+        if len(cand) == 0:
+            continue
+        assign_members = members
+        if len(cand) < len(members):
+            dist, _nbr = cKDTree(slots_xy[cand]).query(xy[members], k=1, workers=-1)
+            keep = np.argsort(np.asarray(dist), kind="stable")[: len(cand)]
+            assign_members = members[keep]
+        local_assign = _assign_slots(
+            xy[assign_members],
+            slots_xy[cand],
+            args.max_hungarian,
+        )
+        chosen = cand[local_assign]
+        out[assign_members] = chosen
+        used[chosen] = True
+
+    missing = np.flatnonzero(out < 0)
+    free = np.flatnonzero(~used)
+    if len(missing) and len(free):
+        dist, _nbr = cKDTree(slots_xy[free]).query(xy[missing], k=1, workers=-1)
+        fill_members = missing[
+            np.argsort(np.asarray(dist), kind="stable")[: len(free)]
+        ]
+        fill = _assign_slots(xy[fill_members], slots_xy[free], args.max_hungarian)
+        out[fill_members] = free[fill]
+    return out
+
+
 def _line_project(
     point: np.ndarray, a: np.ndarray, b: np.ndarray
 ) -> tuple[np.ndarray, float]:
@@ -2537,6 +2645,32 @@ def _block_features(blocks: list[Block]) -> list[dict]:
         for block in blocks
         if not block.geom.is_empty and block.geom.area > 0
     ]
+
+
+def _block_shape_metrics(blocks: list[Block]) -> dict[str, float]:
+    aspects = np.asarray(
+        [
+            _polygon_aspect_ratio(block.geom)
+            for block in blocks
+            if not block.geom.is_empty and block.geom.area > 0
+        ],
+        dtype=np.float64,
+    )
+    if len(aspects) == 0:
+        return {
+            "block_aspect_median": 0.0,
+            "block_aspect_p90": 0.0,
+            "block_aspect_p95": 0.0,
+            "block_aspect_p99": 0.0,
+            "block_aspect_max": 0.0,
+        }
+    return {
+        "block_aspect_median": float(np.median(aspects)),
+        "block_aspect_p90": float(np.quantile(aspects, 0.90)),
+        "block_aspect_p95": float(np.quantile(aspects, 0.95)),
+        "block_aspect_p99": float(np.quantile(aspects, 0.99)),
+        "block_aspect_max": float(np.max(aspects)),
+    }
 
 
 def _layout_sparse_group(
@@ -3027,6 +3161,7 @@ def _city_layout(
         "frontage_coverage": 1.0,
         "islands": island_metrics,
     }
+    metrics.update(_block_shape_metrics(blocks))
     return out_points, roads, blocks, metrics
 
 
@@ -3067,10 +3202,11 @@ def main() -> None:
     ap.add_argument("--road-spacing-max-scale", type=float, default=9.0)
     ap.add_argument("--road-spacing-retry-scale", type=float, default=0.78)
     ap.add_argument("--max-road-attempts", type=int, default=6)
-    ap.add_argument("--frontage-spacing-scale", type=float, default=0.60)
+    ap.add_argument("--frontage-spacing-scale", type=float, default=0.44)
+    ap.add_argument("--frontage-spacing-min-scale", type=float, default=0.36)
     ap.add_argument("--slot-capacity-target", type=float, default=2.2)
     ap.add_argument("--slot-capacity-min", type=float, default=1.6)
-    ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.55)
+    ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.28)
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
     ap.add_argument("--road-slot-end-gap-scale", type=float, default=1.8)
     ap.add_argument("--road-extent-quantile", type=float, default=0.006)
@@ -3138,6 +3274,7 @@ def main() -> None:
     ap.add_argument("--planar-split-margin-frac", type=float, default=0.08)
     ap.add_argument("--planar-min-split-margin-scale", type=float, default=0.35)
     ap.add_argument("--planar-min-split-road-length-slots", type=float, default=1.4)
+    ap.add_argument("--planar-max-child-frac", type=float, default=0.995)
     ap.add_argument("--planar-collector-depth", type=int, default=1)
     ap.add_argument("--planar-service-depth", type=int, default=7)
     ap.add_argument("--planar-split-families", type=int, default=2)
@@ -3145,7 +3282,10 @@ def main() -> None:
     ap.add_argument("--planar-quality-size-weight", type=float, default=0.28)
     ap.add_argument("--planar-quality-count-weight", type=float, default=0.24)
     ap.add_argument("--planar-quality-regular-weight", type=float, default=0.40)
+    ap.add_argument("--planar-quality-aspect-weight", type=float, default=0.55)
     ap.add_argument("--planar-quality-length-weight", type=float, default=0.08)
+    ap.add_argument("--planar-target-child-aspect", type=float, default=4.0)
+    ap.add_argument("--planar-force-crosscut-ratio", type=float, default=2.35)
     ap.add_argument("--planar-streamline-curve-span-scale", type=float, default=0.075)
     ap.add_argument("--planar-streamline-curve-global-scale", type=float, default=4.2)
     ap.add_argument("--planar-streamline-wavelength-scale", type=float, default=0.82)
@@ -3158,7 +3298,7 @@ def main() -> None:
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
     ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
-    ap.add_argument("--planar-coastal-inset-min-frac", type=float, default=0.38)
+    ap.add_argument("--planar-coastal-inset-min-frac", type=float, default=2.0)
     ap.add_argument("--coastal-road-offset-scale", type=float, default=4.2)
     ap.add_argument("--coastal-road-soften-scale", type=float, default=2.4)
     ap.add_argument("--coastal-arterial-min-worlds", type=int, default=350)
@@ -3328,7 +3468,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v11",
+        "layout": "city-planar-v12",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
