@@ -13,7 +13,6 @@ import {
   LABEL_STYLE,
   LABELS,
   LAND,
-  LANDUSE,
   OCEAN,
   REGION_BG,
   REGION_PALETTE,
@@ -275,7 +274,6 @@ export default function WorldMap({
   // Their numeric level varies by dataset (20k: 3/2; 218k: 5/4), discovered at load.
   const [lvl, setLvl] = useState(null); // { top, sub, levels }
   const [land, setLand] = useState(null);
-  const [landuse, setLanduse] = useState(null);
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
   const [roads, setRoads] = useState(null);
@@ -323,9 +321,6 @@ export default function WorldMap({
       .then((info) => {
         setLvl(info);
         fetch(base + "land.geojson").then((r) => r.json()).then(setLand);
-        fetch(base + "landuse.geojson")
-          .then((r) => (r.ok ? r.json() : null))
-          .then(setLanduse, () => setLanduse(null));
         fetch(base + `regions_l${info.top}.geojson`).then((r) => r.json()).then(setRegionsTop);
         fetch(base + `regions_l${info.sub}.geojson`).then((r) => r.json()).then(setRegionsSub);
         fetch(base + "roads.geojson")
@@ -420,9 +415,7 @@ export default function WorldMap({
   // datasets provide parcel squares; legacy datasets fall back to bounded Voronoi.
   const cells = useMemo(() => {
     if (!points.length) return [];
-    if (isCity) {
-      return points.map((p) => ({ polygon: buildingPolygon(p), point: p }));
-    }
+    if (isCity) return [];
     if (points.some((p) => p.parcelSize != null)) {
       return points.map((p) => ({ polygon: parcelPolygon(p), point: p }));
     }
@@ -516,17 +509,22 @@ export default function WorldMap({
   }, [gx, gy, qz]);
 
   const visibleCells = useMemo(() => {
-    if (!renderCells || !cells.length || !viewState) return [];
+    if (!renderCells || !viewState) return [];
+    const source = isCity ? points : cells;
+    if (!source.length) return [];
     const m = 1.6; // render a margin beyond the viewport so panning stays covered
     const [cx, cy] = viewState.target;
     const mhw = hw * m;
     const mhh = hh * m;
-    return cells.filter((c) => {
-      const [x, y] = c.point.position;
+    const visible = source.filter((item) => {
+      const point = isCity ? item : item.point;
+      const [x, y] = point.position;
       return x >= cx - mhw && x <= cx + mhw && y >= cy - mhh && y <= cy + mhh;
     });
+    if (!isCity) return visible;
+    return visible.map((p) => ({ polygon: buildingPolygon(p), point: p }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [renderCells, cells, settle]);
+  }, [renderCells, isCity, points, cells, settle]);
 
   // focus: smoothly frame a world, result set, or cluster extent.
   useEffect(() => {
@@ -799,16 +797,6 @@ export default function WorldMap({
       getFillColor: LAND.color,
       pickable: false,
     }),
-    isCity &&
-      new GeoJsonLayer({
-        id: "landuse",
-        data: landuse,
-        filled: true,
-        stroked: false,
-        getFillColor: (f) =>
-          f.properties.kind === "park" ? LANDUSE.parkColor : LANDUSE.developedColor,
-        pickable: false,
-      }),
     // continent background color field
     !isCity &&
       new GeoJsonLayer({

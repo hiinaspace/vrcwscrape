@@ -1179,10 +1179,14 @@ def _write_landuse(
     out_path: Path,
     min_area: float,
     park_buffer: float,
+    simplify: float,
 ) -> dict[str, float | int]:
     developed = shapely.unary_union([b.geom for b in blocks if not b.geom.is_empty])
     developed = _safe_geom(developed.intersection(land_geom))
     open_space = _safe_geom(land_geom.difference(developed.buffer(park_buffer)))
+    if simplify > 0:
+        developed = _safe_geom(developed.simplify(simplify, preserve_topology=True))
+        open_space = _safe_geom(open_space.simplify(simplify, preserve_topology=True))
     developed = _filter_geom(developed, min_area)
     open_space = _filter_geom(open_space, min_area)
     feats = []
@@ -1440,6 +1444,7 @@ def main() -> None:
     ap.add_argument("--land-chaikin-simplify-scale", type=float, default=0.85)
     ap.add_argument("--land-union-min-area-scale", type=float, default=80.0)
     ap.add_argument("--landuse-min-area-scale", type=float, default=20.0)
+    ap.add_argument("--landuse-simplify-scale", type=float, default=3.0)
     ap.add_argument("--land-raster-min-area-cells", type=float, default=4.0)
     ap.add_argument("--region-raster-max-dim", type=int, default=2048)
     ap.add_argument("--region-raster-nn-cells", type=float, default=2.0)
@@ -1551,6 +1556,7 @@ def main() -> None:
         out_path=args.out_dir / "landuse.geojson",
         min_area=(global_nn * global_nn) * args.landuse_min_area_scale,
         park_buffer=global_nn * args.park_buffer_scale,
+        simplify=global_nn * args.landuse_simplify_scale,
     )
     metrics.update(landuse_metrics)
     _write_geojson(_road_features(roads), args.out_dir / "roads.geojson")
