@@ -48,6 +48,22 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "nolabs-hybrid" ||
+    data === "nolabs-v3" ||
+    data === "nolabs-toponymy" ||
+    data === "nolabs-island-toponymy" ||
+    data === "nolabs-localmap-island-toponymy" ||
+    data === "full-nolabs-localmap-island-toponymy" ||
+    layout === "localmap-island-toponymy" ||
+    (data === "nolabs" && layout === "hybrid")
+  ) {
+    return {
+      key: "nolabs-localmap-island-toponymy",
+      dir: "full-nolabs-localmap-island-toponymy/",
+      label: "No-Labs LocalMAP Island Toponymy",
+    };
+  }
+  if (
     data === "nolabs-v2" ||
     data === "nolabs-physical-v2" ||
     data === "nolabs-localmap-physical-v2" ||
