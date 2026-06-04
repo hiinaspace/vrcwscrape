@@ -15,6 +15,7 @@ import {
   OCEAN,
   REGION_BG,
   REGION_PALETTE,
+  ROADS,
   SEARCH_PIN,
   SELECTED,
   WORLD_LABELS,
@@ -241,6 +242,7 @@ export default function WorldMap({
   const [land, setLand] = useState(null);
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
+  const [roads, setRoads] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
   // Hold label rendering until Inter is loaded, so deck builds the SDF atlas from the
@@ -287,6 +289,9 @@ export default function WorldMap({
         fetch(base + "land.geojson").then((r) => r.json()).then(setLand);
         fetch(base + `regions_l${info.top}.geojson`).then((r) => r.json()).then(setRegionsTop);
         fetch(base + `regions_l${info.sub}.geojson`).then((r) => r.json()).then(setRegionsSub);
+        fetch(base + "roads.geojson")
+          .then((r) => (r.ok ? r.json() : null))
+          .then(setRoads, () => setRoads(null));
         return loadPoints();
       })
       .then((d) => {
@@ -648,6 +653,12 @@ export default function WorldMap({
     return f ? { type: "FeatureCollection", features: [f] } : null;
   }, [highlight, regionsTop, regionsSub, lvl]);
 
+  const roadFeatures = useMemo(() => {
+    const features = roads?.features ?? [];
+    if (tier === "far") return features.filter((f) => f.properties.kind === "arterial");
+    return features;
+  }, [roads, tier]);
+
   if (!viewState) {
     return (
       <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
@@ -657,6 +668,7 @@ export default function WorldMap({
   }
 
   const cellsStroked = TIER_RANK[tier] >= TIER_RANK[CELLS.strokeMinZoomTier];
+  const roadsVisible = roads && TIER_RANK[tier] >= TIER_RANK[ROADS.visibleFromTier];
 
   // one TextLayer per atlas (Latin / wide). Data is pre-decluttered in JS, so no
   // collision extension is needed here (deck just renders the chosen labels).
@@ -751,6 +763,36 @@ export default function WorldMap({
         getLineWidth: selected,
       },
     }),
+    roadsVisible &&
+      new GeoJsonLayer({
+        id: "roads-casing",
+        data: { type: "FeatureCollection", features: roadFeatures },
+        filled: false,
+        stroked: true,
+        getLineColor: ROADS.casingColor,
+        lineWidthUnits: "pixels",
+        getLineWidth: (f) =>
+          (f.properties.kind === "arterial" ? ROADS.arterialWidth : ROADS.localWidth) +
+          ROADS.casingExtraWidth,
+        lineJointRounded: true,
+        lineCapRounded: true,
+        pickable: false,
+      }),
+    roadsVisible &&
+      new GeoJsonLayer({
+        id: "roads",
+        data: { type: "FeatureCollection", features: roadFeatures },
+        filled: false,
+        stroked: true,
+        getLineColor: (f) =>
+          f.properties.kind === "arterial" ? ROADS.arterialColor : ROADS.localColor,
+        lineWidthUnits: "pixels",
+        getLineWidth: (f) =>
+          f.properties.kind === "arterial" ? ROADS.arterialWidth : ROADS.localWidth,
+        lineJointRounded: true,
+        lineCapRounded: true,
+        pickable: false,
+      }),
     // region outlines (continent when far, sub-region when mid)
     (tier === "far" ? regionsTop : tier === "mid" ? regionsSub : null) &&
       new GeoJsonLayer({

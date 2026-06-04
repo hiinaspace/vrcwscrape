@@ -44,6 +44,18 @@ export const REGION_BG = {
   outlineWidth: 1.5,
 };
 
+// Optional virtual road overlay. If a dataset has roads.geojson, roads are drawn
+// above cells as pale map strokes; datasets without that asset simply omit it.
+export const ROADS = {
+  visibleFromTier: "mid", // "far" | "mid" | "near"
+  arterialWidth: 2.8,
+  localWidth: 1.45,
+  casingExtraWidth: 1.6,
+  arterialColor: [252, 249, 239, 235],
+  localColor: [248, 246, 238, 220],
+  casingColor: [168, 158, 135, 150],
+};
+
 // Muted, map-like palette (gmaps / OSM / Apple Maps feel). Regions are colored by
 // index into this list, so reordering/recoloring here restyles the whole map.
 export const REGION_PALETTE = [

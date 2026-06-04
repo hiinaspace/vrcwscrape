@@ -51,6 +51,7 @@ mapgen-physical-hierarchy = "mapgen.physical_hierarchy:main"
 mapgen-island-toponymy = "mapgen.island_toponymy:main"
 mapgen-app-export = "mapgen.export_app:main"
 mapgen-land = "mapgen.land:main"
+mapgen-roads = "mapgen.roads:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6", "ty", "pre-commit>=3.8"]
