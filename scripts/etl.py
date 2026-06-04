@@ -259,6 +259,14 @@ def export_worlds_search(
     limit_clause = _limit_clause(limits.worlds_limit)
     order_clause = "ORDER BY w.last_scrape_time DESC" if limits.worlds_limit else ""
 
+    # Restrict the thumbnail scan to the selected subset when limiting, so we
+    # don't join all ~228k IMAGE rows for a small export.
+    thumb_world_filter = (
+        "AND fm.world_id IN (SELECT world_id FROM selected_worlds)"
+        if use_selected_worlds
+        else ""
+    )
+
     conn.execute(f"""
         COPY (
             WITH latest_metrics AS (
@@ -290,6 +298,28 @@ def export_worlds_search(
                     MAX(CASE WHEN platform = 'android' THEN latest_size_bytes END) AS quest_size_bytes
                 FROM read_parquet('{packages_path}')
                 GROUP BY world_id
+            ),
+            thumbnails AS (
+                -- One IMAGE row per world; pick the latest CONFIRMED image_content
+                -- version's sha256. Select only scalar columns (no file_metadata
+                -- JSON blob) so DuckDB's MySQL scanner prunes the heavy column.
+                SELECT world_id, thumb_sha256
+                FROM (
+                    SELECT
+                        fm.world_id,
+                        ic.sha256 AS thumb_sha256,
+                        row_number() OVER (
+                            PARTITION BY fm.world_id
+                            ORDER BY ic.version DESC
+                        ) AS rn
+                    FROM mysqldb.file_metadata fm
+                    JOIN mysqldb.image_content ic ON fm.file_id = ic.file_id
+                    WHERE fm.file_type = 'IMAGE'
+                      AND ic.state = 'CONFIRMED'
+                      AND ic.sha256 IS NOT NULL
+                      {thumb_world_filter}
+                )
+                WHERE rn = 1
             )
             SELECT
                 w.world_id,
@@ -320,11 +350,13 @@ def export_worlds_search(
                 ps.quest_size_bytes,
                 CAST(ps.pc_size_bytes AS DOUBLE) / 1024 / 1024 AS pc_size_mb,
                 CAST(ps.quest_size_bytes AS DOUBLE) / 1024 / 1024 AS quest_size_mb,
+                th.thumb_sha256,
                 w.scrape_status,
                 w.last_scrape_time
             FROM {world_source}
             LEFT JOIN latest_metrics lm ON w.world_id = lm.world_id
             LEFT JOIN package_sizes ps ON w.world_id = ps.world_id
+            LEFT JOIN thumbnails th ON w.world_id = th.world_id
             WHERE w.scrape_status = 'SUCCESS'
             {order_clause}
             {limit_clause}

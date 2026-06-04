@@ -61,14 +61,14 @@ export const REGION_BG = {
 export const ROADS = {
   visibleFromTier: "mid", // "far" | "mid" | "near"
   arterialWidth: 2.8,
-  localWidth: 1.45,
-  minorWidth: 0.65,
+  localWidth: 1.85,
+  minorWidth: 1.55,
   casingExtraWidth: 1.6,
-  minorCasingExtraWidth: 0.25,
-  arterialColor: [252, 249, 239, 235],
-  localColor: [248, 246, 238, 220],
-  minorColor: [255, 255, 250, 185],
-  casingColor: [168, 158, 135, 150],
+  minorCasingExtraWidth: 0.55,
+  arterialColor: [152, 149, 139, 255],
+  localColor: [148, 146, 138, 255],
+  minorColor: [155, 155, 150, 255],
+  casingColor: [168, 158, 135, 255],
 };
 
 // Muted, map-like palette (gmaps / OSM / Apple Maps feel). Regions are colored by
@@ -95,7 +95,7 @@ export const LABELS = {
   sizeCapitol: 10,
   sizeWorld: 10,
   color: [25, 25, 25],
-  outlineWidth: 1, // deck SDF outline is thin; the background box does the contrast
+  outlineWidth: 15, // deck SDF outline is thin; the background box does the contrast
   outlineColor: [255, 255, 255, 230],
   background: true, // white rounded rectangle behind label text for contrast
   backgroundColor: [255, 255, 255, 125],
@@ -139,7 +139,7 @@ export const SEARCH_PIN = {
 // Per-kind label color / offset / wrapping. (Sizes, bg box, collision in LABELS.)
 export const LABEL_STYLE = {
   worldColor: [30, 30, 30],
-  regionColor: [45, 145, 45],
+  regionColor: [45, 105, 45],
   capitolColor: [40, 65, 120], // distinct hue so "major cities" read differently
   capitolPixelOffset: [0, -7], // lift the capitol label off its pin
   wordBreak: "break-word", // wrap long names at word boundaries…
