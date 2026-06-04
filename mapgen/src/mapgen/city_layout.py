@@ -91,6 +91,14 @@ class SplitParcel:
     depth: int
 
 
+@dataclass
+class PlanarStreetResult:
+    road_specs: list[RoadSpec]
+    leaves: list[SplitParcel]
+    build_geom: object
+    splits: float
+
+
 class Ids:
     def __init__(self) -> None:
         self.road = 0
@@ -1130,6 +1138,465 @@ def _coastal_road_specs(
     return specs
 
 
+def _planning_parts(
+    land_geom,
+    *,
+    coastal_offset: float,
+    min_area: float,
+    args,
+) -> list[Polygon]:
+    parts: list[Polygon] = []
+    for poly in iter_polygons(land_geom):
+        if poly.area <= 0:
+            continue
+        buildable = poly
+        if (
+            coastal_offset > 0
+            and poly.area >= min_area * args.planar_coastal_inset_min_area_scale
+        ):
+            inset = _safe_geom(poly.buffer(-coastal_offset, join_style="round"))
+            inset_parts = [p for p in iter_polygons(inset) if p.area >= min_area]
+            if inset_parts:
+                inset_union = shapely.unary_union(inset_parts)
+                if inset_union.area >= poly.area * args.planar_coastal_inset_min_frac:
+                    buildable = inset_union
+        parts.extend(p for p in iter_polygons(buildable) if p.area >= min_area)
+    return sorted(parts, key=lambda p: p.area, reverse=True)
+
+
+def _planar_boundary_road_specs(
+    parts: list[Polygon],
+    *,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    specs: list[RoadSpec] = []
+    min_length = slot_step * args.min_road_length_slots
+    for part_no, poly in enumerate(parts):
+        if (
+            poly.area
+            < (global_nn * global_nn) * args.coastal_arterial_min_area_scale
+        ):
+            kind = "collector"
+            width = args.collector_road_width
+        else:
+            kind = "arterial"
+            width = args.arterial_road_width
+        coords = _resample_line_coords(
+            np.asarray(poly.exterior.coords, dtype=np.float64),
+            step=max(global_nn * args.planar_boundary_resample_scale, slot_step),
+            closed=True,
+        )
+        coords = _relax_line_curvature(
+            coords,
+            max_turn_deg=args.road_curvature_arterial_max_turn_deg,
+            iterations=args.road_curvature_relax_iterations,
+            strength=args.road_curvature_relax_strength,
+            closed=True,
+        )
+        line = LineString(coords)
+        if line.length >= min_length:
+            specs.append(
+                RoadSpec(
+                    coords=[(float(x), float(y)) for x, y in line.coords],
+                    kind=kind,
+                    island_id=island_id,
+                    width=width,
+                    family=-2,
+                    depth=0,
+                )
+            )
+        for ring_no, hole in enumerate(poly.interiors):
+            line = LineString(hole.coords)
+            if line.length < min_length:
+                continue
+            specs.append(
+                RoadSpec(
+                    coords=[(float(x), float(y)) for x, y in line.coords],
+                    kind="collector",
+                    island_id=island_id,
+                    width=args.collector_road_width,
+                    family=-(200 + part_no * 100 + ring_no),
+                    depth=0,
+                )
+            )
+    return specs
+
+
+def _polygon_irregularity(poly: Polygon) -> float:
+    if poly.is_empty or poly.area <= 1e-12:
+        return 1e6
+    rect = poly.minimum_rotated_rectangle
+    rect_area = max(float(rect.area), 1e-12)
+    fill_penalty = max(0.0, 1.0 - float(poly.area) / rect_area)
+    coords = np.asarray(rect.exterior.coords[:-1], dtype=np.float64)
+    if len(coords) >= 4:
+        edges = np.roll(coords, -1, axis=0) - coords
+        lens = np.linalg.norm(edges, axis=1)
+        long = float(lens.max(initial=1e-12))
+        short = float(max(lens.min(initial=1e-12), 1e-12))
+        aspect_penalty = abs(math.log(np.clip(long / short, 1.0, 1e6))) * 0.18
+        rect_perimeter = max(float(lens.sum()), 1e-12)
+    else:
+        aspect_penalty = 1.0
+        rect_perimeter = max(math.sqrt(rect_area) * 4.0, 1e-12)
+    perimeter_penalty = max(0.0, float(poly.length) / rect_perimeter - 1.0) * 0.35
+    return fill_penalty + aspect_penalty + perimeter_penalty
+
+
+def _split_road_kind(depth: int, args) -> tuple[str, float]:
+    if depth < args.planar_collector_depth:
+        return "collector", args.collector_road_width
+    if depth < args.planar_service_depth:
+        return "local", args.local_road_width
+    return "service", args.service_road_width
+
+
+def _planar_split_candidate_lines(
+    parcel: SplitParcel,
+    xy: np.ndarray,
+    *,
+    global_nn: float,
+    args,
+    rng: np.random.Generator,
+) -> list[LineString]:
+    pts = xy[parcel.point_idx]
+    center, axes = _polygon_axes(parcel.geom, pts)
+    lo, hi = _project_poly_bounds(parcel.geom, center, axes)
+    span = np.maximum(hi - lo, 1e-9)
+    if span.min() < global_nn * args.planar_min_split_width_scale:
+        return []
+
+    local_pts = (pts - center) @ axes if len(pts) else np.empty((0, 2))
+    order = [int(np.argmax(span)), int(np.argmin(span))]
+    if span.max() / max(span.min(), 1e-9) < args.recursive_alternate_ratio:
+        order = [parcel.depth % 2, 1 - (parcel.depth % 2)]
+    quantiles = [0.5, 0.44, 0.56, 0.38, 0.62, 0.32, 0.68]
+    quantiles = quantiles[: args.planar_split_candidates_per_family]
+    candidates: list[LineString] = []
+    for normal_axis in order[: args.planar_split_families]:
+        tangent_axis = 1 - normal_axis
+        tangent_pad = span[tangent_axis] * 0.42 + global_nn * 10.0
+        t0 = lo[tangent_axis] - tangent_pad
+        t1 = hi[tangent_axis] + tangent_pad
+        n = int(
+            np.clip(
+                math.ceil((t1 - t0) / max(global_nn * 2.4, span[tangent_axis] / 160)),
+                32,
+                args.road_curve_max_vertices,
+            )
+        )
+        tangent = np.linspace(t0, t1, n)
+        margin = max(
+            span[normal_axis] * args.planar_split_margin_frac,
+            global_nn * args.planar_min_split_margin_scale,
+        )
+        if margin * 2 >= span[normal_axis]:
+            continue
+        if len(local_pts):
+            split_values = np.quantile(local_pts[:, normal_axis], quantiles)
+        else:
+            split_values = np.full(
+                len(quantiles),
+                (lo[normal_axis] + hi[normal_axis]) / 2,
+            )
+        for cand_no, split_at in enumerate(split_values.tolist()):
+            split_at = float(
+                np.clip(
+                    split_at,
+                    lo[normal_axis] + margin,
+                    hi[normal_axis] - margin,
+                )
+            )
+            amp = min(
+                span[normal_axis] * args.planar_streamline_curve_span_scale,
+                global_nn * args.planar_streamline_curve_global_scale,
+            )
+            wavelength = max(
+                span[tangent_axis] * args.planar_streamline_wavelength_scale,
+                global_nn * 3.0,
+            )
+            phase = rng.uniform(0.0, math.tau)
+            phase2 = rng.uniform(0.0, math.tau)
+            curve = amp * np.sin((tangent / wavelength) * math.tau + phase)
+            curve += (
+                amp
+                * args.planar_streamline_secondary_curve_scale
+                * np.sin((tangent / (wavelength * 2.6)) * math.tau + phase2)
+            )
+            if cand_no == 0:
+                curve *= 0.25
+            local = np.zeros((n, 2), dtype=np.float64)
+            local[:, tangent_axis] = tangent
+            local[:, normal_axis] = split_at + curve
+            line = LineString(_to_world(local, center, axes))
+            if line.length > global_nn:
+                candidates.append(line)
+    return candidates
+
+
+def _try_split_planar_parcel(
+    parcel: SplitParcel,
+    xy: np.ndarray,
+    *,
+    global_nn: float,
+    island_id: int,
+    slot_step: float,
+    args,
+    rng: np.random.Generator,
+) -> tuple[list[SplitParcel], RoadSpec] | None:
+    if parcel.depth >= args.recursive_max_depth:
+        return None
+    if len(parcel.point_idx) < args.recursive_min_split_worlds:
+        return None
+    min_area = (global_nn * global_nn) * args.planar_min_parcel_area_scale
+    best: tuple[float, list[Polygon], list[np.ndarray], LineString] | None = None
+    for line in _planar_split_candidate_lines(
+        parcel,
+        xy,
+        global_nn=global_nn,
+        args=args,
+        rng=rng,
+    ):
+        if line.length <= slot_step * args.planar_min_split_road_length_slots:
+            continue
+        try:
+            result = split_geom(parcel.geom, line)
+        except (ValueError, shapely.GEOSException):
+            continue
+        parts = [
+            p
+            for p in sorted(iter_polygons(result), key=lambda g: g.area, reverse=True)
+            if p.area >= min_area
+        ]
+        if len(parts) != 2:
+            continue
+        area_sum = sum(p.area for p in parts)
+        if area_sum < parcel.geom.area * 0.92:
+            continue
+        child_members = _classify_points_to_polys(parts, xy, parcel.point_idx)
+        counts = np.array([len(m) for m in child_members], dtype=np.int64)
+        if np.count_nonzero(counts) < 2:
+            continue
+        if (
+            counts.max(initial=0)
+            >= len(parcel.point_idx) * args.recursive_max_child_frac
+        ):
+            continue
+        areas = np.array([p.area for p in parts], dtype=np.float64)
+        area_balance = float(areas.min() / max(areas.max(), 1e-12))
+        count_balance = float(counts.min() / max(counts.max(), 1))
+        regularity = 1.0 / (1.0 + sum(_polygon_irregularity(p) for p in parts))
+        split_geom_line = line.intersection(parcel.geom)
+        split_len = sum(seg.length for seg in _iter_lines(split_geom_line))
+        length_score = math.sqrt(float(parcel.geom.area)) / max(split_len, 1e-9)
+        score = (
+            args.planar_quality_size_weight * area_balance
+            + args.planar_quality_count_weight * count_balance
+            + args.planar_quality_regular_weight * regularity
+            + args.planar_quality_length_weight * min(length_score, 1.0)
+        )
+        if best is None or score > best[0]:
+            best = (score, parts, child_members, split_geom_line)
+    if best is None:
+        return None
+    _score, parts, child_members, road_geom = best
+    road_lines = [
+        seg
+        for seg in _iter_lines(road_geom)
+        if seg.length >= slot_step * args.planar_min_split_road_length_slots
+    ]
+    if not road_lines:
+        return None
+    road_line = max(road_lines, key=lambda seg: seg.length)
+    kind, width = _split_road_kind(parcel.depth, args)
+    children = [
+        SplitParcel(geom=part, point_idx=members, depth=parcel.depth + 1)
+        for part, members in zip(parts, child_members, strict=True)
+        if len(members) > 0
+    ]
+    if len(children) < 2:
+        return None
+    spec = RoadSpec(
+        coords=[(float(x), float(y)) for x, y in road_line.coords],
+        kind=kind,
+        island_id=island_id,
+        width=width,
+        family=parcel.depth,
+        depth=parcel.depth,
+    )
+    return children, spec
+
+
+def _choose_split_leaf(
+    leaves: list[SplitParcel],
+    *,
+    global_nn: float,
+    target_leaf_worlds: int,
+    failed: set[int],
+    args,
+) -> list[int]:
+    scored: list[tuple[float, int]] = []
+    for i, leaf in enumerate(leaves):
+        if i in failed:
+            continue
+        n = len(leaf.point_idx)
+        if n < args.recursive_min_split_worlds:
+            continue
+        excess = max(0.0, n - target_leaf_worlds)
+        if excess <= 0 and leaf.depth > 0:
+            continue
+        density = n / max(float(leaf.geom.area), global_nn * global_nn)
+        irregularity = _polygon_irregularity(leaf.geom)
+        scored.append((excess * 8.0 + density * global_nn + irregularity, i))
+    scored.sort(reverse=True)
+    return [i for _score, i in scored[: args.recursive_split_search]]
+
+
+def _node_planar_road_specs(
+    specs: list[RoadSpec],
+    *,
+    island_id: int,
+    global_nn: float,
+    args,
+) -> list[RoadSpec]:
+    source_lines = [LineString(spec.coords) for spec in specs]
+    source_lines = [line for line in source_lines if line.length > 1e-9]
+    if not source_lines:
+        return []
+    noded = shapely.unary_union(source_lines)
+    segments = [seg for seg in _iter_lines(noded) if seg.length > 1e-9]
+    if not segments:
+        return []
+    tree = shapely.STRtree(source_lines)
+    priority = {"arterial": 0, "collector": 1, "local": 2, "service": 3, "slot": 4}
+    tol = max(global_nn * args.planar_source_match_tolerance_scale, 1e-9)
+    min_len = max(global_nn * args.planar_min_noded_segment_scale, 1e-9)
+    out: list[RoadSpec] = []
+    for seg in segments:
+        if seg.length < min_len:
+            continue
+        query_geom = seg.buffer(tol, cap_style="flat", join_style="round").envelope
+        candidates = np.asarray(tree.query(query_geom), dtype=np.int64)
+        best_idx = -1
+        best_rank = 999
+        best_overlap = -1.0
+        for idx in candidates.tolist():
+            src = source_lines[idx]
+            if seg.distance(src) > tol:
+                continue
+            spec = specs[idx]
+            rank = priority.get(spec.kind, 99)
+            overlap = seg.intersection(src.buffer(tol, cap_style="flat")).length
+            if rank < best_rank or (rank == best_rank and overlap > best_overlap):
+                best_idx = idx
+                best_rank = rank
+                best_overlap = overlap
+        if best_idx < 0:
+            best_idx = 0
+        spec = specs[best_idx]
+        out.append(
+            RoadSpec(
+                coords=[(float(x), float(y)) for x, y in seg.coords],
+                kind=spec.kind,
+                island_id=island_id,
+                width=spec.width,
+                family=spec.family,
+                depth=spec.depth,
+            )
+        )
+    return out
+
+
+def _generate_planar_streets(
+    *,
+    xy: np.ndarray,
+    land_geom,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> PlanarStreetResult:
+    min_area = (global_nn * global_nn) * args.planar_min_parcel_area_scale
+    coastal_offset = max(global_nn * args.coastal_road_offset_scale, slot_step * 1.4)
+    parts = _planning_parts(
+        land_geom,
+        coastal_offset=coastal_offset,
+        min_area=min_area,
+        args=args,
+    )
+    if not parts:
+        parts = sorted(iter_polygons(land_geom), key=lambda p: p.area, reverse=True)
+    build_geom = _safe_geom(shapely.unary_union(parts))
+    members_by_part = _classify_points_to_polys(
+        parts,
+        xy,
+        np.arange(len(xy), dtype=np.int64),
+    )
+    leaves = [
+        SplitParcel(geom=p, point_idx=m, depth=0)
+        for p, m in zip(parts, members_by_part, strict=True)
+        if len(m) > 0
+    ]
+    road_specs = _planar_boundary_road_specs(
+        parts,
+        island_id=island_id,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    rng = np.random.default_rng(args.seed + island_id * 7919)
+    target_leaf_worlds = max(args.planar_target_block_worlds, 6)
+    splits = 0
+    failed: set[int] = set()
+    while splits < args.recursive_max_splits and leaves:
+        if max(len(leaf.point_idx) for leaf in leaves) <= target_leaf_worlds * 1.20:
+            break
+        progressed = False
+        for i in _choose_split_leaf(
+            leaves,
+            global_nn=global_nn,
+            target_leaf_worlds=target_leaf_worlds,
+            failed=failed,
+            args=args,
+        ):
+            split = _try_split_planar_parcel(
+                leaves[i],
+                xy,
+                global_nn=global_nn,
+                island_id=island_id,
+                slot_step=slot_step,
+                args=args,
+                rng=rng,
+            )
+            if split is None:
+                failed.add(i)
+                continue
+            children, spec = split
+            leaves = leaves[:i] + children + leaves[i + 1 :]
+            road_specs.append(spec)
+            failed.clear()
+            splits += 1
+            progressed = True
+            break
+        if not progressed:
+            break
+    road_specs = _node_planar_road_specs(
+        road_specs,
+        island_id=island_id,
+        global_nn=global_nn,
+        args=args,
+    )
+    return PlanarStreetResult(
+        road_specs=road_specs,
+        leaves=leaves,
+        build_geom=build_geom,
+        splits=float(splits),
+    )
+
+
 def _project_poly_bounds(
     poly: Polygon,
     center: np.ndarray,
@@ -1720,7 +2187,7 @@ def _layout_streamline_island(
         global_nn * args.road_spacing_min_scale,
         slot_step * args.recursive_road_spacing_slot_scale,
     )
-    road_specs, leaves, splits = _generate_recursive_streets(
+    street_layout = _generate_planar_streets(
         xy=xy,
         land_geom=island_land,
         island_id=island_id,
@@ -1728,9 +2195,13 @@ def _layout_streamline_island(
         slot_step=slot_step,
         args=args,
     )
+    road_specs = street_layout.road_specs
+    leaves = street_layout.leaves
+    build_geom = street_layout.build_geom
+    splits = street_layout.splits
     slots = _slots_for_road_specs(
         road_specs,
-        land_geom=island_land,
+        land_geom=build_geom,
         global_nn=global_nn,
         slot_step=slot_step,
         road_spacing=road_spacing,
@@ -2661,6 +3132,33 @@ def main() -> None:
     ap.add_argument("--recursive-curve-span-scale", type=float, default=0.045)
     ap.add_argument("--recursive-curve-global-scale", type=float, default=3.5)
     ap.add_argument("--recursive-curve-wavelength-scale", type=float, default=0.65)
+    ap.add_argument("--planar-target-block-worlds", type=int, default=14)
+    ap.add_argument("--planar-min-parcel-area-scale", type=float, default=7.0)
+    ap.add_argument("--planar-min-split-width-scale", type=float, default=0.45)
+    ap.add_argument("--planar-split-margin-frac", type=float, default=0.08)
+    ap.add_argument("--planar-min-split-margin-scale", type=float, default=0.35)
+    ap.add_argument("--planar-min-split-road-length-slots", type=float, default=1.4)
+    ap.add_argument("--planar-collector-depth", type=int, default=1)
+    ap.add_argument("--planar-service-depth", type=int, default=7)
+    ap.add_argument("--planar-split-families", type=int, default=2)
+    ap.add_argument("--planar-split-candidates-per-family", type=int, default=5)
+    ap.add_argument("--planar-quality-size-weight", type=float, default=0.28)
+    ap.add_argument("--planar-quality-count-weight", type=float, default=0.24)
+    ap.add_argument("--planar-quality-regular-weight", type=float, default=0.40)
+    ap.add_argument("--planar-quality-length-weight", type=float, default=0.08)
+    ap.add_argument("--planar-streamline-curve-span-scale", type=float, default=0.075)
+    ap.add_argument("--planar-streamline-curve-global-scale", type=float, default=4.2)
+    ap.add_argument("--planar-streamline-wavelength-scale", type=float, default=0.82)
+    ap.add_argument(
+        "--planar-streamline-secondary-curve-scale",
+        type=float,
+        default=0.28,
+    )
+    ap.add_argument("--planar-boundary-resample-scale", type=float, default=1.15)
+    ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
+    ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
+    ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
+    ap.add_argument("--planar-coastal-inset-min-frac", type=float, default=0.38)
     ap.add_argument("--coastal-road-offset-scale", type=float, default=4.2)
     ap.add_argument("--coastal-road-soften-scale", type=float, default=2.4)
     ap.add_argument("--coastal-arterial-min-worlds", type=int, default=350)
@@ -2830,7 +3328,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-hierarchical-v10",
+        "layout": "city-planar-v11",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
