@@ -1167,6 +1167,7 @@ def _planning_parts(
 def _planar_boundary_road_specs(
     parts: list[Polygon],
     *,
+    members_by_part: list[np.ndarray],
     island_id: int,
     global_nn: float,
     slot_step: float,
@@ -1175,7 +1176,27 @@ def _planar_boundary_road_specs(
     specs: list[RoadSpec] = []
     min_length = slot_step * args.min_road_length_slots
     for part_no, poly in enumerate(parts):
-        if (
+        count = len(members_by_part[part_no]) if part_no < len(members_by_part) else 0
+        ring_min_area = (
+            global_nn * global_nn * args.planar_boundary_ring_min_area_scale
+        )
+        ring_allowed = (
+            count >= args.planar_boundary_ring_min_worlds
+            and poly.area >= ring_min_area
+        )
+        if not ring_allowed:
+            specs.extend(
+                _planar_spine_road_specs(
+                    poly,
+                    island_id=island_id,
+                    part_no=part_no,
+                    world_count=count,
+                    slot_step=slot_step,
+                    args=args,
+                )
+            )
+            continue
+        if count < args.coastal_arterial_min_worlds or (
             poly.area
             < (global_nn * global_nn) * args.coastal_arterial_min_area_scale
         ):
@@ -1204,7 +1225,7 @@ def _planar_boundary_road_specs(
                     kind=kind,
                     island_id=island_id,
                     width=width,
-                    family=-2,
+                    family=-10000 - part_no,
                     depth=0,
                 )
             )
@@ -1218,11 +1239,52 @@ def _planar_boundary_road_specs(
                     kind="collector",
                     island_id=island_id,
                     width=args.collector_road_width,
-                    family=-(200 + part_no * 100 + ring_no),
+                    family=-(20000 + part_no * 100 + ring_no),
                     depth=0,
                 )
             )
     return specs
+
+
+def _planar_spine_road_specs(
+    poly: Polygon,
+    *,
+    island_id: int,
+    part_no: int,
+    world_count: int,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    if world_count <= 0:
+        return []
+    center, axes = _parcel_shape_axes(poly)
+    lo, hi = _project_poly_bounds(poly, center, axes)
+    span = np.maximum(hi - lo, 1e-9)
+    along_axis = int(np.argmax(span))
+    cross_axis = 1 - along_axis
+    local = np.zeros((2, 2), dtype=np.float64)
+    local[:, along_axis] = [lo[along_axis], hi[along_axis]]
+    local[:, cross_axis] = (lo[cross_axis] + hi[cross_axis]) * 0.5
+    line = LineString(_to_world(local, center, axes)).intersection(poly)
+    candidates = [seg for seg in _iter_lines(line) if seg.length > 1e-9]
+    if not candidates:
+        return []
+    line = max(candidates, key=lambda seg: seg.length)
+    min_length = slot_step * args.boundary_road_min_length_slots
+    if line.length < min_length:
+        return []
+    kind = "local" if world_count >= args.recursive_min_split_worlds else "service"
+    width = args.local_road_width if kind == "local" else args.service_road_width
+    return [
+        RoadSpec(
+            coords=[(float(x), float(y)) for x, y in line.coords],
+            kind=kind,
+            island_id=island_id,
+            width=width,
+            family=-30000 - part_no,
+            depth=0,
+        )
+    ]
 
 
 def _polygon_irregularity(poly: Polygon) -> float:
@@ -1498,6 +1560,107 @@ def _choose_split_leaf(
     return [i for _score, i in scored[: args.recursive_split_search]]
 
 
+def _snap_planar_junctions(
+    specs: list[RoadSpec],
+    *,
+    global_nn: float,
+    args,
+) -> list[RoadSpec]:
+    if (
+        len(specs) < 2
+        or args.planar_junction_snap_scale <= 0
+        or args.planar_junction_merge_scale <= 0
+    ):
+        return specs
+    lines = [LineString(spec.coords) for spec in specs]
+    tree = shapely.STRtree(lines)
+    snap_tol = global_nn * args.planar_junction_snap_scale
+    merge_tol = global_nn * args.planar_junction_merge_scale
+    proposals: list[tuple[int, int, np.ndarray]] = []
+    for i, line in enumerate(lines):
+        coords = np.asarray(line.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        closed = np.linalg.norm(coords[0] - coords[-1]) <= 1e-9
+        if closed:
+            continue
+        for end_idx in (0, len(coords) - 1):
+            endpoint = coords[end_idx]
+            p = shapely.Point(float(endpoint[0]), float(endpoint[1]))
+            cand = np.asarray(tree.query(p.buffer(snap_tol).envelope), dtype=np.int64)
+            best_q = None
+            best_d = float("inf")
+            for j in cand.tolist():
+                if j == i:
+                    continue
+                q = _nearest_point_on_geom(endpoint, lines[j])
+                if q is None:
+                    continue
+                d = float(np.linalg.norm(endpoint - q))
+                if d <= snap_tol and d < best_d:
+                    best_q = q
+                    best_d = d
+            if best_q is not None:
+                proposals.append((i, end_idx, best_q))
+    if not proposals:
+        return specs
+
+    pts = np.stack([p for _i, _end, p in proposals])
+    parent = np.arange(len(proposals), dtype=np.int64)
+
+    def find(v: int) -> int:
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = int(parent[v])
+        return v
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    nbrs = cKDTree(pts).query_pairs(merge_tol)
+    for a, b in nbrs:
+        union(int(a), int(b))
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(proposals)):
+        clusters[find(i)].append(i)
+
+    line_union = shapely.unary_union(lines)
+    snap_points: dict[tuple[int, int], np.ndarray] = {}
+    for members in clusters.values():
+        center = pts[members].mean(axis=0)
+        snapped = _nearest_point_on_geom(center, line_union)
+        if snapped is None:
+            snapped = center
+        for member in members:
+            spec_idx, end_idx, _q = proposals[member]
+            snap_points[(spec_idx, end_idx)] = snapped
+
+    out: list[RoadSpec] = []
+    max_move = snap_tol + merge_tol
+    for i, spec in enumerate(specs):
+        coords = np.asarray(spec.coords, dtype=np.float64).copy()
+        for end_idx in (0, len(coords) - 1):
+            q = snap_points.get((i, end_idx))
+            if q is None:
+                continue
+            if float(np.linalg.norm(coords[end_idx] - q)) <= max_move:
+                coords[end_idx] = q
+        out.append(
+            RoadSpec(
+                coords=[(float(x), float(y)) for x, y in coords],
+                kind=spec.kind,
+                island_id=spec.island_id,
+                width=spec.width,
+                family=spec.family,
+                depth=spec.depth,
+            )
+        )
+    return out
+
+
 def _node_planar_road_specs(
     specs: list[RoadSpec],
     *,
@@ -1585,6 +1748,7 @@ def _generate_planar_streets(
     ]
     road_specs = _planar_boundary_road_specs(
         parts,
+        members_by_part=members_by_part,
         island_id=island_id,
         global_nn=global_nn,
         slot_step=slot_step,
@@ -1626,6 +1790,11 @@ def _generate_planar_streets(
             break
         if not progressed:
             break
+    road_specs = _snap_planar_junctions(
+        road_specs,
+        global_nn=global_nn,
+        args=args,
+    )
     road_specs = _node_planar_road_specs(
         road_specs,
         island_id=island_id,
@@ -3224,8 +3393,8 @@ def main() -> None:
     ap.add_argument("--road-smooth-local-iterations", type=int, default=1)
     ap.add_argument("--road-smooth-service-iterations", type=int, default=1)
     ap.add_argument("--road-curvature-relax-iterations", type=int, default=12)
-    ap.add_argument("--road-curvature-relax-strength", type=float, default=0.42)
-    ap.add_argument("--road-curvature-arterial-max-turn-deg", type=float, default=14.0)
+    ap.add_argument("--road-curvature-relax-strength", type=float, default=0.46)
+    ap.add_argument("--road-curvature-arterial-max-turn-deg", type=float, default=10.0)
     ap.add_argument("--road-curvature-collector-max-turn-deg", type=float, default=28.0)
     ap.add_argument("--road-curvature-local-max-turn-deg", type=float, default=36.0)
     ap.add_argument("--road-curvature-service-max-turn-deg", type=float, default=42.0)
@@ -3294,9 +3463,13 @@ def main() -> None:
         type=float,
         default=0.28,
     )
-    ap.add_argument("--planar-boundary-resample-scale", type=float, default=1.15)
+    ap.add_argument("--planar-boundary-resample-scale", type=float, default=1.85)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
+    ap.add_argument("--planar-junction-snap-scale", type=float, default=1.35)
+    ap.add_argument("--planar-junction-merge-scale", type=float, default=1.20)
+    ap.add_argument("--planar-boundary-ring-min-worlds", type=int, default=650)
+    ap.add_argument("--planar-boundary-ring-min-area-scale", type=float, default=1200.0)
     ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
     ap.add_argument("--planar-coastal-inset-min-frac", type=float, default=2.0)
     ap.add_argument("--coastal-road-offset-scale", type=float, default=4.2)
@@ -3468,7 +3641,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v12",
+        "layout": "city-planar-v13",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
