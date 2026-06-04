@@ -449,16 +449,25 @@ def _grid_filter_slots(
     min_dist: float,
     seed: int,
     priority: np.ndarray | None = None,
+    footprint_radius_scale: float = 0.0,
 ) -> SlotSet:
     if min_dist <= 0 or len(slots.xy) < 2:
         return slots
     rng = np.random.default_rng(seed)
+    radii = None
+    max_check_dist = float(min_dist)
+    if footprint_radius_scale > 0:
+        radii = 0.5 * np.hypot(slots.width, slots.depth)
+        max_check_dist = max(
+            max_check_dist,
+            float(radii.max(initial=0.0) * 2.0 * footprint_radius_scale),
+        )
     if priority is None:
         order = rng.permutation(len(slots.xy))
     else:
         rank = np.where(priority, 0, 1)
         order = np.lexsort((rng.random(len(slots.xy)), rank))
-    cell = float(min_dist)
+    cell = max(float(max_check_dist), 1e-12)
     min_d2 = float(min_dist * min_dist)
     accepted: list[int] = []
     buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -469,7 +478,14 @@ def _grid_filter_slots(
         for gx in range(key[0] - 1, key[0] + 2):
             for gy in range(key[1] - 1, key[1] + 2):
                 for j in buckets.get((gx, gy), []):
-                    if float(np.sum((p - slots.xy[j]) ** 2)) < min_d2:
+                    limit2 = min_d2
+                    if radii is not None:
+                        limit = max(
+                            float(min_dist),
+                            float((radii[i] + radii[j]) * footprint_radius_scale),
+                        )
+                        limit2 = limit * limit
+                    if float(np.sum((p - slots.xy[j]) ** 2)) < limit2:
                         ok = False
                         break
                 if not ok:
@@ -525,7 +541,13 @@ def _filter_slots_for_road_corridors(
     global_nn: float,
     args,
 ) -> SlotSet:
-    if len(slots.xy) == 0 or args.road_corridor_clearance_scale <= 0:
+    if (
+        len(slots.xy) == 0
+        or (
+            args.road_corridor_clearance_scale <= 0
+            and args.road_corridor_building_clearance_scale <= 0
+        )
+    ):
         return slots
     lines = [LineString(spec.coords) for spec in road_specs]
     road_geom = shapely.unary_union(lines)
@@ -741,6 +763,7 @@ def _generate_warped_streets(
             slots,
             min_dist=min_dist,
             seed=args.seed + island_id * 9176,
+            footprint_radius_scale=args.slot_filter_footprint_radius_scale,
         )
     return roads, slots
 
@@ -1298,6 +1321,115 @@ def _planar_spine_road_specs(
     ]
 
 
+def _planar_axis_trunk_road_specs(
+    parts: list[Polygon],
+    *,
+    members_by_part: list[np.ndarray],
+    xy: np.ndarray,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    specs: list[RoadSpec] = []
+    min_length = slot_step * args.min_road_length_slots
+    rng = np.random.default_rng(args.seed + island_id * 16981)
+    for part_no, poly in enumerate(parts):
+        members = members_by_part[part_no] if part_no < len(members_by_part) else []
+        count = len(members)
+        if count < args.planar_axis_trunk_min_worlds:
+            continue
+        if poly.area < (global_nn * global_nn) * args.planar_axis_trunk_min_area_scale:
+            continue
+        center, axes = _parcel_shape_axes(poly)
+        lo, hi = _project_poly_bounds(poly, center, axes)
+        span = np.maximum(hi - lo, 1e-9)
+        shape_ratio = float(span.max() / max(span.min(), 1e-9))
+        if shape_ratio < args.planar_axis_trunk_min_aspect:
+            continue
+        along_axis = int(np.argmax(span))
+        cross_axis = 1 - along_axis
+        pts = xy[np.asarray(members, dtype=np.int64)]
+        local_pts = (pts - center) @ axes if len(pts) else np.empty((0, 2))
+        trunk_count = min(
+            args.planar_axis_trunk_max_roads,
+            max(
+                1,
+                int(math.ceil(count / max(args.planar_axis_trunk_worlds_per_road, 1))),
+            ),
+        )
+        if trunk_count <= 0:
+            continue
+        if trunk_count == 1:
+            quantiles = [0.5]
+        else:
+            quantiles = np.linspace(0.0, 1.0, trunk_count + 2)[1:-1].tolist()
+        margin = max(
+            span[cross_axis] * args.planar_axis_trunk_margin_frac,
+            global_nn * args.planar_min_split_margin_scale,
+        )
+        if margin * 2 >= span[cross_axis]:
+            continue
+        along_pad = span[along_axis] * 0.10 + global_nn * 6.0
+        a0 = lo[along_axis] - along_pad
+        a1 = hi[along_axis] + along_pad
+        n = int(
+            np.clip(
+                math.ceil((a1 - a0) / max(global_nn * 2.2, span[along_axis] / 180)),
+                32,
+                args.road_curve_max_vertices,
+            )
+        )
+        along = np.linspace(a0, a1, n)
+        bridge_geom = poly.buffer(
+            global_nn * args.planar_axis_trunk_bridge_scale,
+            join_style="round",
+        )
+        for trunk_no, q in enumerate(quantiles):
+            if len(local_pts):
+                cross = float(np.quantile(local_pts[:, cross_axis], q))
+            else:
+                cross = float((lo[cross_axis] + hi[cross_axis]) * 0.5)
+            cross = float(
+                np.clip(cross, lo[cross_axis] + margin, hi[cross_axis] - margin)
+            )
+            amp = min(
+                span[cross_axis] * args.planar_axis_trunk_curve_span_scale,
+                global_nn * args.planar_axis_trunk_curve_global_scale,
+            )
+            phase = rng.uniform(0.0, math.tau)
+            curve = amp * np.sin(
+                (along / max(span[along_axis] * 0.85, global_nn * 6.0)) * math.tau
+                + phase
+            )
+            local = np.zeros((len(along), 2), dtype=np.float64)
+            local[:, along_axis] = along
+            local[:, cross_axis] = cross + curve
+            line = LineString(_to_world(local, center, axes)).intersection(bridge_geom)
+            kind = (
+                "arterial"
+                if count >= args.planar_axis_trunk_arterial_min_worlds
+                else "collector"
+            )
+            width = (
+                args.arterial_road_width
+                if kind == "arterial"
+                else args.collector_road_width
+            )
+            specs.extend(
+                _line_specs_from_geom(
+                    line,
+                    island_id=island_id,
+                    kind=kind,
+                    width=width,
+                    family=-(40000 + part_no * 100 + trunk_no),
+                    min_length=min_length,
+                    depth=0,
+                )
+            )
+    return specs
+
+
 def _polygon_irregularity(poly: Polygon) -> float:
     if poly.is_empty or poly.area <= 1e-12:
         return 1e6
@@ -1764,6 +1896,17 @@ def _generate_planar_streets(
         global_nn=global_nn,
         slot_step=slot_step,
         args=args,
+    )
+    road_specs.extend(
+        _planar_axis_trunk_road_specs(
+            parts,
+            members_by_part=members_by_part,
+            xy=xy,
+            island_id=island_id,
+            global_nn=global_nn,
+            slot_step=slot_step,
+            args=args,
+        )
     )
     rng = np.random.default_rng(args.seed + island_id * 7919)
     target_leaf_worlds = max(args.planar_target_block_worlds, 6)
@@ -2270,6 +2413,7 @@ def _slots_for_road_specs(
             min_dist=min_dist,
             seed=args.seed + island_id * 9176,
             priority=visible_priority,
+            footprint_radius_scale=args.slot_filter_footprint_radius_scale,
         )
         if min_slots and len(slots.xy) < min_slots <= len(covered_slots.xy):
             return covered_slots
@@ -3405,6 +3549,7 @@ def main() -> None:
     ap.add_argument("--slot-capacity-min", type=float, default=1.6)
     ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.28)
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
+    ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.0)
     ap.add_argument("--road-slot-end-gap-scale", type=float, default=1.8)
     ap.add_argument("--road-extent-quantile", type=float, default=0.006)
     ap.add_argument("--road-extent-pad-scale", type=float, default=4.0)
@@ -3483,8 +3628,8 @@ def main() -> None:
     ap.add_argument("--planar-quality-length-weight", type=float, default=0.08)
     ap.add_argument("--planar-target-child-aspect", type=float, default=4.0)
     ap.add_argument("--planar-force-crosscut-ratio", type=float, default=2.35)
-    ap.add_argument("--planar-streamline-curve-span-scale", type=float, default=0.075)
-    ap.add_argument("--planar-streamline-curve-global-scale", type=float, default=4.2)
+    ap.add_argument("--planar-streamline-curve-span-scale", type=float, default=0.060)
+    ap.add_argument("--planar-streamline-curve-global-scale", type=float, default=3.4)
     ap.add_argument("--planar-streamline-wavelength-scale", type=float, default=0.82)
     ap.add_argument(
         "--planar-streamline-secondary-curve-scale",
@@ -3494,8 +3639,18 @@ def main() -> None:
     ap.add_argument("--planar-boundary-resample-scale", type=float, default=2.35)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
-    ap.add_argument("--planar-junction-snap-scale", type=float, default=1.75)
-    ap.add_argument("--planar-junction-merge-scale", type=float, default=1.55)
+    ap.add_argument("--planar-junction-snap-scale", type=float, default=2.05)
+    ap.add_argument("--planar-junction-merge-scale", type=float, default=1.85)
+    ap.add_argument("--planar-axis-trunk-min-worlds", type=int, default=2500)
+    ap.add_argument("--planar-axis-trunk-arterial-min-worlds", type=int, default=50000)
+    ap.add_argument("--planar-axis-trunk-worlds-per-road", type=int, default=60000)
+    ap.add_argument("--planar-axis-trunk-max-roads", type=int, default=1)
+    ap.add_argument("--planar-axis-trunk-min-area-scale", type=float, default=1000.0)
+    ap.add_argument("--planar-axis-trunk-min-aspect", type=float, default=1.18)
+    ap.add_argument("--planar-axis-trunk-margin-frac", type=float, default=0.18)
+    ap.add_argument("--planar-axis-trunk-bridge-scale", type=float, default=3.5)
+    ap.add_argument("--planar-axis-trunk-curve-span-scale", type=float, default=0.025)
+    ap.add_argument("--planar-axis-trunk-curve-global-scale", type=float, default=1.4)
     ap.add_argument("--planar-boundary-ring-min-worlds", type=int, default=650)
     ap.add_argument("--planar-boundary-ring-min-area-scale", type=float, default=1200.0)
     ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
@@ -3669,7 +3824,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v14",
+        "layout": "city-planar-v15",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
