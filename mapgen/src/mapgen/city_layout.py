@@ -408,6 +408,41 @@ def _grid_filter_slots(slots: SlotSet, *, min_dist: float, seed: int) -> SlotSet
     return _take_slots(slots, keep)
 
 
+def _filter_slots_for_major_corridors(
+    slots: SlotSet,
+    road_specs: list[RoadSpec],
+    *,
+    global_nn: float,
+    args,
+) -> SlotSet:
+    if len(slots.xy) == 0:
+        return slots
+    major_mask = np.asarray(
+        [spec.kind == "arterial" for spec in road_specs],
+        dtype=bool,
+    )
+    if not np.any(major_mask):
+        return slots
+    lines = [
+        LineString(spec.coords)
+        for spec, is_major in zip(road_specs, major_mask, strict=True)
+        if is_major
+    ]
+    major_geom = shapely.unary_union(lines)
+    if major_geom.is_empty:
+        return slots
+    clearance = max(
+        global_nn * args.major_corridor_clearance_scale,
+        float(np.median(np.maximum(slots.width, slots.depth)))
+        * args.major_corridor_building_clearance_scale,
+    )
+    corridor = major_geom.buffer(clearance, cap_style="round", join_style="round")
+    pts = shapely.points(slots.xy[:, 0], slots.xy[:, 1])
+    blocked = np.asarray(shapely.covers(corridor, pts), dtype=bool)
+    own_major = major_mask[np.clip(slots.road_index, 0, len(major_mask) - 1)]
+    return _take_slots(slots, own_major | ~blocked)
+
+
 def _sample_slots_for_road(
     line: LineString,
     *,
@@ -728,7 +763,13 @@ def _smooth_road_line(
         )
     smoothed = _safe_geom(smoothed)
     if land_geom is not None and not smoothed.is_empty:
-        smoothed = smoothed.intersection(land_geom)
+        clip_geom = land_geom
+        if kind in {"arterial", "collector"} and args.major_road_bridge_scale > 0:
+            clip_geom = land_geom.buffer(
+                global_nn * args.major_road_bridge_scale,
+                join_style="round",
+            )
+        smoothed = smoothed.intersection(clip_geom)
     return [seg for seg in _iter_lines(smoothed) if seg.length >= min_length]
 
 
@@ -741,7 +782,7 @@ def _postprocess_road_specs(
     args,
 ) -> list[RoadSpec]:
     out: list[RoadSpec] = []
-    for spec in specs:
+    for spec in _merge_major_road_specs(specs):
         min_length = (
             slot_step * args.boundary_road_min_length_slots
             if spec.kind in {"local", "service"}
@@ -767,6 +808,37 @@ def _postprocess_road_specs(
                 )
             )
     return out
+
+
+def _merge_major_road_specs(specs: list[RoadSpec]) -> list[RoadSpec]:
+    grouped: dict[tuple[str, int, float, int, int], list[LineString]] = defaultdict(
+        list
+    )
+    passthrough: list[RoadSpec] = []
+    for spec in specs:
+        if spec.kind in {"arterial", "collector"}:
+            grouped[
+                (spec.kind, spec.island_id, spec.width, spec.family, spec.depth)
+            ].append(LineString(spec.coords))
+        else:
+            passthrough.append(spec)
+    merged_specs = list(passthrough)
+    for (kind, island_id, width, family, depth), lines in grouped.items():
+        geom = shapely.line_merge(shapely.unary_union(lines))
+        for line in _iter_lines(geom):
+            if line.length <= 1e-9:
+                continue
+            merged_specs.append(
+                RoadSpec(
+                    coords=[(float(x), float(y)) for x, y in line.coords],
+                    kind=kind,
+                    island_id=island_id,
+                    width=width,
+                    family=family,
+                    depth=depth,
+                )
+            )
+    return merged_specs
 
 
 def _boundary_road_specs(
@@ -904,7 +976,7 @@ def _split_candidate_line(
     t1 = hi[tangent_axis] + tangent_pad
     n = int(
         np.clip(
-            math.ceil((t1 - t0) / max(global_nn * 8, span[tangent_axis] / 36)),
+            math.ceil((t1 - t0) / max(global_nn * 3.5, span[tangent_axis] / 96)),
             24,
             args.road_curve_max_vertices,
         )
@@ -1049,6 +1121,13 @@ def _generate_recursive_streets(
                     args=args,
                 )
             )
+    coastal_specs = _postprocess_road_specs(
+        coastal_specs,
+        land_geom=land_geom,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
     planning_specs.extend(coastal_specs)
 
     rng = np.random.default_rng(args.seed + island_id * 7919)
@@ -1122,8 +1201,8 @@ def _generate_recursive_streets(
         slot_step=slot_step,
         args=args,
     )
-    road_specs = _postprocess_road_specs(
-        coastal_specs + boundary_specs + access_specs,
+    road_specs = coastal_specs + _postprocess_road_specs(
+        boundary_specs + access_specs,
         land_geom=land_geom,
         global_nn=global_nn,
         slot_step=slot_step,
@@ -1167,7 +1246,30 @@ def _leaf_access_lane_specs(
             span[cross_axis] * args.access_lane_margin_frac,
             global_nn * args.recursive_min_split_margin_scale,
         )
-        offsets = np.clip(offsets, lo[cross_axis] + margin, hi[cross_axis] - margin)
+        available = float(span[cross_axis] - margin * 2)
+        min_lane_spacing = max(
+            global_nn * args.access_lane_min_spacing_scale,
+            slot_step * args.access_lane_min_spacing_slot_scale,
+        )
+        if available <= 0:
+            continue
+        max_lanes_by_spacing = max(1, int(math.floor(available / min_lane_spacing)) - 1)
+        if lane_count > max_lanes_by_spacing:
+            lane_count = max_lanes_by_spacing
+            qs = np.linspace(0.0, 1.0, lane_count + 2)[1:-1]
+            offsets = np.quantile(local_pts[:, cross_axis], qs)
+        lo_cross = lo[cross_axis] + margin
+        hi_cross = hi[cross_axis] - margin
+        even_offsets = np.linspace(lo_cross, hi_cross, lane_count + 2)[1:-1]
+        offsets = np.clip(offsets, lo_cross, hi_cross)
+        offsets = np.sort(offsets * 0.55 + even_offsets * 0.45)
+        spaced_offsets = []
+        for offset in offsets.tolist():
+            if not spaced_offsets or offset - spaced_offsets[-1] >= min_lane_spacing:
+                spaced_offsets.append(offset)
+        if len(spaced_offsets) < lane_count:
+            spaced_offsets = even_offsets.tolist()
+        offsets = np.asarray(spaced_offsets, dtype=np.float64)
         tangent_pad = span[tangent_axis] * 0.25 + global_nn * 6
         t = np.linspace(
             lo[tangent_axis] - tangent_pad,
@@ -1219,6 +1321,12 @@ def _slots_for_road_specs(
     slots = _concat_slots(slotsets)
     if len(slots.xy):
         slots = _take_slots(slots, _covers_xy(land_geom, slots.xy))
+        slots = _filter_slots_for_major_corridors(
+            slots,
+            road_specs,
+            global_nn=global_nn,
+            args=args,
+        )
     covered_slots = slots
     if len(slots.xy):
         min_dist = max(
@@ -1670,10 +1778,18 @@ def _add_road(
     return rid
 
 
-def _road_features(roads: list[Road]) -> list[dict]:
+def _road_features(
+    roads: list[Road],
+    *,
+    simplify: float = 0.0,
+) -> list[dict]:
     feats = []
     for road in roads:
         line = LineString(road.coords)
+        if simplify > 0 and len(line.coords) > 3:
+            line = line.simplify(simplify, preserve_topology=False)
+            if line.is_empty or line.length <= 1e-9:
+                line = LineString(road.coords)
         feats.append(
             _geom_feature(
                 line,
@@ -2249,15 +2365,23 @@ def main() -> None:
     ap.add_argument("--road-jitter-scale", type=float, default=0.17)
     ap.add_argument("--road-curve-amplitude-scale", type=float, default=0.48)
     ap.add_argument("--road-curve-wavelength-scale", type=float, default=18.0)
-    ap.add_argument("--road-curve-max-vertices", type=int, default=180)
+    ap.add_argument("--road-curve-max-vertices", type=int, default=420)
     ap.add_argument("--road-simplify-scale", type=float, default=1.2)
     ap.add_argument("--road-smooth-resample-scale", type=float, default=1.15)
-    ap.add_argument("--road-smooth-max-vertices", type=int, default=420)
-    ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.18)
+    ap.add_argument("--road-smooth-max-vertices", type=int, default=900)
+    ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.05)
     ap.add_argument("--road-smooth-arterial-iterations", type=int, default=3)
-    ap.add_argument("--road-smooth-collector-iterations", type=int, default=2)
+    ap.add_argument("--road-smooth-collector-iterations", type=int, default=0)
     ap.add_argument("--road-smooth-local-iterations", type=int, default=0)
     ap.add_argument("--road-smooth-service-iterations", type=int, default=0)
+    ap.add_argument("--road-lod-simplify-scale", type=float, default=0.65)
+    ap.add_argument("--major-road-bridge-scale", type=float, default=8.0)
+    ap.add_argument("--major-corridor-clearance-scale", type=float, default=0.30)
+    ap.add_argument(
+        "--major-corridor-building-clearance-scale",
+        type=float,
+        default=0.45,
+    )
     ap.add_argument("--min-road-length-slots", type=float, default=6.0)
     ap.add_argument("--service-chunk-worlds", type=int, default=48)
     ap.add_argument("--block-target-worlds", type=int, default=96)
@@ -2289,6 +2413,8 @@ def main() -> None:
     ap.add_argument("--access-lane-trigger-scale", type=float, default=0.50)
     ap.add_argument("--access-lane-max-per-block", type=int, default=40)
     ap.add_argument("--access-lane-margin-frac", type=float, default=0.18)
+    ap.add_argument("--access-lane-min-spacing-scale", type=float, default=0.20)
+    ap.add_argument("--access-lane-min-spacing-slot-scale", type=float, default=0.24)
     ap.add_argument("--local-assignment-buffer-scale", type=float, default=2.5)
     ap.add_argument("--local-assignment-candidate-factor", type=float, default=2.0)
     ap.add_argument("--park-buffer-scale", type=float, default=0.8)
@@ -2417,7 +2543,11 @@ def main() -> None:
         simplify=global_nn * args.landuse_simplify_scale,
     )
     metrics.update(landuse_metrics)
-    _write_geojson(_road_features(roads), args.out_dir / "roads.geojson")
+    _write_geojson(
+        _road_features(roads, simplify=global_nn * args.road_lod_simplify_scale),
+        args.out_dir / "roads.geojson",
+    )
+    _write_geojson(_road_features(roads), args.out_dir / "roads_near.geojson")
     _write_geojson(_block_features(blocks), args.out_dir / "blocks.geojson")
     _write_regions(
         out_points,
@@ -2434,7 +2564,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-hierarchical-v6",
+        "layout": "city-hierarchical-v7",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
@@ -2444,6 +2574,7 @@ def main() -> None:
             "land": "land.geojson",
             "landuse": "landuse.geojson",
             "roads": "roads.geojson",
+            "roads_near": "roads_near.geojson",
             "blocks": "blocks.geojson",
             "regions": [
                 f"regions_l{sub_level}.geojson",

@@ -277,6 +277,7 @@ export default function WorldMap({
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
   const [roads, setRoads] = useState(null);
+  const [roadsNear, setRoadsNear] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
   // Hold label rendering until Inter is loaded, so deck builds the SDF atlas from the
@@ -326,6 +327,9 @@ export default function WorldMap({
         fetch(base + "roads.geojson")
           .then((r) => (r.ok ? r.json() : null))
           .then(setRoads, () => setRoads(null));
+        fetch(base + "roads_near.geojson")
+          .then((r) => (r.ok ? r.json() : null))
+          .then(setRoadsNear, () => setRoadsNear(null));
         return loadPoints();
       })
       .then((d) => {
@@ -704,7 +708,8 @@ export default function WorldMap({
   }, [highlight, regionsTop, regionsSub, lvl]);
 
   const roadFeatures = useMemo(() => {
-    const features = roads?.features ?? [];
+    const source = tier === "near" && roadsNear ? roadsNear : roads;
+    const features = source?.features ?? [];
     if (tier === "far") return features.filter((f) => f.properties.kind === "arterial");
     if (tier === "mid") {
       return features.filter(
@@ -712,7 +717,7 @@ export default function WorldMap({
       );
     }
     return features;
-  }, [roads, tier]);
+  }, [roads, roadsNear, tier]);
 
   if (!viewState) {
     return (
@@ -730,7 +735,7 @@ export default function WorldMap({
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
       : f.properties.kind === "minor" || f.properties.kind === "service"
-        ? Math.max(ROADS.minorWidth ?? ROADS.localWidth * 0.55, 0.9)
+        ? (tier === "near" ? 1.35 : 1.0)
         : f.properties.kind === "collector"
           ? (ROADS.collectorWidth ?? Math.max(ROADS.localWidth * 1.45, 2.05))
           : ROADS.localWidth;
@@ -738,13 +743,13 @@ export default function WorldMap({
     f.properties.kind === "arterial"
       ? ROADS.arterialColor
       : f.properties.kind === "minor" || f.properties.kind === "service"
-        ? (ROADS.minorColor ?? ROADS.localColor)
+        ? [255, 255, 255, tier === "near" ? 235 : 205]
         : f.properties.kind === "collector"
           ? (ROADS.collectorColor ?? [251, 248, 238, 230])
         : ROADS.localColor;
   const roadCasingExtra = (f) =>
     f.properties.kind === "minor" || f.properties.kind === "service"
-      ? (ROADS.minorCasingExtraWidth ?? 0.25)
+      ? (tier === "near" ? 0.8 : 0.45)
       : ROADS.casingExtraWidth;
 
   // one TextLayer per atlas (Latin / wide). Data is pre-decluttered in JS, so no
