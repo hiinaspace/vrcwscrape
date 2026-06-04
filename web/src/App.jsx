@@ -14,6 +14,9 @@ export default function App() {
   // sidebar uses it to only offer navigation into clusters with a visible region.
   const [regionSets, setRegionSets] = useState(null);
 
+  const selectWorld = useCallback((world_id) => {
+    setSelected(world_id);
+  }, []);
   const focusWorld = useCallback((world_id) => {
     setSelected(world_id);
     setFocus({ world_id, nonce: Date.now() });
@@ -60,7 +63,7 @@ export default function App() {
       />
       <div className="map-pane">
         <WorldMap
-          onSelect={focusWorld}
+          onSelect={selectWorld}
           onPickRegion={browseCluster}
           onRegions={setRegionSets}
           selected={selected}
