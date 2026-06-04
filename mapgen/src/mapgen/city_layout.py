@@ -139,6 +139,15 @@ def _median_nn(xy: np.ndarray, sample: int = 12000) -> float:
     return float(np.median(dist[:, 1]))
 
 
+def _nn_quantile(xy: np.ndarray, q: float, sample: int = 12000) -> float:
+    if len(xy) < 2:
+        return 0.0
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(xy), size=min(sample, len(xy)), replace=False)
+    dist, _ = cKDTree(xy).query(xy[idx], k=2, workers=-1)
+    return float(np.quantile(dist[:, 1], q))
+
+
 def _pca_axes(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     center = xy.mean(axis=0)
     if len(xy) < 3:
@@ -540,6 +549,7 @@ def _sample_slots_for_road(
     road_spacing: float,
     slot_step: float,
     global_nn: float,
+    building_scale: float,
     args,
     rng: np.random.Generator,
 ) -> SlotSet:
@@ -574,12 +584,12 @@ def _sample_slots_for_road(
     tangent = seg[si] / seg_len[si, None]
     frontage = starts[si] + tangent * (t * seg_len[si])[:, None]
     normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
-    base_width = slot_step * args.building_width_scale
+    base_width = slot_step * args.building_width_scale * building_scale
     base_depth = min(
-        slot_step * args.building_depth_scale,
+        slot_step * args.building_depth_scale * building_scale,
         road_spacing * args.building_depth_road_spacing_scale,
     )
-    setback = global_nn * args.building_setback_scale
+    setback = global_nn * args.building_setback_scale * math.sqrt(building_scale)
     offset = base_depth / 2 + setback
     xy = np.vstack([frontage + normal * offset, frontage - normal * offset])
     frontage2 = np.vstack([frontage, frontage])
@@ -711,6 +721,7 @@ def _generate_warped_streets(
                         road_spacing=road_spacing,
                         slot_step=slot_step,
                         global_nn=global_nn,
+                        building_scale=1.0,
                         args=args,
                         rng=rng,
                     )
@@ -2209,6 +2220,7 @@ def _slots_for_road_specs(
     global_nn: float,
     slot_step: float,
     road_spacing: float,
+    building_scale: float,
     island_id: int,
     args,
     min_slots: int = 0,
@@ -2221,6 +2233,7 @@ def _slots_for_road_specs(
             road_spacing=road_spacing,
             slot_step=slot_step,
             global_nn=global_nn,
+            building_scale=building_scale,
             args=args,
             rng=rng,
         )
@@ -2402,6 +2415,14 @@ def _layout_streamline_island(
         global_nn * args.road_spacing_min_scale,
         slot_step * args.recursive_road_spacing_slot_scale,
     )
+    local_nn_q = _nn_quantile(xy, args.building_scale_nn_quantile)
+    building_scale = float(
+        np.clip(
+            (local_nn_q / max(global_nn, 1e-9)) ** args.building_local_nn_power,
+            args.building_local_scale_min,
+            args.building_local_scale_max,
+        )
+    )
     street_layout = _generate_planar_streets(
         xy=xy,
         land_geom=island_land,
@@ -2420,6 +2441,7 @@ def _layout_streamline_island(
         global_nn=global_nn,
         slot_step=slot_step,
         road_spacing=road_spacing,
+        building_scale=building_scale,
         island_id=island_id,
         args=args,
         min_slots=int(math.ceil(len(xy) * args.slot_capacity_min)),
@@ -2534,6 +2556,8 @@ def _layout_streamline_island(
         "active_roads": int(np.count_nonzero(active_counts)),
         "blocks": int(len(leaves)),
         "splits": int(splits),
+        "building_scale": float(building_scale),
+        "local_nn_q": float(local_nn_q),
     }
 
 
@@ -3349,10 +3373,14 @@ def main() -> None:
     ap.add_argument("--dense-spacing-nn-scale", type=float, default=1.75)
     ap.add_argument("--dense-spacing-area-scale", type=float, default=1.18)
     ap.add_argument("--dense-spacing-max-scale", type=float, default=5.0)
-    ap.add_argument("--building-width-scale", type=float, default=0.56)
-    ap.add_argument("--building-depth-scale", type=float, default=0.62)
+    ap.add_argument("--building-width-scale", type=float, default=0.64)
+    ap.add_argument("--building-depth-scale", type=float, default=0.70)
     ap.add_argument("--building-depth-road-spacing-scale", type=float, default=0.24)
     ap.add_argument("--building-setback-scale", type=float, default=0.55)
+    ap.add_argument("--building-scale-nn-quantile", type=float, default=0.90)
+    ap.add_argument("--building-local-nn-power", type=float, default=0.52)
+    ap.add_argument("--building-local-scale-min", type=float, default=0.94)
+    ap.add_argument("--building-local-scale-max", type=float, default=1.35)
     ap.add_argument("--building-width-jitter", type=float, default=0.09)
     ap.add_argument("--building-depth-jitter", type=float, default=0.12)
     ap.add_argument("--building-angle-jitter", type=float, default=0.018)
@@ -3393,8 +3421,8 @@ def main() -> None:
     ap.add_argument("--road-smooth-local-iterations", type=int, default=1)
     ap.add_argument("--road-smooth-service-iterations", type=int, default=1)
     ap.add_argument("--road-curvature-relax-iterations", type=int, default=12)
-    ap.add_argument("--road-curvature-relax-strength", type=float, default=0.46)
-    ap.add_argument("--road-curvature-arterial-max-turn-deg", type=float, default=10.0)
+    ap.add_argument("--road-curvature-relax-strength", type=float, default=0.50)
+    ap.add_argument("--road-curvature-arterial-max-turn-deg", type=float, default=8.0)
     ap.add_argument("--road-curvature-collector-max-turn-deg", type=float, default=28.0)
     ap.add_argument("--road-curvature-local-max-turn-deg", type=float, default=36.0)
     ap.add_argument("--road-curvature-service-max-turn-deg", type=float, default=42.0)
@@ -3438,13 +3466,13 @@ def main() -> None:
     ap.add_argument("--recursive-curve-global-scale", type=float, default=3.5)
     ap.add_argument("--recursive-curve-wavelength-scale", type=float, default=0.65)
     ap.add_argument("--planar-target-block-worlds", type=int, default=14)
-    ap.add_argument("--planar-min-parcel-area-scale", type=float, default=7.0)
-    ap.add_argument("--planar-min-split-width-scale", type=float, default=0.45)
+    ap.add_argument("--planar-min-parcel-area-scale", type=float, default=5.5)
+    ap.add_argument("--planar-min-split-width-scale", type=float, default=0.35)
     ap.add_argument("--planar-split-margin-frac", type=float, default=0.08)
     ap.add_argument("--planar-min-split-margin-scale", type=float, default=0.35)
-    ap.add_argument("--planar-min-split-road-length-slots", type=float, default=1.4)
+    ap.add_argument("--planar-min-split-road-length-slots", type=float, default=1.2)
     ap.add_argument("--planar-max-child-frac", type=float, default=0.995)
-    ap.add_argument("--planar-collector-depth", type=int, default=1)
+    ap.add_argument("--planar-collector-depth", type=int, default=3)
     ap.add_argument("--planar-service-depth", type=int, default=7)
     ap.add_argument("--planar-split-families", type=int, default=2)
     ap.add_argument("--planar-split-candidates-per-family", type=int, default=5)
@@ -3463,11 +3491,11 @@ def main() -> None:
         type=float,
         default=0.28,
     )
-    ap.add_argument("--planar-boundary-resample-scale", type=float, default=1.85)
+    ap.add_argument("--planar-boundary-resample-scale", type=float, default=2.35)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
-    ap.add_argument("--planar-junction-snap-scale", type=float, default=1.35)
-    ap.add_argument("--planar-junction-merge-scale", type=float, default=1.20)
+    ap.add_argument("--planar-junction-snap-scale", type=float, default=1.75)
+    ap.add_argument("--planar-junction-merge-scale", type=float, default=1.55)
     ap.add_argument("--planar-boundary-ring-min-worlds", type=int, default=650)
     ap.add_argument("--planar-boundary-ring-min-area-scale", type=float, default=1200.0)
     ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
@@ -3641,7 +3669,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v13",
+        "layout": "city-planar-v14",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
