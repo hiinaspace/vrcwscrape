@@ -234,9 +234,13 @@ export async function loadPoints() {
   const { levels } = await getLevels();
   const pointColumns = await getPointColumns();
   const sidCols = levels.map((i) => `l${i}_sid`).join(", ");
-  const optionalCols = ["parcel_angle", "parcel_size"].filter((c) =>
-    pointColumns.has(c),
-  );
+  const optionalCols = [
+    "parcel_angle",
+    "parcel_size",
+    "parcel_width",
+    "parcel_depth",
+    "parcel_skew",
+  ].filter((c) => pointColumns.has(c));
   const optionalSql = optionalCols.length ? `, ${optionalCols.join(", ")}` : "";
   const res = await conn.query(`
     SELECT world_id, x, y, region, region_name, color, name, visits, ${sidCols}${optionalSql}
@@ -255,6 +259,9 @@ export async function loadPoints() {
       region_name: r.region_name ?? "",
       parcelAngle: r.parcel_angle == null ? null : Number(r.parcel_angle),
       parcelSize: r.parcel_size == null ? null : Number(r.parcel_size),
+      parcelWidth: r.parcel_width == null ? null : Number(r.parcel_width),
+      parcelDepth: r.parcel_depth == null ? null : Number(r.parcel_depth),
+      parcelSkew: r.parcel_skew == null ? null : Number(r.parcel_skew),
       sid,
     };
   });

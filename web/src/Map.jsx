@@ -226,18 +226,21 @@ function shrink(ring, f) {
   return ring.map(([x, y]) => [cx + (x - cx) * f, cy + (y - cy) * f]);
 }
 
-function parcelSquare(point) {
+function parcelPolygon(point) {
   const [x, y] = point.position;
-  const s = Math.max(point.parcelSize ?? 0, 1e-9);
+  const width = Math.max(point.parcelWidth ?? point.parcelSize ?? 0, 1e-9);
+  const depth = Math.max(point.parcelDepth ?? point.parcelSize ?? 0, 1e-9);
   const a = point.parcelAngle ?? 0;
-  const ux = [Math.cos(a) * s * 0.5, Math.sin(a) * s * 0.5];
-  const uy = [-Math.sin(a) * s * 0.5, Math.cos(a) * s * 0.5];
-  return [
-    [x - ux[0] - uy[0], y - ux[1] - uy[1]],
-    [x + ux[0] - uy[0], y + ux[1] - uy[1]],
-    [x + ux[0] + uy[0], y + ux[1] + uy[1]],
-    [x - ux[0] + uy[0], y - ux[1] + uy[1]],
+  const skew = point.parcelSkew ?? 0;
+  const ca = Math.cos(a);
+  const sa = Math.sin(a);
+  const local = [
+    [-width / 2 - skew * depth / 2, -depth / 2],
+    [width / 2 - skew * depth / 2, -depth / 2],
+    [width / 2 + skew * depth / 2, depth / 2],
+    [-width / 2 + skew * depth / 2, depth / 2],
   ];
+  return local.map(([lx, ly]) => [x + lx * ca - ly * sa, y + lx * sa + ly * ca]);
 }
 
 export default function WorldMap({
@@ -391,7 +394,7 @@ export default function WorldMap({
   const cells = useMemo(() => {
     if (!points.length) return [];
     if (points.some((p) => p.parcelSize != null)) {
-      return points.map((p) => ({ polygon: parcelSquare(p), point: p }));
+      return points.map((p) => ({ polygon: parcelPolygon(p), point: p }));
     }
     const b = dataBounds(points);
     const pad = (b[2] - b[0]) * 0.05;
@@ -673,6 +676,7 @@ export default function WorldMap({
   const roadFeatures = useMemo(() => {
     const features = roads?.features ?? [];
     if (tier === "far") return features.filter((f) => f.properties.kind === "arterial");
+    if (tier === "mid") return features.filter((f) => f.properties.kind !== "minor");
     return features;
   }, [roads, tier]);
 
@@ -686,6 +690,22 @@ export default function WorldMap({
 
   const cellsStroked = TIER_RANK[tier] >= TIER_RANK[CELLS.strokeMinZoomTier];
   const roadsVisible = roads && TIER_RANK[tier] >= TIER_RANK[ROADS.visibleFromTier];
+  const roadWidth = (f) =>
+    f.properties.kind === "arterial"
+      ? ROADS.arterialWidth
+      : f.properties.kind === "minor"
+        ? (ROADS.minorWidth ?? ROADS.localWidth * 0.55)
+        : ROADS.localWidth;
+  const roadColor = (f) =>
+    f.properties.kind === "arterial"
+      ? ROADS.arterialColor
+      : f.properties.kind === "minor"
+        ? (ROADS.minorColor ?? ROADS.localColor)
+        : ROADS.localColor;
+  const roadCasingExtra = (f) =>
+    f.properties.kind === "minor"
+      ? (ROADS.minorCasingExtraWidth ?? 0.25)
+      : ROADS.casingExtraWidth;
 
   // one TextLayer per atlas (Latin / wide). Data is pre-decluttered in JS, so no
   // collision extension is needed here (deck just renders the chosen labels).
@@ -788,9 +808,7 @@ export default function WorldMap({
         stroked: true,
         getLineColor: ROADS.casingColor,
         lineWidthUnits: "pixels",
-        getLineWidth: (f) =>
-          (f.properties.kind === "arterial" ? ROADS.arterialWidth : ROADS.localWidth) +
-          ROADS.casingExtraWidth,
+        getLineWidth: (f) => roadWidth(f) + roadCasingExtra(f),
         lineJointRounded: true,
         lineCapRounded: true,
         pickable: false,
@@ -801,11 +819,9 @@ export default function WorldMap({
         data: { type: "FeatureCollection", features: roadFeatures },
         filled: false,
         stroked: true,
-        getLineColor: (f) =>
-          f.properties.kind === "arterial" ? ROADS.arterialColor : ROADS.localColor,
+        getLineColor: roadColor,
         lineWidthUnits: "pixels",
-        getLineWidth: (f) =>
-          f.properties.kind === "arterial" ? ROADS.arterialWidth : ROADS.localWidth,
+        getLineWidth: roadWidth,
         lineJointRounded: true,
         lineCapRounded: true,
         pickable: false,

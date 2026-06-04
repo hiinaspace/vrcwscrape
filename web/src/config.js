@@ -50,9 +50,12 @@ export const ROADS = {
   visibleFromTier: "mid", // "far" | "mid" | "near"
   arterialWidth: 2.8,
   localWidth: 1.45,
+  minorWidth: 0.65,
   casingExtraWidth: 1.6,
+  minorCasingExtraWidth: 0.25,
   arterialColor: [252, 249, 239, 235],
   localColor: [248, 246, 238, 220],
+  minorColor: [255, 255, 250, 185],
   casingColor: [168, 158, 135, 150],
 };
 

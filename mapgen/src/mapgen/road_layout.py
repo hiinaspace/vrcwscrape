@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import shapely
+from scipy.spatial import cKDTree
 
 from mapgen.land import write_land_geojson
 from mapgen.raster_poly import estimate_cell_size, raster_region_polys
@@ -166,6 +167,191 @@ def _nearest_segments(
     return nearest, t[np.arange(len(xy)), nearest]
 
 
+def _seeded_rng(seed: int, *parts: int) -> np.random.Generator:
+    state = seed & 0xFFFFFFFF
+    for p in parts:
+        state ^= (int(p) + 0x9E3779B9 + ((state << 6) & 0xFFFFFFFF) + (state >> 2))
+        state &= 0xFFFFFFFF
+    return np.random.default_rng(state)
+
+
+def _trim_segment_for_members(
+    seg: Segment,
+    tvals: np.ndarray,
+    *,
+    parcel_size: float,
+    trim_quantile: float,
+    trim_pad_scale: float,
+    min_span_scale: float,
+) -> Segment:
+    length = float(np.linalg.norm(seg.b - seg.a))
+    if length <= 1e-9 or len(tvals) == 0:
+        return seg
+    q = float(np.clip(trim_quantile, 0.0, 0.45))
+    lo = float(np.quantile(tvals, q))
+    hi = float(np.quantile(tvals, 1.0 - q))
+    pad = min(0.20, parcel_size * trim_pad_scale / length)
+    lo = max(0.0, lo - pad)
+    hi = min(1.0, hi + pad)
+    min_span = min(1.0, max(0.08, parcel_size * min_span_scale / length))
+    if hi - lo < min_span:
+        mid = float(np.median(tvals))
+        lo = max(0.0, mid - min_span / 2)
+        hi = min(1.0, mid + min_span / 2)
+    if hi <= lo:
+        return seg
+    v = seg.b - seg.a
+    return Segment(
+        a=seg.a + v * lo,
+        b=seg.a + v * hi,
+        kind=seg.kind,
+        region=seg.region,
+        subregion=seg.subregion,
+        world_count=seg.world_count,
+    )
+
+
+def _relax_parcels(
+    xy: np.ndarray,
+    *,
+    anchors: np.ndarray,
+    original_xy: np.ndarray,
+    widths: np.ndarray,
+    depths: np.ndarray,
+    iterations: int,
+    clearance: float,
+    repel_strength: float,
+    anchor_strength: float,
+    original_strength: float,
+) -> np.ndarray:
+    if iterations <= 0 or len(xy) < 2:
+        return xy
+    pos = xy.copy()
+    size = np.maximum(widths, depths).astype(np.float64)
+    search_r = max(float(np.quantile(size, 0.98) * clearance), float(size.max()))
+    max_step = float(np.median(size) * 0.65)
+    for _ in range(iterations):
+        pairs = np.array(list(cKDTree(pos).query_pairs(search_r)), dtype=np.int64)
+        if len(pairs) == 0:
+            break
+        a = pairs[:, 0]
+        b = pairs[:, 1]
+        delta = pos[a] - pos[b]
+        dist = np.linalg.norm(delta, axis=1)
+        target = (size[a] + size[b]) * 0.5 * clearance
+        mask = dist < target
+        if not np.any(mask):
+            pos += (anchors - pos) * anchor_strength
+            continue
+        a = a[mask]
+        b = b[mask]
+        delta = delta[mask]
+        dist = np.maximum(dist[mask], 1e-9)
+        overlap = target[mask] - dist
+        move = (delta / dist[:, None]) * (overlap * repel_strength)[:, None]
+        offset = np.zeros_like(pos)
+        np.add.at(offset, a, move)
+        np.add.at(offset, b, -move)
+        step = np.linalg.norm(offset, axis=1)
+        too_far = step > max_step
+        if np.any(too_far):
+            offset[too_far] *= (max_step / step[too_far])[:, None]
+        pos += offset
+        pos += (anchors - pos) * anchor_strength
+        pos += (original_xy - pos) * original_strength
+    return pos
+
+
+def _minor_roads_from_rows(
+    xy: np.ndarray,
+    *,
+    segments: list[Segment],
+    seg_ids: np.ndarray,
+    lane_sides: np.ndarray,
+    lane_rows: np.ndarray,
+    widths: np.ndarray,
+    min_worlds: int,
+) -> list[RoadFeature]:
+    groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for i, sid in enumerate(seg_ids.tolist()):
+        if sid >= 0:
+            groups[(sid, int(lane_sides[i]), int(lane_rows[i]))].append(i)
+
+    roads: list[RoadFeature] = []
+    for (sid, _side, _row), members in groups.items():
+        seg = segments[sid]
+        tangent = seg.b - seg.a
+        length = float(np.linalg.norm(tangent))
+        if length <= 1e-9:
+            continue
+        tangent /= length
+        normal = np.array([-tangent[1], tangent[0]])
+        arr = np.array(members, dtype=np.int64)
+        along = (xy[arr] - seg.a) @ tangent
+        offset = float(np.mean((xy[arr] - seg.a) @ normal))
+        lane_count = len(arr)
+        if lane_count < min_worlds:
+            mid = float(np.mean(along))
+            start = seg.a + tangent * mid
+            end = start + normal * offset
+            coords = [
+                (float(start[0]), float(start[1])),
+                (float(end[0]), float(end[1])),
+            ]
+            roads.append(
+                RoadFeature(
+                    coords=coords,
+                    kind="minor",
+                    region=seg.region,
+                    subregion=seg.subregion,
+                    world_count=lane_count,
+                    weight=math.dist(coords[0], coords[1]),
+                )
+            )
+            continue
+
+        pad = float(np.median(widths[arr]) * 0.6)
+        lo = max(0.0, float(np.min(along) - pad))
+        hi = min(length, float(np.max(along) + pad))
+        if hi - lo <= 1e-9:
+            continue
+        lane_a = seg.a + tangent * lo + normal * offset
+        lane_b = seg.a + tangent * hi + normal * offset
+        lane_coords = [
+            (float(lane_a[0]), float(lane_a[1])),
+            (float(lane_b[0]), float(lane_b[1])),
+        ]
+        roads.append(
+            RoadFeature(
+                coords=lane_coords,
+                kind="minor",
+                region=seg.region,
+                subregion=seg.subregion,
+                world_count=lane_count,
+                weight=math.dist(lane_coords[0], lane_coords[1]),
+            )
+        )
+
+        mid = (lo + hi) / 2
+        conn_a = seg.a + tangent * mid
+        conn_b = conn_a + normal * offset
+        conn_coords = [
+            (float(conn_a[0]), float(conn_a[1])),
+            (float(conn_b[0]), float(conn_b[1])),
+        ]
+        roads.append(
+            RoadFeature(
+                coords=conn_coords,
+                kind="minor",
+                region=seg.region,
+                subregion=seg.subregion,
+                world_count=0,
+                weight=math.dist(conn_coords[0], conn_coords[1]),
+            )
+        )
+    return roads
+
+
 def _place_along_segments(
     xy: np.ndarray,
     segments: list[Segment],
@@ -175,18 +361,51 @@ def _place_along_segments(
     road_gap_scale: float,
     row_spacing_scale: float,
     max_rows_per_side: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    end_gap_scale: float,
+    segment_trim_quantile: float,
+    segment_trim_pad_scale: float,
+    segment_min_span_scale: float,
+    width_jitter: float,
+    depth_jitter: float,
+    angle_jitter: float,
+    skew_jitter: float,
+    seed: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[Segment],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     nearest, t_of_point = _nearest_segments(xy, segments)
     out = np.empty_like(xy)
     angles = np.empty(len(xy), dtype=np.float32)
-    sizes = np.empty(len(xy), dtype=np.float32)
-    used_segment_ids = []
+    widths = np.empty(len(xy), dtype=np.float32)
+    depths = np.empty(len(xy), dtype=np.float32)
+    skews = np.empty(len(xy), dtype=np.float32)
+    seg_ids = np.full(len(xy), -1, dtype=np.int32)
+    lane_sides = np.zeros(len(xy), dtype=np.int8)
+    lane_rows = np.zeros(len(xy), dtype=np.int16)
+    active_segments: list[Segment] = []
 
     for si, seg in enumerate(segments):
         members = np.flatnonzero(nearest == si)
         if len(members) == 0:
             continue
-        used_segment_ids.append(si)
+        seg = _trim_segment_for_members(
+            seg,
+            t_of_point[members],
+            parcel_size=parcel_size,
+            trim_quantile=segment_trim_quantile,
+            trim_pad_scale=segment_trim_pad_scale,
+            min_span_scale=segment_min_span_scale,
+        )
+        active_id = len(active_segments)
+        active_segments.append(seg)
         tangent = seg.b - seg.a
         length = float(np.linalg.norm(tangent))
         if length <= 1e-9:
@@ -202,24 +421,52 @@ def _place_along_segments(
         rows_per_side = max(1, min(max_rows_per_side, rows_per_side))
         lane_count = rows_per_side * 2
         slots = int(math.ceil(len(members) / lane_count))
-        step = length / (slots + 1)
+        end_gap = min(
+            length * 0.28,
+            parcel_size * end_gap_scale * (1.0 + 0.18 * rows_per_side),
+        )
+        usable = max(length - 2 * end_gap, length * 0.40)
+        start_gap = (length - usable) / 2
+        step = usable / (slots + 1)
         local_size = min(parcel_size, max(parcel_size * 0.55, step / spacing_scale))
         row_spacing = local_size * row_spacing_scale
         road_gap = local_size * road_gap_scale
         angle = float(math.atan2(tangent[1], tangent[0]))
+        rng = _seeded_rng(seed, seg.region, seg.subregion, si)
 
         for rank, idx in enumerate(members):
             slot = rank // lane_count
             lane = rank % lane_count
             side = 1.0 if lane % 2 == 0 else -1.0
             row = lane // 2
-            along = (slot + 1) * step
+            along = start_gap + (slot + 1) * step
             offset = side * (road_gap + local_size / 2 + row * row_spacing)
+            width = local_size * float(
+                np.clip(1.0 + rng.normal(0.0, width_jitter), 0.72, 1.34)
+            )
+            depth = local_size * float(
+                np.clip(1.0 + rng.normal(0.0, depth_jitter), 0.72, 1.42)
+            )
             out[idx] = seg.a + tangent * along + normal * offset
-            angles[idx] = angle
-            sizes[idx] = local_size
+            angles[idx] = angle + float(rng.normal(0.0, angle_jitter))
+            widths[idx] = width
+            depths[idx] = depth
+            skews[idx] = float(np.clip(rng.normal(0.0, skew_jitter), -0.28, 0.28))
+            seg_ids[idx] = active_id
+            lane_sides[idx] = int(side)
+            lane_rows[idx] = row
 
-    return out, angles, sizes, used_segment_ids
+    return (
+        out,
+        angles,
+        widths,
+        depths,
+        skews,
+        active_segments,
+        seg_ids,
+        lane_sides,
+        lane_rows,
+    )
 
 
 def _road_feature(seg: Segment, *, world_count: int | None = None) -> RoadFeature:
@@ -244,11 +491,23 @@ def _local_layout(
     sub_col: str,
     global_nn: float,
     args: argparse.Namespace,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[RoadFeature], list[Connector]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[RoadFeature],
+    list[Connector],
+]:
     xy_all = points.select("x", "y").to_numpy().astype(np.float64)
     out_xy = xy_all.copy()
     out_angle = np.zeros(len(xy_all), dtype=np.float32)
     out_size = np.full(len(xy_all), global_nn, dtype=np.float32)
+    out_width = np.full(len(xy_all), global_nn, dtype=np.float32)
+    out_depth = np.full(len(xy_all), global_nn, dtype=np.float32)
+    out_skew = np.zeros(len(xy_all), dtype=np.float32)
     roads: list[RoadFeature] = []
     connectors: list[Connector] = []
 
@@ -283,6 +542,9 @@ def _local_layout(
             out_xy[idx] = grid_xy
             out_angle[idx] = grid_angle
             out_size[idx] = parcel_size
+            out_width[idx] = parcel_size
+            out_depth[idx] = parcel_size
+            out_skew[idx] = 0.0
             continue
 
         k = int(round(n / max(args.local_target_worlds, 1)))
@@ -319,9 +581,22 @@ def _local_layout(
             out_xy[idx] = grid_xy
             out_angle[idx] = grid_angle
             out_size[idx] = parcel_size
+            out_width[idx] = parcel_size
+            out_depth[idx] = parcel_size
+            out_skew[idx] = 0.0
             continue
 
-        placed, angles, sizes, used_segment_ids = _place_along_segments(
+        (
+            placed,
+            angles,
+            widths,
+            depths,
+            skews,
+            active_segments,
+            seg_ids,
+            lane_sides,
+            lane_rows,
+        ) = _place_along_segments(
             xy,
             segments,
             parcel_size=parcel_size,
@@ -329,32 +604,86 @@ def _local_layout(
             road_gap_scale=args.road_gap_scale,
             row_spacing_scale=args.row_spacing_scale,
             max_rows_per_side=args.max_rows_per_side,
+            end_gap_scale=args.end_gap_scale,
+            segment_trim_quantile=args.segment_trim_quantile,
+            segment_trim_pad_scale=args.segment_trim_pad_scale,
+            segment_min_span_scale=args.segment_min_span_scale,
+            width_jitter=args.parcel_width_jitter,
+            depth_jitter=args.parcel_depth_jitter,
+            angle_jitter=args.parcel_angle_jitter,
+            skew_jitter=args.parcel_skew_jitter,
+            seed=args.seed,
+        )
+        anchors = placed.copy()
+        placed = _relax_parcels(
+            placed,
+            anchors=anchors,
+            original_xy=xy,
+            widths=widths,
+            depths=depths,
+            iterations=args.relax_iterations,
+            clearance=args.relax_clearance,
+            repel_strength=args.relax_repel_strength,
+            anchor_strength=args.relax_anchor_strength,
+            original_strength=args.relax_original_strength,
         )
         out_xy[idx] = placed
         out_angle[idx] = angles
-        out_size[idx] = sizes
+        out_width[idx] = widths
+        out_depth[idx] = depths
+        out_size[idx] = (widths + depths) / 2
+        out_skew[idx] = skews
 
+        valid_seg = seg_ids >= 0
         counts = np.bincount(
-            _nearest_segments(xy, segments)[0],
-            minlength=len(segments),
+            seg_ids[valid_seg],
+            minlength=len(active_segments),
         )
-        used = set(used_segment_ids)
-        for si, seg in enumerate(segments):
-            if si in used:
+        for si, seg in enumerate(active_segments):
+            if counts[si] > 0:
                 roads.append(_road_feature(seg, world_count=int(counts[si])))
+        if args.minor_roads:
+            roads.extend(
+                _minor_roads_from_rows(
+                    placed,
+                    segments=active_segments,
+                    seg_ids=seg_ids,
+                    lane_sides=lane_sides,
+                    lane_rows=lane_rows,
+                    widths=widths,
+                    min_worlds=args.minor_min_worlds,
+                )
+            )
 
         centroid = xy.mean(axis=0)
-        nearest_node = int(np.argmin(((straight_nodes - centroid) ** 2).sum(axis=1)))
+        if active_segments:
+            connector_nodes = np.vstack(
+                [seg.a for seg in active_segments] + [seg.b for seg in active_segments]
+            )
+        else:
+            connector_nodes = straight_nodes
+        nearest_node = int(
+            np.argmin(((connector_nodes - centroid) ** 2).sum(axis=1))
+        )
         connectors.append(
             Connector(
-                xy=straight_nodes[nearest_node],
+                xy=connector_nodes[nearest_node],
                 region=region,
                 subregion=subregion,
                 world_count=n,
             )
         )
 
-    return out_xy, out_angle, out_size, roads, connectors
+    return (
+        out_xy,
+        out_angle,
+        out_size,
+        out_width,
+        out_depth,
+        out_skew,
+        roads,
+        connectors,
+    )
 
 
 def _arterial_roads(
@@ -525,10 +854,30 @@ def main() -> None:
     ap.add_argument("--road-gap-scale", type=float, default=0.70)
     ap.add_argument("--row-spacing-scale", type=float, default=1.18)
     ap.add_argument("--max-rows-per-side", type=int, default=12)
+    ap.add_argument("--end-gap-scale", type=float, default=2.4)
+    ap.add_argument("--segment-trim-quantile", type=float, default=0.03)
+    ap.add_argument("--segment-trim-pad-scale", type=float, default=3.0)
+    ap.add_argument("--segment-min-span-scale", type=float, default=7.0)
+    ap.add_argument("--parcel-width-jitter", type=float, default=0.10)
+    ap.add_argument("--parcel-depth-jitter", type=float, default=0.13)
+    ap.add_argument("--parcel-angle-jitter", type=float, default=0.025)
+    ap.add_argument("--parcel-skew-jitter", type=float, default=0.045)
+    ap.add_argument("--relax-iterations", type=int, default=7)
+    ap.add_argument("--relax-clearance", type=float, default=1.08)
+    ap.add_argument("--relax-repel-strength", type=float, default=0.28)
+    ap.add_argument("--relax-anchor-strength", type=float, default=0.18)
+    ap.add_argument("--relax-original-strength", type=float, default=0.025)
+    ap.add_argument(
+        "--minor-roads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="emit thin service lanes/stubs connecting parcels to local roads",
+    )
+    ap.add_argument("--minor-min-worlds", type=int, default=2)
     ap.add_argument("--land-raster-max-dim", type=int, default=2048)
     ap.add_argument("--land-raster-nn-cells", type=float, default=2.0)
-    ap.add_argument("--land-raster-dilate-cells", type=int, default=5)
-    ap.add_argument("--land-raster-close-cells", type=int, default=2)
+    ap.add_argument("--land-raster-dilate-cells", type=int, default=7)
+    ap.add_argument("--land-raster-close-cells", type=int, default=3)
     ap.add_argument("--land-raster-simplify-cells", type=float, default=0.75)
     ap.add_argument("--land-raster-smooth-cells", type=float, default=0.0)
     ap.add_argument("--land-raster-min-area-cells", type=float, default=4.0)
@@ -579,7 +928,16 @@ def main() -> None:
         f"global_nn={global_nn:.5f}"
     )
 
-    layout_xy, angle, size, local_roads, connectors = _local_layout(
+    (
+        layout_xy,
+        angle,
+        size,
+        width,
+        depth,
+        skew,
+        local_roads,
+        connectors,
+    ) = _local_layout(
         work,
         top_col=top_col,
         sub_col=sub_col,
@@ -607,6 +965,9 @@ def main() -> None:
             pl.Series("y", layout_xy[:, 1]),
             pl.Series("parcel_angle", angle),
             pl.Series("parcel_size", size),
+            pl.Series("parcel_width", width),
+            pl.Series("parcel_depth", depth),
+            pl.Series("parcel_skew", skew),
         )
     )
     out_points.write_parquet(args.out_dir / "app_points.parquet")
@@ -627,7 +988,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "road-parcels",
+        "layout": "road-parcels-v2",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
