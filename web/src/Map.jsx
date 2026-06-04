@@ -6,12 +6,14 @@ import { Delaunay } from "d3-delaunay";
 import { DATA_DIR, getLevels, loadPoints } from "./duckdb.js";
 import { hexToRgb, labelPoint } from "./util.js";
 import {
+  BUILDINGS,
   CAPITOL_DOT,
   CAPITOLS_PER_REGION,
   CELLS,
   LABEL_STYLE,
   LABELS,
   LAND,
+  LANDUSE,
   OCEAN,
   REGION_BG,
   REGION_PALETTE,
@@ -243,6 +245,22 @@ function parcelPolygon(point) {
   return local.map(([lx, ly]) => [x + lx * ca - ly * sa, y + lx * sa + ly * ca]);
 }
 
+function buildingPolygon(point) {
+  const [x, y] = point.position;
+  const width = Math.max(point.buildingWidth ?? 0, 1e-9);
+  const depth = Math.max(point.buildingDepth ?? 0, 1e-9);
+  const a = point.buildingAngle ?? 0;
+  const ca = Math.cos(a);
+  const sa = Math.sin(a);
+  const local = [
+    [-width / 2, -depth / 2],
+    [width / 2, -depth / 2],
+    [width / 2, depth / 2],
+    [-width / 2, depth / 2],
+  ];
+  return local.map(([lx, ly]) => [x + lx * ca - ly * sa, y + lx * sa + ly * ca]);
+}
+
 export default function WorldMap({
   onSelect,
   onPickRegion,
@@ -257,6 +275,7 @@ export default function WorldMap({
   // Their numeric level varies by dataset (20k: 3/2; 218k: 5/4), discovered at load.
   const [lvl, setLvl] = useState(null); // { top, sub, levels }
   const [land, setLand] = useState(null);
+  const [landuse, setLanduse] = useState(null);
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
   const [roads, setRoads] = useState(null);
@@ -304,6 +323,9 @@ export default function WorldMap({
       .then((info) => {
         setLvl(info);
         fetch(base + "land.geojson").then((r) => r.json()).then(setLand);
+        fetch(base + "landuse.geojson")
+          .then((r) => (r.ok ? r.json() : null))
+          .then(setLanduse, () => setLanduse(null));
         fetch(base + `regions_l${info.top}.geojson`).then((r) => r.json()).then(setRegionsTop);
         fetch(base + `regions_l${info.sub}.geojson`).then((r) => r.json()).then(setRegionsSub);
         fetch(base + "roads.geojson")
@@ -389,10 +411,18 @@ export default function WorldMap({
       hexToRgb(REGION_PALETTE[(idx.get(rid) ?? 0) % REGION_PALETTE.length]);
   }, [points, regionsTop, regionsSub]);
 
-  // The map body. Road-layout datasets provide explicit parcel squares; older
-  // datasets fall back to per-world Voronoi cells clamped to a max radius.
+  const isCity = useMemo(
+    () => points.some((p) => p.buildingWidth != null && p.buildingDepth != null),
+    [points],
+  );
+
+  // The map body. City datasets provide explicit building footprints; older road
+  // datasets provide parcel squares; legacy datasets fall back to bounded Voronoi.
   const cells = useMemo(() => {
     if (!points.length) return [];
+    if (isCity) {
+      return points.map((p) => ({ polygon: buildingPolygon(p), point: p }));
+    }
     if (points.some((p) => p.parcelSize != null)) {
       return points.map((p) => ({ polygon: parcelPolygon(p), point: p }));
     }
@@ -411,7 +441,7 @@ export default function WorldMap({
       if (clipped) out.push({ polygon: shrink(clipped, CELLS.shrink), point: points[i] });
     }
     return out;
-  }, [points]);
+  }, [points, isCity]);
 
   // Two fixed global character sets (stable, so no per-pan atlas rebuilds): Latin-only
   // labels' glyphs vs. everything else (CJK/kana/emoji + any Latin co-occurring in
@@ -466,7 +496,9 @@ export default function WorldMap({
   // viewport — at scale (218k worlds) drawing every cell each frame is the killer.
   // Recompute the visible set only when the view moves ~a viewport or zoom changes a
   // step (a generous margin covers movement between recomputes), not every frame.
-  const renderCells = TIER_RANK[tier] >= TIER_RANK[CELLS.renderFromTier];
+  const renderCells =
+    TIER_RANK[tier] >=
+    TIER_RANK[isCity ? BUILDINGS.renderFromTier : CELLS.renderFromTier];
   const z2 = 2 ** zoom;
   const hw = size.width / 2 / z2;
   const hh = size.height / 2 / z2;
@@ -676,7 +708,11 @@ export default function WorldMap({
   const roadFeatures = useMemo(() => {
     const features = roads?.features ?? [];
     if (tier === "far") return features.filter((f) => f.properties.kind === "arterial");
-    if (tier === "mid") return features.filter((f) => f.properties.kind !== "minor");
+    if (tier === "mid") {
+      return features.filter(
+        (f) => f.properties.kind !== "minor" && f.properties.kind !== "service",
+      );
+    }
     return features;
   }, [roads, tier]);
 
@@ -688,22 +724,26 @@ export default function WorldMap({
     );
   }
 
-  const cellsStroked = TIER_RANK[tier] >= TIER_RANK[CELLS.strokeMinZoomTier];
+  const cellsStroked =
+    TIER_RANK[tier] >=
+    TIER_RANK[isCity ? BUILDINGS.strokeMinZoomTier : CELLS.strokeMinZoomTier];
   const roadsVisible = roads && TIER_RANK[tier] >= TIER_RANK[ROADS.visibleFromTier];
   const roadWidth = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
-      : f.properties.kind === "minor"
+      : f.properties.kind === "minor" || f.properties.kind === "service"
         ? (ROADS.minorWidth ?? ROADS.localWidth * 0.55)
+        : f.properties.kind === "collector"
+          ? (ROADS.collectorWidth ?? ROADS.localWidth * 1.25)
         : ROADS.localWidth;
   const roadColor = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialColor
-      : f.properties.kind === "minor"
+      : f.properties.kind === "minor" || f.properties.kind === "service"
         ? (ROADS.minorColor ?? ROADS.localColor)
         : ROADS.localColor;
   const roadCasingExtra = (f) =>
-    f.properties.kind === "minor"
+    f.properties.kind === "minor" || f.properties.kind === "service"
       ? (ROADS.minorCasingExtraWidth ?? 0.25)
       : ROADS.casingExtraWidth;
 
@@ -759,35 +799,52 @@ export default function WorldMap({
       getFillColor: LAND.color,
       pickable: false,
     }),
+    isCity &&
+      new GeoJsonLayer({
+        id: "landuse",
+        data: landuse,
+        filled: true,
+        stroked: false,
+        getFillColor: (f) =>
+          f.properties.kind === "park" ? LANDUSE.parkColor : LANDUSE.developedColor,
+        pickable: false,
+      }),
     // continent background color field
-    new GeoJsonLayer({
-      id: "bg-top",
-      data: regionsTop,
-      filled: true,
-      stroked: false,
-      getFillColor: (f) => [...regionRGB(f.properties.region), REGION_BG.l3Alpha],
-      pickable: false,
-    }),
+    !isCity &&
+      new GeoJsonLayer({
+        id: "bg-top",
+        data: regionsTop,
+        filled: true,
+        stroked: false,
+        getFillColor: (f) => [...regionRGB(f.properties.region), REGION_BG.l3Alpha],
+        pickable: false,
+      }),
     // sub-region tint (adds a second density layer when zoomed in a bit)
-    new GeoJsonLayer({
-      id: "bg-sub",
-      data: regionsSub,
-      visible: tier !== "far",
-      filled: true,
-      stroked: false,
-      getFillColor: (f) => [...regionRGB(f.properties.region), REGION_BG.l2Alpha],
-      pickable: false,
-    }),
+    !isCity &&
+      new GeoJsonLayer({
+        id: "bg-sub",
+        data: regionsSub,
+        visible: tier !== "far",
+        filled: true,
+        stroked: false,
+        getFillColor: (f) => [...regionRGB(f.properties.region), REGION_BG.l2Alpha],
+        pickable: false,
+      }),
     new PolygonLayer({
-      id: "cells",
+      id: isCity ? "buildings" : "cells",
       data: visibleCells,
       getPolygon: (d) => d.polygon,
       getFillColor: (d) =>
         d.point.world_id === selected
           ? [...regionRGB(d.point.region).map((c) => Math.round(c * SELECTED.valueMul)), SELECTED.fillAlpha]
-          : [...regionRGB(d.point.region), CELLS.fillAlpha],
+          : [
+              ...regionRGB(d.point.region),
+              isCity ? BUILDINGS.fillAlpha : CELLS.fillAlpha,
+            ],
       getLineColor: (d) =>
-        d.point.world_id === selected ? SELECTED.outline : [255, 255, 255, CELLS.strokeAlpha],
+        d.point.world_id === selected
+          ? SELECTED.outline
+          : [255, 255, 255, isCity ? BUILDINGS.strokeAlpha : CELLS.strokeAlpha],
       getLineWidth: (d) => (d.point.world_id === selected ? SELECTED.outlineWidth : 0.5),
       lineWidthUnits: "pixels",
       stroked: cellsStroked || selected != null,

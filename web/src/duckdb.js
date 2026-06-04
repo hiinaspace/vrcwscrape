@@ -48,6 +48,19 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "nolabs-city" ||
+    data === "nolabs-city-layout" ||
+    data === "full-nolabs-localmap-island-toponymy-city" ||
+    layout === "city" ||
+    (data === "nolabs" && layout === "city")
+  ) {
+    return {
+      key: "nolabs-localmap-island-toponymy-city",
+      dir: "full-nolabs-localmap-island-toponymy-city/",
+      label: "No-Labs LocalMAP City Layout",
+    };
+  }
+  if (
     data === "nolabs-roads" ||
     data === "nolabs-roadmap" ||
     data === "nolabs-road-parcels" ||
@@ -240,6 +253,16 @@ export async function loadPoints() {
     "parcel_width",
     "parcel_depth",
     "parcel_skew",
+    "building_angle",
+    "building_width",
+    "building_depth",
+    "building_height",
+    "lot_id",
+    "block_id",
+    "road_id",
+    "frontage_x",
+    "frontage_y",
+    "layout_displacement",
   ].filter((c) => pointColumns.has(c));
   const optionalSql = optionalCols.length ? `, ${optionalCols.join(", ")}` : "";
   const res = await conn.query(`
@@ -262,6 +285,19 @@ export async function loadPoints() {
       parcelWidth: r.parcel_width == null ? null : Number(r.parcel_width),
       parcelDepth: r.parcel_depth == null ? null : Number(r.parcel_depth),
       parcelSkew: r.parcel_skew == null ? null : Number(r.parcel_skew),
+      buildingAngle: r.building_angle == null ? null : Number(r.building_angle),
+      buildingWidth: r.building_width == null ? null : Number(r.building_width),
+      buildingDepth: r.building_depth == null ? null : Number(r.building_depth),
+      buildingHeight: r.building_height == null ? null : Number(r.building_height),
+      lotId: r.lot_id == null ? null : Number(r.lot_id),
+      blockId: r.block_id == null ? null : Number(r.block_id),
+      roadId: r.road_id == null ? null : Number(r.road_id),
+      frontage:
+        r.frontage_x == null || r.frontage_y == null
+          ? null
+          : [Number(r.frontage_x), Number(r.frontage_y)],
+      layoutDisplacement:
+        r.layout_displacement == null ? null : Number(r.layout_displacement),
       sid,
     };
   });

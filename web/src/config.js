@@ -27,12 +27,24 @@ export const CELLS = {
   renderFromTier: "near", // "far" | "mid" | "near"
 };
 
+export const BUILDINGS = {
+  renderFromTier: "mid",
+  fillAlpha: 180,
+  strokeAlpha: 170,
+  strokeMinZoomTier: "near",
+};
+
 // "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). The land is
 // a precomputed alpha-shape polygon over the world coordinates, so it stays solid at
 // any zoom without drawing every world as an overlapping scatter point.
 export const OCEAN = "#28323f"; // viewport background (any CSS color)
 export const LAND = {
   color: [226, 229, 231], // neutral light-grey landmass
+};
+
+export const LANDUSE = {
+  parkColor: [196, 218, 184, 210],
+  developedColor: [232, 231, 224, 70],
 };
 
 // Region "background" fills (continent l3 + sub-region l2), drawn under the cells
