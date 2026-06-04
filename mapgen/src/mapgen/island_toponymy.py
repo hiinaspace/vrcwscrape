@@ -157,7 +157,7 @@ def _globalize(
     for cid in order:
         gid = next_id
         next_id += 1
-        label = _short_label(local.label_by_cluster.get(cid), fallback) or fallback
+        label = _short_label(local.label_by_cluster.get(cid)) or fallback
         mask = local.cluster_id == cid
         target = global_indices[mask]
         out_id[target] = gid
