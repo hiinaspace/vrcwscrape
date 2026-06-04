@@ -308,6 +308,54 @@ def _resample_line_coords(
     return out
 
 
+def _relax_line_curvature(
+    coords: np.ndarray,
+    *,
+    max_turn_deg: float,
+    iterations: int,
+    strength: float,
+    closed: bool,
+) -> np.ndarray:
+    if len(coords) < 4 or iterations <= 0 or strength <= 0:
+        return coords
+    arr = np.asarray(coords, dtype=np.float64)
+    if closed and np.linalg.norm(arr[0] - arr[-1]) <= 1e-9:
+        arr = arr[:-1]
+    max_turn = math.radians(max_turn_deg)
+    if max_turn <= 0:
+        return coords
+    for _ in range(iterations):
+        prev = np.roll(arr, 1, axis=0) if closed else arr[:-2]
+        cur = arr if closed else arr[1:-1]
+        nxt = np.roll(arr, -1, axis=0) if closed else arr[2:]
+        if len(cur) == 0:
+            break
+        a = cur - prev
+        b = nxt - cur
+        al = np.linalg.norm(a, axis=1)
+        bl = np.linalg.norm(b, axis=1)
+        good = (al > 1e-9) & (bl > 1e-9)
+        if not np.any(good):
+            break
+        cos = np.ones(len(cur), dtype=np.float64)
+        cos[good] = np.sum(a[good] * b[good], axis=1) / (al[good] * bl[good])
+        turn = np.arccos(np.clip(cos, -1.0, 1.0))
+        excess = np.clip((turn - max_turn) / max(math.pi - max_turn, 1e-9), 0.0, 1.0)
+        weight = (excess * strength)[:, None]
+        target = (prev + nxt) * 0.5
+        updated = cur * (1.0 - weight) + target * weight
+        if closed:
+            arr = updated
+        else:
+            arr = arr.copy()
+            arr[1:-1] = updated
+        if float(excess.max(initial=0.0)) <= 1e-4:
+            break
+    if closed:
+        arr = np.vstack([arr, arr[0]])
+    return arr
+
+
 def _smooth_coastline_geom(geom, *, iterations: int, simplify: float):
     if geom.is_empty:
         return geom
@@ -760,6 +808,18 @@ def _road_smooth_iterations(kind: str, args) -> int:
     return args.road_smooth_service_iterations
 
 
+def _road_max_turn_deg(kind: str, args) -> float:
+    if kind == "arterial":
+        return args.road_curvature_arterial_max_turn_deg
+    if kind == "collector":
+        return args.road_curvature_collector_max_turn_deg
+    if kind == "local":
+        return args.road_curvature_local_max_turn_deg
+    if kind == "service":
+        return args.road_curvature_service_max_turn_deg
+    return 0.0
+
+
 def _smooth_road_line(
     line: LineString,
     *,
@@ -785,6 +845,15 @@ def _smooth_road_line(
         )
         coords = _resample_line_coords(coords, step=step, closed=closed)
         coords = _chaikin_line_coords(coords, iterations=iterations, closed=closed)
+    max_turn = _road_max_turn_deg(kind, args)
+    if max_turn > 0 and args.road_curvature_relax_iterations > 0:
+        coords = _relax_line_curvature(
+            coords,
+            max_turn_deg=max_turn,
+            iterations=args.road_curvature_relax_iterations,
+            strength=args.road_curvature_relax_strength,
+            closed=closed,
+        )
     smoothed = LineString(coords)
     if (
         iterations > 0
@@ -873,6 +942,94 @@ def _merge_major_road_specs(specs: list[RoadSpec]) -> list[RoadSpec]:
                 )
             )
     return merged_specs
+
+
+def _nearest_point_on_geom(point: np.ndarray, geom) -> np.ndarray | None:
+    if geom.is_empty:
+        return None
+    p = shapely.Point(float(point[0]), float(point[1]))
+    d = geom.project(p)
+    try:
+        q = geom.interpolate(d)
+    except (shapely.GEOSException, TypeError):
+        return None
+    if q.is_empty:
+        return None
+    return np.array([q.x, q.y], dtype=np.float64)
+
+
+def _endpoint_connector_specs(
+    road_specs: list[RoadSpec],
+    *,
+    land_geom,
+    island_id: int,
+    global_nn: float,
+    args,
+) -> list[RoadSpec]:
+    if args.road_endpoint_connector_max_scale <= 0:
+        return []
+    arterial = [
+        LineString(spec.coords)
+        for spec in road_specs
+        if spec.kind == "arterial" and LineString(spec.coords).length > 1e-9
+    ]
+    trunk = [
+        LineString(spec.coords)
+        for spec in road_specs
+        if spec.kind in {"arterial", "collector"}
+        and LineString(spec.coords).length > 1e-9
+    ]
+    arterial_geom = shapely.unary_union(arterial) if arterial else GeometryCollection()
+    trunk_geom = shapely.unary_union(trunk) if trunk else GeometryCollection()
+    if arterial_geom.is_empty and trunk_geom.is_empty:
+        return []
+    min_dist = global_nn * args.road_endpoint_connector_min_scale
+    max_dist = global_nn * args.road_endpoint_connector_max_scale
+    allowed = land_geom.buffer(
+        global_nn * args.major_road_bridge_scale,
+        join_style="round",
+    )
+    out: list[RoadSpec] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for spec in road_specs:
+        if spec.kind not in {"collector", "local"}:
+            continue
+        coords = np.asarray(spec.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        dest = arterial_geom if spec.kind == "collector" else trunk_geom
+        if dest.is_empty:
+            continue
+        for endpoint in (coords[0], coords[-1]):
+            q = _nearest_point_on_geom(endpoint, dest)
+            if q is None:
+                continue
+            dist = float(np.linalg.norm(endpoint - q))
+            if dist < min_dist or dist > max_dist:
+                continue
+            coords = [
+                (float(endpoint[0]), float(endpoint[1])),
+                (float(q[0]), float(q[1])),
+            ]
+            line = LineString(coords)
+            if line.length <= 1e-9 or not shapely.covers(allowed, line):
+                continue
+            key = tuple(int(round(v / max(global_nn, 1e-9))) for v in (*endpoint, *q))
+            rkey = (key[2], key[3], key[0], key[1])
+            if key in seen or rkey in seen:
+                continue
+            seen.add(key)
+            out.append(
+                RoadSpec(
+                    coords=coords,
+                    kind=spec.kind,
+                    island_id=island_id,
+                    width=spec.width,
+                    family=-4,
+                    depth=spec.depth,
+                )
+            )
+    return out
 
 
 def _boundary_road_specs(
@@ -1260,6 +1417,15 @@ def _generate_recursive_streets(
         slot_step=slot_step,
         args=args,
     )
+    road_specs.extend(
+        _endpoint_connector_specs(
+            road_specs,
+            land_geom=land_geom,
+            island_id=island_id,
+            global_nn=global_nn,
+            args=args,
+        )
+    )
     return road_specs, leaves, float(splits)
 
 
@@ -1327,7 +1493,7 @@ def _leaf_access_lane_specs(
         t = np.linspace(
             lo[tangent_axis] - tangent_pad,
             hi[tangent_axis] + tangent_pad,
-            28,
+            args.access_lane_curve_vertices,
         )
         for lane_no, offset in enumerate(offsets.tolist()):
             local = np.zeros((len(t), 2), dtype=np.float64)
@@ -2448,11 +2614,19 @@ def main() -> None:
     ap.add_argument("--road-smooth-simplify-scale", type=float, default=0.0)
     ap.add_argument("--road-smooth-arterial-iterations", type=int, default=4)
     ap.add_argument("--road-smooth-collector-iterations", type=int, default=0)
-    ap.add_argument("--road-smooth-local-iterations", type=int, default=0)
-    ap.add_argument("--road-smooth-service-iterations", type=int, default=0)
+    ap.add_argument("--road-smooth-local-iterations", type=int, default=1)
+    ap.add_argument("--road-smooth-service-iterations", type=int, default=1)
+    ap.add_argument("--road-curvature-relax-iterations", type=int, default=12)
+    ap.add_argument("--road-curvature-relax-strength", type=float, default=0.42)
+    ap.add_argument("--road-curvature-arterial-max-turn-deg", type=float, default=14.0)
+    ap.add_argument("--road-curvature-collector-max-turn-deg", type=float, default=28.0)
+    ap.add_argument("--road-curvature-local-max-turn-deg", type=float, default=36.0)
+    ap.add_argument("--road-curvature-service-max-turn-deg", type=float, default=42.0)
     ap.add_argument("--road-lod-simplify-scale", type=float, default=0.95)
     ap.add_argument("--road-lod-mid-simplify-scale", type=float, default=0.28)
     ap.add_argument("--major-road-bridge-scale", type=float, default=8.0)
+    ap.add_argument("--road-endpoint-connector-min-scale", type=float, default=0.80)
+    ap.add_argument("--road-endpoint-connector-max-scale", type=float, default=12.0)
     ap.add_argument("--major-corridor-clearance-scale", type=float, default=0.30)
     ap.add_argument(
         "--major-corridor-building-clearance-scale",
@@ -2499,9 +2673,10 @@ def main() -> None:
     ap.add_argument("--access-lane-margin-frac", type=float, default=0.18)
     ap.add_argument("--access-lane-min-spacing-scale", type=float, default=0.20)
     ap.add_argument("--access-lane-min-spacing-slot-scale", type=float, default=0.24)
-    ap.add_argument("--access-lane-curve-span-scale", type=float, default=0.012)
-    ap.add_argument("--access-lane-curve-global-scale", type=float, default=0.45)
-    ap.add_argument("--access-lane-curve-wavelength-scale", type=float, default=0.72)
+    ap.add_argument("--access-lane-curve-span-scale", type=float, default=0.045)
+    ap.add_argument("--access-lane-curve-global-scale", type=float, default=1.60)
+    ap.add_argument("--access-lane-curve-wavelength-scale", type=float, default=0.55)
+    ap.add_argument("--access-lane-curve-vertices", type=int, default=56)
     ap.add_argument("--local-assignment-buffer-scale", type=float, default=2.5)
     ap.add_argument("--local-assignment-candidate-factor", type=float, default=2.0)
     ap.add_argument("--park-buffer-scale", type=float, default=0.8)
@@ -2655,7 +2830,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-hierarchical-v9",
+        "layout": "city-hierarchical-v10",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
