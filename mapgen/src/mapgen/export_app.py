@@ -189,6 +189,17 @@ def main() -> None:
     )
     ap.add_argument("--buffer-scale", type=float, default=3.5)
     ap.add_argument(
+        "--buffer-scale-level",
+        action="append",
+        nargs=2,
+        metavar=("LEVEL", "SCALE"),
+        default=[],
+        help=(
+            "override --buffer-scale for a specific geojson hierarchy level; "
+            "repeatable, e.g. --buffer-scale-level 1 1.2"
+        ),
+    )
+    ap.add_argument(
         "--region-polygon-method",
         choices=("raster", "union"),
         default="raster",
@@ -255,6 +266,14 @@ def main() -> None:
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        buffer_scale_by_level = {
+            int(level): float(scale) for level, scale in args.buffer_scale_level
+        }
+    except ValueError as err:
+        raise SystemExit(
+            "--buffer-scale-level expects integer LEVEL and numeric SCALE"
+        ) from err
 
     layer_paths = _discover_layers(args.topo_dir)
     n_layers = len(layer_paths)
@@ -408,7 +427,6 @@ def main() -> None:
 
     # --- region polygons per requested level (from soft ids = full coverage) ---
     nn = _median_nn(xy)
-    buffer_r = nn * args.buffer_scale
     region_raster_cell = estimate_cell_size(
         xy,
         max_dim=args.region_raster_max_dim,
@@ -418,7 +436,7 @@ def main() -> None:
     if args.region_polygon_method == "raster":
         print(
             f"  region raster: cell_size={region_raster_cell:.5f}, "
-            f"buffer={buffer_r:.5f}"
+            f"default_buffer={nn * args.buffer_scale:.5f}"
         )
     region_soft = points["region"].to_numpy()
     for lvl in geojson_levels:
@@ -443,6 +461,13 @@ def main() -> None:
         for r in modal.iter_rows(named=True):
             region_by_cid[int(r["_c"])] = int(r["_rr"])
             color_by_cid[int(r["_c"])] = region_color.get(int(r["_rr"]), "#888888")
+        level_buffer_scale = buffer_scale_by_level.get(lvl, args.buffer_scale)
+        level_buffer_r = nn * level_buffer_scale
+        if buffer_scale_by_level:
+            print(
+                f"  level {lvl}: buffer_scale={level_buffer_scale:g}, "
+                f"buffer={level_buffer_r:.5f}"
+            )
         _export_geojson(
             xy,
             cluster_id,
@@ -450,7 +475,7 @@ def main() -> None:
             color_by_cid,
             label_by_cid,
             region_by_cid,
-            buffer_r,
+            level_buffer_r,
             args.out_dir / f"regions_l{lvl}.geojson",
             method=args.region_polygon_method,
             raster_cell_size=region_raster_cell,
