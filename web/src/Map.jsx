@@ -226,6 +226,20 @@ function shrink(ring, f) {
   return ring.map(([x, y]) => [cx + (x - cx) * f, cy + (y - cy) * f]);
 }
 
+function parcelSquare(point) {
+  const [x, y] = point.position;
+  const s = Math.max(point.parcelSize ?? 0, 1e-9);
+  const a = point.parcelAngle ?? 0;
+  const ux = [Math.cos(a) * s * 0.5, Math.sin(a) * s * 0.5];
+  const uy = [-Math.sin(a) * s * 0.5, Math.cos(a) * s * 0.5];
+  return [
+    [x - ux[0] - uy[0], y - ux[1] - uy[1]],
+    [x + ux[0] - uy[0], y + ux[1] - uy[1]],
+    [x + ux[0] + uy[0], y + ux[1] + uy[1]],
+    [x - ux[0] + uy[0], y - ux[1] + uy[1]],
+  ];
+}
+
 export default function WorldMap({
   onSelect,
   onPickRegion,
@@ -372,10 +386,13 @@ export default function WorldMap({
       hexToRgb(REGION_PALETTE[(idx.get(rid) ?? 0) % REGION_PALETTE.length]);
   }, [points, regionsTop, regionsSub]);
 
-  // The map body: per-world Voronoi cells, clamped to a max radius (config) so
-  // sparse worlds become small plots not huge wedges. Computed once.
+  // The map body. Road-layout datasets provide explicit parcel squares; older
+  // datasets fall back to per-world Voronoi cells clamped to a max radius.
   const cells = useMemo(() => {
     if (!points.length) return [];
+    if (points.some((p) => p.parcelSize != null)) {
+      return points.map((p) => ({ polygon: parcelSquare(p), point: p }));
+    }
     const b = dataBounds(points);
     const pad = (b[2] - b[0]) * 0.05;
     const delaunay = Delaunay.from(points, (p) => p.position[0], (p) => p.position[1]);

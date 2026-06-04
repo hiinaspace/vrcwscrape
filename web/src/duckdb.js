@@ -48,6 +48,20 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "nolabs-roads" ||
+    data === "nolabs-roadmap" ||
+    data === "nolabs-road-parcels" ||
+    data === "full-nolabs-localmap-island-toponymy-roads" ||
+    layout === "road-parcels" ||
+    (data === "nolabs" && layout === "roads")
+  ) {
+    return {
+      key: "nolabs-localmap-island-toponymy-roads",
+      dir: "full-nolabs-localmap-island-toponymy-roads/",
+      label: "No-Labs LocalMAP Road Parcels",
+    };
+  }
+  if (
     data === "nolabs-hybrid" ||
     data === "nolabs-v3" ||
     data === "nolabs-toponymy" ||
@@ -173,6 +187,17 @@ async function getConn() {
   return _connPromise;
 }
 
+let _pointColumns;
+async function getPointColumns() {
+  if (_pointColumns) return _pointColumns;
+  const conn = await getConn();
+  const res = await conn.query(
+    `DESCRIBE SELECT * FROM read_parquet('app_points.parquet')`,
+  );
+  _pointColumns = new Set(res.toArray().map((r) => r.column_name));
+  return _pointColumns;
+}
+
 // The toponymy hierarchy depth varies by dataset (20k -> 4 layers l0..l3; 218k ->
 // 6 layers l0..l5). Discover the soft-id levels present so the rest of the app can
 // treat the coarsest as "continents" and the next as "sub-regions" generically.
@@ -207,9 +232,14 @@ export async function getLevels() {
 export async function loadPoints() {
   const conn = await getConn();
   const { levels } = await getLevels();
+  const pointColumns = await getPointColumns();
   const sidCols = levels.map((i) => `l${i}_sid`).join(", ");
+  const optionalCols = ["parcel_angle", "parcel_size"].filter((c) =>
+    pointColumns.has(c),
+  );
+  const optionalSql = optionalCols.length ? `, ${optionalCols.join(", ")}` : "";
   const res = await conn.query(`
-    SELECT world_id, x, y, region, region_name, color, name, visits, ${sidCols}
+    SELECT world_id, x, y, region, region_name, color, name, visits, ${sidCols}${optionalSql}
     FROM read_parquet('app_points.parquet')
   `);
   return res.toArray().map((r) => {
@@ -223,6 +253,8 @@ export async function loadPoints() {
       visits: Number(r.visits ?? 0),
       region: r.region,
       region_name: r.region_name ?? "",
+      parcelAngle: r.parcel_angle == null ? null : Number(r.parcel_angle),
+      parcelSize: r.parcel_size == null ? null : Number(r.parcel_size),
       sid,
     };
   });

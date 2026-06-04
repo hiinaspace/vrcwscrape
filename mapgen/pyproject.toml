@@ -52,6 +52,7 @@ mapgen-island-toponymy = "mapgen.island_toponymy:main"
 mapgen-app-export = "mapgen.export_app:main"
 mapgen-land = "mapgen.land:main"
 mapgen-roads = "mapgen.roads:main"
+mapgen-road-layout = "mapgen.road_layout:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6", "ty", "pre-commit>=3.8"]
