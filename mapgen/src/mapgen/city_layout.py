@@ -577,6 +577,78 @@ def _grid_filter_slots(
     return _take_slots(slots, keep)
 
 
+def _relax_assignment_targets(
+    xy: np.ndarray,
+    *,
+    global_nn: float,
+    island_id: int,
+    args,
+) -> tuple[np.ndarray, dict[str, float]]:
+    if args.assignment_relax_iterations <= 0 or len(xy) < 2:
+        return xy, {
+            "assignment_relax_median": 0.0,
+            "assignment_relax_p95": 0.0,
+            "assignment_relax_last_pairs": 0.0,
+        }
+    pos = xy.astype(np.float64, copy=True)
+    orig = pos.copy()
+    min_dist = global_nn * args.assignment_relax_min_dist_scale
+    if min_dist <= 0:
+        return xy, {
+            "assignment_relax_median": 0.0,
+            "assignment_relax_p95": 0.0,
+            "assignment_relax_last_pairs": 0.0,
+        }
+    rng = np.random.default_rng(args.seed + island_id * 1709)
+    max_step = min_dist * args.assignment_relax_max_step_scale
+    max_displacement = global_nn * args.assignment_relax_max_displacement_scale
+    eps = max(min_dist * 1e-6, 1e-12)
+    last_pairs = 0
+    for _ in range(args.assignment_relax_iterations):
+        pairs = cKDTree(pos).query_pairs(min_dist, output_type="ndarray")
+        last_pairs = int(len(pairs))
+        if last_pairs == 0:
+            break
+        a = pairs[:, 0]
+        b = pairs[:, 1]
+        delta = pos[a] - pos[b]
+        dist = np.linalg.norm(delta, axis=1)
+        zero = dist < eps
+        if np.any(zero):
+            angle = rng.uniform(0.0, math.tau, int(np.count_nonzero(zero)))
+            delta[zero, 0] = np.cos(angle) * eps
+            delta[zero, 1] = np.sin(angle) * eps
+            dist[zero] = eps
+        overlap = min_dist - dist
+        move = delta * (
+            (overlap * args.assignment_relax_strength * 0.5) / dist
+        )[:, None]
+        offset = np.zeros_like(pos)
+        np.add.at(offset, a, move)
+        np.add.at(offset, b, -move)
+        step = np.linalg.norm(offset, axis=1)
+        too_far = step > max_step
+        if np.any(too_far):
+            offset[too_far] *= (max_step / step[too_far])[:, None]
+        pos += offset
+        if args.assignment_relax_anchor > 0:
+            pos += (orig - pos) * args.assignment_relax_anchor
+        if max_displacement > 0:
+            disp = pos - orig
+            dist0 = np.linalg.norm(disp, axis=1)
+            clipped = dist0 > max_displacement
+            if np.any(clipped):
+                pos[clipped] = orig[clipped] + disp[clipped] * (
+                    max_displacement / dist0[clipped]
+                )[:, None]
+    disp = np.linalg.norm(pos - orig, axis=1)
+    return pos, {
+        "assignment_relax_median": float(np.median(disp)),
+        "assignment_relax_p95": float(np.quantile(disp, 0.95)),
+        "assignment_relax_last_pairs": float(last_pairs),
+    }
+
+
 def _filter_slots_for_major_corridors(
     slots: SlotSet,
     road_specs: list[RoadSpec],
@@ -2512,7 +2584,11 @@ def _slots_for_road_specs(
             priority=visible_priority,
             footprint_radius_scale=args.slot_filter_footprint_radius_scale,
         )
-        if min_slots and len(slots.xy) < min_slots <= len(covered_slots.xy):
+        if (
+            args.slot_filter_capacity_fallback
+            and min_slots
+            and len(slots.xy) < min_slots <= len(covered_slots.xy)
+        ):
             return covered_slots
     return slots
 
@@ -2690,6 +2766,12 @@ def _layout_streamline_island(
     )
     generated_slots = int(len(slots.xy))
     fallback_slots = 0
+    assignment_xy, assignment_relax_metrics = _relax_assignment_targets(
+        xy,
+        global_nn=global_nn,
+        island_id=island_id,
+        args=args,
+    )
 
     local_block_ids = np.full(len(xy), -1, dtype=np.int64)
     for leaf in leaves:
@@ -2722,7 +2804,7 @@ def _layout_streamline_island(
 
     if len(slots.xy) >= len(xy):
         assigned = _assign_slots_by_leaves(
-            xy,
+            assignment_xy,
             slots.xy,
             leaves,
             global_nn=global_nn,
@@ -2730,7 +2812,7 @@ def _layout_streamline_island(
         )
     else:
         assigned = _assign_slots_by_leaves_partial(
-            xy,
+            assignment_xy,
             slots.xy,
             leaves,
             global_nn=global_nn,
@@ -2748,7 +2830,7 @@ def _layout_streamline_island(
             road_specs.extend(fallback_roads)
             offset = len(slots.xy)
             fallback_assign = _assign_slots(
-                xy[missing],
+                assignment_xy[missing],
                 fallback_slotset.xy,
                 args.max_hungarian,
             )
@@ -2800,6 +2882,7 @@ def _layout_streamline_island(
         "splits": int(splits),
         "building_scale": float(building_scale),
         "local_nn_q": float(local_nn_q),
+        **assignment_relax_metrics,
     }
 
 
@@ -3626,7 +3709,7 @@ def main() -> None:
     ap.add_argument("--building-density-knn", type=int, default=12)
     ap.add_argument("--building-density-reference-quantile", type=float, default=0.50)
     ap.add_argument("--building-density-reference-sample", type=int, default=12000)
-    ap.add_argument("--building-density-scale-power", type=float, default=0.32)
+    ap.add_argument("--building-density-scale-power", type=float, default=0.0)
     ap.add_argument("--building-density-scale-min", type=float, default=0.74)
     ap.add_argument("--building-density-scale-max", type=float, default=1.18)
     ap.add_argument("--building-width-jitter", type=float, default=0.09)
@@ -3650,10 +3733,11 @@ def main() -> None:
     ap.add_argument("--frontage-spacing-scale", type=float, default=0.44)
     ap.add_argument("--frontage-spacing-min-scale", type=float, default=0.36)
     ap.add_argument("--slot-capacity-target", type=float, default=2.2)
-    ap.add_argument("--slot-capacity-min", type=float, default=1.6)
+    ap.add_argument("--slot-capacity-min", type=float, default=1.0)
     ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.28)
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
-    ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.0)
+    ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.75)
+    ap.add_argument("--slot-filter-capacity-fallback", action="store_true")
     ap.add_argument("--road-slot-end-gap-scale", type=float, default=0.9)
     ap.add_argument("--road-extent-quantile", type=float, default=0.006)
     ap.add_argument("--road-extent-pad-scale", type=float, default=4.0)
@@ -3768,7 +3852,7 @@ def main() -> None:
     ap.add_argument("--boundary-trunk-snap-scale", type=float, default=1.4)
     ap.add_argument("--boundary-trunk-overlap-frac", type=float, default=0.42)
     ap.add_argument("--access-lane-trigger-scale", type=float, default=0.50)
-    ap.add_argument("--access-lane-density-scale", type=float, default=2.4)
+    ap.add_argument("--access-lane-density-scale", type=float, default=999.0)
     ap.add_argument("--access-lane-local-density-scale", type=float, default=4.0)
     ap.add_argument("--access-lane-max-per-block", type=int, default=40)
     ap.add_argument("--access-lane-margin-frac", type=float, default=0.18)
@@ -3780,6 +3864,16 @@ def main() -> None:
     ap.add_argument("--access-lane-curve-vertices", type=int, default=56)
     ap.add_argument("--local-assignment-buffer-scale", type=float, default=2.5)
     ap.add_argument("--local-assignment-candidate-factor", type=float, default=2.0)
+    ap.add_argument("--assignment-relax-iterations", type=int, default=14)
+    ap.add_argument("--assignment-relax-min-dist-scale", type=float, default=1.25)
+    ap.add_argument("--assignment-relax-strength", type=float, default=0.42)
+    ap.add_argument("--assignment-relax-anchor", type=float, default=0.04)
+    ap.add_argument("--assignment-relax-max-step-scale", type=float, default=0.65)
+    ap.add_argument(
+        "--assignment-relax-max-displacement-scale",
+        type=float,
+        default=8.0,
+    )
     ap.add_argument("--park-buffer-scale", type=float, default=0.8)
     ap.add_argument("--land-raster-max-dim", type=int, default=2048)
     ap.add_argument("--land-raster-nn-cells", type=float, default=2.0)
@@ -3931,7 +4025,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v17",
+        "layout": "city-planar-v18",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
