@@ -136,8 +136,10 @@ class MeshBlock:
 class MeshSlotResult:
     slots: SlotSet
     block_index: np.ndarray
+    parcel_valid: np.ndarray
     rejected_outside: int
     rejected_roadless: int
+    rejected_parcel: int
 
 
 @dataclass
@@ -3189,16 +3191,19 @@ def _fallback_service_slots(
     slotsets = []
     angle = _angle_of_axes(axes)
     size = global_nn * args.fallback_building_scale
+    setback = global_nn * args.building_setback_scale
+    normal = axes[:, 1]
     for chunk_no, start in enumerate(range(0, len(order), chunk)):
         members = order[start : start + chunk]
         pts = xy[members]
+        frontage = pts - normal[None, :] * (size * 0.5 + setback)
         if len(pts) == 1:
-            a = pts[0] - axes[:, 0] * size
-            b = pts[0] + axes[:, 0] * size
+            a = frontage[0] - axes[:, 0] * size
+            b = frontage[0] + axes[:, 0] * size
             coords = [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
         else:
-            pts = pts[np.argsort((pts - center) @ axes[:, 0])]
-            coords = [(float(px), float(py)) for px, py in pts]
+            frontage = frontage[np.argsort((pts - center) @ axes[:, 0])]
+            coords = [(float(px), float(py)) for px, py in frontage]
         ridx = road_index_offset + chunk_no
         road_specs.append(
             RoadSpec(
@@ -3212,7 +3217,8 @@ def _fallback_service_slots(
         slotsets.append(
             SlotSet(
                 xy=xy[members],
-                frontage=xy[members],
+                frontage=xy[members]
+                - normal[None, :] * (size * 0.5 + setback),
                 angle=np.full(len(members), angle, dtype=np.float32),
                 width=np.full(len(members), size, dtype=np.float32),
                 depth=np.full(len(members), size, dtype=np.float32),
@@ -3342,6 +3348,32 @@ def _mesh_ellipse_line(
     n = max(16, int(vertices))
     t = np.linspace(0.0, math.tau, n, endpoint=False)
     local = np.column_stack([np.cos(t) * rx, np.sin(t) * ry])
+    world = _to_world(local, center, axes)
+    world = np.vstack([world, world[0]])
+    return LineString(world)
+
+
+def _mesh_warped_ellipse_line(
+    center: np.ndarray,
+    axes: np.ndarray,
+    rx: float,
+    ry: float,
+    *,
+    vertices: int,
+    warp: float,
+    seed: int,
+) -> LineString:
+    n = max(16, int(vertices))
+    t = np.linspace(0.0, math.tau, n, endpoint=False)
+    rng = np.random.default_rng(seed)
+    phase1 = rng.uniform(0.0, math.tau)
+    phase2 = rng.uniform(0.0, math.tau)
+    radial = 1.0
+    if warp > 0:
+        radial += warp * np.sin(t * 3.0 + phase1)
+        radial += warp * 0.45 * np.sin(t * 5.0 + phase2)
+        radial = np.clip(radial, 1.0 - warp * 1.6, 1.0 + warp * 1.6)
+    local = np.column_stack([np.cos(t) * rx * radial, np.sin(t) * ry * radial])
     world = _to_world(local, center, axes)
     world = np.vstack([world, world[0]])
     return LineString(world)
@@ -3530,6 +3562,7 @@ def _mesh_connector_spoke_specs(
     )
     min_length = slot_step * args.boundary_road_min_length_slots
     specs: list[RoadSpec] = []
+    rng = np.random.default_rng(args.seed + island_id * 11939 + center_no * 7919)
     for spoke_no in range(spoke_count):
         theta = (math.pi * spoke_no) / max(spoke_count, 1)
         for side in (-1, 1):
@@ -3538,12 +3571,33 @@ def _mesh_connector_spoke_specs(
                 [math.cos(direction_theta), math.sin(direction_theta)],
                 dtype=np.float64,
             )
+            local_perp = np.array([-local_dir[1], local_dir[0]], dtype=np.float64)
             belt_r = _mesh_ellipse_direction_radius(rx, ry, direction_theta)
             start_r = belt_r * args.mesh_spoke_start_ring_frac
             end_r = max(reach, belt_r * args.mesh_spoke_min_end_frac)
             if end_r <= start_r + min_length:
                 continue
-            local = np.vstack([local_dir * start_r, local_dir * end_r])
+            n = max(8, int(args.mesh_spoke_curve_vertices))
+            s = np.linspace(0.0, 1.0, n)
+            dist = start_r + (end_r - start_r) * s
+            bend_sign = -1.0 if rng.random() < 0.5 else 1.0
+            bend = (
+                np.sin(math.pi * s)
+                * (end_r - start_r)
+                * args.mesh_spoke_curve_frac
+                * bend_sign
+            )
+            bend += (
+                np.sin(math.pi * s * 2.0)
+                * (end_r - start_r)
+                * args.mesh_spoke_curve_frac
+                * 0.25
+                * (-bend_sign)
+            )
+            local = (
+                local_dir[None, :] * dist[:, None]
+                + local_perp[None, :] * bend[:, None]
+            )
             line = LineString(_to_world(local, center.xy, center.axes))
             kind = (
                 "collector"
@@ -3653,12 +3707,14 @@ def _mesh_center_road_specs(
         last_rx = max(last_rx, rx)
         last_ry = max(last_ry, ry)
         kind = "collector" if ring_no == ring_count - 1 else "local"
-        line = _mesh_ellipse_line(
+        line = _mesh_warped_ellipse_line(
             center.xy,
             center.axes,
             rx,
             ry,
             vertices=args.mesh_ring_vertices,
+            warp=args.mesh_ring_warp_frac,
+            seed=args.seed + island_id * 7919 + center_no * 101 + ring_no,
         )
         specs.extend(
             _mesh_clip_line_specs(
@@ -3995,6 +4051,16 @@ def _mesh_best_block_split(
     if len(block.point_idx) < args.mesh_refine_min_worlds:
         return None
     min_area = (global_nn * global_nn) * args.mesh_min_block_area_scale
+    target_block_area = (
+        global_nn
+        * global_nn
+        * max(args.mesh_target_block_area_scale, args.mesh_min_block_area_scale)
+    )
+    area_excess = max(
+        0.0,
+        float(block.geom.area) / max(target_block_area, 1e-12) - 1.0,
+    )
+    allow_empty_side = area_excess >= args.mesh_area_split_allow_empty_excess
     best: tuple[float, LineString] | None = None
     for line, bonus in _mesh_split_candidate_lines(
         block,
@@ -4016,13 +4082,18 @@ def _mesh_best_block_split(
             continue
         members_by_part = _classify_points_to_polys(parts, xy, block.point_idx)
         counts = np.asarray([len(m) for m in members_by_part], dtype=np.float64)
-        if np.count_nonzero(counts) < 2:
+        nonempty = int(np.count_nonzero(counts))
+        if nonempty < (1 if allow_empty_side else 2):
             continue
-        count_balance = float(counts.min() / max(counts.max(), 1.0))
-        if count_balance < args.mesh_split_min_count_balance:
+        count_balance = (
+            float(counts.min() / max(counts.max(), 1.0)) if nonempty >= 2 else 0.0
+        )
+        if not allow_empty_side and count_balance < args.mesh_split_min_count_balance:
             continue
         area = np.asarray([p.area for p in parts], dtype=np.float64)
         area_balance = float(area.min() / max(area.max(), 1e-12))
+        if allow_empty_side and area_balance < args.mesh_area_split_min_balance:
+            continue
         aspect = max(_polygon_aspect_ratio(p) for p in parts)
         aspect_score = 1.0 / (
             1.0 + max(0.0, math.log(aspect / max(args.mesh_target_block_aspect, 1e-9)))
@@ -4035,12 +4106,13 @@ def _mesh_best_block_split(
         if road_line.length < slot_step * args.boundary_road_min_length_slots:
             continue
         score = (
-            count_balance * 0.44
-            + area_balance * 0.22
+            count_balance * (0.44 if not allow_empty_side else 0.18)
+            + area_balance * (0.22 if not allow_empty_side else 0.42)
             + aspect_score * 0.24
             + min(road_line.length / max(_mesh_poly_diag(block.geom), 1e-9), 1.0)
             * 0.10
             + bonus
+            + min(area_excess * 0.02, 0.22)
         )
         if best is None or score > best[0]:
             best = (score, road_line)
@@ -4315,8 +4387,10 @@ def _mesh_slots_for_blocks(
         return MeshSlotResult(
             slots=_slotset_empty(),
             block_index=np.empty(0, dtype=np.int32),
+            parcel_valid=np.empty(0, dtype=bool),
             rejected_outside=0,
             rejected_roadless=0,
+            rejected_parcel=0,
         )
     tree = shapely.STRtree(road_lines)
     road_corridor = GeometryCollection()
@@ -4344,8 +4418,10 @@ def _mesh_slots_for_blocks(
     side_out: list[int] = []
     along_out: list[float] = []
     block_out: list[int] = []
+    parcel_valid_out: list[bool] = []
     rejected_outside = 0
     rejected_roadless = 0
+    rejected_parcel = 0
     for block_no, block in enumerate(blocks):
         if block.geom.is_empty or block.geom.area <= 0:
             continue
@@ -4396,6 +4472,28 @@ def _mesh_slots_for_blocks(
             if not road_corridor.is_empty and footprint.intersects(road_corridor):
                 rejected_outside += 1
                 continue
+            parcel_valid = True
+            if args.parcel_validate_slots:
+                parcel_width, parcel_depth = _parcel_dimensions(
+                    building_width=width,
+                    building_depth=depth,
+                    frontage_distance=float(np.linalg.norm(center - frontage)),
+                    global_nn=global_nn,
+                    args=args,
+                )
+                parcel_center = frontage + normal * (parcel_depth * 0.5)
+                parcel = _rect_poly_from_axes(
+                    parcel_center,
+                    tangent,
+                    normal,
+                    parcel_width,
+                    parcel_depth,
+                )
+                if not block.geom.covers(parcel):
+                    rejected_parcel += 1
+                    parcel_valid = False
+                    if args.parcel_reject_invalid_slots:
+                        continue
             xy_out.append(center)
             frontage_out.append(road_frontage)
             angle_out.append(angle)
@@ -4405,12 +4503,15 @@ def _mesh_slots_for_blocks(
             side_out.append(1)
             along_out.append(d)
             block_out.append(block_no)
+            parcel_valid_out.append(parcel_valid)
     if not xy_out:
         return MeshSlotResult(
             slots=_slotset_empty(),
             block_index=np.empty(0, dtype=np.int32),
+            parcel_valid=np.empty(0, dtype=bool),
             rejected_outside=rejected_outside,
             rejected_roadless=rejected_roadless,
+            rejected_parcel=rejected_parcel,
         )
     slots = SlotSet(
         xy=np.vstack(xy_out).astype(np.float64),
@@ -4423,6 +4524,7 @@ def _mesh_slots_for_blocks(
         along=np.asarray(along_out, dtype=np.float32),
     )
     block_index = np.asarray(block_out, dtype=np.int32)
+    parcel_valid = np.asarray(parcel_valid_out, dtype=bool)
     keep = _mesh_filter_slot_indices(
         slots,
         seed=args.seed + island_id * 9176,
@@ -4432,8 +4534,10 @@ def _mesh_slots_for_blocks(
     return MeshSlotResult(
         slots=_take_slots(slots, keep),
         block_index=block_index[keep],
+        parcel_valid=parcel_valid[keep],
         rejected_outside=rejected_outside,
         rejected_roadless=rejected_roadless,
+        rejected_parcel=rejected_parcel,
     )
 
 
@@ -4445,6 +4549,8 @@ def _assign_slots_by_mesh_blocks(
     *,
     global_nn: float,
     args,
+    slot_penalty: np.ndarray | None = None,
+    penalty_cost: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, int]]:
     out = np.full(len(xy), -1, dtype=np.int64)
     used = np.zeros(len(slots.xy), dtype=bool)
@@ -4477,6 +4583,8 @@ def _assign_slots_by_mesh_blocks(
             slots.xy[cand],
             args.max_hungarian,
             candidate_k=args.assignment_candidate_k,
+            slot_penalty=slot_penalty[cand] if slot_penalty is not None else None,
+            penalty_cost=penalty_cost,
         )
         chosen = cand[local]
         out[assign_members] = chosen
@@ -4491,6 +4599,8 @@ def _assign_slots_by_mesh_blocks(
                 slots.xy[free],
                 args.max_hungarian,
                 candidate_k=args.assignment_candidate_k,
+                slot_penalty=slot_penalty[free] if slot_penalty is not None else None,
+                penalty_cost=penalty_cost,
             )
             chosen = free[fill]
             out[missing[:fill_count]] = chosen
@@ -4952,6 +5062,7 @@ def _layout_mesh_island(
     )
     slots = slot_result.slots
     slot_block = slot_result.block_index
+    slot_parcel_valid = slot_result.parcel_valid
     generated_slots = int(len(slots.xy))
     slot_road_hit = _slot_other_road_hit_mask(
         slots,
@@ -4966,6 +5077,9 @@ def _layout_mesh_island(
         args=args,
     )
     if len(slots.xy):
+        parcel_penalty_cost = (
+            global_nn * args.parcel_invalid_slot_penalty_scale
+        ) ** 2
         assigned, assign_metrics = _assign_slots_by_mesh_blocks(
             assignment_xy,
             slots,
@@ -4973,6 +5087,8 @@ def _layout_mesh_island(
             mesh_blocks,
             global_nn=global_nn,
             args=args,
+            slot_penalty=(~slot_parcel_valid).astype(np.float64),
+            penalty_cost=parcel_penalty_cost,
         )
     else:
         assigned = np.full(len(xy), -1, dtype=np.int64)
@@ -5007,6 +5123,12 @@ def _layout_mesh_island(
                 np.full(len(fallback_slotset.xy), -1, dtype=np.int32),
             ]
         )
+        slot_parcel_valid = np.concatenate(
+            [
+                slot_parcel_valid,
+                np.zeros(len(fallback_slotset.xy), dtype=bool),
+            ]
+        )
         if len(slot_road_hit):
             slot_road_hit = np.concatenate(
                 [
@@ -5029,6 +5151,7 @@ def _layout_mesh_island(
     selected_depth = slots.depth[assigned]
     selected_angle = slots.angle[assigned]
     selected_block = slot_block[assigned]
+    selected_parcel_valid = slot_parcel_valid[assigned]
     footprint_metrics = _selected_footprint_metrics(
         selected_xy=selected_xy,
         selected_width=selected_width,
@@ -5131,6 +5254,11 @@ def _layout_mesh_island(
         "slot_road_hit_candidates": int(np.count_nonzero(slot_road_hit)),
         "mesh_slot_rejected_outside": int(slot_result.rejected_outside),
         "mesh_slot_rejected_roadless": int(slot_result.rejected_roadless),
+        "mesh_slot_rejected_parcel": int(slot_result.rejected_parcel),
+        "mesh_slot_invalid_parcel_candidates": int(
+            np.count_nonzero(~slot_result.parcel_valid)
+        ),
+        "mesh_selected_invalid_parcels": int(np.count_nonzero(~selected_parcel_valid)),
         **street_metrics,
         **assign_metrics,
         **footprint_metrics,
@@ -5517,6 +5645,197 @@ def _block_shape_metrics(blocks: list[Block]) -> dict[str, float]:
         "block_aspect_p95": float(np.quantile(aspects, 0.95)),
         "block_aspect_p99": float(np.quantile(aspects, 0.99)),
         "block_aspect_max": float(np.max(aspects)),
+    }
+
+
+def _rect_poly_from_axes(
+    center: np.ndarray,
+    tangent: np.ndarray,
+    normal: np.ndarray,
+    width: float,
+    depth: float,
+) -> Polygon:
+    hw = width * 0.5
+    hd = depth * 0.5
+    corners = np.array(
+        [
+            center - tangent * hw - normal * hd,
+            center + tangent * hw - normal * hd,
+            center + tangent * hw + normal * hd,
+            center - tangent * hw + normal * hd,
+            center - tangent * hw - normal * hd,
+        ],
+        dtype=np.float64,
+    )
+    return Polygon(corners)
+
+
+def _parcel_dimensions(
+    *,
+    building_width: float,
+    building_depth: float,
+    frontage_distance: float,
+    global_nn: float,
+    args,
+) -> tuple[float, float]:
+    width = max(
+        building_width * args.parcel_width_building_scale,
+        global_nn * args.parcel_min_width_scale,
+    )
+    needed_depth = (
+        frontage_distance
+        + building_depth * 0.5
+        + global_nn * args.parcel_back_clearance_scale
+    )
+    preferred_depth = max(
+        building_depth * args.parcel_depth_building_scale,
+        width * args.parcel_min_depth_width_ratio,
+        needed_depth,
+    )
+    max_depth = width * args.parcel_max_depth_width_ratio
+    depth = max(needed_depth, min(preferred_depth, max_depth))
+    return float(width), float(depth)
+
+
+def _parcel_poly_from_row(row: dict, *, global_nn: float, args) -> Polygon:
+    xy = np.array([float(row["x"]), float(row["y"])], dtype=np.float64)
+    frontage = np.array(
+        [float(row["frontage_x"]), float(row["frontage_y"])],
+        dtype=np.float64,
+    )
+    building_tangent = np.array(
+        [
+            math.cos(float(row["building_angle"])),
+            math.sin(float(row["building_angle"])),
+        ],
+        dtype=np.float64,
+    )
+    normal = xy - frontage
+    dist = float(np.linalg.norm(normal))
+    if dist <= 1e-12:
+        normal = np.array([-building_tangent[1], building_tangent[0]], dtype=np.float64)
+        dist = 0.0
+    else:
+        normal /= dist
+    tangent = np.array([normal[1], -normal[0]], dtype=np.float64)
+    if float(np.dot(tangent, building_tangent)) < 0:
+        tangent = -tangent
+    width, depth = _parcel_dimensions(
+        building_width=float(row["building_width"]),
+        building_depth=float(row["building_depth"]),
+        frontage_distance=dist,
+        global_nn=global_nn,
+        args=args,
+    )
+    center = frontage + normal * (depth * 0.5)
+    return _rect_poly_from_axes(center, tangent, normal, width, depth)
+
+
+def _building_poly_from_row(row: dict) -> Polygon:
+    xy = np.array([float(row["x"]), float(row["y"])], dtype=np.float64)
+    tangent = np.array(
+        [
+            math.cos(float(row["building_angle"])),
+            math.sin(float(row["building_angle"])),
+        ],
+        dtype=np.float64,
+    )
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    return _rect_poly_from_axes(
+        xy,
+        tangent,
+        normal,
+        float(row["building_width"]),
+        float(row["building_depth"]),
+    )
+
+
+def _clip_parcel_to_block(parcel: Polygon, block: Polygon, building: Polygon):
+    clipped = _safe_geom(parcel.intersection(block))
+    if clipped.is_empty:
+        return GeometryCollection()
+    parts = list(iter_polygons(clipped))
+    if not parts:
+        return GeometryCollection()
+    containing = [p for p in parts if p.covers(building.representative_point())]
+    if containing:
+        out = max(containing, key=lambda p: p.area)
+    else:
+        out = max(parts, key=lambda p: p.area)
+    if not out.covers(building):
+        eps = max(math.sqrt(max(building.area, 0.0)) * 1e-6, 1e-12)
+        out = _safe_geom(out.union(building.buffer(eps, join_style="mitre")))
+    return out
+
+
+def _write_parcels(
+    points: pl.DataFrame,
+    *,
+    blocks: list[Block],
+    out_path: Path,
+    global_nn: float,
+    args,
+) -> dict[str, float | int]:
+    block_by_id = {int(block.block_id): block.geom for block in blocks}
+    feats = []
+    aspects: list[float] = []
+    area_ratios: list[float] = []
+    contains_building = 0
+    missing = 0
+    bad_aspect = 0
+    for row in points.iter_rows(named=True):
+        if row.get("lot_id") is None or int(row["lot_id"]) < 0:
+            continue
+        raw = _parcel_poly_from_row(row, global_nn=global_nn, args=args)
+        building = _building_poly_from_row(row)
+        geom = raw
+        block = block_by_id.get(int(row["block_id"]))
+        if block is not None and args.parcel_clip_to_block:
+            geom = _clip_parcel_to_block(raw, block, building)
+        geom = _safe_geom(geom)
+        if geom.is_empty:
+            missing += 1
+            continue
+        aspect = _polygon_aspect_ratio(geom)
+        aspects.append(aspect)
+        if aspect >= args.parcel_bad_aspect_threshold:
+            bad_aspect += 1
+        if geom.covers(building):
+            contains_building += 1
+        area_ratios.append(float(geom.area / max(raw.area, 1e-12)))
+        feats.append(
+            _geom_feature(
+                geom,
+                {
+                    "lot_id": int(row["lot_id"]),
+                    "block_id": int(row["block_id"]),
+                    "road_id": int(row["road_id"]),
+                    "world_id": row.get("world_id"),
+                    "region": int(row["region"]),
+                    "contains_building": bool(geom.covers(building)),
+                    "aspect": float(aspect),
+                    "area_ratio": float(area_ratios[-1]),
+                },
+            )
+        )
+    _write_geojson(feats, out_path)
+    arr = np.asarray(aspects, dtype=np.float64)
+    ratios = np.asarray(area_ratios, dtype=np.float64)
+    return {
+        "parcel_count": int(len(feats)),
+        "parcel_missing": int(missing),
+        "parcel_contains_building": int(contains_building),
+        "parcel_building_violations": int(len(feats) - contains_building),
+        "parcel_bad_aspect": int(bad_aspect),
+        "parcel_aspect_median": float(np.median(arr)) if len(arr) else 0.0,
+        "parcel_aspect_p90": float(np.quantile(arr, 0.90)) if len(arr) else 0.0,
+        "parcel_aspect_p95": float(np.quantile(arr, 0.95)) if len(arr) else 0.0,
+        "parcel_aspect_p99": float(np.quantile(arr, 0.99)) if len(arr) else 0.0,
+        "parcel_aspect_max": float(np.max(arr)) if len(arr) else 0.0,
+        "parcel_area_ratio_p05": float(np.quantile(ratios, 0.05))
+        if len(ratios)
+        else 0.0,
+        "parcel_area_ratio_median": float(np.median(ratios)) if len(ratios) else 0.0,
     }
 
 
@@ -6317,7 +6636,7 @@ def main() -> None:
     ap.add_argument("--mesh-contour-spacing-scale", type=float, default=13.0)
     ap.add_argument("--mesh-contour-slot-spacing-scale", type=float, default=30.0)
     ap.add_argument("--mesh-contour-max-offset-frac", type=float, default=0.22)
-    ap.add_argument("--mesh-contour-max-rings", type=int, default=2)
+    ap.add_argument("--mesh-contour-max-rings", type=int, default=0)
     ap.add_argument("--mesh-contour-collector-every", type=int, default=2)
     ap.add_argument("--mesh-downtown-min-worlds", type=int, default=900)
     ap.add_argument("--mesh-downtown-radius-quantile", type=float, default=0.42)
@@ -6327,12 +6646,13 @@ def main() -> None:
     ap.add_argument("--mesh-downtown-max-lines", type=int, default=8)
     ap.add_argument("--mesh-downtown-grid-extent-frac", type=float, default=0.78)
     ap.add_argument("--mesh-ring-worlds-scale", type=float, default=70.0)
-    ap.add_argument("--mesh-max-city-rings", type=int, default=2)
+    ap.add_argument("--mesh-max-city-rings", type=int, default=1)
     ap.add_argument("--mesh-ring-inner-quantile", type=float, default=0.66)
     ap.add_argument("--mesh-ring-outer-quantile", type=float, default=0.88)
     ap.add_argument("--mesh-ring-max-aspect", type=float, default=2.8)
     ap.add_argument("--mesh-ring-min-downtown-gap", type=float, default=1.22)
     ap.add_argument("--mesh-ring-vertices", type=int, default=192)
+    ap.add_argument("--mesh-ring-warp-frac", type=float, default=0.12)
     ap.add_argument("--mesh-spoke-worlds-scale", type=float, default=85.0)
     ap.add_argument("--mesh-min-spokes", type=int, default=4)
     ap.add_argument("--mesh-max-spokes", type=int, default=8)
@@ -6340,10 +6660,14 @@ def main() -> None:
     ap.add_argument("--mesh-spoke-collector-every", type=int, default=4)
     ap.add_argument("--mesh-spoke-start-ring-frac", type=float, default=0.98)
     ap.add_argument("--mesh-spoke-min-end-frac", type=float, default=1.55)
+    ap.add_argument("--mesh-spoke-curve-frac", type=float, default=0.12)
+    ap.add_argument("--mesh-spoke-curve-vertices", type=int, default=24)
     ap.add_argument("--mesh-axis-min-worlds", type=int, default=10000)
     ap.add_argument("--mesh-cross-axis-min-worlds", type=int, default=26000)
     ap.add_argument("--mesh-min-block-area-scale", type=float, default=5.0)
-    ap.add_argument("--mesh-target-block-area-scale", type=float, default=42.0)
+    ap.add_argument("--mesh-target-block-area-scale", type=float, default=30.0)
+    ap.add_argument("--mesh-area-split-allow-empty-excess", type=float, default=1.6)
+    ap.add_argument("--mesh-area-split-min-balance", type=float, default=0.16)
     ap.add_argument("--mesh-area-refine-min-worlds", type=int, default=12)
     ap.add_argument("--mesh-area-refine-score-scale", type=float, default=10.0)
     ap.add_argument("--mesh-capacity-spacing-scale", type=float, default=1.25)
@@ -6367,6 +6691,29 @@ def main() -> None:
     ap.add_argument("--mesh-slot-phase", type=float, default=0.5)
     ap.add_argument("--mesh-slot-filter-building-scale", type=float, default=0.78)
     ap.add_argument("--mesh-slot-filter-radius-scale", type=float, default=0.86)
+    ap.add_argument(
+        "--parcel-validate-slots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument(
+        "--parcel-reject-invalid-slots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    ap.add_argument("--parcel-invalid-slot-penalty-scale", type=float, default=18.0)
+    ap.add_argument("--parcel-width-building-scale", type=float, default=1.85)
+    ap.add_argument("--parcel-min-width-scale", type=float, default=0.40)
+    ap.add_argument("--parcel-back-clearance-scale", type=float, default=0.08)
+    ap.add_argument("--parcel-depth-building-scale", type=float, default=2.25)
+    ap.add_argument("--parcel-min-depth-width-ratio", type=float, default=1.0)
+    ap.add_argument("--parcel-max-depth-width-ratio", type=float, default=2.7)
+    ap.add_argument(
+        "--parcel-clip-to-block",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--parcel-bad-aspect-threshold", type=float, default=4.0)
     ap.add_argument("--planar-boundary-resample-scale", type=float, default=2.35)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
@@ -6554,6 +6901,14 @@ def main() -> None:
         simplify=global_nn * args.landuse_simplify_scale,
     )
     metrics.update(landuse_metrics)
+    parcel_metrics = _write_parcels(
+        out_points,
+        blocks=blocks,
+        out_path=args.out_dir / "parcels.geojson",
+        global_nn=global_nn,
+        args=args,
+    )
+    metrics.update(parcel_metrics)
     _write_geojson(
         _road_features(roads, simplify=global_nn * args.road_lod_simplify_scale),
         args.out_dir / "roads.geojson",
@@ -6580,7 +6935,7 @@ def main() -> None:
         "top": top_level,
         "sub": sub_level,
         "layout": (
-            "city-mesh-v2" if args.layout_engine == "mesh" else "city-planar-v20"
+            "city-mesh-v3" if args.layout_engine == "mesh" else "city-planar-v20"
         ),
     }
     assets = dict(out_manifest.get("assets") or {})
@@ -6590,6 +6945,7 @@ def main() -> None:
             "meta": "worlds_meta.parquet",
             "land": "land.geojson",
             "landuse": "landuse.geojson",
+            "parcels": "parcels.geojson",
             "roads": "roads.geojson",
             "roads_mid": "roads_mid.geojson",
             "roads_near": "roads_near.geojson",

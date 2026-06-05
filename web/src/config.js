@@ -47,6 +47,12 @@ export const LANDUSE = {
   developedColor: [232, 231, 224, 70],
 };
 
+export const PARCELS = {
+  visibleFromTier: "near",
+  lineColor: [118, 116, 108, 130],
+  lineWidth: 0.65,
+};
+
 // Region "background" fills (continent l3 + sub-region l2), drawn under the cells
 // to give the space an underlying color field even where cells leave gaps.
 export const REGION_BG = {

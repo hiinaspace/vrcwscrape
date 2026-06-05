@@ -14,6 +14,7 @@ import {
   LABELS,
   LAND,
   OCEAN,
+  PARCELS,
   REGION_BG,
   REGION_PALETTE,
   ROADS,
@@ -279,6 +280,7 @@ export default function WorldMap({
   const [roads, setRoads] = useState(null);
   const [roadsMid, setRoadsMid] = useState(null);
   const [roadsNear, setRoadsNear] = useState(null);
+  const [parcels, setParcels] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
   // Hold label rendering until Inter is loaded, so deck builds the SDF atlas from the
@@ -287,6 +289,7 @@ export default function WorldMap({
   const baseZoom = useRef(0);
   const wrapRef = useRef(null);
   const focusAnimation = useRef(null);
+  const parcelsRequested = useRef(false);
 
   const cancelFocusAnimation = () => {
     if (focusAnimation.current != null) cancelAnimationFrame(focusAnimation.current);
@@ -724,6 +727,16 @@ export default function WorldMap({
     return features;
   }, [roads, roadsMid, roadsNear, tier]);
 
+  useEffect(() => {
+    if (!isCity || parcels || parcelsRequested.current) return;
+    if (TIER_RANK[tier] < TIER_RANK[PARCELS.visibleFromTier]) return;
+    parcelsRequested.current = true;
+    const base = import.meta.env.BASE_URL + DATA_DIR;
+    fetch(base + "parcels.geojson")
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setParcels, () => setParcels(null));
+  }, [isCity, parcels, tier]);
+
   if (!viewState) {
     return (
       <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
@@ -736,6 +749,8 @@ export default function WorldMap({
     TIER_RANK[tier] >=
     TIER_RANK[isCity ? BUILDINGS.strokeMinZoomTier : CELLS.strokeMinZoomTier];
   const roadsVisible = roads && TIER_RANK[tier] >= TIER_RANK[ROADS.visibleFromTier];
+  const parcelsVisible =
+    isCity && parcels && TIER_RANK[tier] >= TIER_RANK[PARCELS.visibleFromTier];
   const roadWidth = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
@@ -857,6 +872,17 @@ export default function WorldMap({
         getLineWidth: selected,
       },
     }),
+    parcelsVisible &&
+      new GeoJsonLayer({
+        id: "parcels",
+        data: parcels,
+        filled: false,
+        stroked: true,
+        getLineColor: PARCELS.lineColor,
+        lineWidthUnits: "pixels",
+        getLineWidth: PARCELS.lineWidth,
+        pickable: false,
+      }),
     roadsVisible &&
       new GeoJsonLayer({
         id: "roads-casing",
