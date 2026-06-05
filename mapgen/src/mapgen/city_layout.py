@@ -446,6 +446,74 @@ def _concat_slots(slotsets: list[SlotSet]) -> SlotSet:
     )
 
 
+def _density_scaled_slots(
+    slots: SlotSet,
+    *,
+    demand_xy: np.ndarray,
+    global_nn: float,
+    base_building_scale: float,
+    island_id: int,
+    args,
+) -> SlotSet:
+    if (
+        len(slots.xy) == 0
+        or len(demand_xy) < 2
+        or args.building_density_scale_power <= 0
+    ):
+        return slots
+    k = min(max(1, int(args.building_density_knn)), len(demand_xy))
+    tree = cKDTree(demand_xy)
+    slot_dist, _slot_idx = tree.query(slots.frontage, k=k, workers=-1)
+    slot_dist = np.asarray(slot_dist, dtype=np.float64)
+    slot_radius = slot_dist if slot_dist.ndim == 1 else slot_dist[:, -1]
+
+    sample_n = min(max(1, int(args.building_density_reference_sample)), len(demand_xy))
+    rng = np.random.default_rng(args.seed + island_id * 3301)
+    sample = rng.choice(len(demand_xy), size=sample_n, replace=False)
+    ref_k = min(k + 1, len(demand_xy))
+    ref_dist, _ref_idx = tree.query(demand_xy[sample], k=ref_k, workers=-1)
+    ref_dist = np.asarray(ref_dist, dtype=np.float64)
+    ref_radius = ref_dist if ref_dist.ndim == 1 else ref_dist[:, -1]
+    ref = float(
+        np.quantile(
+            ref_radius[np.isfinite(ref_radius)],
+            args.building_density_reference_quantile,
+        )
+    )
+    ref = max(ref, global_nn * 0.15, 1e-9)
+    scale = np.clip(
+        (np.maximum(slot_radius, ref * 0.05) / ref)
+        ** args.building_density_scale_power,
+        args.building_density_scale_min,
+        args.building_density_scale_max,
+    )
+    width = (slots.width.astype(np.float64) * scale).astype(np.float32)
+    depth = (slots.depth.astype(np.float64) * scale).astype(np.float32)
+    normal = np.column_stack([-np.sin(slots.angle), np.cos(slots.angle)]).astype(
+        np.float64
+    )
+    setback = (
+        global_nn
+        * args.building_setback_scale
+        * np.sqrt(np.maximum(base_building_scale * scale, 1e-9))
+    )
+    offset = depth.astype(np.float64) * 0.5 + setback
+    xy = (
+        slots.frontage
+        + normal * slots.side[:, None].astype(np.float64) * offset[:, None]
+    )
+    return SlotSet(
+        xy=xy,
+        frontage=slots.frontage,
+        angle=slots.angle,
+        width=width,
+        depth=depth,
+        road_index=slots.road_index,
+        side=slots.side,
+        along=slots.along,
+    )
+
+
 def _covers_xy(geom, xy: np.ndarray) -> np.ndarray:
     if len(xy) == 0:
         return np.zeros(0, dtype=bool)
@@ -1943,6 +2011,16 @@ def _generate_planar_streets(
             break
         if not progressed:
             break
+    road_specs.extend(
+        _leaf_access_lane_specs(
+            leaves,
+            xy=xy,
+            island_id=island_id,
+            global_nn=global_nn,
+            slot_step=slot_step,
+            args=args,
+        )
+    )
     road_specs = _snap_planar_junctions(
         road_specs,
         global_nn=global_nn,
@@ -2278,6 +2356,11 @@ def _leaf_access_lane_specs(
         n_worlds = len(leaf.point_idx)
         if n_worlds <= target * args.access_lane_trigger_scale:
             continue
+        density_norm = (
+            n_worlds * global_nn * global_nn / max(float(leaf.geom.area), 1e-12)
+        )
+        if density_norm < args.access_lane_density_scale:
+            continue
         pts = xy[leaf.point_idx]
         center, axes = _polygon_axes(leaf.geom, pts)
         lo, hi = _project_poly_bounds(leaf.geom, center, axes)
@@ -2327,6 +2410,12 @@ def _leaf_access_lane_specs(
             hi[tangent_axis] + tangent_pad,
             args.access_lane_curve_vertices,
         )
+        kind = (
+            "local"
+            if density_norm >= args.access_lane_local_density_scale
+            else "service"
+        )
+        width = args.local_road_width if kind == "local" else args.service_road_width
         for lane_no, offset in enumerate(offsets.tolist()):
             local = np.zeros((len(t), 2), dtype=np.float64)
             local[:, tangent_axis] = t
@@ -2346,8 +2435,8 @@ def _leaf_access_lane_specs(
                 _line_specs_from_geom(
                     line,
                     island_id=island_id,
-                    kind="service",
-                    width=args.service_road_width,
+                    kind=kind,
+                    width=width,
                     family=leaf_no * 1000 + lane_no,
                     min_length=min_length,
                 )
@@ -2359,6 +2448,7 @@ def _slots_for_road_specs(
     road_specs: list[RoadSpec],
     *,
     land_geom,
+    demand_xy: np.ndarray,
     global_nn: float,
     slot_step: float,
     road_spacing: float,
@@ -2382,6 +2472,14 @@ def _slots_for_road_specs(
         for i, spec in enumerate(road_specs)
     ]
     slots = _concat_slots(slotsets)
+    slots = _density_scaled_slots(
+        slots,
+        demand_xy=demand_xy,
+        global_nn=global_nn,
+        base_building_scale=building_scale,
+        island_id=island_id,
+        args=args,
+    )
     if len(slots.xy):
         slots = _take_slots(slots, _covers_xy(land_geom, slots.xy))
         slots = _filter_slots_for_major_corridors(
@@ -2581,6 +2679,7 @@ def _layout_streamline_island(
     slots = _slots_for_road_specs(
         road_specs,
         land_geom=build_geom,
+        demand_xy=xy,
         global_nn=global_nn,
         slot_step=slot_step,
         road_spacing=road_spacing,
@@ -3524,6 +3623,12 @@ def main() -> None:
     ap.add_argument("--building-local-nn-power", type=float, default=0.52)
     ap.add_argument("--building-local-scale-min", type=float, default=0.94)
     ap.add_argument("--building-local-scale-max", type=float, default=1.35)
+    ap.add_argument("--building-density-knn", type=int, default=12)
+    ap.add_argument("--building-density-reference-quantile", type=float, default=0.50)
+    ap.add_argument("--building-density-reference-sample", type=int, default=12000)
+    ap.add_argument("--building-density-scale-power", type=float, default=0.32)
+    ap.add_argument("--building-density-scale-min", type=float, default=0.74)
+    ap.add_argument("--building-density-scale-max", type=float, default=1.18)
     ap.add_argument("--building-width-jitter", type=float, default=0.09)
     ap.add_argument("--building-depth-jitter", type=float, default=0.12)
     ap.add_argument("--building-angle-jitter", type=float, default=0.018)
@@ -3663,6 +3768,8 @@ def main() -> None:
     ap.add_argument("--boundary-trunk-snap-scale", type=float, default=1.4)
     ap.add_argument("--boundary-trunk-overlap-frac", type=float, default=0.42)
     ap.add_argument("--access-lane-trigger-scale", type=float, default=0.50)
+    ap.add_argument("--access-lane-density-scale", type=float, default=2.4)
+    ap.add_argument("--access-lane-local-density-scale", type=float, default=4.0)
     ap.add_argument("--access-lane-max-per-block", type=int, default=40)
     ap.add_argument("--access-lane-margin-frac", type=float, default=0.18)
     ap.add_argument("--access-lane-min-spacing-scale", type=float, default=0.20)
@@ -3824,7 +3931,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v16",
+        "layout": "city-planar-v17",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
