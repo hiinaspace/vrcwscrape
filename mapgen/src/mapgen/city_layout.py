@@ -798,6 +798,23 @@ def _filter_slots_by_footprints(
     return _take_slots(slots, keep)
 
 
+def _slot_other_road_hit_mask(
+    slots: SlotSet,
+    *,
+    road_specs: list[RoadSpec],
+    global_nn: float,
+    args,
+) -> np.ndarray:
+    if len(slots.xy) == 0 or args.slot_footprint_road_clearance_scale <= 0:
+        return np.zeros(len(slots.xy), dtype=bool)
+    return _footprint_other_road_hits(
+        _slot_footprint_geoms(slots),
+        road_specs=road_specs,
+        road_index=slots.road_index,
+        clearance=global_nn * args.slot_footprint_road_clearance_scale,
+    )
+
+
 def _footprint_other_road_hits(
     footprints,
     *,
@@ -1969,12 +1986,19 @@ def _try_split_planar_parcel(
     global_nn: float,
     island_id: int,
     slot_step: float,
+    target_leaf_area: float,
     args,
     rng: np.random.Generator,
 ) -> tuple[list[SplitParcel], RoadSpec] | None:
     if parcel.depth >= args.recursive_max_depth:
         return None
-    if len(parcel.point_idx) < args.recursive_min_split_worlds:
+    area_split = parcel.geom.area > target_leaf_area * args.planar_area_split_scale
+    min_worlds = (
+        args.planar_area_split_min_worlds
+        if area_split
+        else args.recursive_min_split_worlds
+    )
+    if len(parcel.point_idx) < min_worlds:
         return None
     min_area = (global_nn * global_nn) * args.planar_min_parcel_area_scale
     best: tuple[float, list[Polygon], list[np.ndarray], LineString] | None = None
@@ -2081,6 +2105,7 @@ def _choose_split_leaf(
     *,
     global_nn: float,
     target_leaf_worlds: int,
+    target_leaf_area: float,
     failed: set[int],
     args,
 ) -> list[int]:
@@ -2089,14 +2114,30 @@ def _choose_split_leaf(
         if i in failed:
             continue
         n = len(leaf.point_idx)
-        if n < args.recursive_min_split_worlds:
+        area = float(leaf.geom.area)
+        area_excess = max(0.0, area / max(target_leaf_area, 1e-12) - 1.0)
+        area_split = area_excess > args.planar_area_split_scale - 1.0
+        min_worlds = (
+            args.planar_area_split_min_worlds
+            if area_split
+            else args.recursive_min_split_worlds
+        )
+        if n < min_worlds:
             continue
         excess = max(0.0, n - target_leaf_worlds)
-        if excess <= 0 and leaf.depth > 0:
+        if excess <= 0 and area_excess <= 0 and leaf.depth > 0:
             continue
         density = n / max(float(leaf.geom.area), global_nn * global_nn)
         irregularity = _polygon_irregularity(leaf.geom)
-        scored.append((excess * 8.0 + density * global_nn + irregularity, i))
+        scored.append(
+            (
+                excess * 8.0
+                + area_excess * args.planar_area_split_score_weight
+                + density * global_nn
+                + irregularity,
+                i,
+            )
+        )
     scored.sort(reverse=True)
     return [i for _score, i in scored[: args.recursive_split_search]]
 
@@ -2537,16 +2578,26 @@ def _generate_planar_streets(
     density_guide = _density_guide_for_points(xy, global_nn=global_nn, args=args)
     rng = np.random.default_rng(args.seed + island_id * 7919)
     target_leaf_worlds = max(args.planar_target_block_worlds, 6)
+    target_leaf_area = (
+        global_nn
+        * global_nn
+        * max(args.planar_target_block_area_scale, 1.0)
+    )
     splits = 0
     failed: set[int] = set()
     while splits < args.recursive_max_splits and leaves:
-        if max(len(leaf.point_idx) for leaf in leaves) <= target_leaf_worlds * 1.20:
+        if (
+            max(len(leaf.point_idx) for leaf in leaves) <= target_leaf_worlds * 1.20
+            and max(float(leaf.geom.area) for leaf in leaves)
+            <= target_leaf_area * args.planar_area_stop_scale
+        ):
             break
         progressed = False
         for i in _choose_split_leaf(
             leaves,
             global_nn=global_nn,
             target_leaf_worlds=target_leaf_worlds,
+            target_leaf_area=target_leaf_area,
             failed=failed,
             args=args,
         ):
@@ -2557,6 +2608,7 @@ def _generate_planar_streets(
                 global_nn=global_nn,
                 island_id=island_id,
                 slot_step=slot_step,
+                target_leaf_area=target_leaf_area,
                 args=args,
                 rng=rng,
             )
@@ -2605,6 +2657,7 @@ def _generate_planar_streets(
                 if density_guide is None
                 else int(len(density_guide.centers))
             ),
+            "target_leaf_area": float(target_leaf_area),
         },
     )
 
@@ -3271,6 +3324,13 @@ def _layout_streamline_island(
     )
     generated_slots = int(len(slots.xy))
     fallback_slots = 0
+    slot_road_hit = _slot_other_road_hit_mask(
+        slots,
+        road_specs=road_specs,
+        global_nn=global_nn,
+        args=args,
+    )
+    slot_penalty = slot_road_hit.astype(np.float64)
     assignment_xy, assignment_relax_metrics = _relax_assignment_targets(
         xy,
         global_nn=global_nn,
@@ -3311,6 +3371,7 @@ def _layout_streamline_island(
         assigned = _assign_slots_by_leaves(
             assignment_xy,
             slots.xy,
+            slot_penalty,
             leaves,
             global_nn=global_nn,
             args=args,
@@ -3319,6 +3380,7 @@ def _layout_streamline_island(
         assigned = _assign_slots_by_leaves_partial(
             assignment_xy,
             slots.xy,
+            slot_penalty,
             leaves,
             global_nn=global_nn,
             args=args,
@@ -3338,8 +3400,15 @@ def _layout_streamline_island(
                 assignment_xy[missing],
                 fallback_slotset.xy,
                 args.max_hungarian,
+                candidate_k=args.assignment_candidate_k,
             )
             slots = _concat_slots([slots, fallback_slotset])
+            slot_penalty = np.concatenate(
+                [
+                    slot_penalty,
+                    np.zeros(len(fallback_slotset.xy), dtype=np.float64),
+                ]
+            )
             assigned[missing] = offset + fallback_assign
             fallback_slots = int(len(fallback_slotset.xy))
     selected_xy = slots.xy[assigned]
@@ -3397,6 +3466,7 @@ def _layout_streamline_island(
         "splits": int(splits),
         "building_scale": float(building_scale),
         "local_nn_q": float(local_nn_q),
+        "slot_road_hit_candidates": int(np.count_nonzero(slot_road_hit)),
         **street_metrics,
         **footprint_metrics,
         **assignment_relax_metrics,
@@ -3414,17 +3484,28 @@ def _robust_extent(local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _assign_slots(
-    local: np.ndarray, slots: np.ndarray, max_hungarian: int
+    local: np.ndarray,
+    slots: np.ndarray,
+    max_hungarian: int,
+    *,
+    slot_penalty: np.ndarray | None = None,
+    penalty_cost: float = 0.0,
+    candidate_k: int = 64,
 ) -> np.ndarray:
     n = len(local)
+    penalty = None
+    if slot_penalty is not None and penalty_cost > 0:
+        penalty = np.asarray(slot_penalty, dtype=np.float64) * float(penalty_cost)
     if n <= max_hungarian:
         d2 = ((local[:, None, :] - slots[None, :, :]) ** 2).sum(axis=2)
+        if penalty is not None:
+            d2 = d2 + penalty[None, :]
         rows, cols = linear_sum_assignment(d2)
         out = np.empty(n, dtype=np.int64)
         out[rows] = cols
         return out
 
-    k = min(64, len(slots))
+    k = min(max(1, int(candidate_k)), len(slots))
     dist, nbr = cKDTree(slots).query(local, k=k, workers=_spatial_workers())
     dist = np.asarray(dist)
     nbr = np.asarray(nbr)
@@ -3432,7 +3513,10 @@ def _assign_slots(
         dist = dist[:, None]
         nbr = nbr[:, None]
     point_idx = np.repeat(np.arange(n, dtype=np.int64), dist.shape[1])
-    order = np.argsort(dist.ravel(), kind="stable")
+    cost = dist.ravel() ** 2
+    if penalty is not None:
+        cost = cost + penalty[nbr.ravel()]
+    order = np.argsort(cost, kind="stable")
     out = np.full(n, -1, dtype=np.int64)
     used = np.zeros(len(slots), dtype=bool)
     for flat in order.tolist():
@@ -3447,14 +3531,27 @@ def _assign_slots(
         tree = cKDTree(slots[remaining_slots])
         d, j = tree.query(
             local[remaining_points],
-            k=1,
+            k=min(k, len(remaining_slots)),
             workers=_spatial_workers(),
         )
-        order = np.argsort(np.asarray(d), kind="stable")
+        d = np.asarray(d)
+        j = np.asarray(j)
+        if d.ndim == 1:
+            d = d[:, None]
+            j = j[:, None]
+        fill_point_idx = np.repeat(
+            np.arange(len(remaining_points), dtype=np.int64),
+            d.shape[1],
+        )
+        fill_cost = d.ravel() ** 2
+        flat_slots = remaining_slots[j.ravel()]
+        if penalty is not None:
+            fill_cost = fill_cost + penalty[flat_slots]
+        order = np.argsort(fill_cost, kind="stable")
         progressed = False
         for pos in order.tolist():
-            p = int(remaining_points[pos])
-            s = int(remaining_slots[int(np.asarray(j)[pos])])
+            p = int(remaining_points[int(fill_point_idx[pos])])
+            s = int(flat_slots[pos])
             if out[p] == -1 and not used[s]:
                 out[p] = s
                 used[s] = True
@@ -3496,6 +3593,7 @@ def _slot_candidates_for_leaf(
 def _assign_slots_by_leaves(
     xy: np.ndarray,
     slots_xy: np.ndarray,
+    slot_penalty: np.ndarray,
     leaves: list[SplitParcel],
     *,
     global_nn: float,
@@ -3532,7 +3630,17 @@ def _assign_slots_by_leaves(
             continue
         if len(cand) < len(members):
             members = members[: len(cand)]
-        local_assign = _assign_slots(xy[members], slots_xy[cand], args.max_hungarian)
+        local_assign = _assign_slots(
+            xy[members],
+            slots_xy[cand],
+            args.max_hungarian,
+            slot_penalty=slot_penalty[cand],
+            penalty_cost=(
+                global_nn * args.assignment_footprint_road_penalty_scale
+            )
+            ** 2,
+            candidate_k=args.assignment_candidate_k,
+        )
         chosen = cand[local_assign]
         out[members] = chosen
         used[chosen] = True
@@ -3544,7 +3652,17 @@ def _assign_slots_by_leaves(
             raise RuntimeError(
                 f"not enough generated slots: {len(slots_xy)} for {len(xy)} points"
             )
-        fill = _assign_slots(xy[missing], slots_xy[free], args.max_hungarian)
+        fill = _assign_slots(
+            xy[missing],
+            slots_xy[free],
+            args.max_hungarian,
+            slot_penalty=slot_penalty[free],
+            penalty_cost=(
+                global_nn * args.assignment_footprint_road_penalty_scale
+            )
+            ** 2,
+            candidate_k=args.assignment_candidate_k,
+        )
         out[missing] = free[fill]
     return out
 
@@ -3552,6 +3670,7 @@ def _assign_slots_by_leaves(
 def _assign_slots_by_leaves_partial(
     xy: np.ndarray,
     slots_xy: np.ndarray,
+    slot_penalty: np.ndarray,
     leaves: list[SplitParcel],
     *,
     global_nn: float,
@@ -3582,6 +3701,12 @@ def _assign_slots_by_leaves_partial(
             xy[assign_members],
             slots_xy[cand],
             args.max_hungarian,
+            slot_penalty=slot_penalty[cand],
+            penalty_cost=(
+                global_nn * args.assignment_footprint_road_penalty_scale
+            )
+            ** 2,
+            candidate_k=args.assignment_candidate_k,
         )
         chosen = cand[local_assign]
         out[assign_members] = chosen
@@ -3598,7 +3723,17 @@ def _assign_slots_by_leaves_partial(
         fill_members = missing[
             np.argsort(np.asarray(dist), kind="stable")[: len(free)]
         ]
-        fill = _assign_slots(xy[fill_members], slots_xy[free], args.max_hungarian)
+        fill = _assign_slots(
+            xy[fill_members],
+            slots_xy[free],
+            args.max_hungarian,
+            slot_penalty=slot_penalty[free],
+            penalty_cost=(
+                global_nn * args.assignment_footprint_road_penalty_scale
+            )
+            ** 2,
+            candidate_k=args.assignment_candidate_k,
+        )
         out[fill_members] = free[fill]
     return out
 
@@ -4373,7 +4508,7 @@ def main() -> None:
     ap.add_argument("--slot-capacity-min", type=float, default=1.0)
     ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.28)
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
-    ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.75)
+    ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.80)
     ap.add_argument("--slot-filter-capacity-fallback", action="store_true")
     ap.add_argument(
         "--slot-footprint-validation",
@@ -4444,6 +4579,11 @@ def main() -> None:
     ap.add_argument("--recursive-curve-global-scale", type=float, default=3.5)
     ap.add_argument("--recursive-curve-wavelength-scale", type=float, default=0.65)
     ap.add_argument("--planar-target-block-worlds", type=int, default=14)
+    ap.add_argument("--planar-target-block-area-scale", type=float, default=70.0)
+    ap.add_argument("--planar-area-stop-scale", type=float, default=1.35)
+    ap.add_argument("--planar-area-split-scale", type=float, default=1.15)
+    ap.add_argument("--planar-area-split-min-worlds", type=int, default=6)
+    ap.add_argument("--planar-area-split-score-weight", type=float, default=2.5)
     ap.add_argument("--planar-min-parcel-area-scale", type=float, default=5.5)
     ap.add_argument("--planar-min-split-width-scale", type=float, default=0.35)
     ap.add_argument("--planar-split-margin-frac", type=float, default=0.08)
@@ -4536,6 +4676,12 @@ def main() -> None:
     ap.add_argument("--access-lane-curve-vertices", type=int, default=56)
     ap.add_argument("--local-assignment-buffer-scale", type=float, default=2.5)
     ap.add_argument("--local-assignment-candidate-factor", type=float, default=2.0)
+    ap.add_argument("--assignment-candidate-k", type=int, default=96)
+    ap.add_argument(
+        "--assignment-footprint-road-penalty-scale",
+        type=float,
+        default=4.0,
+    )
     ap.add_argument("--assignment-relax-iterations", type=int, default=14)
     ap.add_argument("--assignment-relax-min-dist-scale", type=float, default=1.25)
     ap.add_argument("--assignment-relax-strength", type=float, default=0.42)
@@ -4698,7 +4844,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v19",
+        "layout": "city-planar-v20",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
