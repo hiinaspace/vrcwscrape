@@ -31,6 +31,7 @@ from shapely import (
     MultiPolygon,
     Polygon,
 )
+from shapely.ops import polygonize
 from shapely.ops import split as split_geom
 
 from mapgen.land import build_land_geometry
@@ -115,6 +116,28 @@ class PlanarStreetResult:
 @dataclass
 class DensityGuide:
     centers: np.ndarray
+
+
+@dataclass
+class MeshCenter:
+    xy: np.ndarray
+    axes: np.ndarray
+    members: np.ndarray
+    radius: float
+
+
+@dataclass
+class MeshBlock:
+    geom: Polygon
+    point_idx: np.ndarray
+
+
+@dataclass
+class MeshSlotResult:
+    slots: SlotSet
+    block_index: np.ndarray
+    rejected_outside: int
+    rejected_roadless: int
 
 
 @dataclass
@@ -3201,6 +3224,1216 @@ def _fallback_service_slots(
     return road_specs, _concat_slots(slotsets)
 
 
+def _road_width_for_kind(kind: str, args) -> float:
+    if kind == "arterial":
+        return args.arterial_road_width
+    if kind == "collector":
+        return args.collector_road_width
+    if kind == "local":
+        return args.local_road_width
+    return args.service_road_width
+
+
+def _mesh_density_centers(
+    xy: np.ndarray,
+    *,
+    global_nn: float,
+    args,
+) -> list[MeshCenter]:
+    if len(xy) < max(args.mesh_density_min_worlds, 2):
+        return []
+    k = min(max(2, int(args.mesh_density_knn)), len(xy))
+    tree = cKDTree(xy)
+    dist, _idx = tree.query(xy, k=k, workers=_spatial_workers())
+    radius = np.asarray(dist, dtype=np.float64)
+    radius = radius if radius.ndim == 1 else radius[:, -1]
+    finite = np.isfinite(radius) & (radius > 0)
+    if not np.any(finite):
+        return []
+    threshold = float(np.quantile(radius[finite], args.mesh_density_quantile))
+    candidates = np.flatnonzero(finite & (radius <= threshold))
+    if len(candidates) == 0:
+        return []
+
+    min_sep = max(global_nn * args.mesh_density_center_min_sep_scale, 1e-9)
+    centers_xy: list[np.ndarray] = []
+    for i in candidates[np.argsort(radius[candidates], kind="stable")].tolist():
+        p = xy[i]
+        if any(float(np.linalg.norm(p - q)) < min_sep for q in centers_xy):
+            continue
+        centers_xy.append(p.astype(np.float64, copy=True))
+        if len(centers_xy) >= args.mesh_density_max_centers:
+            break
+    if not centers_xy:
+        return []
+
+    centers_arr = np.vstack(centers_xy)
+    _d, assigned = cKDTree(centers_arr).query(xy, k=1, workers=_spatial_workers())
+    out: list[MeshCenter] = []
+    for center_no, center_xy in enumerate(centers_arr):
+        members = np.flatnonzero(np.asarray(assigned) == center_no).astype(np.int64)
+        if len(members) < args.mesh_center_min_worlds:
+            continue
+        center, axes = _pca_axes(xy[members])
+        # Keep the high-density seed as the radial field origin, but use local PCA
+        # axes from its Voronoi demand catchment.
+        local_dist = np.linalg.norm(xy[members] - center_xy, axis=1)
+        finite_dist = local_dist[np.isfinite(local_dist)]
+        if len(finite_dist) == 0:
+            continue
+        reach = float(np.quantile(finite_dist, args.mesh_center_radius_quantile))
+        reach = max(reach, global_nn * args.mesh_city_min_radius_scale)
+        out.append(
+            MeshCenter(
+                xy=center_xy.astype(np.float64, copy=True),
+                axes=axes,
+                members=members,
+                radius=reach,
+            )
+        )
+    if not out and len(xy) >= args.mesh_center_min_worlds:
+        center, axes = _pca_axes(xy)
+        dist = np.linalg.norm(xy - center, axis=1)
+        out.append(
+            MeshCenter(
+                xy=center,
+                axes=axes,
+                members=np.arange(len(xy), dtype=np.int64),
+                radius=max(
+                    float(np.quantile(dist, args.mesh_center_radius_quantile)),
+                    global_nn * args.mesh_city_min_radius_scale,
+                ),
+            )
+        )
+    return out
+
+
+def _mesh_clip_line_specs(
+    line: LineString,
+    poly: Polygon,
+    *,
+    island_id: int,
+    kind: str,
+    family: int,
+    min_length: float,
+    args,
+    depth: int = -1,
+) -> list[RoadSpec]:
+    clipped = line.intersection(poly)
+    return _line_specs_from_geom(
+        clipped,
+        island_id=island_id,
+        kind=kind,
+        width=_road_width_for_kind(kind, args),
+        family=family,
+        min_length=min_length,
+        depth=depth,
+    )
+
+
+def _mesh_ellipse_line(
+    center: np.ndarray,
+    axes: np.ndarray,
+    rx: float,
+    ry: float,
+    *,
+    vertices: int,
+) -> LineString:
+    n = max(16, int(vertices))
+    t = np.linspace(0.0, math.tau, n, endpoint=False)
+    local = np.column_stack([np.cos(t) * rx, np.sin(t) * ry])
+    world = _to_world(local, center, axes)
+    world = np.vstack([world, world[0]])
+    return LineString(world)
+
+
+def _mesh_poly_diag(poly: Polygon) -> float:
+    minx, miny, maxx, maxy = poly.bounds
+    return float(math.hypot(maxx - minx, maxy - miny))
+
+
+def _mesh_axis_line(
+    origin: np.ndarray,
+    direction: np.ndarray,
+    *,
+    length: float,
+) -> LineString:
+    d = np.asarray(direction, dtype=np.float64)
+    norm = float(np.linalg.norm(d))
+    if norm <= 1e-12:
+        d = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        d /= norm
+    a = origin - d * length * 0.5
+    b = origin + d * length * 0.5
+    return LineString([(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))])
+
+
+def _mesh_contour_road_specs(
+    poly: Polygon,
+    *,
+    world_count: int,
+    island_id: int,
+    part_no: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    if (
+        world_count < args.mesh_contour_min_worlds
+        or poly.area < (global_nn * global_nn) * args.mesh_contour_min_area_scale
+    ):
+        return []
+    spacing = max(
+        global_nn * args.mesh_contour_spacing_scale,
+        slot_step * args.mesh_contour_slot_spacing_scale,
+    )
+    if spacing <= 0:
+        return []
+    max_offset = min(
+        math.sqrt(float(poly.area)) * args.mesh_contour_max_offset_frac,
+        spacing * args.mesh_contour_max_rings,
+    )
+    offsets = np.arange(spacing * 1.15, max_offset + spacing * 0.25, spacing)
+    min_length = slot_step * args.boundary_road_min_length_slots
+    specs: list[RoadSpec] = []
+    for ring_no, offset in enumerate(offsets.tolist()):
+        inner = _safe_geom(poly.buffer(-offset, join_style="round"))
+        parts = [p for p in iter_polygons(inner) if p.area > 0]
+        if not parts:
+            break
+        kind = (
+            "collector"
+            if ring_no % max(args.mesh_contour_collector_every, 1) == 0
+            else "local"
+        )
+        for inner_no, part in enumerate(parts):
+            if part.area < (global_nn * global_nn) * args.planar_min_parcel_area_scale:
+                continue
+            line = LineString(part.exterior.coords)
+            specs.extend(
+                _line_specs_from_geom(
+                    line,
+                    island_id=island_id,
+                    kind=kind,
+                    width=_road_width_for_kind(kind, args),
+                    family=-(41000 + part_no * 1000 + ring_no * 20 + inner_no),
+                    min_length=min_length,
+                    depth=ring_no + 1,
+                )
+            )
+    return specs
+
+
+def _mesh_center_road_specs(
+    poly: Polygon,
+    *,
+    center: MeshCenter,
+    xy: np.ndarray,
+    island_id: int,
+    center_no: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    members = center.members
+    if len(members) < args.mesh_center_min_worlds:
+        return []
+    pts = xy[members]
+    local = (pts - center.xy) @ center.axes
+    abs_local = np.abs(local)
+    if len(abs_local) == 0:
+        return []
+
+    ring_count = int(
+        np.clip(
+            math.ceil(math.sqrt(len(members)) / args.mesh_ring_worlds_scale),
+            1,
+            args.mesh_max_city_rings,
+        )
+    )
+    qs = np.linspace(
+        args.mesh_ring_inner_quantile,
+        args.mesh_ring_outer_quantile,
+        ring_count,
+    )
+    min_radius = global_nn * args.mesh_city_min_radius_scale
+    min_length = slot_step * args.boundary_road_min_length_slots
+    specs: list[RoadSpec] = []
+    last_rx = min_radius
+    last_ry = min_radius
+    for ring_no, q in enumerate(qs.tolist()):
+        rx = max(float(np.quantile(abs_local[:, 0], q)) * 1.08, min_radius)
+        ry = max(float(np.quantile(abs_local[:, 1], q)) * 1.08, min_radius)
+        long = max(rx, ry)
+        short = max(min(rx, ry), long / max(args.mesh_ring_max_aspect, 1.0))
+        if rx >= ry:
+            rx, ry = long, short
+        else:
+            rx, ry = short, long
+        last_rx = max(last_rx, rx)
+        last_ry = max(last_ry, ry)
+        kind = "collector" if ring_no == ring_count - 1 else "local"
+        line = _mesh_ellipse_line(
+            center.xy,
+            center.axes,
+            rx,
+            ry,
+            vertices=args.mesh_ring_vertices,
+        )
+        specs.extend(
+            _mesh_clip_line_specs(
+                line,
+                poly,
+                island_id=island_id,
+                kind=kind,
+                family=-(50000 + center_no * 100 + ring_no),
+                min_length=min_length,
+                args=args,
+                depth=ring_no + 1,
+            )
+        )
+
+    spoke_count = int(
+        np.clip(
+            math.ceil(math.sqrt(len(members)) / args.mesh_spoke_worlds_scale),
+            args.mesh_min_spokes,
+            args.mesh_max_spokes,
+        )
+    )
+    reach = max(last_rx, last_ry, center.radius) * args.mesh_spoke_reach_scale
+    reach = max(reach, min_radius * 2.0)
+    for spoke_no in range(spoke_count):
+        theta = (math.pi * spoke_no) / max(spoke_count, 1)
+        local_dir = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+        world_dir = center.axes @ local_dir
+        kind = (
+            "collector"
+            if spoke_no % max(args.mesh_spoke_collector_every, 1) == 0
+            else "local"
+        )
+        line = _mesh_axis_line(center.xy, world_dir, length=reach * 2.0)
+        specs.extend(
+            _mesh_clip_line_specs(
+                line,
+                poly,
+                island_id=island_id,
+                kind=kind,
+                family=-(52000 + center_no * 100 + spoke_no),
+                min_length=min_length,
+                args=args,
+                depth=1,
+            )
+        )
+    return specs
+
+
+def _mesh_axis_road_specs(
+    poly: Polygon,
+    pts: np.ndarray,
+    *,
+    island_id: int,
+    part_no: int,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    if len(pts) < args.mesh_axis_min_worlds:
+        return []
+    center, axes = _pca_axes(pts)
+    diag = _mesh_poly_diag(poly) * 1.6
+    min_length = slot_step * args.min_road_length_slots
+    specs: list[RoadSpec] = []
+    for axis_no in range(2):
+        if axis_no == 1 and len(pts) < args.mesh_cross_axis_min_worlds:
+            continue
+        kind = "collector" if axis_no == 0 else "local"
+        line = _mesh_axis_line(center, axes[:, axis_no], length=diag)
+        specs.extend(
+            _mesh_clip_line_specs(
+                line,
+                poly,
+                island_id=island_id,
+                kind=kind,
+                family=-(54000 + part_no * 10 + axis_no),
+                min_length=min_length,
+                args=args,
+                depth=0,
+            )
+        )
+    return specs
+
+
+def _mesh_initial_road_specs(
+    *,
+    parts: list[Polygon],
+    members_by_part: list[np.ndarray],
+    centers: list[MeshCenter],
+    xy: np.ndarray,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    specs = _planar_boundary_road_specs(
+        parts,
+        members_by_part=members_by_part,
+        island_id=island_id,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    for part_no, poly in enumerate(parts):
+        members = members_by_part[part_no]
+        pts = xy[members]
+        specs.extend(
+            _mesh_contour_road_specs(
+                poly,
+                world_count=len(members),
+                island_id=island_id,
+                part_no=part_no,
+                global_nn=global_nn,
+                slot_step=slot_step,
+                args=args,
+            )
+        )
+        specs.extend(
+            _mesh_axis_road_specs(
+                poly,
+                pts,
+                island_id=island_id,
+                part_no=part_no,
+                slot_step=slot_step,
+                args=args,
+            )
+        )
+        if centers:
+            member_set = set(members.tolist())
+            for center_no, center in enumerate(centers):
+                center_point = shapely.Point(
+                    float(center.xy[0]),
+                    float(center.xy[1]),
+                )
+                if not poly.covers(center_point):
+                    continue
+                overlap = np.asarray(
+                    [i for i in center.members.tolist() if i in member_set],
+                    dtype=np.int64,
+                )
+                if len(overlap) < args.mesh_center_min_worlds:
+                    continue
+                local_center = MeshCenter(
+                    xy=center.xy,
+                    axes=center.axes,
+                    members=overlap,
+                    radius=center.radius,
+                )
+                specs.extend(
+                    _mesh_center_road_specs(
+                        poly,
+                        center=local_center,
+                        xy=xy,
+                        island_id=island_id,
+                        center_no=center_no,
+                        global_nn=global_nn,
+                        slot_step=slot_step,
+                        args=args,
+                    )
+                )
+    return specs
+
+
+def _mesh_finalize_roads(
+    specs: list[RoadSpec],
+    *,
+    land_geom,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+    smooth: bool,
+) -> tuple[list[RoadSpec], dict[str, int]]:
+    if smooth:
+        specs = _postprocess_road_specs(
+            specs,
+            land_geom=land_geom,
+            global_nn=global_nn,
+            slot_step=slot_step,
+            args=args,
+        )
+    specs = _snap_planar_junctions(specs, global_nn=global_nn, args=args)
+    return _node_planar_road_specs(
+        specs,
+        island_id=island_id,
+        global_nn=global_nn,
+        args=args,
+    )
+
+
+def _mesh_polygonize_blocks(
+    *,
+    parts: list[Polygon],
+    road_specs: list[RoadSpec],
+    xy: np.ndarray,
+    global_nn: float,
+    args,
+) -> list[MeshBlock]:
+    boundary_lines: list[LineString] = []
+    for poly in parts:
+        boundary_lines.append(LineString(poly.exterior.coords))
+        boundary_lines.extend(LineString(ring.coords) for ring in poly.interiors)
+    road_lines = [
+        LineString(spec.coords)
+        for spec in road_specs
+        if len(spec.coords) >= 2 and LineString(spec.coords).length > 1e-9
+    ]
+    if not boundary_lines:
+        return []
+    land_union = _safe_geom(shapely.unary_union(parts))
+    min_area = (global_nn * global_nn) * args.mesh_min_block_area_scale
+    linework = shapely.unary_union([*boundary_lines, *road_lines])
+    faces = []
+    for face in polygonize(linework):
+        if face.is_empty:
+            continue
+        if not land_union.covers(face.representative_point()):
+            continue
+        clipped = _safe_geom(face.intersection(land_union))
+        for poly in iter_polygons(clipped):
+            if poly.area >= min_area:
+                faces.append(poly)
+    if not faces:
+        faces = [p for p in parts if p.area >= min_area]
+    members_by_face = _classify_points_to_polys(
+        faces,
+        xy,
+        np.arange(len(xy), dtype=np.int64),
+    )
+    return [
+        MeshBlock(geom=poly, point_idx=members)
+        for poly, members in zip(faces, members_by_face, strict=True)
+        if len(members) > 0
+    ]
+
+
+def _mesh_block_capacity(block: MeshBlock, *, slot_step: float, args) -> int:
+    spacing = max(slot_step * args.mesh_capacity_spacing_scale, 1e-9)
+    return max(
+        1,
+        int(
+            math.floor(
+                block.geom.exterior.length
+                * args.mesh_block_frontage_efficiency
+                / spacing
+            )
+        ),
+    )
+
+
+def _mesh_curved_split_line(
+    *,
+    origin: np.ndarray,
+    tangent: np.ndarray,
+    normal: np.ndarray,
+    length: float,
+    radius: float,
+    args,
+) -> LineString:
+    n = int(
+        np.clip(
+            length / max(radius * 0.05, 1e-9),
+            24,
+            args.road_curve_max_vertices,
+        )
+    )
+    t = np.linspace(-length * 0.5, length * 0.5, n)
+    curve = -(t * t) / max(radius * 2.0, 1e-9)
+    curve = np.clip(
+        curve * args.mesh_split_curve_strength,
+        -length * args.mesh_split_curve_max_frac,
+        length * args.mesh_split_curve_max_frac,
+    )
+    pts = origin + tangent[None, :] * t[:, None] + normal[None, :] * curve[:, None]
+    return LineString([(float(x), float(y)) for x, y in pts])
+
+
+def _mesh_split_candidate_lines(
+    block: MeshBlock,
+    xy: np.ndarray,
+    centers: list[MeshCenter],
+    *,
+    global_nn: float,
+    args,
+) -> list[tuple[LineString, float]]:
+    poly = block.geom
+    centroid = np.array([poly.centroid.x, poly.centroid.y], dtype=np.float64)
+    diag = _mesh_poly_diag(poly) * 1.5
+    out: list[tuple[LineString, float]] = []
+    if centers:
+        nearest = min(centers, key=lambda c: float(np.linalg.norm(centroid - c.xy)))
+        radial = centroid - nearest.xy
+        radius = float(np.linalg.norm(radial))
+        if radius > global_nn * 0.5:
+            radial /= radius
+            tangent = np.array([-radial[1], radial[0]], dtype=np.float64)
+            out.append(
+                (
+                    _mesh_curved_split_line(
+                        origin=centroid,
+                        tangent=tangent,
+                        normal=-radial,
+                        length=diag,
+                        radius=max(radius, global_nn),
+                        args=args,
+                    ),
+                    args.mesh_split_tensor_bonus,
+                )
+            )
+            out.append(
+                (
+                    _mesh_axis_line(centroid, radial, length=diag),
+                    args.mesh_split_tensor_bonus * 0.65,
+                )
+            )
+    pts = xy[block.point_idx]
+    center, axes = _polygon_axes(poly, pts)
+    lo, hi = _project_poly_bounds(poly, center, axes)
+    span = np.maximum(hi - lo, 1e-9)
+    major = int(np.argmax(span))
+    minor = 1 - major
+    for normal_axis, bonus in ((major, 0.0), (minor, -0.05)):
+        tangent_axis = 1 - normal_axis
+        local = np.zeros((2, 2), dtype=np.float64)
+        local[:, tangent_axis] = [
+            lo[tangent_axis] - span[tangent_axis] * 0.35,
+            hi[tangent_axis] + span[tangent_axis] * 0.35,
+        ]
+        if len(pts) > 1:
+            local_pts = (pts - center) @ axes
+            split_at = float(np.median(local_pts[:, normal_axis]))
+        else:
+            split_at = float((lo[normal_axis] + hi[normal_axis]) * 0.5)
+        local[:, normal_axis] = split_at
+        out.append((LineString(_to_world(local, center, axes)), bonus))
+    return out
+
+
+def _mesh_best_block_split(
+    block: MeshBlock,
+    xy: np.ndarray,
+    centers: list[MeshCenter],
+    *,
+    island_id: int,
+    family: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> RoadSpec | None:
+    if len(block.point_idx) < args.mesh_refine_min_worlds:
+        return None
+    min_area = (global_nn * global_nn) * args.mesh_min_block_area_scale
+    best: tuple[float, LineString] | None = None
+    for line, bonus in _mesh_split_candidate_lines(
+        block,
+        xy,
+        centers,
+        global_nn=global_nn,
+        args=args,
+    ):
+        try:
+            result = split_geom(block.geom, line)
+        except (ValueError, shapely.GEOSException):
+            continue
+        parts = [
+            p
+            for p in sorted(iter_polygons(result), key=lambda g: g.area, reverse=True)
+            if p.area >= min_area
+        ]
+        if len(parts) != 2:
+            continue
+        members_by_part = _classify_points_to_polys(parts, xy, block.point_idx)
+        counts = np.asarray([len(m) for m in members_by_part], dtype=np.float64)
+        if np.count_nonzero(counts) < 2:
+            continue
+        count_balance = float(counts.min() / max(counts.max(), 1.0))
+        if count_balance < args.mesh_split_min_count_balance:
+            continue
+        area = np.asarray([p.area for p in parts], dtype=np.float64)
+        area_balance = float(area.min() / max(area.max(), 1e-12))
+        aspect = max(_polygon_aspect_ratio(p) for p in parts)
+        aspect_score = 1.0 / (
+            1.0 + max(0.0, math.log(aspect / max(args.mesh_target_block_aspect, 1e-9)))
+        )
+        clipped = line.intersection(block.geom)
+        segments = [seg for seg in _iter_lines(clipped) if seg.length > 1e-9]
+        if not segments:
+            continue
+        road_line = max(segments, key=lambda seg: seg.length)
+        if road_line.length < slot_step * args.boundary_road_min_length_slots:
+            continue
+        score = (
+            count_balance * 0.44
+            + area_balance * 0.22
+            + aspect_score * 0.24
+            + min(road_line.length / max(_mesh_poly_diag(block.geom), 1e-9), 1.0)
+            * 0.10
+            + bonus
+        )
+        if best is None or score > best[0]:
+            best = (score, road_line)
+    if best is None:
+        return None
+    _score, road_line = best
+    density_norm = len(block.point_idx) * global_nn * global_nn / max(
+        float(block.geom.area),
+        1e-12,
+    )
+    kind = "local" if density_norm >= args.mesh_refine_local_density else "service"
+    return RoadSpec(
+        coords=[(float(x), float(y)) for x, y in road_line.coords],
+        kind=kind,
+        island_id=island_id,
+        width=_road_width_for_kind(kind, args),
+        family=family,
+        depth=2,
+    )
+
+
+def _mesh_refine_roads(
+    *,
+    road_specs: list[RoadSpec],
+    parts: list[Polygon],
+    xy: np.ndarray,
+    centers: list[MeshCenter],
+    island_id: int,
+    land_geom,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> tuple[list[RoadSpec], list[MeshBlock], dict[str, int]]:
+    road_specs, topo_metrics = _mesh_finalize_roads(
+        road_specs,
+        land_geom=land_geom,
+        island_id=island_id,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+        smooth=True,
+    )
+    metrics = {
+        "mesh_refine_added_roads": 0,
+        "mesh_refine_rounds": 0,
+        **topo_metrics,
+    }
+    if args.mesh_progress:
+        print(
+            f"      mesh island {island_id}: polygonize initial "
+            f"{len(road_specs):,} roads",
+            flush=True,
+        )
+    blocks = _mesh_polygonize_blocks(
+        parts=parts,
+        road_specs=road_specs,
+        xy=xy,
+        global_nn=global_nn,
+        args=args,
+    )
+    if args.mesh_progress:
+        print(
+            f"      mesh island {island_id}: initial {len(blocks):,} blocks",
+            flush=True,
+        )
+    for round_no in range(max(0, int(args.mesh_refine_rounds))):
+        scored: list[tuple[float, int, MeshBlock]] = []
+        for block_no, block in enumerate(blocks):
+            capacity = _mesh_block_capacity(block, slot_step=slot_step, args=args)
+            overload = len(block.point_idx) - capacity * args.mesh_capacity_target
+            if overload <= 0:
+                continue
+            scored.append((float(overload), block_no, block))
+        scored.sort(reverse=True, key=lambda x: x[0])
+        if not scored:
+            break
+        additions: list[RoadSpec] = []
+        for _overload, block_no, block in scored[: args.mesh_refine_batch]:
+            spec = _mesh_best_block_split(
+                block,
+                xy,
+                centers,
+                island_id=island_id,
+                family=round_no * 100000 + block_no,
+                global_nn=global_nn,
+                slot_step=slot_step,
+                args=args,
+            )
+            if spec is not None:
+                additions.append(spec)
+        if not additions:
+            break
+        if args.mesh_progress:
+            worst = scored[0][0] if scored else 0.0
+            print(
+                f"      mesh island {island_id}: refine {round_no + 1} "
+                f"adding {len(additions):,} roads "
+                f"(worst overload {worst:.1f})",
+                flush=True,
+            )
+        road_specs.extend(additions)
+        metrics["mesh_refine_added_roads"] += int(len(additions))
+        metrics["mesh_refine_rounds"] = round_no + 1
+        road_specs, topo = _mesh_finalize_roads(
+            road_specs,
+            land_geom=land_geom,
+            island_id=island_id,
+            global_nn=global_nn,
+            slot_step=slot_step,
+            args=args,
+            smooth=False,
+        )
+        metrics["topology_junction_merges"] += topo.get("topology_junction_merges", 0)
+        metrics["topology_short_edge_merges"] += topo.get(
+            "topology_short_edge_merges",
+            0,
+        )
+        blocks = _mesh_polygonize_blocks(
+            parts=parts,
+            road_specs=road_specs,
+            xy=xy,
+            global_nn=global_nn,
+            args=args,
+        )
+        if args.mesh_progress:
+            print(
+                f"      mesh island {island_id}: refine {round_no + 1} -> "
+                f"{len(road_specs):,} roads, {len(blocks):,} blocks",
+                flush=True,
+            )
+    return road_specs, blocks, metrics
+
+
+def _line_tangent_at(line: LineString, distance: float, eps: float) -> np.ndarray:
+    total = max(float(line.length), 1e-12)
+    a = line.interpolate(max(0.0, distance - eps))
+    b = line.interpolate(min(total, distance + eps))
+    v = np.array([b.x - a.x, b.y - a.y], dtype=np.float64)
+    norm = float(np.linalg.norm(v))
+    if norm <= 1e-12:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return v / norm
+
+
+def _nearest_road_for_frontage(
+    point: np.ndarray,
+    *,
+    road_lines: list[LineString],
+    tree: shapely.STRtree,
+    match_tol: float,
+) -> tuple[int, np.ndarray, float] | None:
+    p = shapely.Point(float(point[0]), float(point[1]))
+    cand = np.asarray(tree.query(p.buffer(match_tol).envelope), dtype=np.int64)
+    best: tuple[int, np.ndarray, float] | None = None
+    for road_idx in cand.tolist():
+        line = road_lines[road_idx]
+        d = float(line.distance(p))
+        if d > match_tol:
+            continue
+        q = line.interpolate(line.project(p))
+        qxy = np.array([q.x, q.y], dtype=np.float64)
+        if best is None or d < best[2]:
+            best = (road_idx, qxy, d)
+    return best
+
+
+def _footprint_poly(
+    xy: np.ndarray,
+    tangent: np.ndarray,
+    width: float,
+    depth: float,
+) -> Polygon:
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    hw = width * 0.5
+    hd = depth * 0.5
+    corners = np.array(
+        [
+            xy - tangent * hw - normal * hd,
+            xy + tangent * hw - normal * hd,
+            xy + tangent * hw + normal * hd,
+            xy - tangent * hw + normal * hd,
+            xy - tangent * hw - normal * hd,
+        ],
+        dtype=np.float64,
+    )
+    return Polygon(corners)
+
+
+def _mesh_filter_slot_indices(
+    slots: SlotSet,
+    *,
+    seed: int,
+    global_nn: float,
+    args,
+) -> np.ndarray:
+    if len(slots.xy) < 2:
+        return np.arange(len(slots.xy), dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    radii = 0.5 * np.hypot(slots.width, slots.depth)
+    min_dist = max(
+        global_nn * args.slot_filter_min_global_scale,
+        float(np.median(np.maximum(slots.width, slots.depth)))
+        * args.mesh_slot_filter_building_scale,
+    )
+    cell = max(
+        float(min_dist),
+        float(radii.max(initial=0.0) * args.mesh_slot_filter_radius_scale),
+        1e-12,
+    )
+    order = rng.permutation(len(slots.xy))
+    accepted: list[int] = []
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i in order.tolist():
+        p = slots.xy[i]
+        key = (math.floor(float(p[0]) / cell), math.floor(float(p[1]) / cell))
+        ok = True
+        for gx in range(key[0] - 1, key[0] + 2):
+            for gy in range(key[1] - 1, key[1] + 2):
+                for j in buckets.get((gx, gy), []):
+                    limit = max(
+                        min_dist,
+                        float(
+                            (radii[i] + radii[j])
+                            * args.mesh_slot_filter_radius_scale
+                        ),
+                    )
+                    if float(np.linalg.norm(p - slots.xy[j])) < limit:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if ok:
+            buckets[key].append(i)
+            accepted.append(i)
+    return np.asarray(sorted(accepted), dtype=np.int64)
+
+
+def _mesh_slots_for_blocks(
+    blocks: list[MeshBlock],
+    road_specs: list[RoadSpec],
+    *,
+    global_nn: float,
+    slot_step: float,
+    road_spacing: float,
+    building_scale: float,
+    island_id: int,
+    args,
+) -> MeshSlotResult:
+    road_lines = [
+        LineString(spec.coords)
+        for spec in road_specs
+        if len(spec.coords) >= 2 and LineString(spec.coords).length > 1e-9
+    ]
+    if not road_lines:
+        return MeshSlotResult(
+            slots=_slotset_empty(),
+            block_index=np.empty(0, dtype=np.int32),
+            rejected_outside=0,
+            rejected_roadless=0,
+        )
+    tree = shapely.STRtree(road_lines)
+    road_corridor = GeometryCollection()
+    road_clearance = global_nn * args.slot_footprint_road_clearance_scale
+    if road_clearance > 0:
+        road_corridor = shapely.unary_union(road_lines).buffer(
+            road_clearance,
+            cap_style="round",
+            join_style="round",
+        )
+    rng = np.random.default_rng(args.seed + island_id * 2207)
+    match_tol = max(global_nn * args.mesh_frontage_match_scale, slot_step * 0.18)
+    setback = global_nn * args.building_setback_scale * math.sqrt(building_scale)
+    base_width = slot_step * args.building_width_scale * building_scale
+    base_depth = min(
+        slot_step * args.building_depth_scale * building_scale,
+        road_spacing * args.building_depth_road_spacing_scale,
+    )
+    xy_out: list[np.ndarray] = []
+    frontage_out: list[np.ndarray] = []
+    angle_out: list[float] = []
+    width_out: list[float] = []
+    depth_out: list[float] = []
+    road_out: list[int] = []
+    side_out: list[int] = []
+    along_out: list[float] = []
+    block_out: list[int] = []
+    rejected_outside = 0
+    rejected_roadless = 0
+    for block_no, block in enumerate(blocks):
+        if block.geom.is_empty or block.geom.area <= 0:
+            continue
+        ring = LineString(block.geom.exterior.coords)
+        total = float(ring.length)
+        if total <= slot_step:
+            continue
+        start = slot_step * args.mesh_slot_phase
+        distances = np.arange(start, total, slot_step, dtype=np.float64)
+        eps = min(slot_step * 0.45, total * 0.01)
+        for d in distances.tolist():
+            p = ring.interpolate(d)
+            frontage = np.array([p.x, p.y], dtype=np.float64)
+            nearest = _nearest_road_for_frontage(
+                frontage,
+                road_lines=road_lines,
+                tree=tree,
+                match_tol=match_tol,
+            )
+            if nearest is None:
+                rejected_roadless += 1
+                continue
+            road_idx, road_frontage, _road_dist = nearest
+            tangent = _line_tangent_at(ring, d, eps)
+            normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+            probe = frontage + normal * max(global_nn * 0.1, 1e-9)
+            if not block.geom.covers(shapely.Point(float(probe[0]), float(probe[1]))):
+                normal = -normal
+                probe = frontage + normal * max(global_nn * 0.1, 1e-9)
+            if not block.geom.covers(shapely.Point(float(probe[0]), float(probe[1]))):
+                rejected_outside += 1
+                continue
+            width = base_width * float(
+                np.clip(1.0 + rng.normal(0, args.building_width_jitter), 0.72, 1.28)
+            )
+            depth = base_depth * float(
+                np.clip(1.0 + rng.normal(0, args.building_depth_jitter), 0.72, 1.35)
+            )
+            center = frontage + normal * (depth * 0.5 + setback)
+            angle = math.atan2(tangent[1], tangent[0]) + float(
+                rng.normal(0, args.building_angle_jitter)
+            )
+            tangent2 = np.array([math.cos(angle), math.sin(angle)], dtype=np.float64)
+            footprint = _footprint_poly(center, tangent2, width, depth)
+            if not block.geom.covers(footprint):
+                rejected_outside += 1
+                continue
+            if not road_corridor.is_empty and footprint.intersects(road_corridor):
+                rejected_outside += 1
+                continue
+            xy_out.append(center)
+            frontage_out.append(road_frontage)
+            angle_out.append(angle)
+            width_out.append(width)
+            depth_out.append(depth)
+            road_out.append(road_idx)
+            side_out.append(1)
+            along_out.append(d)
+            block_out.append(block_no)
+    if not xy_out:
+        return MeshSlotResult(
+            slots=_slotset_empty(),
+            block_index=np.empty(0, dtype=np.int32),
+            rejected_outside=rejected_outside,
+            rejected_roadless=rejected_roadless,
+        )
+    slots = SlotSet(
+        xy=np.vstack(xy_out).astype(np.float64),
+        frontage=np.vstack(frontage_out).astype(np.float64),
+        angle=np.asarray(angle_out, dtype=np.float32),
+        width=np.asarray(width_out, dtype=np.float32),
+        depth=np.asarray(depth_out, dtype=np.float32),
+        road_index=np.asarray(road_out, dtype=np.int32),
+        side=np.asarray(side_out, dtype=np.int8),
+        along=np.asarray(along_out, dtype=np.float32),
+    )
+    block_index = np.asarray(block_out, dtype=np.int32)
+    keep = _mesh_filter_slot_indices(
+        slots,
+        seed=args.seed + island_id * 9176,
+        global_nn=global_nn,
+        args=args,
+    )
+    return MeshSlotResult(
+        slots=_take_slots(slots, keep),
+        block_index=block_index[keep],
+        rejected_outside=rejected_outside,
+        rejected_roadless=rejected_roadless,
+    )
+
+
+def _assign_slots_by_mesh_blocks(
+    xy: np.ndarray,
+    slots: SlotSet,
+    slot_block: np.ndarray,
+    blocks: list[MeshBlock],
+    *,
+    global_nn: float,
+    args,
+) -> tuple[np.ndarray, dict[str, int]]:
+    out = np.full(len(xy), -1, dtype=np.int64)
+    used = np.zeros(len(slots.xy), dtype=bool)
+    cross_block = 0
+    shortage = 0
+    for block_no, block in sorted(
+        enumerate(blocks),
+        key=lambda item: len(item[1].point_idx),
+        reverse=True,
+    ):
+        members = block.point_idx
+        if len(members) == 0:
+            continue
+        cand = np.flatnonzero((slot_block == block_no) & ~used)
+        if len(cand) == 0:
+            shortage += len(members)
+            continue
+        assign_members = members
+        if len(cand) < len(members):
+            shortage += len(members) - len(cand)
+            dist, _nbr = cKDTree(slots.xy[cand]).query(
+                xy[members],
+                k=1,
+                workers=_spatial_workers(),
+            )
+            keep = np.argsort(np.asarray(dist), kind="stable")[: len(cand)]
+            assign_members = members[keep]
+        local = _assign_slots(
+            xy[assign_members],
+            slots.xy[cand],
+            args.max_hungarian,
+            candidate_k=args.assignment_candidate_k,
+        )
+        chosen = cand[local]
+        out[assign_members] = chosen
+        used[chosen] = True
+    missing = np.flatnonzero(out < 0)
+    if len(missing):
+        free = np.flatnonzero(~used)
+        if len(free):
+            fill_count = min(len(missing), len(free))
+            fill = _assign_slots(
+                xy[missing[:fill_count]],
+                slots.xy[free],
+                args.max_hungarian,
+                candidate_k=args.assignment_candidate_k,
+            )
+            chosen = free[fill]
+            out[missing[:fill_count]] = chosen
+            used[chosen] = True
+            cross_block += fill_count
+    return out, {
+        "mesh_slot_shortage": int(shortage),
+        "mesh_cross_block_assignments": int(cross_block),
+        "mesh_unassigned_after_slots": int(np.count_nonzero(out < 0)),
+    }
+
+
+def _mesh_road_graph_metrics(
+    road_specs: list[RoadSpec],
+    *,
+    global_nn: float,
+) -> dict[str, float | int]:
+    node_dirs: dict[tuple[int, int], list[np.ndarray]] = defaultdict(list)
+    tol = max(global_nn * 1e-4, 1e-10)
+    for spec in road_specs:
+        coords = np.asarray(spec.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        for end_idx, nbr_idx in ((0, 1), (len(coords) - 1, len(coords) - 2)):
+            p = coords[end_idx]
+            q = coords[nbr_idx]
+            v = q - p
+            norm = float(np.linalg.norm(v))
+            if norm <= 1e-12:
+                continue
+            node_dirs[_endpoint_node_key(p, tol)].append(v / norm)
+    degrees = np.asarray([len(v) for v in node_dirs.values()], dtype=np.int64)
+    angle_devs: list[float] = []
+    for dirs in node_dirs.values():
+        if len(dirs) < 2:
+            continue
+        for i in range(len(dirs)):
+            for j in range(i + 1, len(dirs)):
+                dot = float(np.dot(dirs[i], dirs[j]))
+                angle = math.degrees(math.acos(np.clip(dot, -1.0, 1.0)))
+                angle = min(angle, 180.0 - angle)
+                if angle < 25.0:
+                    continue
+                angle_devs.append(abs(angle - 90.0))
+    dev = np.asarray(angle_devs, dtype=np.float64)
+    return {
+        "road_nodes": int(len(degrees)),
+        "road_degree1": int(np.count_nonzero(degrees == 1)),
+        "road_degree2": int(np.count_nonzero(degrees == 2)),
+        "road_degree3": int(np.count_nonzero(degrees == 3)),
+        "road_degree4": int(np.count_nonzero(degrees == 4)),
+        "road_degree5_plus": int(np.count_nonzero(degrees >= 5)),
+        "junction_angle_dev_median": float(np.median(dev)) if len(dev) else 0.0,
+        "junction_angle_dev_p90": float(np.quantile(dev, 0.90)) if len(dev) else 0.0,
+    }
+
+
+def _generate_mesh_streets(
+    *,
+    xy: np.ndarray,
+    land_geom,
+    island_id: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> tuple[list[RoadSpec], list[MeshBlock], object, dict[str, int | float]]:
+    min_area = (global_nn * global_nn) * args.planar_min_parcel_area_scale
+    parts = sorted(
+        [p for p in iter_polygons(land_geom) if p.area >= min_area],
+        key=lambda p: p.area,
+        reverse=True,
+    )
+    if not parts:
+        parts = sorted(iter_polygons(land_geom), key=lambda p: p.area, reverse=True)
+    build_geom = _safe_geom(shapely.unary_union(parts))
+    members_by_part = _classify_points_to_polys(
+        parts,
+        xy,
+        np.arange(len(xy), dtype=np.int64),
+    )
+    centers = _mesh_density_centers(xy, global_nn=global_nn, args=args)
+    initial_specs = _mesh_initial_road_specs(
+        parts=parts,
+        members_by_part=members_by_part,
+        centers=centers,
+        xy=xy,
+        island_id=island_id,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    road_specs, blocks, metrics = _mesh_refine_roads(
+        road_specs=initial_specs,
+        parts=parts,
+        xy=xy,
+        centers=centers,
+        island_id=island_id,
+        land_geom=build_geom,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    overloaded = 0
+    shortage = 0.0
+    for block in blocks:
+        capacity = _mesh_block_capacity(block, slot_step=slot_step, args=args)
+        excess = len(block.point_idx) - capacity * args.mesh_capacity_target
+        if excess > 0:
+            overloaded += 1
+            shortage += float(excess)
+    metrics.update(
+        {
+            "density_centers": int(len(centers)),
+            "mesh_initial_roads": int(len(initial_specs)),
+            "mesh_blocks_over_capacity": int(overloaded),
+            "mesh_capacity_shortage": float(shortage),
+        }
+    )
+    metrics.update(_mesh_road_graph_metrics(road_specs, global_nn=global_nn))
+    return road_specs, blocks, build_geom, metrics
+
+
 def _frontage_blocks(
     *,
     island_id: int,
@@ -3468,6 +4701,256 @@ def _layout_streamline_island(
         "local_nn_q": float(local_nn_q),
         "slot_road_hit_candidates": int(np.count_nonzero(slot_road_hit)),
         **street_metrics,
+        **footprint_metrics,
+        **assignment_relax_metrics,
+    }
+
+
+def _layout_mesh_island(
+    *,
+    idx: np.ndarray,
+    xy: np.ndarray,
+    island_id: int,
+    global_nn: float,
+    args,
+    ids: Ids,
+    roads: list[Road],
+    blocks: list[Block],
+    out: dict[str, np.ndarray],
+) -> dict[str, int | float]:
+    island_land, _info = build_land_geometry(
+        xy,
+        method="raster",
+        raster_max_dim=args.road_land_raster_max_dim,
+        raster_nn_cells=args.land_raster_nn_cells,
+        raster_dilate_cells=args.land_raster_dilate_cells,
+        raster_close_cells=args.land_raster_close_cells,
+        raster_simplify_cells=args.land_raster_simplify_cells,
+        raster_smooth_cells=args.land_raster_smooth_cells,
+        raster_min_area_cells=args.land_raster_min_area_cells,
+    )
+    island_land = _smooth_coastline_geom(
+        _safe_geom(island_land),
+        iterations=args.land_chaikin_iterations,
+        simplify=global_nn * args.land_chaikin_simplify_scale,
+    )
+    slot_step = max(
+        global_nn * args.frontage_spacing_scale,
+        global_nn * args.frontage_spacing_min_scale,
+    )
+    road_spacing = max(
+        global_nn * args.road_spacing_min_scale,
+        slot_step * args.recursive_road_spacing_slot_scale,
+    )
+    local_nn_q = _nn_quantile(xy, args.building_scale_nn_quantile)
+    building_scale = float(
+        np.clip(
+            (local_nn_q / max(global_nn, 1e-9)) ** args.building_local_nn_power,
+            args.building_local_scale_min,
+            args.building_local_scale_max,
+        )
+    )
+    road_specs, mesh_blocks, build_geom, street_metrics = _generate_mesh_streets(
+        xy=xy,
+        land_geom=island_land,
+        island_id=island_id,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        args=args,
+    )
+    slot_result = _mesh_slots_for_blocks(
+        mesh_blocks,
+        road_specs,
+        global_nn=global_nn,
+        slot_step=slot_step,
+        road_spacing=road_spacing,
+        building_scale=building_scale,
+        island_id=island_id,
+        args=args,
+    )
+    slots = slot_result.slots
+    slot_block = slot_result.block_index
+    generated_slots = int(len(slots.xy))
+    slot_road_hit = _slot_other_road_hit_mask(
+        slots,
+        road_specs=road_specs,
+        global_nn=global_nn,
+        args=args,
+    )
+    assignment_xy, assignment_relax_metrics = _relax_assignment_targets(
+        xy,
+        global_nn=global_nn,
+        island_id=island_id,
+        args=args,
+    )
+    if len(slots.xy):
+        assigned, assign_metrics = _assign_slots_by_mesh_blocks(
+            assignment_xy,
+            slots,
+            slot_block,
+            mesh_blocks,
+            global_nn=global_nn,
+            args=args,
+        )
+    else:
+        assigned = np.full(len(xy), -1, dtype=np.int64)
+        assign_metrics = {
+            "mesh_slot_shortage": int(len(xy)),
+            "mesh_cross_block_assignments": 0,
+            "mesh_unassigned_after_slots": int(len(xy)),
+        }
+
+    missing = np.flatnonzero(assigned < 0)
+    fallback_slots = 0
+    if len(missing):
+        fallback_roads, fallback_slotset = _fallback_service_slots(
+            xy=xy[missing],
+            island_id=island_id,
+            global_nn=global_nn,
+            road_index_offset=len(road_specs),
+            args=args,
+        )
+        road_specs.extend(fallback_roads)
+        offset = len(slots.xy)
+        fallback_assign = _assign_slots(
+            assignment_xy[missing],
+            fallback_slotset.xy,
+            args.max_hungarian,
+            candidate_k=args.assignment_candidate_k,
+        )
+        slots = _concat_slots([slots, fallback_slotset])
+        slot_block = np.concatenate(
+            [
+                slot_block,
+                np.full(len(fallback_slotset.xy), -1, dtype=np.int32),
+            ]
+        )
+        if len(slot_road_hit):
+            slot_road_hit = np.concatenate(
+                [
+                    slot_road_hit,
+                    np.zeros(len(fallback_slotset.xy), dtype=bool),
+                ]
+            )
+        else:
+            slot_road_hit = np.zeros(len(slots.xy), dtype=bool)
+        assigned[missing] = offset + fallback_assign
+        fallback_slots = int(len(fallback_slotset.xy))
+        assign_metrics["mesh_unassigned_after_slots"] = int(
+            np.count_nonzero(assigned < 0)
+        )
+
+    selected_xy = slots.xy[assigned]
+    selected_frontage = slots.frontage[assigned]
+    selected_road = slots.road_index[assigned]
+    selected_width = slots.width[assigned]
+    selected_depth = slots.depth[assigned]
+    selected_angle = slots.angle[assigned]
+    selected_block = slot_block[assigned]
+    footprint_metrics = _selected_footprint_metrics(
+        selected_xy=selected_xy,
+        selected_width=selected_width,
+        selected_depth=selected_depth,
+        selected_angle=selected_angle,
+        selected_road=selected_road,
+        road_specs=road_specs,
+        global_nn=global_nn,
+        args=args,
+    )
+
+    local_block_ids = np.full(len(xy), -1, dtype=np.int64)
+    for block_no, block in enumerate(mesh_blocks):
+        members = np.flatnonzero(selected_block == block_no)
+        if len(members) == 0:
+            continue
+        bid = ids.block_id()
+        local_block_ids[members] = bid
+        blocks.append(
+            Block(
+                block_id=bid,
+                island_id=island_id,
+                geom=block.geom,
+                target_lots=len(block.point_idx),
+                assigned_worlds=len(members),
+            )
+        )
+    fallback_members = np.flatnonzero(selected_block < 0)
+    if len(fallback_members):
+        pts = selected_xy[fallback_members]
+        geom = _safe_geom(
+            shapely.MultiPoint(pts).convex_hull.buffer(
+                global_nn * args.fallback_building_scale,
+                cap_style="round",
+                join_style="round",
+            )
+        )
+        bid = ids.block_id()
+        local_block_ids[fallback_members] = bid
+        blocks.append(
+            Block(
+                block_id=bid,
+                island_id=island_id,
+                geom=geom,
+                target_lots=len(fallback_members),
+                assigned_worlds=len(fallback_members),
+            )
+        )
+    if np.any(local_block_ids < 0):
+        bid = ids.block_id()
+        missing_blocks = np.flatnonzero(local_block_ids < 0)
+        local_block_ids[missing_blocks] = bid
+        blocks.append(
+            Block(
+                block_id=bid,
+                island_id=island_id,
+                geom=_safe_geom(shapely.MultiPoint(selected_xy[missing_blocks]).convex_hull),
+                target_lots=len(missing_blocks),
+                assigned_worlds=len(missing_blocks),
+            )
+        )
+
+    active_counts = np.bincount(selected_road, minlength=len(road_specs))
+    road_id_by_temp: dict[int, int] = {}
+    for temp_id, spec in enumerate(road_specs):
+        count = int(active_counts[temp_id]) if temp_id < len(active_counts) else 0
+        if count <= 0 and spec.kind not in {"arterial", "collector", "local"}:
+            continue
+        road_id_by_temp[temp_id] = _add_road(
+            roads,
+            ids,
+            coords=spec.coords,
+            kind=spec.kind,
+            island_id=island_id,
+            world_count=count,
+            width=spec.width,
+        )
+
+    for local_i, row in enumerate(idx.tolist()):
+        out["x"][row] = selected_xy[local_i, 0]
+        out["y"][row] = selected_xy[local_i, 1]
+        out["building_angle"][row] = selected_angle[local_i]
+        out["building_width"][row] = selected_width[local_i]
+        out["building_depth"][row] = selected_depth[local_i]
+        out["building_height"][row] = args.default_building_height
+        out["lot_id"][row] = ids.lot_id()
+        out["block_id"][row] = local_block_ids[local_i]
+        out["road_id"][row] = road_id_by_temp[int(selected_road[local_i])]
+        out["frontage_x"][row] = selected_frontage[local_i, 0]
+        out["frontage_y"][row] = selected_frontage[local_i, 1]
+
+    return {
+        "slots": int(len(slots.xy)),
+        "generated_slots": generated_slots,
+        "fallback_slots": fallback_slots,
+        "active_roads": int(np.count_nonzero(active_counts)),
+        "blocks": int(len(mesh_blocks)),
+        "building_scale": float(building_scale),
+        "local_nn_q": float(local_nn_q),
+        "slot_road_hit_candidates": int(np.count_nonzero(slot_road_hit)),
+        "mesh_slot_rejected_outside": int(slot_result.rejected_outside),
+        "mesh_slot_rejected_roadless": int(slot_result.rejected_roadless),
+        **street_metrics,
+        **assign_metrics,
         **footprint_metrics,
         **assignment_relax_metrics,
     }
@@ -4255,7 +5738,12 @@ def _layout_island_worker(payload) -> IslandLayoutResult:
     local_out = _empty_layout_columns(len(island_xy))
     roads: list[Road] = []
     blocks: list[Block] = []
-    info = _layout_streamline_island(
+    layout_fn = (
+        _layout_mesh_island
+        if args.layout_engine == "mesh"
+        else _layout_streamline_island
+    )
+    info = layout_fn(
         idx=np.arange(len(island_xy), dtype=np.int64),
         xy=island_xy,
         island_id=island_id,
@@ -4438,6 +5926,7 @@ def _city_layout(
     displacement = np.linalg.norm(layout_xy - orig_xy, axis=1)
     out_points = out_points.with_columns(pl.Series("layout_displacement", displacement))
     metrics = {
+        "layout_engine": args.layout_engine,
         "global_median_nn": float(global_nn),
         "point_count": int(out_points.height),
         "processed_islands": sorted(island_set),
@@ -4458,6 +5947,7 @@ def main() -> None:
     ap.add_argument("--in-dir", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--max-islands", type=int, default=3)
+    ap.add_argument("--layout-engine", choices=["mesh", "planar"], default="mesh")
     ap.add_argument("--layout-workers", type=int, default=0)
     ap.add_argument("--spatial-workers", type=int, default=-1)
     ap.add_argument("--top-level", type=int, default=None)
@@ -4632,6 +6122,56 @@ def main() -> None:
     ap.add_argument("--planar-density-isoline-max-curve-frac", type=float, default=0.32)
     ap.add_argument("--planar-density-isoline-offsets", type=int, default=1)
     ap.add_argument("--planar-density-isoline-offset-frac", type=float, default=0.18)
+    ap.add_argument("--mesh-density-min-worlds", type=int, default=1800)
+    ap.add_argument("--mesh-density-knn", type=int, default=36)
+    ap.add_argument("--mesh-density-quantile", type=float, default=0.11)
+    ap.add_argument("--mesh-density-max-centers", type=int, default=18)
+    ap.add_argument("--mesh-density-center-min-sep-scale", type=float, default=22.0)
+    ap.add_argument("--mesh-center-min-worlds", type=int, default=900)
+    ap.add_argument("--mesh-center-radius-quantile", type=float, default=0.76)
+    ap.add_argument("--mesh-city-min-radius-scale", type=float, default=9.0)
+    ap.add_argument("--mesh-contour-min-worlds", type=int, default=6500)
+    ap.add_argument("--mesh-contour-min-area-scale", type=float, default=1800.0)
+    ap.add_argument("--mesh-contour-spacing-scale", type=float, default=8.0)
+    ap.add_argument("--mesh-contour-slot-spacing-scale", type=float, default=18.0)
+    ap.add_argument("--mesh-contour-max-offset-frac", type=float, default=0.42)
+    ap.add_argument("--mesh-contour-max-rings", type=int, default=7)
+    ap.add_argument("--mesh-contour-collector-every", type=int, default=2)
+    ap.add_argument("--mesh-ring-worlds-scale", type=float, default=32.0)
+    ap.add_argument("--mesh-max-city-rings", type=int, default=5)
+    ap.add_argument("--mesh-ring-inner-quantile", type=float, default=0.42)
+    ap.add_argument("--mesh-ring-outer-quantile", type=float, default=0.88)
+    ap.add_argument("--mesh-ring-max-aspect", type=float, default=2.8)
+    ap.add_argument("--mesh-ring-vertices", type=int, default=192)
+    ap.add_argument("--mesh-spoke-worlds-scale", type=float, default=45.0)
+    ap.add_argument("--mesh-min-spokes", type=int, default=7)
+    ap.add_argument("--mesh-max-spokes", type=int, default=16)
+    ap.add_argument("--mesh-spoke-reach-scale", type=float, default=1.28)
+    ap.add_argument("--mesh-spoke-collector-every", type=int, default=4)
+    ap.add_argument("--mesh-axis-min-worlds", type=int, default=10000)
+    ap.add_argument("--mesh-cross-axis-min-worlds", type=int, default=26000)
+    ap.add_argument("--mesh-min-block-area-scale", type=float, default=5.0)
+    ap.add_argument("--mesh-capacity-spacing-scale", type=float, default=1.25)
+    ap.add_argument("--mesh-block-frontage-efficiency", type=float, default=0.62)
+    ap.add_argument("--mesh-capacity-target", type=float, default=1.0)
+    ap.add_argument(
+        "--mesh-progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--mesh-refine-rounds", type=int, default=4)
+    ap.add_argument("--mesh-refine-batch", type=int, default=110)
+    ap.add_argument("--mesh-refine-min-worlds", type=int, default=8)
+    ap.add_argument("--mesh-refine-local-density", type=float, default=0.38)
+    ap.add_argument("--mesh-split-curve-strength", type=float, default=0.55)
+    ap.add_argument("--mesh-split-curve-max-frac", type=float, default=0.18)
+    ap.add_argument("--mesh-split-tensor-bonus", type=float, default=0.10)
+    ap.add_argument("--mesh-split-min-count-balance", type=float, default=0.18)
+    ap.add_argument("--mesh-target-block-aspect", type=float, default=3.2)
+    ap.add_argument("--mesh-frontage-match-scale", type=float, default=0.55)
+    ap.add_argument("--mesh-slot-phase", type=float, default=0.5)
+    ap.add_argument("--mesh-slot-filter-building-scale", type=float, default=0.78)
+    ap.add_argument("--mesh-slot-filter-radius-scale", type=float, default=0.86)
     ap.add_argument("--planar-boundary-resample-scale", type=float, default=2.35)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
@@ -4844,7 +6384,9 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v20",
+        "layout": (
+            "city-mesh-v1" if args.layout_engine == "mesh" else "city-planar-v20"
+        ),
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(

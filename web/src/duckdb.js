@@ -48,6 +48,18 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "nolabs-city-mesh" ||
+    data === "full-nolabs-localmap-island-toponymy-city-mesh" ||
+    layout === "city-mesh" ||
+    (data === "nolabs" && layout === "city-mesh")
+  ) {
+    return {
+      key: "nolabs-localmap-island-toponymy-city-mesh",
+      dir: "full-nolabs-localmap-island-toponymy-city-mesh/",
+      label: "No-Labs LocalMAP City Mesh Layout",
+    };
+  }
+  if (
     data === "nolabs-city-isoline" ||
     data === "nolabs-city-density" ||
     data === "full-nolabs-localmap-island-toponymy-city-isoline" ||
