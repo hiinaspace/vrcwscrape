@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +109,22 @@ class PlanarStreetResult:
     leaves: list[SplitParcel]
     build_geom: object
     splits: float
+    metrics: dict[str, float | int]
+
+
+@dataclass
+class DensityGuide:
+    centers: np.ndarray
+
+
+@dataclass
+class IslandLayoutResult:
+    idx: np.ndarray
+    island_id: int
+    columns: dict[str, np.ndarray]
+    roads: list[Road]
+    blocks: list[Block]
+    info: dict[str, int | float]
 
 
 class Ids:
@@ -131,6 +149,18 @@ class Ids:
         return v
 
 
+_KDTREE_WORKERS = 1
+
+
+def _set_spatial_workers(workers: int) -> None:
+    global _KDTREE_WORKERS
+    _KDTREE_WORKERS = int(workers)
+
+
+def _spatial_workers() -> int:
+    return int(_KDTREE_WORKERS)
+
+
 def _level_numbers(columns: list[str]) -> list[int]:
     out = []
     for col in columns:
@@ -145,7 +175,7 @@ def _median_nn(xy: np.ndarray, sample: int = 12000) -> float:
         return 0.0
     rng = np.random.default_rng(0)
     idx = rng.choice(len(xy), size=min(sample, len(xy)), replace=False)
-    dist, _ = cKDTree(xy).query(xy[idx], k=2, workers=-1)
+    dist, _ = cKDTree(xy).query(xy[idx], k=2, workers=_spatial_workers())
     return float(np.median(dist[:, 1]))
 
 
@@ -154,7 +184,7 @@ def _nn_quantile(xy: np.ndarray, q: float, sample: int = 12000) -> float:
         return 0.0
     rng = np.random.default_rng(0)
     idx = rng.choice(len(xy), size=min(sample, len(xy)), replace=False)
-    dist, _ = cKDTree(xy).query(xy[idx], k=2, workers=-1)
+    dist, _ = cKDTree(xy).query(xy[idx], k=2, workers=_spatial_workers())
     return float(np.quantile(dist[:, 1], q))
 
 
@@ -463,7 +493,11 @@ def _density_scaled_slots(
         return slots
     k = min(max(1, int(args.building_density_knn)), len(demand_xy))
     tree = cKDTree(demand_xy)
-    slot_dist, _slot_idx = tree.query(slots.frontage, k=k, workers=-1)
+    slot_dist, _slot_idx = tree.query(
+        slots.frontage,
+        k=k,
+        workers=_spatial_workers(),
+    )
     slot_dist = np.asarray(slot_dist, dtype=np.float64)
     slot_radius = slot_dist if slot_dist.ndim == 1 else slot_dist[:, -1]
 
@@ -471,7 +505,11 @@ def _density_scaled_slots(
     rng = np.random.default_rng(args.seed + island_id * 3301)
     sample = rng.choice(len(demand_xy), size=sample_n, replace=False)
     ref_k = min(k + 1, len(demand_xy))
-    ref_dist, _ref_idx = tree.query(demand_xy[sample], k=ref_k, workers=-1)
+    ref_dist, _ref_idx = tree.query(
+        demand_xy[sample],
+        k=ref_k,
+        workers=_spatial_workers(),
+    )
     ref_dist = np.asarray(ref_dist, dtype=np.float64)
     ref_radius = ref_dist if ref_dist.ndim == 1 else ref_dist[:, -1]
     ref = float(
@@ -712,6 +750,147 @@ def _filter_slots_for_road_corridors(
     pts = shapely.points(slots.xy[:, 0], slots.xy[:, 1])
     blocked = np.asarray(shapely.covers(corridor, pts), dtype=bool)
     return _take_slots(slots, ~blocked)
+
+
+def _slot_footprint_geoms(slots: SlotSet):
+    if len(slots.xy) == 0:
+        return np.asarray([], dtype=object)
+    tangent = np.column_stack([np.cos(slots.angle), np.sin(slots.angle)]).astype(
+        np.float64,
+    )
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    half_w = slots.width.astype(np.float64)[:, None] * 0.5
+    half_d = slots.depth.astype(np.float64)[:, None] * 0.5
+    xy = slots.xy.astype(np.float64)
+    corners = np.stack(
+        [
+            xy - tangent * half_w - normal * half_d,
+            xy + tangent * half_w - normal * half_d,
+            xy + tangent * half_w + normal * half_d,
+            xy - tangent * half_w + normal * half_d,
+            xy - tangent * half_w - normal * half_d,
+        ],
+        axis=1,
+    )
+    return shapely.polygons(corners)
+
+
+def _filter_slots_by_footprints(
+    slots: SlotSet,
+    *,
+    land_geom,
+    road_specs: list[RoadSpec],
+    global_nn: float,
+    args,
+) -> SlotSet:
+    if len(slots.xy) == 0 or not args.slot_footprint_validation:
+        return slots
+    footprints = _slot_footprint_geoms(slots)
+    keep = np.asarray(shapely.covers(land_geom, footprints), dtype=bool)
+    if road_specs and args.slot_footprint_road_clearance_scale > 0:
+        road_hits = _footprint_other_road_hits(
+            footprints,
+            road_specs=road_specs,
+            road_index=slots.road_index,
+            clearance=global_nn * args.slot_footprint_road_clearance_scale,
+        )
+        keep &= ~road_hits
+    return _take_slots(slots, keep)
+
+
+def _footprint_other_road_hits(
+    footprints,
+    *,
+    road_specs: list[RoadSpec],
+    road_index: np.ndarray,
+    clearance: float,
+) -> np.ndarray:
+    hits = np.zeros(len(footprints), dtype=bool)
+    if len(footprints) == 0 or clearance <= 0:
+        return hits
+    corridors = []
+    corridor_road_index = []
+    for i, spec in enumerate(road_specs):
+        if len(spec.coords) < 2:
+            continue
+        line = LineString(spec.coords)
+        if line.length <= 1e-9:
+            continue
+        corridors.append(
+            line.buffer(clearance, cap_style="round", join_style="round")
+        )
+        corridor_road_index.append(i)
+    if not corridors:
+        return hits
+    pairs = shapely.STRtree(corridors).query(footprints, predicate="intersects")
+    pairs = np.asarray(pairs, dtype=np.int64)
+    if pairs.size == 0:
+        return hits
+    input_idx = pairs[0]
+    tree_idx = pairs[1]
+    corridor_road_index_arr = np.asarray(corridor_road_index, dtype=np.int32)
+    other = corridor_road_index_arr[tree_idx] != road_index[input_idx]
+    if np.any(other):
+        hits[np.unique(input_idx[other])] = True
+    return hits
+
+
+def _selected_footprint_metrics(
+    *,
+    selected_xy: np.ndarray,
+    selected_width: np.ndarray,
+    selected_depth: np.ndarray,
+    selected_angle: np.ndarray,
+    selected_road: np.ndarray,
+    road_specs: list[RoadSpec],
+    global_nn: float,
+    args,
+) -> dict[str, int]:
+    slots = SlotSet(
+        xy=selected_xy,
+        frontage=selected_xy,
+        angle=selected_angle,
+        width=selected_width,
+        depth=selected_depth,
+        road_index=selected_road.astype(np.int32, copy=False),
+        side=np.zeros(len(selected_xy), dtype=np.int8),
+        along=np.zeros(len(selected_xy), dtype=np.float32),
+    )
+    footprints = _slot_footprint_geoms(slots)
+    road_hits = 0
+    if len(road_specs) and args.slot_footprint_road_clearance_scale > 0:
+        road_hits = int(
+            np.count_nonzero(
+                _footprint_other_road_hits(
+                    footprints,
+                    road_specs=road_specs,
+                    road_index=slots.road_index,
+                    clearance=global_nn * args.slot_footprint_road_clearance_scale,
+                )
+            )
+        )
+    overlap_pairs = 0
+    if len(selected_xy) > 1:
+        radius = float(
+            np.quantile(
+                np.hypot(
+                    selected_width.astype(np.float64),
+                    selected_depth.astype(np.float64),
+                ),
+                args.slot_footprint_overlap_query_quantile,
+            )
+        )
+        if radius > 0:
+            pairs = cKDTree(selected_xy).query_pairs(
+                radius * args.slot_footprint_overlap_query_scale,
+            )
+            for a, b in pairs:
+                if footprints[int(a)].intersects(footprints[int(b)]):
+                    overlap_pairs += 1
+    return {
+        "footprint_road_hits": int(road_hits),
+        "footprint_overlap_pairs": int(overlap_pairs),
+    }
 
 
 def _sample_slots_for_road(
@@ -958,7 +1137,11 @@ def _classify_points_to_polys(
             [[p.representative_point().x, p.representative_point().y] for p in parts],
             dtype=np.float64,
         )
-        _d, near = cKDTree(reps).query(pts_xy[missing], k=1, workers=-1)
+        _d, near = cKDTree(reps).query(
+            pts_xy[missing],
+            k=1,
+            workers=_spatial_workers(),
+        )
         assigned[missing] = np.asarray(near, dtype=np.int32)
     return [members[assigned == i] for i in range(len(parts))]
 
@@ -1522,6 +1705,143 @@ def _parcel_shape_axes(poly: Polygon) -> tuple[np.ndarray, np.ndarray]:
     return coords.mean(axis=0), axes
 
 
+def _density_guide_for_points(
+    xy: np.ndarray,
+    *,
+    global_nn: float,
+    args,
+) -> DensityGuide | None:
+    if (
+        not args.planar_density_isoline_enabled
+        or len(xy) < args.planar_density_min_worlds
+    ):
+        return None
+    k = min(max(2, int(args.planar_density_knn)), len(xy))
+    dist, _idx = cKDTree(xy).query(xy, k=k, workers=_spatial_workers())
+    radius = np.asarray(dist, dtype=np.float64)
+    radius = radius if radius.ndim == 1 else radius[:, -1]
+    finite = np.isfinite(radius) & (radius > 0)
+    if not np.any(finite):
+        return None
+    threshold = float(
+        np.quantile(radius[finite], args.planar_density_center_quantile)
+    )
+    candidates = np.flatnonzero(finite & (radius <= threshold))
+    if len(candidates) == 0:
+        return None
+    order = candidates[np.argsort(radius[candidates], kind="stable")]
+    min_sep = max(global_nn * args.planar_density_center_min_sep_scale, 1e-9)
+    centers: list[np.ndarray] = []
+    for i in order.tolist():
+        p = xy[i]
+        if any(float(np.linalg.norm(p - q)) < min_sep for q in centers):
+            continue
+        centers.append(p.astype(np.float64, copy=True))
+        if len(centers) >= args.planar_density_max_centers:
+            break
+    if not centers:
+        return None
+    return DensityGuide(centers=np.vstack(centers))
+
+
+def _density_isoline_split_candidates(
+    parcel: SplitParcel,
+    *,
+    density_guide: DensityGuide | None,
+    global_nn: float,
+    args,
+) -> list[SplitLineCandidate]:
+    if (
+        density_guide is None
+        or len(density_guide.centers) == 0
+        or parcel.depth > args.planar_density_isoline_max_depth
+    ):
+        return []
+    centroid = np.array(
+        [parcel.geom.centroid.x, parcel.geom.centroid.y],
+        dtype=np.float64,
+    )
+    extent = max(math.sqrt(max(float(parcel.geom.area), 1e-12)), global_nn)
+    center_dist = np.linalg.norm(density_guide.centers - centroid, axis=1)
+    nearest_order = np.argsort(center_dist, kind="stable")[
+        : args.planar_density_centers_per_parcel
+    ]
+    out: list[SplitLineCandidate] = []
+    for center_idx in nearest_order.tolist():
+        dense_center = density_guide.centers[center_idx]
+        dense_point = shapely.Point(float(dense_center[0]), float(dense_center[1]))
+        if parcel.geom.distance(dense_point) > max(
+            extent * args.planar_density_center_reach_scale,
+            global_nn * args.planar_density_center_reach_min_scale,
+        ):
+            continue
+        radial = centroid - dense_center
+        radius = float(np.linalg.norm(radial))
+        if radius < global_nn * args.planar_density_min_radius_scale:
+            continue
+        radial /= radius
+        tangent = np.array([-radial[1], radial[0]], dtype=np.float64)
+        axes = np.column_stack([tangent, radial])
+        coords = np.asarray(parcel.geom.exterior.coords, dtype=np.float64)
+        local_poly = (coords - centroid) @ axes
+        lo = local_poly.min(axis=0)
+        hi = local_poly.max(axis=0)
+        span = np.maximum(hi - lo, 1e-9)
+        if span.min() < global_nn * args.planar_min_split_width_scale:
+            continue
+        pad = span[0] * 0.42 + global_nn * 8.0
+        t0 = lo[0] - pad
+        t1 = hi[0] + pad
+        n = int(
+            np.clip(
+                math.ceil((t1 - t0) / max(global_nn * 2.0, span[0] / 180)),
+                36,
+                args.road_curve_max_vertices,
+            )
+        )
+        tangent_pos = np.linspace(t0, t1, n)
+        safe_radius = max(radius, global_nn * args.planar_density_min_radius_scale)
+        curve = -(tangent_pos * tangent_pos) / (2.0 * safe_radius)
+        curve = np.clip(
+            curve * args.planar_density_isoline_curve_strength,
+            -span[1] * args.planar_density_isoline_max_curve_frac,
+            span[1] * args.planar_density_isoline_max_curve_frac,
+        )
+        margin = max(
+            span[1] * args.planar_split_margin_frac,
+            global_nn * args.planar_min_split_margin_scale,
+        )
+        offsets = [0.0]
+        if args.planar_density_isoline_offsets > 1:
+            offsets.extend(
+                [
+                    -span[1] * args.planar_density_isoline_offset_frac,
+                    span[1] * args.planar_density_isoline_offset_frac,
+                ][: args.planar_density_isoline_offsets - 1]
+            )
+        for off in offsets:
+            normal = np.clip(curve + off, lo[1] + margin, hi[1] - margin)
+            if np.allclose(normal, lo[1] + margin) or np.allclose(
+                normal,
+                hi[1] - margin,
+            ):
+                continue
+            local = np.column_stack([tangent_pos, normal])
+            line = LineString(_to_world(local, centroid, axes))
+            if line.length > global_nn:
+                out.append(
+                    SplitLineCandidate(
+                        line=line,
+                        normal_axis=1,
+                        tangent_axis=0,
+                        major_axis=0,
+                        shape_ratio=float(span.max() / max(span.min(), 1e-9)),
+                        tangent_span=float(span[0]),
+                    )
+                )
+    return out
+
+
 def _split_road_kind(depth: int, args) -> tuple[str, float]:
     if depth < args.planar_collector_depth:
         return "collector", args.collector_road_width
@@ -1534,6 +1854,7 @@ def _planar_split_candidate_lines(
     parcel: SplitParcel,
     xy: np.ndarray,
     *,
+    density_guide: DensityGuide | None,
     global_nn: float,
     args,
     rng: np.random.Generator,
@@ -1564,7 +1885,12 @@ def _planar_split_candidate_lines(
             order = [int(np.argmax(span)), int(np.argmin(span))]
     quantiles = [0.5, 0.44, 0.56, 0.38, 0.62, 0.32, 0.68]
     quantiles = quantiles[: args.planar_split_candidates_per_family]
-    candidates: list[LineString] = []
+    candidates: list[SplitLineCandidate] = _density_isoline_split_candidates(
+        parcel,
+        density_guide=density_guide,
+        global_nn=global_nn,
+        args=args,
+    )
     for normal_axis in order[: args.planar_split_families]:
         tangent_axis = 1 - normal_axis
         tangent_pad = span[tangent_axis] * 0.42 + global_nn * 10.0
@@ -1639,6 +1965,7 @@ def _try_split_planar_parcel(
     parcel: SplitParcel,
     xy: np.ndarray,
     *,
+    density_guide: DensityGuide | None,
     global_nn: float,
     island_id: int,
     slot_step: float,
@@ -1654,6 +1981,7 @@ def _try_split_planar_parcel(
     for cand in _planar_split_candidate_lines(
         parcel,
         xy,
+        density_guide=density_guide,
         global_nn=global_nn,
         args=args,
         rng=rng,
@@ -1954,7 +2282,7 @@ def _snap_planar_junctions(
     return out
 
 
-def _node_planar_road_specs(
+def _node_planar_road_specs_once(
     specs: list[RoadSpec],
     *,
     island_id: int,
@@ -2009,6 +2337,165 @@ def _node_planar_road_specs(
     return out
 
 
+def _endpoint_node_key(p: np.ndarray, tol: float = 1e-8) -> tuple[int, int]:
+    return (int(round(float(p[0]) / tol)), int(round(float(p[1]) / tol)))
+
+
+def _repair_planar_road_topology(
+    specs: list[RoadSpec],
+    *,
+    global_nn: float,
+    args,
+) -> tuple[list[RoadSpec], dict[str, int]]:
+    if len(specs) < 2 or args.planar_topology_merge_scale <= 0:
+        return specs, {"topology_junction_merges": 0, "topology_short_edge_merges": 0}
+    endpoints: list[tuple[int, int, np.ndarray]] = []
+    node_degree: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for i, spec in enumerate(specs):
+        coords = np.asarray(spec.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        closed = float(np.linalg.norm(coords[0] - coords[-1])) <= 1e-9
+        if closed:
+            continue
+        for end_idx in (0, len(coords) - 1):
+            p = coords[end_idx]
+            node_degree[_endpoint_node_key(p)].add(i)
+            endpoints.append((i, end_idx, p))
+    if len(endpoints) < 2:
+        return specs, {"topology_junction_merges": 0, "topology_short_edge_merges": 0}
+
+    pts = np.stack([p for _i, _end, p in endpoints])
+    merge_tol = max(global_nn * args.planar_topology_merge_scale, 1e-9)
+    short_edge_tol = max(global_nn * args.planar_topology_short_edge_scale, 0.0)
+    parent = np.arange(len(endpoints), dtype=np.int64)
+
+    def find(v: int) -> int:
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = int(parent[v])
+        return v
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    tree = cKDTree(pts)
+    for a, b in tree.query_pairs(merge_tol):
+        union(int(a), int(b))
+
+    by_spec_end = {
+        (spec_idx, end_idx): endpoint_no
+        for endpoint_no, (spec_idx, end_idx, _p) in enumerate(endpoints)
+    }
+    short_edge_merges = 0
+    for spec_idx, spec in enumerate(specs):
+        line = LineString(spec.coords)
+        if line.length > short_edge_tol or spec.kind == "arterial":
+            continue
+        coords = np.asarray(spec.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        a_key = _endpoint_node_key(coords[0])
+        b_key = _endpoint_node_key(coords[-1])
+        if (
+            len(node_degree.get(a_key, set())) < 2
+            or len(node_degree.get(b_key, set())) < 2
+        ):
+            continue
+        a = by_spec_end.get((spec_idx, 0))
+        b = by_spec_end.get((spec_idx, len(coords) - 1))
+        if a is None or b is None:
+            continue
+        union(a, b)
+        short_edge_merges += 1
+
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(endpoints)):
+        clusters[find(i)].append(i)
+    snap_points: dict[tuple[int, int], np.ndarray] = {}
+    junction_merges = 0
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        center = pts[members].mean(axis=0)
+        junction_merges += len(members) - 1
+        for member in members:
+            spec_idx, end_idx, _p = endpoints[member]
+            snap_points[(spec_idx, end_idx)] = center
+    if not snap_points:
+        return specs, {
+            "topology_junction_merges": 0,
+            "topology_short_edge_merges": short_edge_merges,
+        }
+
+    out: list[RoadSpec] = []
+    max_move = merge_tol * args.planar_topology_max_move_scale
+    for i, spec in enumerate(specs):
+        coords = np.asarray(spec.coords, dtype=np.float64).copy()
+        for end_idx in (0, len(coords) - 1):
+            q = snap_points.get((i, end_idx))
+            if q is None:
+                continue
+            if float(np.linalg.norm(coords[end_idx] - q)) > max_move:
+                continue
+            if not _endpoint_snap_turn_ok(
+                coords,
+                end_idx,
+                q,
+                max_turn_deg=args.planar_topology_endpoint_max_turn_deg,
+            ):
+                continue
+            coords[end_idx] = q
+        if LineString(coords).length <= 1e-9:
+            continue
+        out.append(
+            RoadSpec(
+                coords=[(float(x), float(y)) for x, y in coords],
+                kind=spec.kind,
+                island_id=spec.island_id,
+                width=spec.width,
+                family=spec.family,
+                depth=spec.depth,
+            )
+        )
+    return out, {
+        "topology_junction_merges": int(junction_merges),
+        "topology_short_edge_merges": int(short_edge_merges),
+    }
+
+
+def _node_planar_road_specs(
+    specs: list[RoadSpec],
+    *,
+    island_id: int,
+    global_nn: float,
+    args,
+) -> tuple[list[RoadSpec], dict[str, int]]:
+    noded = _node_planar_road_specs_once(
+        specs,
+        island_id=island_id,
+        global_nn=global_nn,
+        args=args,
+    )
+    repaired, metrics = _repair_planar_road_topology(
+        noded,
+        global_nn=global_nn,
+        args=args,
+    )
+    if repaired is noded:
+        return noded, metrics
+    noded = _node_planar_road_specs_once(
+        repaired,
+        island_id=island_id,
+        global_nn=global_nn,
+        args=args,
+    )
+    return noded, metrics
+
+
 def _generate_planar_streets(
     *,
     xy: np.ndarray,
@@ -2047,6 +2534,7 @@ def _generate_planar_streets(
         slot_step=slot_step,
         args=args,
     )
+    density_guide = _density_guide_for_points(xy, global_nn=global_nn, args=args)
     rng = np.random.default_rng(args.seed + island_id * 7919)
     target_leaf_worlds = max(args.planar_target_block_worlds, 6)
     splits = 0
@@ -2065,6 +2553,7 @@ def _generate_planar_streets(
             split = _try_split_planar_parcel(
                 leaves[i],
                 xy,
+                density_guide=density_guide,
                 global_nn=global_nn,
                 island_id=island_id,
                 slot_step=slot_step,
@@ -2098,7 +2587,7 @@ def _generate_planar_streets(
         global_nn=global_nn,
         args=args,
     )
-    road_specs = _node_planar_road_specs(
+    road_specs, topology_metrics = _node_planar_road_specs(
         road_specs,
         island_id=island_id,
         global_nn=global_nn,
@@ -2109,6 +2598,14 @@ def _generate_planar_streets(
         leaves=leaves,
         build_geom=build_geom,
         splits=float(splits),
+        metrics={
+            **topology_metrics,
+            "density_centers": (
+                0
+                if density_guide is None
+                else int(len(density_guide.centers))
+            ),
+        },
     )
 
 
@@ -2584,6 +3081,13 @@ def _slots_for_road_specs(
             priority=visible_priority,
             footprint_radius_scale=args.slot_filter_footprint_radius_scale,
         )
+        slots = _filter_slots_by_footprints(
+            slots,
+            land_geom=land_geom,
+            road_specs=road_specs,
+            global_nn=global_nn,
+            args=args,
+        )
         if (
             args.slot_filter_capacity_fallback
             and min_slots
@@ -2752,6 +3256,7 @@ def _layout_streamline_island(
     leaves = street_layout.leaves
     build_geom = street_layout.build_geom
     splits = street_layout.splits
+    street_metrics = street_layout.metrics
     slots = _slots_for_road_specs(
         road_specs,
         land_geom=build_geom,
@@ -2843,6 +3348,16 @@ def _layout_streamline_island(
     selected_width = slots.width[assigned]
     selected_depth = slots.depth[assigned]
     selected_angle = slots.angle[assigned]
+    footprint_metrics = _selected_footprint_metrics(
+        selected_xy=selected_xy,
+        selected_width=selected_width,
+        selected_depth=selected_depth,
+        selected_angle=selected_angle,
+        selected_road=selected_road,
+        road_specs=road_specs,
+        global_nn=global_nn,
+        args=args,
+    )
 
     active_counts = np.bincount(selected_road, minlength=len(road_specs))
     road_id_by_temp: dict[int, int] = {}
@@ -2882,6 +3397,8 @@ def _layout_streamline_island(
         "splits": int(splits),
         "building_scale": float(building_scale),
         "local_nn_q": float(local_nn_q),
+        **street_metrics,
+        **footprint_metrics,
         **assignment_relax_metrics,
     }
 
@@ -2908,7 +3425,7 @@ def _assign_slots(
         return out
 
     k = min(64, len(slots))
-    dist, nbr = cKDTree(slots).query(local, k=k, workers=-1)
+    dist, nbr = cKDTree(slots).query(local, k=k, workers=_spatial_workers())
     dist = np.asarray(dist)
     nbr = np.asarray(nbr)
     if dist.ndim == 1:
@@ -2928,7 +3445,11 @@ def _assign_slots(
         remaining_points = np.flatnonzero(out == -1)
         remaining_slots = np.flatnonzero(~used)
         tree = cKDTree(slots[remaining_slots])
-        d, j = tree.query(local[remaining_points], k=1, workers=-1)
+        d, j = tree.query(
+            local[remaining_points],
+            k=1,
+            workers=_spatial_workers(),
+        )
         order = np.argsort(np.asarray(d), kind="stable")
         progressed = False
         for pos in order.tolist():
@@ -3050,7 +3571,11 @@ def _assign_slots_by_leaves_partial(
             continue
         assign_members = members
         if len(cand) < len(members):
-            dist, _nbr = cKDTree(slots_xy[cand]).query(xy[members], k=1, workers=-1)
+            dist, _nbr = cKDTree(slots_xy[cand]).query(
+                xy[members],
+                k=1,
+                workers=_spatial_workers(),
+            )
             keep = np.argsort(np.asarray(dist), kind="stable")[: len(cand)]
             assign_members = members[keep]
         local_assign = _assign_slots(
@@ -3065,7 +3590,11 @@ def _assign_slots_by_leaves_partial(
     missing = np.flatnonzero(out < 0)
     free = np.flatnonzero(~used)
     if len(missing) and len(free):
-        dist, _nbr = cKDTree(slots_xy[free]).query(xy[missing], k=1, workers=-1)
+        dist, _nbr = cKDTree(slots_xy[free]).query(
+            xy[missing],
+            k=1,
+            workers=_spatial_workers(),
+        )
         fill_members = missing[
             np.argsort(np.asarray(dist), kind="stable")[: len(free)]
         ]
@@ -3569,14 +4098,8 @@ def _write_regions(
         _write_geojson(feats, out_dir / f"regions_l{lvl}.geojson")
 
 
-def _city_layout(
-    points: pl.DataFrame, *, top_col: str, sub_col: str, args
-) -> tuple[pl.DataFrame, list[Road], list[Block], dict]:
-    n = points.height
-    xy = points.select("x", "y").to_numpy().astype(np.float64)
-    global_nn = _median_nn(xy)
-    print(f"  global median nn={global_nn:.5f}")
-    out = {
+def _empty_layout_columns(n: int) -> dict[str, np.ndarray]:
+    return {
         "x": np.full(n, np.nan, dtype=np.float64),
         "y": np.full(n, np.nan, dtype=np.float64),
         "building_angle": np.zeros(n, dtype=np.float32),
@@ -3589,6 +4112,100 @@ def _city_layout(
         "frontage_x": np.full(n, np.nan, dtype=np.float64),
         "frontage_y": np.full(n, np.nan, dtype=np.float64),
     }
+
+
+def _layout_island_worker(payload) -> IslandLayoutResult:
+    island_id, idx, island_xy, global_nn, args = payload
+    _set_spatial_workers(1)
+    local_out = _empty_layout_columns(len(island_xy))
+    roads: list[Road] = []
+    blocks: list[Block] = []
+    info = _layout_streamline_island(
+        idx=np.arange(len(island_xy), dtype=np.int64),
+        xy=island_xy,
+        island_id=island_id,
+        global_nn=global_nn,
+        args=args,
+        ids=Ids(),
+        roads=roads,
+        blocks=blocks,
+        out=local_out,
+    )
+    return IslandLayoutResult(
+        idx=idx,
+        island_id=island_id,
+        columns=local_out,
+        roads=roads,
+        blocks=blocks,
+        info=info,
+    )
+
+
+def _remap_island_result(
+    result: IslandLayoutResult,
+    *,
+    ids: Ids,
+    out: dict[str, np.ndarray],
+    roads: list[Road],
+    blocks: list[Block],
+) -> dict[str, int | float]:
+    road_offset = ids.road
+    block_offset = ids.block
+    lot_offset = ids.lot
+
+    local_road_ids = [road.road_id for road in result.roads]
+    local_block_ids = [block.block_id for block in result.blocks]
+    road_count = (max(local_road_ids) + 1) if local_road_ids else 0
+    block_count = (max(local_block_ids) + 1) if local_block_ids else 0
+    lot_count = int(np.nanmax(result.columns["lot_id"]) + 1) if len(result.idx) else 0
+
+    for road in result.roads:
+        roads.append(
+            Road(
+                road_id=road.road_id + road_offset,
+                coords=road.coords,
+                kind=road.kind,
+                island_id=road.island_id,
+                world_count=road.world_count,
+                width=road.width,
+            )
+        )
+    for block in result.blocks:
+        blocks.append(
+            Block(
+                block_id=block.block_id + block_offset,
+                island_id=block.island_id,
+                geom=block.geom,
+                target_lots=block.target_lots,
+                assigned_worlds=block.assigned_worlds,
+            )
+        )
+
+    columns = {name: values.copy() for name, values in result.columns.items()}
+    for name, offset in (
+        ("road_id", road_offset),
+        ("block_id", block_offset),
+        ("lot_id", lot_offset),
+    ):
+        mask = columns[name] >= 0
+        columns[name][mask] += offset
+    for name, values in columns.items():
+        out[name][result.idx] = values
+
+    ids.road += road_count
+    ids.block += block_count
+    ids.lot += lot_count
+    return result.info
+
+
+def _city_layout(
+    points: pl.DataFrame, *, top_col: str, sub_col: str, args
+) -> tuple[pl.DataFrame, list[Road], list[Block], dict]:
+    n = points.height
+    xy = points.select("x", "y").to_numpy().astype(np.float64)
+    global_nn = _median_nn(xy)
+    print(f"  global median nn={global_nn:.5f}")
+    out = _empty_layout_columns(n)
     roads: list[Road] = []
     blocks: list[Block] = []
     ids = Ids()
@@ -3614,29 +4231,47 @@ def _city_layout(
         .filter(pl.col(top_col).is_in(sorted(island_set)))
         .sort(top_col)
     )
-    for row in work.group_by(top_col).len().sort("len", descending=True).iter_rows(
-        named=True
-    ):
+    island_rows = list(
+        work.group_by(top_col).len().sort("len", descending=True).iter_rows(
+            named=True,
+        )
+    )
+    payloads = []
+    for row in island_rows:
         island_id = int(row[top_col])
         island = work.filter(pl.col(top_col) == island_id)
         idx = island["_idx"].to_numpy()
         island_xy = island.select("x", "y").to_numpy().astype(np.float64)
-        info = _layout_streamline_island(
-            idx=idx,
-            xy=island_xy,
-            island_id=island_id,
-            global_nn=global_nn,
-            args=args,
+        payloads.append((island_id, idx, island_xy, global_nn, args))
+
+    if args.layout_workers == 0:
+        layout_workers = min(
+            len(payloads),
+            max(1, os.cpu_count() or 1),
+        )
+    else:
+        layout_workers = max(1, min(int(args.layout_workers), len(payloads)))
+
+    if layout_workers > 1:
+        print(f"  layout workers={layout_workers}")
+        with ProcessPoolExecutor(max_workers=layout_workers) as executor:
+            results = list(executor.map(_layout_island_worker, payloads))
+    else:
+        results = [_layout_island_worker(payload) for payload in payloads]
+
+    for result in results:
+        info = _remap_island_result(
+            result,
             ids=ids,
+            out=out,
             roads=roads,
             blocks=blocks,
-            out=out,
         )
         island_metrics.append(
-            {"island_id": island_id, "worlds": len(island_xy), **info}
+            {"island_id": result.island_id, "worlds": len(result.idx), **info}
         )
         print(
-            f"    island {island_id}: {len(island_xy):,} worlds, "
+            f"    island {result.island_id}: {len(result.idx):,} worlds, "
             f"{info['active_roads']:,} roads, {info['slots']:,} slots"
         )
 
@@ -3688,6 +4323,8 @@ def main() -> None:
     ap.add_argument("--in-dir", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--max-islands", type=int, default=3)
+    ap.add_argument("--layout-workers", type=int, default=0)
+    ap.add_argument("--spatial-workers", type=int, default=-1)
     ap.add_argument("--top-level", type=int, default=None)
     ap.add_argument("--sub-level", type=int, default=None)
     ap.add_argument("--sparse-max-worlds", type=int, default=80)
@@ -3738,6 +4375,14 @@ def main() -> None:
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
     ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.75)
     ap.add_argument("--slot-filter-capacity-fallback", action="store_true")
+    ap.add_argument(
+        "--slot-footprint-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    ap.add_argument("--slot-footprint-road-clearance-scale", type=float, default=0.12)
+    ap.add_argument("--slot-footprint-overlap-query-quantile", type=float, default=0.99)
+    ap.add_argument("--slot-footprint-overlap-query-scale", type=float, default=1.05)
     ap.add_argument("--road-slot-end-gap-scale", type=float, default=0.9)
     ap.add_argument("--road-extent-quantile", type=float, default=0.006)
     ap.add_argument("--road-extent-pad-scale", type=float, default=4.0)
@@ -3828,9 +4473,36 @@ def main() -> None:
         type=float,
         default=0.28,
     )
+    ap.add_argument(
+        "--planar-density-isoline-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    ap.add_argument("--planar-density-min-worlds", type=int, default=2500)
+    ap.add_argument("--planar-density-knn", type=int, default=32)
+    ap.add_argument("--planar-density-center-quantile", type=float, default=0.08)
+    ap.add_argument("--planar-density-max-centers", type=int, default=14)
+    ap.add_argument("--planar-density-center-min-sep-scale", type=float, default=24.0)
+    ap.add_argument("--planar-density-centers-per-parcel", type=int, default=2)
+    ap.add_argument("--planar-density-isoline-max-depth", type=int, default=8)
+    ap.add_argument("--planar-density-center-reach-scale", type=float, default=1.15)
+    ap.add_argument("--planar-density-center-reach-min-scale", type=float, default=36.0)
+    ap.add_argument("--planar-density-min-radius-scale", type=float, default=5.0)
+    ap.add_argument("--planar-density-isoline-curve-strength", type=float, default=0.75)
+    ap.add_argument("--planar-density-isoline-max-curve-frac", type=float, default=0.32)
+    ap.add_argument("--planar-density-isoline-offsets", type=int, default=1)
+    ap.add_argument("--planar-density-isoline-offset-frac", type=float, default=0.18)
     ap.add_argument("--planar-boundary-resample-scale", type=float, default=2.35)
     ap.add_argument("--planar-min-noded-segment-scale", type=float, default=0.08)
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
+    ap.add_argument("--planar-topology-merge-scale", type=float, default=0.55)
+    ap.add_argument("--planar-topology-short-edge-scale", type=float, default=0.85)
+    ap.add_argument("--planar-topology-max-move-scale", type=float, default=1.8)
+    ap.add_argument(
+        "--planar-topology-endpoint-max-turn-deg",
+        type=float,
+        default=70.0,
+    )
     ap.add_argument("--planar-junction-snap-scale", type=float, default=2.05)
     ap.add_argument("--planar-junction-merge-scale", type=float, default=1.85)
     ap.add_argument("--planar-local-junction-snap-scale", type=float, default=1.75)
@@ -3896,6 +4568,7 @@ def main() -> None:
     ap.add_argument("--region-buffer-scale", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    _set_spatial_workers(args.spatial_workers)
 
     manifest_path = args.in_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
@@ -4025,7 +4698,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v18",
+        "layout": "city-planar-v19",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
