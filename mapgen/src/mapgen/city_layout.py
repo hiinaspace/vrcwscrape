@@ -3347,6 +3347,24 @@ def _mesh_ellipse_line(
     return LineString(world)
 
 
+def _mesh_ellipse_polygon(
+    center: np.ndarray,
+    axes: np.ndarray,
+    rx: float,
+    ry: float,
+    *,
+    vertices: int,
+) -> Polygon:
+    line = _mesh_ellipse_line(center, axes, rx, ry, vertices=vertices)
+    return _safe_geom(Polygon(line.coords))
+
+
+def _mesh_ellipse_direction_radius(rx: float, ry: float, theta: float) -> float:
+    c = math.cos(theta)
+    s = math.sin(theta)
+    return 1.0 / math.sqrt((c / max(rx, 1e-12)) ** 2 + (s / max(ry, 1e-12)) ** 2)
+
+
 def _mesh_poly_diag(poly: Polygon) -> float:
     minx, miny, maxx, maxy = poly.bounds
     return float(math.hypot(maxx - minx, maxy - miny))
@@ -3425,6 +3443,128 @@ def _mesh_contour_road_specs(
     return specs
 
 
+def _mesh_downtown_grid_specs(
+    poly: Polygon,
+    *,
+    center: MeshCenter,
+    rx: float,
+    ry: float,
+    member_count: int,
+    island_id: int,
+    center_no: int,
+    global_nn: float,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    if member_count < args.mesh_downtown_min_worlds:
+        return []
+    district = _mesh_ellipse_polygon(
+        center.xy,
+        center.axes,
+        rx,
+        ry,
+        vertices=args.mesh_ring_vertices,
+    )
+    clip_geom = _safe_geom(poly.intersection(district))
+    if clip_geom.is_empty:
+        return []
+    min_length = slot_step * args.boundary_road_min_length_slots
+    grid_lines = int(
+        np.clip(
+            math.ceil(math.sqrt(member_count) / args.mesh_downtown_grid_worlds_scale),
+            args.mesh_downtown_min_lines,
+            args.mesh_downtown_max_lines,
+        )
+    )
+    specs: list[RoadSpec] = []
+    extents = [
+        rx * args.mesh_downtown_grid_extent_frac,
+        ry * args.mesh_downtown_grid_extent_frac,
+    ]
+    for family in (0, 1):
+        normal_axis = family
+        tangent_axis = 1 - family
+        half_normal = extents[normal_axis]
+        half_tangent = extents[tangent_axis] * 1.35
+        if half_normal <= global_nn or half_tangent <= global_nn:
+            continue
+        offsets = np.linspace(-half_normal, half_normal, grid_lines)
+        for line_no, offset in enumerate(offsets.tolist()):
+            local = np.zeros((2, 2), dtype=np.float64)
+            local[:, normal_axis] = offset
+            local[:, tangent_axis] = [-half_tangent, half_tangent]
+            line = LineString(_to_world(local, center.xy, center.axes))
+            specs.extend(
+                _line_specs_from_geom(
+                    line.intersection(clip_geom),
+                    island_id=island_id,
+                    kind="local",
+                    width=args.local_road_width,
+                    family=-(56000 + center_no * 1000 + family * 100 + line_no),
+                    min_length=min_length,
+                    depth=1,
+                )
+            )
+    return specs
+
+
+def _mesh_connector_spoke_specs(
+    poly: Polygon,
+    *,
+    center: MeshCenter,
+    rx: float,
+    ry: float,
+    reach: float,
+    member_count: int,
+    island_id: int,
+    center_no: int,
+    slot_step: float,
+    args,
+) -> list[RoadSpec]:
+    spoke_count = int(
+        np.clip(
+            math.ceil(math.sqrt(member_count) / args.mesh_spoke_worlds_scale),
+            args.mesh_min_spokes,
+            args.mesh_max_spokes,
+        )
+    )
+    min_length = slot_step * args.boundary_road_min_length_slots
+    specs: list[RoadSpec] = []
+    for spoke_no in range(spoke_count):
+        theta = (math.pi * spoke_no) / max(spoke_count, 1)
+        for side in (-1, 1):
+            direction_theta = theta + (0.0 if side > 0 else math.pi)
+            local_dir = np.array(
+                [math.cos(direction_theta), math.sin(direction_theta)],
+                dtype=np.float64,
+            )
+            belt_r = _mesh_ellipse_direction_radius(rx, ry, direction_theta)
+            start_r = belt_r * args.mesh_spoke_start_ring_frac
+            end_r = max(reach, belt_r * args.mesh_spoke_min_end_frac)
+            if end_r <= start_r + min_length:
+                continue
+            local = np.vstack([local_dir * start_r, local_dir * end_r])
+            line = LineString(_to_world(local, center.xy, center.axes))
+            kind = (
+                "collector"
+                if spoke_no % max(args.mesh_spoke_collector_every, 1) == 0
+                else "local"
+            )
+            specs.extend(
+                _mesh_clip_line_specs(
+                    line,
+                    poly,
+                    island_id=island_id,
+                    kind=kind,
+                    family=-(52000 + center_no * 1000 + spoke_no * 10 + side),
+                    min_length=min_length,
+                    args=args,
+                    depth=1,
+                )
+            )
+    return specs
+
+
 def _mesh_center_road_specs(
     poly: Polygon,
     *,
@@ -3460,8 +3600,42 @@ def _mesh_center_road_specs(
     min_radius = global_nn * args.mesh_city_min_radius_scale
     min_length = slot_step * args.boundary_road_min_length_slots
     specs: list[RoadSpec] = []
-    last_rx = min_radius
-    last_ry = min_radius
+
+    downtown_q = args.mesh_downtown_radius_quantile
+    downtown_rx = max(
+        float(np.quantile(abs_local[:, 0], downtown_q)) * 1.12,
+        min_radius * args.mesh_downtown_min_radius_frac,
+    )
+    downtown_ry = max(
+        float(np.quantile(abs_local[:, 1], downtown_q)) * 1.12,
+        min_radius * args.mesh_downtown_min_radius_frac,
+    )
+    long = max(downtown_rx, downtown_ry)
+    short = max(
+        min(downtown_rx, downtown_ry),
+        long / max(args.mesh_ring_max_aspect, 1.0),
+    )
+    if downtown_rx >= downtown_ry:
+        downtown_rx, downtown_ry = long, short
+    else:
+        downtown_rx, downtown_ry = short, long
+    specs.extend(
+        _mesh_downtown_grid_specs(
+            poly,
+            center=center,
+            rx=downtown_rx,
+            ry=downtown_ry,
+            member_count=len(members),
+            island_id=island_id,
+            center_no=center_no,
+            global_nn=global_nn,
+            slot_step=slot_step,
+            args=args,
+        )
+    )
+
+    last_rx = downtown_rx
+    last_ry = downtown_ry
     for ring_no, q in enumerate(qs.tolist()):
         rx = max(float(np.quantile(abs_local[:, 0], q)) * 1.08, min_radius)
         ry = max(float(np.quantile(abs_local[:, 1], q)) * 1.08, min_radius)
@@ -3471,6 +3645,11 @@ def _mesh_center_road_specs(
             rx, ry = long, short
         else:
             rx, ry = short, long
+        if (
+            rx < downtown_rx * args.mesh_ring_min_downtown_gap
+            and ry < downtown_ry * args.mesh_ring_min_downtown_gap
+        ):
+            continue
         last_rx = max(last_rx, rx)
         last_ry = max(last_ry, ry)
         kind = "collector" if ring_no == ring_count - 1 else "local"
@@ -3494,37 +3673,22 @@ def _mesh_center_road_specs(
             )
         )
 
-    spoke_count = int(
-        np.clip(
-            math.ceil(math.sqrt(len(members)) / args.mesh_spoke_worlds_scale),
-            args.mesh_min_spokes,
-            args.mesh_max_spokes,
-        )
-    )
     reach = max(last_rx, last_ry, center.radius) * args.mesh_spoke_reach_scale
     reach = max(reach, min_radius * 2.0)
-    for spoke_no in range(spoke_count):
-        theta = (math.pi * spoke_no) / max(spoke_count, 1)
-        local_dir = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
-        world_dir = center.axes @ local_dir
-        kind = (
-            "collector"
-            if spoke_no % max(args.mesh_spoke_collector_every, 1) == 0
-            else "local"
+    specs.extend(
+        _mesh_connector_spoke_specs(
+            poly,
+            center=center,
+            rx=last_rx,
+            ry=last_ry,
+            reach=reach,
+            member_count=len(members),
+            island_id=island_id,
+            center_no=center_no,
+            slot_step=slot_step,
+            args=args,
         )
-        line = _mesh_axis_line(center.xy, world_dir, length=reach * 2.0)
-        specs.extend(
-            _mesh_clip_line_specs(
-                line,
-                poly,
-                island_id=island_id,
-                kind=kind,
-                family=-(52000 + center_no * 100 + spoke_no),
-                min_length=min_length,
-                args=args,
-                depth=1,
-            )
-        )
+    )
     return specs
 
 
@@ -3942,14 +4106,29 @@ def _mesh_refine_roads(
             f"      mesh island {island_id}: initial {len(blocks):,} blocks",
             flush=True,
         )
+    target_block_area = (
+        global_nn
+        * global_nn
+        * max(args.mesh_target_block_area_scale, args.mesh_min_block_area_scale)
+    )
     for round_no in range(max(0, int(args.mesh_refine_rounds))):
         scored: list[tuple[float, int, MeshBlock]] = []
         for block_no, block in enumerate(blocks):
             capacity = _mesh_block_capacity(block, slot_step=slot_step, args=args)
             overload = len(block.point_idx) - capacity * args.mesh_capacity_target
-            if overload <= 0:
+            area_excess = max(
+                0.0,
+                float(block.geom.area) / max(target_block_area, 1e-12) - 1.0,
+            )
+            area_score = (
+                area_excess * args.mesh_area_refine_score_scale
+                if len(block.point_idx) >= args.mesh_area_refine_min_worlds
+                else 0.0
+            )
+            score = max(float(overload), area_score)
+            if score <= 0:
                 continue
-            scored.append((float(overload), block_no, block))
+            scored.append((score, block_no, block))
         scored.sort(reverse=True, key=lambda x: x[0])
         if not scored:
             break
@@ -3974,7 +4153,7 @@ def _mesh_refine_roads(
             print(
                 f"      mesh island {island_id}: refine {round_no + 1} "
                 f"adding {len(additions):,} roads "
-                f"(worst overload {worst:.1f})",
+                f"(worst score {worst:.1f})",
                 flush=True,
             )
         road_specs.extend(additions)
@@ -4364,6 +4543,9 @@ def _mesh_road_graph_metrics(
         "road_degree3": int(np.count_nonzero(degrees == 3)),
         "road_degree4": int(np.count_nonzero(degrees == 4)),
         "road_degree5_plus": int(np.count_nonzero(degrees >= 5)),
+        "road_degree8_plus": int(np.count_nonzero(degrees >= 8)),
+        "road_degree12_plus": int(np.count_nonzero(degrees >= 12)),
+        "road_degree_max": int(degrees.max(initial=0)),
         "junction_angle_dev_median": float(np.median(dev)) if len(dev) else 0.0,
         "junction_angle_dev_p90": float(np.quantile(dev, 0.90)) if len(dev) else 0.0,
     }
@@ -6132,25 +6314,38 @@ def main() -> None:
     ap.add_argument("--mesh-city-min-radius-scale", type=float, default=9.0)
     ap.add_argument("--mesh-contour-min-worlds", type=int, default=6500)
     ap.add_argument("--mesh-contour-min-area-scale", type=float, default=1800.0)
-    ap.add_argument("--mesh-contour-spacing-scale", type=float, default=8.0)
-    ap.add_argument("--mesh-contour-slot-spacing-scale", type=float, default=18.0)
-    ap.add_argument("--mesh-contour-max-offset-frac", type=float, default=0.42)
-    ap.add_argument("--mesh-contour-max-rings", type=int, default=7)
+    ap.add_argument("--mesh-contour-spacing-scale", type=float, default=13.0)
+    ap.add_argument("--mesh-contour-slot-spacing-scale", type=float, default=30.0)
+    ap.add_argument("--mesh-contour-max-offset-frac", type=float, default=0.22)
+    ap.add_argument("--mesh-contour-max-rings", type=int, default=2)
     ap.add_argument("--mesh-contour-collector-every", type=int, default=2)
-    ap.add_argument("--mesh-ring-worlds-scale", type=float, default=32.0)
-    ap.add_argument("--mesh-max-city-rings", type=int, default=5)
-    ap.add_argument("--mesh-ring-inner-quantile", type=float, default=0.42)
+    ap.add_argument("--mesh-downtown-min-worlds", type=int, default=900)
+    ap.add_argument("--mesh-downtown-radius-quantile", type=float, default=0.42)
+    ap.add_argument("--mesh-downtown-min-radius-frac", type=float, default=1.35)
+    ap.add_argument("--mesh-downtown-grid-worlds-scale", type=float, default=38.0)
+    ap.add_argument("--mesh-downtown-min-lines", type=int, default=3)
+    ap.add_argument("--mesh-downtown-max-lines", type=int, default=8)
+    ap.add_argument("--mesh-downtown-grid-extent-frac", type=float, default=0.78)
+    ap.add_argument("--mesh-ring-worlds-scale", type=float, default=70.0)
+    ap.add_argument("--mesh-max-city-rings", type=int, default=2)
+    ap.add_argument("--mesh-ring-inner-quantile", type=float, default=0.66)
     ap.add_argument("--mesh-ring-outer-quantile", type=float, default=0.88)
     ap.add_argument("--mesh-ring-max-aspect", type=float, default=2.8)
+    ap.add_argument("--mesh-ring-min-downtown-gap", type=float, default=1.22)
     ap.add_argument("--mesh-ring-vertices", type=int, default=192)
-    ap.add_argument("--mesh-spoke-worlds-scale", type=float, default=45.0)
-    ap.add_argument("--mesh-min-spokes", type=int, default=7)
-    ap.add_argument("--mesh-max-spokes", type=int, default=16)
+    ap.add_argument("--mesh-spoke-worlds-scale", type=float, default=85.0)
+    ap.add_argument("--mesh-min-spokes", type=int, default=4)
+    ap.add_argument("--mesh-max-spokes", type=int, default=8)
     ap.add_argument("--mesh-spoke-reach-scale", type=float, default=1.28)
     ap.add_argument("--mesh-spoke-collector-every", type=int, default=4)
+    ap.add_argument("--mesh-spoke-start-ring-frac", type=float, default=0.98)
+    ap.add_argument("--mesh-spoke-min-end-frac", type=float, default=1.55)
     ap.add_argument("--mesh-axis-min-worlds", type=int, default=10000)
     ap.add_argument("--mesh-cross-axis-min-worlds", type=int, default=26000)
     ap.add_argument("--mesh-min-block-area-scale", type=float, default=5.0)
+    ap.add_argument("--mesh-target-block-area-scale", type=float, default=42.0)
+    ap.add_argument("--mesh-area-refine-min-worlds", type=int, default=12)
+    ap.add_argument("--mesh-area-refine-score-scale", type=float, default=10.0)
     ap.add_argument("--mesh-capacity-spacing-scale", type=float, default=1.25)
     ap.add_argument("--mesh-block-frontage-efficiency", type=float, default=0.62)
     ap.add_argument("--mesh-capacity-target", type=float, default=1.0)
@@ -6159,8 +6354,8 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    ap.add_argument("--mesh-refine-rounds", type=int, default=4)
-    ap.add_argument("--mesh-refine-batch", type=int, default=110)
+    ap.add_argument("--mesh-refine-rounds", type=int, default=8)
+    ap.add_argument("--mesh-refine-batch", type=int, default=240)
     ap.add_argument("--mesh-refine-min-worlds", type=int, default=8)
     ap.add_argument("--mesh-refine-local-density", type=float, default=0.38)
     ap.add_argument("--mesh-split-curve-strength", type=float, default=0.55)
@@ -6385,7 +6580,7 @@ def main() -> None:
         "top": top_level,
         "sub": sub_level,
         "layout": (
-            "city-mesh-v1" if args.layout_engine == "mesh" else "city-planar-v20"
+            "city-mesh-v2" if args.layout_engine == "mesh" else "city-planar-v20"
         ),
     }
     assets = dict(out_manifest.get("assets") or {})
