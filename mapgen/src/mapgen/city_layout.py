@@ -92,6 +92,16 @@ class SplitParcel:
 
 
 @dataclass
+class SplitLineCandidate:
+    line: LineString
+    normal_axis: int
+    tangent_axis: int
+    major_axis: int
+    shape_ratio: float
+    tangent_span: float
+
+
+@dataclass
 class PlanarStreetResult:
     road_specs: list[RoadSpec]
     leaves: list[SplitParcel]
@@ -1321,115 +1331,6 @@ def _planar_spine_road_specs(
     ]
 
 
-def _planar_axis_trunk_road_specs(
-    parts: list[Polygon],
-    *,
-    members_by_part: list[np.ndarray],
-    xy: np.ndarray,
-    island_id: int,
-    global_nn: float,
-    slot_step: float,
-    args,
-) -> list[RoadSpec]:
-    specs: list[RoadSpec] = []
-    min_length = slot_step * args.min_road_length_slots
-    rng = np.random.default_rng(args.seed + island_id * 16981)
-    for part_no, poly in enumerate(parts):
-        members = members_by_part[part_no] if part_no < len(members_by_part) else []
-        count = len(members)
-        if count < args.planar_axis_trunk_min_worlds:
-            continue
-        if poly.area < (global_nn * global_nn) * args.planar_axis_trunk_min_area_scale:
-            continue
-        center, axes = _parcel_shape_axes(poly)
-        lo, hi = _project_poly_bounds(poly, center, axes)
-        span = np.maximum(hi - lo, 1e-9)
-        shape_ratio = float(span.max() / max(span.min(), 1e-9))
-        if shape_ratio < args.planar_axis_trunk_min_aspect:
-            continue
-        along_axis = int(np.argmax(span))
-        cross_axis = 1 - along_axis
-        pts = xy[np.asarray(members, dtype=np.int64)]
-        local_pts = (pts - center) @ axes if len(pts) else np.empty((0, 2))
-        trunk_count = min(
-            args.planar_axis_trunk_max_roads,
-            max(
-                1,
-                int(math.ceil(count / max(args.planar_axis_trunk_worlds_per_road, 1))),
-            ),
-        )
-        if trunk_count <= 0:
-            continue
-        if trunk_count == 1:
-            quantiles = [0.5]
-        else:
-            quantiles = np.linspace(0.0, 1.0, trunk_count + 2)[1:-1].tolist()
-        margin = max(
-            span[cross_axis] * args.planar_axis_trunk_margin_frac,
-            global_nn * args.planar_min_split_margin_scale,
-        )
-        if margin * 2 >= span[cross_axis]:
-            continue
-        along_pad = span[along_axis] * 0.10 + global_nn * 6.0
-        a0 = lo[along_axis] - along_pad
-        a1 = hi[along_axis] + along_pad
-        n = int(
-            np.clip(
-                math.ceil((a1 - a0) / max(global_nn * 2.2, span[along_axis] / 180)),
-                32,
-                args.road_curve_max_vertices,
-            )
-        )
-        along = np.linspace(a0, a1, n)
-        bridge_geom = poly.buffer(
-            global_nn * args.planar_axis_trunk_bridge_scale,
-            join_style="round",
-        )
-        for trunk_no, q in enumerate(quantiles):
-            if len(local_pts):
-                cross = float(np.quantile(local_pts[:, cross_axis], q))
-            else:
-                cross = float((lo[cross_axis] + hi[cross_axis]) * 0.5)
-            cross = float(
-                np.clip(cross, lo[cross_axis] + margin, hi[cross_axis] - margin)
-            )
-            amp = min(
-                span[cross_axis] * args.planar_axis_trunk_curve_span_scale,
-                global_nn * args.planar_axis_trunk_curve_global_scale,
-            )
-            phase = rng.uniform(0.0, math.tau)
-            curve = amp * np.sin(
-                (along / max(span[along_axis] * 0.85, global_nn * 6.0)) * math.tau
-                + phase
-            )
-            local = np.zeros((len(along), 2), dtype=np.float64)
-            local[:, along_axis] = along
-            local[:, cross_axis] = cross + curve
-            line = LineString(_to_world(local, center, axes)).intersection(bridge_geom)
-            kind = (
-                "arterial"
-                if count >= args.planar_axis_trunk_arterial_min_worlds
-                else "collector"
-            )
-            width = (
-                args.arterial_road_width
-                if kind == "arterial"
-                else args.collector_road_width
-            )
-            specs.extend(
-                _line_specs_from_geom(
-                    line,
-                    island_id=island_id,
-                    kind=kind,
-                    width=width,
-                    family=-(40000 + part_no * 100 + trunk_no),
-                    min_length=min_length,
-                    depth=0,
-                )
-            )
-    return specs
-
-
 def _polygon_irregularity(poly: Polygon) -> float:
     if poly.is_empty or poly.area <= 1e-12:
         return 1e6
@@ -1496,7 +1397,7 @@ def _planar_split_candidate_lines(
     global_nn: float,
     args,
     rng: np.random.Generator,
-) -> list[LineString]:
+) -> list[SplitLineCandidate]:
     pts = xy[parcel.point_idx]
     center, axes = _parcel_shape_axes(parcel.geom)
     lo, hi = _project_poly_bounds(parcel.geom, center, axes)
@@ -1506,7 +1407,16 @@ def _planar_split_candidate_lines(
 
     local_pts = (pts - center) @ axes if len(pts) else np.empty((0, 2))
     shape_ratio = float(span.max() / max(span.min(), 1e-9))
-    if shape_ratio >= args.planar_force_crosscut_ratio:
+    major_axis = int(np.argmax(span))
+    minor_axis = 1 - major_axis
+    use_axis_bias = (
+        parcel.depth < args.planar_axis_split_depth
+        and len(parcel.point_idx) >= args.planar_axis_split_min_worlds
+        and shape_ratio >= args.planar_axis_split_min_aspect
+    )
+    if use_axis_bias:
+        order = [minor_axis, major_axis]
+    elif shape_ratio >= args.planar_force_crosscut_ratio:
         order = [int(np.argmax(span))]
     else:
         order = [parcel.depth % 2, 1 - (parcel.depth % 2)]
@@ -1572,7 +1482,16 @@ def _planar_split_candidate_lines(
             local[:, normal_axis] = split_at + curve
             line = LineString(_to_world(local, center, axes))
             if line.length > global_nn:
-                candidates.append(line)
+                candidates.append(
+                    SplitLineCandidate(
+                        line=line,
+                        normal_axis=int(normal_axis),
+                        tangent_axis=int(tangent_axis),
+                        major_axis=major_axis,
+                        shape_ratio=shape_ratio,
+                        tangent_span=float(span[tangent_axis]),
+                    )
+                )
     return candidates
 
 
@@ -1592,13 +1511,14 @@ def _try_split_planar_parcel(
         return None
     min_area = (global_nn * global_nn) * args.planar_min_parcel_area_scale
     best: tuple[float, list[Polygon], list[np.ndarray], LineString] | None = None
-    for line in _planar_split_candidate_lines(
+    for cand in _planar_split_candidate_lines(
         parcel,
         xy,
         global_nn=global_nn,
         args=args,
         rng=rng,
     ):
+        line = cand.line
         if line.length <= slot_step * args.planar_min_split_road_length_slots:
             continue
         try:
@@ -1639,12 +1559,22 @@ def _try_split_planar_parcel(
         split_geom_line = line.intersection(parcel.geom)
         split_len = sum(seg.length for seg in _iter_lines(split_geom_line))
         length_score = math.sqrt(float(parcel.geom.area)) / max(split_len, 1e-9)
+        axis_score = 0.0
+        if (
+            parcel.depth < args.planar_axis_split_depth
+            and len(parcel.point_idx) >= args.planar_axis_split_min_worlds
+            and cand.shape_ratio >= args.planar_axis_split_min_aspect
+            and cand.tangent_axis == cand.major_axis
+        ):
+            through_score = min(split_len / max(cand.tangent_span, 1e-9), 1.0)
+            axis_score = through_score * math.sqrt(area_balance * count_balance)
         score = (
             args.planar_quality_size_weight * area_balance
             + args.planar_quality_count_weight * count_balance
             + args.planar_quality_regular_weight * regularity
             + args.planar_quality_aspect_weight * aspect_score
             + args.planar_quality_length_weight * min(length_score, 1.0)
+            + args.planar_quality_axis_weight * axis_score
         )
         if best is None or score > best[0]:
             best = (score, parts, child_members, split_geom_line)
@@ -1703,6 +1633,52 @@ def _choose_split_leaf(
     return [i for _score, i in scored[: args.recursive_split_search]]
 
 
+def _planar_junction_snap_tol(spec: RoadSpec, global_nn: float, args) -> float:
+    if spec.kind in {"arterial", "collector"}:
+        return global_nn * args.planar_junction_snap_scale
+    if spec.kind == "local":
+        return global_nn * args.planar_local_junction_snap_scale
+    return global_nn * args.planar_service_junction_snap_scale
+
+
+def _planar_junction_merge_tol(spec: RoadSpec, global_nn: float, args) -> float:
+    if spec.kind in {"arterial", "collector"}:
+        return global_nn * args.planar_junction_merge_scale
+    if spec.kind == "local":
+        return global_nn * args.planar_local_junction_merge_scale
+    return global_nn * args.planar_service_junction_merge_scale
+
+
+def _planar_junction_max_turn_deg(spec: RoadSpec, args) -> float:
+    if spec.kind in {"arterial", "collector"}:
+        return args.planar_major_junction_max_turn_deg
+    if spec.kind == "local":
+        return args.planar_local_junction_max_turn_deg
+    return args.planar_service_junction_max_turn_deg
+
+
+def _endpoint_snap_turn_ok(
+    coords: np.ndarray,
+    end_idx: int,
+    target: np.ndarray,
+    *,
+    max_turn_deg: float,
+) -> bool:
+    if len(coords) < 2 or max_turn_deg <= 0:
+        return True
+    endpoint = coords[end_idx]
+    neighbor = coords[1] if end_idx == 0 else coords[-2]
+    old_vec = endpoint - neighbor
+    new_vec = target - neighbor
+    old_len = float(np.linalg.norm(old_vec))
+    new_len = float(np.linalg.norm(new_vec))
+    if old_len <= 1e-9 or new_len <= 1e-9:
+        return True
+    cos = float(np.dot(old_vec, new_vec) / (old_len * new_len))
+    turn = math.degrees(math.acos(float(np.clip(cos, -1.0, 1.0))))
+    return turn <= max_turn_deg
+
+
 def _snap_planar_junctions(
     specs: list[RoadSpec],
     *,
@@ -1717,15 +1693,24 @@ def _snap_planar_junctions(
         return specs
     lines = [LineString(spec.coords) for spec in specs]
     tree = shapely.STRtree(lines)
-    snap_tol = global_nn * args.planar_junction_snap_scale
-    merge_tol = global_nn * args.planar_junction_merge_scale
-    proposals: list[tuple[int, int, np.ndarray]] = []
+    snap_tols = np.asarray(
+        [_planar_junction_snap_tol(spec, global_nn, args) for spec in specs],
+        dtype=np.float64,
+    )
+    merge_tols = np.asarray(
+        [_planar_junction_merge_tol(spec, global_nn, args) for spec in specs],
+        dtype=np.float64,
+    )
+    proposals: list[tuple[int, int, np.ndarray, float]] = []
     for i, line in enumerate(lines):
         coords = np.asarray(line.coords, dtype=np.float64)
         if len(coords) < 2:
             continue
         closed = np.linalg.norm(coords[0] - coords[-1]) <= 1e-9
         if closed:
+            continue
+        snap_tol = float(snap_tols[i])
+        if snap_tol <= 0:
             continue
         for end_idx in (0, len(coords) - 1):
             endpoint = coords[end_idx]
@@ -1740,15 +1725,25 @@ def _snap_planar_junctions(
                 if q is None:
                     continue
                 d = float(np.linalg.norm(endpoint - q))
-                if d <= snap_tol and d < best_d:
+                if (
+                    d <= snap_tol
+                    and d < best_d
+                    and _endpoint_snap_turn_ok(
+                        coords,
+                        end_idx,
+                        q,
+                        max_turn_deg=_planar_junction_max_turn_deg(specs[i], args),
+                    )
+                ):
                     best_q = q
                     best_d = d
             if best_q is not None:
-                proposals.append((i, end_idx, best_q))
+                proposals.append((i, end_idx, best_q, float(merge_tols[i])))
     if not proposals:
         return specs
 
-    pts = np.stack([p for _i, _end, p in proposals])
+    pts = np.stack([p for _i, _end, p, _merge in proposals])
+    proposal_merge_tols = np.asarray([m for *_rest, m in proposals], dtype=np.float64)
     parent = np.arange(len(proposals), dtype=np.int64)
 
     def find(v: int) -> int:
@@ -1763,9 +1758,17 @@ def _snap_planar_junctions(
         if ra != rb:
             parent[rb] = ra
 
-    nbrs = cKDTree(pts).query_pairs(merge_tol)
+    max_merge_tol = float(proposal_merge_tols.max(initial=0.0))
+    nbrs = cKDTree(pts).query_pairs(max_merge_tol)
     for a, b in nbrs:
-        union(int(a), int(b))
+        if (
+            float(np.linalg.norm(pts[int(a)] - pts[int(b)]))
+            <= min(
+                float(proposal_merge_tols[int(a)]),
+                float(proposal_merge_tols[int(b)]),
+            )
+        ):
+            union(int(a), int(b))
     clusters: dict[int, list[int]] = defaultdict(list)
     for i in range(len(proposals)):
         clusters[find(i)].append(i)
@@ -1778,18 +1781,25 @@ def _snap_planar_junctions(
         if snapped is None:
             snapped = center
         for member in members:
-            spec_idx, end_idx, _q = proposals[member]
+            spec_idx, end_idx, _q, _merge = proposals[member]
             snap_points[(spec_idx, end_idx)] = snapped
 
     out: list[RoadSpec] = []
-    max_move = snap_tol + merge_tol
     for i, spec in enumerate(specs):
         coords = np.asarray(spec.coords, dtype=np.float64).copy()
+        max_move = float(snap_tols[i] + merge_tols[i])
         for end_idx in (0, len(coords) - 1):
             q = snap_points.get((i, end_idx))
             if q is None:
                 continue
-            if float(np.linalg.norm(coords[end_idx] - q)) <= max_move:
+            if float(np.linalg.norm(coords[end_idx] - q)) <= max_move and (
+                _endpoint_snap_turn_ok(
+                    coords,
+                    end_idx,
+                    q,
+                    max_turn_deg=_planar_junction_max_turn_deg(spec, args),
+                )
+            ):
                 coords[end_idx] = q
         out.append(
             RoadSpec(
@@ -1896,17 +1906,6 @@ def _generate_planar_streets(
         global_nn=global_nn,
         slot_step=slot_step,
         args=args,
-    )
-    road_specs.extend(
-        _planar_axis_trunk_road_specs(
-            parts,
-            members_by_part=members_by_part,
-            xy=xy,
-            island_id=island_id,
-            global_nn=global_nn,
-            slot_step=slot_step,
-            args=args,
-        )
     )
     rng = np.random.default_rng(args.seed + island_id * 7919)
     target_leaf_worlds = max(args.planar_target_block_worlds, 6)
@@ -3550,7 +3549,7 @@ def main() -> None:
     ap.add_argument("--slot-filter-min-global-scale", type=float, default=0.28)
     ap.add_argument("--slot-filter-building-scale", type=float, default=0.88)
     ap.add_argument("--slot-filter-footprint-radius-scale", type=float, default=0.0)
-    ap.add_argument("--road-slot-end-gap-scale", type=float, default=1.8)
+    ap.add_argument("--road-slot-end-gap-scale", type=float, default=0.9)
     ap.add_argument("--road-extent-quantile", type=float, default=0.006)
     ap.add_argument("--road-extent-pad-scale", type=float, default=4.0)
     ap.add_argument("--road-jitter-scale", type=float, default=0.17)
@@ -3626,8 +3625,12 @@ def main() -> None:
     ap.add_argument("--planar-quality-regular-weight", type=float, default=0.40)
     ap.add_argument("--planar-quality-aspect-weight", type=float, default=0.55)
     ap.add_argument("--planar-quality-length-weight", type=float, default=0.08)
+    ap.add_argument("--planar-quality-axis-weight", type=float, default=0.14)
     ap.add_argument("--planar-target-child-aspect", type=float, default=4.0)
     ap.add_argument("--planar-force-crosscut-ratio", type=float, default=2.35)
+    ap.add_argument("--planar-axis-split-depth", type=int, default=0)
+    ap.add_argument("--planar-axis-split-min-worlds", type=int, default=2500)
+    ap.add_argument("--planar-axis-split-min-aspect", type=float, default=1.18)
     ap.add_argument("--planar-streamline-curve-span-scale", type=float, default=0.060)
     ap.add_argument("--planar-streamline-curve-global-scale", type=float, default=3.4)
     ap.add_argument("--planar-streamline-wavelength-scale", type=float, default=0.82)
@@ -3641,16 +3644,13 @@ def main() -> None:
     ap.add_argument("--planar-source-match-tolerance-scale", type=float, default=0.12)
     ap.add_argument("--planar-junction-snap-scale", type=float, default=2.05)
     ap.add_argument("--planar-junction-merge-scale", type=float, default=1.85)
-    ap.add_argument("--planar-axis-trunk-min-worlds", type=int, default=2500)
-    ap.add_argument("--planar-axis-trunk-arterial-min-worlds", type=int, default=50000)
-    ap.add_argument("--planar-axis-trunk-worlds-per-road", type=int, default=60000)
-    ap.add_argument("--planar-axis-trunk-max-roads", type=int, default=1)
-    ap.add_argument("--planar-axis-trunk-min-area-scale", type=float, default=1000.0)
-    ap.add_argument("--planar-axis-trunk-min-aspect", type=float, default=1.18)
-    ap.add_argument("--planar-axis-trunk-margin-frac", type=float, default=0.18)
-    ap.add_argument("--planar-axis-trunk-bridge-scale", type=float, default=3.5)
-    ap.add_argument("--planar-axis-trunk-curve-span-scale", type=float, default=0.025)
-    ap.add_argument("--planar-axis-trunk-curve-global-scale", type=float, default=1.4)
+    ap.add_argument("--planar-local-junction-snap-scale", type=float, default=1.75)
+    ap.add_argument("--planar-local-junction-merge-scale", type=float, default=1.55)
+    ap.add_argument("--planar-service-junction-snap-scale", type=float, default=1.15)
+    ap.add_argument("--planar-service-junction-merge-scale", type=float, default=0.95)
+    ap.add_argument("--planar-major-junction-max-turn-deg", type=float, default=55.0)
+    ap.add_argument("--planar-local-junction-max-turn-deg", type=float, default=28.0)
+    ap.add_argument("--planar-service-junction-max-turn-deg", type=float, default=22.0)
     ap.add_argument("--planar-boundary-ring-min-worlds", type=int, default=650)
     ap.add_argument("--planar-boundary-ring-min-area-scale", type=float, default=1200.0)
     ap.add_argument("--planar-coastal-inset-min-area-scale", type=float, default=4.0)
@@ -3824,7 +3824,7 @@ def main() -> None:
         "levels": levels,
         "top": top_level,
         "sub": sub_level,
-        "layout": "city-planar-v15",
+        "layout": "city-planar-v16",
     }
     assets = dict(out_manifest.get("assets") or {})
     assets.update(
