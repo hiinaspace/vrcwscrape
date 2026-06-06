@@ -171,6 +171,13 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
     assert "short_edge_count_after" in metrics
     assert "geometry_optimization_applied" in metrics
     assert "geometry_opt_width_p01_before" in metrics
+    assert "geometry_opt_parcel_wrinkles_before" in metrics
+    assert "geometry_opt_parcel_wrinkles_after" in metrics
+    if metrics["geometry_optimization_applied"]:
+        assert (
+            metrics["geometry_opt_parcel_wrinkles_after"]
+            <= metrics["geometry_opt_parcel_wrinkles_before"] * 1.05
+        )
     assert "planar_face_count" in metrics
     assert "planar_nonmanifold_edge_count" in metrics
     assert metrics["split_weight_regularity"] > metrics["split_weight_access"]
@@ -191,6 +198,14 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
     assert "boundary_hugging_street_ratio" in metrics
     assert "street_wrinkle_turn_count" in metrics
     assert "seed_boundary_hug_reject_count" in metrics
+    assert metrics["perimeter_street_count"] == 1
+    assert metrics["perimeter_street_is_ring"]
+    assert math.isclose(metrics["perimeter_street_length_ratio"], 1.0, rel_tol=1e-9)
+    assert metrics["perimeter_street_hausdorff"] < 1e-7
+    assert (
+        metrics["global_street_cleanup_wrinkles_after"]
+        <= metrics["global_street_cleanup_wrinkles_before"]
+    )
     assert any(s.kind == "perimeter" and s.geom.is_ring for s in streets)
     assert any(s.kind == "street_access" for s in streets)
     assert any(g.kind == "cross_field" for g in guides)

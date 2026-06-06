@@ -490,6 +490,31 @@ def _short_edge_count(poly: Polygon, threshold: float) -> int:
     return sum(1 for a, b in _polygon_edges(poly) if math.hypot(b[0] - a[0], b[1] - a[1]) < threshold)
 
 
+def _parcel_wrinkle_count(parcels: list[ParcelRec], boundary: Polygon, target_area: float) -> int:
+    short_threshold = math.sqrt(target_area) * 0.38
+    boundary_tol = math.sqrt(target_area) * 0.18
+    wrinkles = 0
+    for parcel in parcels:
+        coords = [(float(x), float(y)) for x, y in parcel.geom.exterior.coords[:-1]]
+        if len(coords) < 4:
+            continue
+        for i, point in enumerate(coords):
+            if shapely.Point(point).distance(boundary.boundary) <= boundary_tol:
+                continue
+            prev = coords[i - 1]
+            nxt = coords[(i + 1) % len(coords)]
+            len_a = math.hypot(point[0] - prev[0], point[1] - prev[1])
+            len_b = math.hypot(nxt[0] - point[0], nxt[1] - point[1])
+            if min(len_a, len_b) > short_threshold:
+                continue
+            angle_a = math.atan2(point[1] - prev[1], point[0] - prev[0])
+            angle_b = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+            turn = abs(math.atan2(math.sin(angle_b - angle_a), math.cos(angle_b - angle_a)))
+            if turn > math.radians(35):
+                wrinkles += 1
+    return wrinkles
+
+
 def _approx_polygon_coords(poly: Polygon) -> list[tuple[float, float]]:
     coords = [(float(x), float(y)) for x, y in poly.exterior.coords[:-1]]
     if len(coords) <= 3:
@@ -741,8 +766,8 @@ def _optimize_shared_vertices(
         adjacency[b].add(a)
 
     min_len = math.sqrt(target_area) * 0.24
-    max_move = math.sqrt(target_area) * 0.40
-    for _iter in range(36):
+    max_move = math.sqrt(target_area) * 0.42
+    for _iter in range(44):
         disp = np.zeros_like(nodes)
         weight = np.zeros(len(nodes), dtype=np.float64)
         for a, b in edges:
@@ -765,8 +790,22 @@ def _optimize_shared_vertices(
             if i in boundary_nodes or len(nbrs) < 2:
                 continue
             avg = np.mean(nodes[list(nbrs)], axis=0)
-            disp[i] += (avg - nodes[i]) * 0.018
+            disp[i] += (avg - nodes[i]) * 0.022
             weight[i] += 1.0
+            if len(nbrs) == 2:
+                a_idx, b_idx = tuple(nbrs)
+                a = nodes[a_idx]
+                b = nodes[b_idx]
+                chord = b - a
+                denom = float(np.dot(chord, chord))
+                if denom > 1e-9:
+                    t = float(np.clip(np.dot(nodes[i] - a, chord) / denom, 0.0, 1.0))
+                    projected = a + chord * t
+                    dist = float(np.linalg.norm(projected - nodes[i]))
+                    neighbor_dist = min(float(np.linalg.norm(nodes[i] - a)), float(np.linalg.norm(nodes[i] - b)))
+                    if dist > min_len * 0.04 or neighbor_dist < min_len * 1.35:
+                        disp[i] += (projected - nodes[i]) * 0.08
+                        weight[i] += 1.0
 
         for i in range(len(nodes)):
             if i in boundary_nodes or weight[i] <= 0:
@@ -787,6 +826,7 @@ def _optimize_shared_vertices(
     before_p01, before_p05 = _parcel_width_quantiles(parcels)
     short_threshold = math.sqrt(target_area) * 0.12
     before_short = sum(_short_edge_count(parcel.geom, short_threshold) for parcel in parcels)
+    before_wrinkles = _parcel_wrinkle_count(parcels, boundary, target_area)
     best_candidate = parcels
     best_metrics: dict[str, Any] | None = None
     applied = False
@@ -801,12 +841,18 @@ def _optimize_shared_vertices(
         overlaps = _overlap_count(candidate_polys)
         after_p01, after_p05 = _parcel_width_quantiles(candidate)
         after_short = sum(_short_edge_count(parcel.geom, short_threshold) for parcel in candidate)
-        improved = after_p05 >= before_p05 * 0.98 and (after_p01 > before_p01 or after_short < before_short)
+        after_wrinkles = _parcel_wrinkle_count(candidate, boundary, target_area)
+        improved = after_p05 >= before_p05 * 0.98 and after_wrinkles <= before_wrinkles * 1.05 and (
+            after_p01 > before_p01
+            or after_short < before_short
+            or after_wrinkles < before_wrinkles
+        )
         metrics = {
             "geometry_opt_step_scale": float(scale),
             "geometry_opt_width_p01_after": after_p01,
             "geometry_opt_width_p05_after": after_p05,
             "geometry_opt_short_edges_after": int(after_short),
+            "geometry_opt_parcel_wrinkles_after": int(after_wrinkles),
             "geometry_opt_candidate_overlap_count": int(overlaps),
             "geometry_opt_candidate_coverage": float(coverage),
         }
@@ -827,6 +873,7 @@ def _optimize_shared_vertices(
             "geometry_opt_width_p01_before": before_p01,
             "geometry_opt_width_p05_before": before_p05,
             "geometry_opt_short_edges_before": int(before_short),
+            "geometry_opt_parcel_wrinkles_before": int(before_wrinkles),
             **(best_metrics or {}),
         },
     )
@@ -1214,6 +1261,27 @@ def _street_smoothness_energy(streets: list[StreetRec]) -> float:
     return total / max(length, 1e-9)
 
 
+def _perimeter_street_metrics(streets: list[StreetRec], boundary: Polygon) -> dict[str, Any]:
+    perimeter_streets = [street for street in streets if street.kind == "perimeter"]
+    boundary_line = LineString([(float(x), float(y)) for x, y in boundary.exterior.coords])
+    if not perimeter_streets:
+        return {
+            "perimeter_street_count": 0,
+            "perimeter_street_is_ring": False,
+            "perimeter_street_length_ratio": 0.0,
+            "perimeter_street_hausdorff": float("inf"),
+            "perimeter_street_boundary_distance": float("inf"),
+        }
+    geom = unary_union([street.geom for street in perimeter_streets])
+    return {
+        "perimeter_street_count": int(len(perimeter_streets)),
+        "perimeter_street_is_ring": bool(any(street.geom.is_ring for street in perimeter_streets)),
+        "perimeter_street_length_ratio": float(geom.length / max(boundary_line.length, 1e-9)),
+        "perimeter_street_hausdorff": float(geom.hausdorff_distance(boundary_line)),
+        "perimeter_street_boundary_distance": float(geom.distance(boundary_line)),
+    }
+
+
 def _street_wrinkle_metrics(streets: list[StreetRec], target_area: float) -> dict[str, Any]:
     short_threshold = math.sqrt(target_area) * 0.42
     wrinkle_turns = 0
@@ -1278,6 +1346,24 @@ def _boundary_hugging_street_metrics(
         "boundary_parallel_street_length": float(parallel_hugging_length),
         "boundary_parallel_street_ratio": float(parallel_hugging_length / max(internal_length, 1e-9)),
     }
+
+
+def _boundary_parallel_line_ratio(line: LineString, boundary: Polygon, target_area: float) -> float:
+    band = math.sqrt(target_area) * 2.00
+    parallel_length = 0.0
+    for a, b in zip(line.coords[:-1], line.coords[1:], strict=False):
+        segment = LineString([a, b])
+        if segment.length <= 1e-9 or segment.distance(boundary.boundary) > band:
+            continue
+        mid = segment.interpolate(0.5, normalized=True)
+        boundary_s = boundary.boundary.project(mid)
+        before = boundary.boundary.interpolate(max(0.0, boundary_s - band * 0.35))
+        after = boundary.boundary.interpolate(min(boundary.boundary.length, boundary_s + band * 0.35))
+        boundary_angle = math.atan2(after.y - before.y, after.x - before.x)
+        segment_angle = _line_mid_angle(segment)
+        if _axis_delta(boundary_angle, segment_angle) < math.radians(25):
+            parallel_length += float(segment.length)
+    return parallel_length / max(float(line.length), 1e-9)
 
 
 def _access_ratio_metrics(
@@ -1349,6 +1435,7 @@ def _street_topology_metrics(
     }
     metrics.update(_street_wrinkle_metrics(streets, target_area))
     metrics.update(_boundary_hugging_street_metrics(streets, boundary, target_area))
+    metrics.update(_perimeter_street_metrics(streets, boundary))
     return metrics
 
 
@@ -1741,6 +1828,7 @@ def _street_graph_from_parcels(
         has_frontage,
     )
     streets = _merge_street_edges(nodes, edge_data, street_edges, boundary)
+    streets, cleanup_metrics = _cleanup_street_geometry(streets, boundary, target_area)
 
     metrics = {
         "corner_node_count": len(nodes),
@@ -1751,6 +1839,7 @@ def _street_graph_from_parcels(
         "seed_through_street_edge_count": int(len(seed_through_edges)),
         "seed_boundary_hug_reject_count": int(seed_boundary_hug_reject_count),
         "boundary_parallel_pruned_edge_count": int(boundary_parallel_pruned_edge_count),
+        **cleanup_metrics,
         "street_access_path_count": added_access_paths,
         "street_component_connection_path_count": int(component_connection_paths),
         "unreachable_group_count": int(unreachable_group_count),
@@ -1874,6 +1963,70 @@ def _display_polygon(poly: Polygon, tolerance: float) -> Polygon:
     simplified = poly.simplify(tolerance, preserve_topology=True)
     largest = _largest_polygon(simplified)
     return largest if largest is not None and largest.is_valid else poly
+
+
+def _cleanup_internal_street_line(line: LineString, boundary: Polygon, target_area: float) -> LineString:
+    if line.length <= 1e-9:
+        return line
+    coords = list(line.coords)
+    if len(coords) < 3:
+        return line
+    start = coords[0]
+    end = coords[-1]
+    tolerance = max(math.sqrt(target_area) * 0.045, line.length * 0.006)
+    simplified = line.simplify(tolerance, preserve_topology=False)
+    clean_coords = list(simplified.coords)
+    if len(clean_coords) < 2:
+        return line
+    clean_coords[0] = start
+    clean_coords[-1] = end
+    out = np.asarray(clean_coords, dtype=np.float64)
+    if len(out) >= 5:
+        for _ in range(2):
+            new = out.copy()
+            for i in range(1, len(out) - 1):
+                new[i] = out[i] * 0.62 + (out[i - 1] + out[i + 1]) * 0.19
+            out = new
+        out[0] = np.asarray(start, dtype=np.float64)
+        out[-1] = np.asarray(end, dtype=np.float64)
+    candidate = LineString([(float(x), float(y)) for x, y in out])
+    if candidate.length <= 1e-9 or not boundary.buffer(math.sqrt(target_area) * 0.08).contains(candidate):
+        return line
+    boundary_band = math.sqrt(target_area) * 2.00
+    near_boundary = line.distance(boundary.boundary) <= boundary_band
+    if near_boundary and candidate.length < line.length * 0.98:
+        return line
+    before_parallel = _boundary_parallel_line_ratio(line, boundary, target_area)
+    after_parallel = _boundary_parallel_line_ratio(candidate, boundary, target_area)
+    if after_parallel > before_parallel + 0.02:
+        return line
+    return candidate
+
+
+def _cleanup_street_geometry(
+    streets: list[StreetRec],
+    boundary: Polygon,
+    target_area: float,
+) -> tuple[list[StreetRec], dict[str, Any]]:
+    before = _street_wrinkle_metrics(streets, target_area)
+    cleaned: list[StreetRec] = []
+    changed = 0
+    for street in streets:
+        if street.kind == "perimeter":
+            cleaned.append(street)
+            continue
+        geom = _cleanup_internal_street_line(street.geom, boundary, target_area)
+        if not geom.equals_exact(street.geom, 1e-7):
+            changed += 1
+        cleaned.append(StreetRec(street.street_id, street.kind, geom))
+    after = _street_wrinkle_metrics(cleaned, target_area)
+    return cleaned, {
+        "global_street_cleanup_changed_count": int(changed),
+        "global_street_cleanup_wrinkles_before": int(before["street_wrinkle_turn_count"]),
+        "global_street_cleanup_wrinkles_after": int(after["street_wrinkle_turn_count"]),
+        "global_street_cleanup_turn_p95_before": float(before["street_turn_angle_p95_deg"]),
+        "global_street_cleanup_turn_p95_after": float(after["street_turn_angle_p95_deg"]),
+    }
 
 
 def _find_streamline_split(
@@ -2455,15 +2608,20 @@ def _render_svg(
         opacity = "0.28" if guide.kind == "cross_field" else "0.22"
         width_px = "0.8" if guide.kind == "cross_field" else "0.8"
         parts.append(f'<polyline points="{d}" fill="none" stroke="{color}" stroke-width="{width_px}" stroke-linecap="round" opacity="{opacity}"/>')
-    for street in streets:
+    for street in [street for street in streets if street.kind != "perimeter"]:
         display_geom = _display_line(street.geom)
         coords = [pxy(float(x), float(y)) for x, y in display_geom.coords]
         d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
-        width_px = 5 if street.kind == "perimeter" else 4 if street.kind == "streamline_split" else 2
+        width_px = 4 if street.kind == "streamline_split" else 2
         casing = "#7b969b" if street.kind == "streamline_split" else "#8fa2a5"
         parts.append(f'<polyline points="{d}" fill="none" stroke="#8fa2a5" stroke-width="{width_px + 2}" stroke-linecap="round"/>')
         parts[-1] = f'<polyline points="{d}" fill="none" stroke="{casing}" stroke-width="{width_px + 2}" stroke-linecap="round"/>'
         parts.append(f'<polyline points="{d}" fill="none" stroke="#fdfbf4" stroke-width="{width_px}" stroke-linecap="round"/>')
+    for street in [street for street in streets if street.kind == "perimeter"]:
+        coords = [pxy(float(x), float(y)) for x, y in street.geom.coords]
+        d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
+        parts.append(f'<polyline points="{d}" fill="none" stroke="#5d6f73" stroke-width="8" stroke-linejoin="round" stroke-linecap="round"/>')
+        parts.append(f'<polyline points="{d}" fill="none" stroke="#fdfbf4" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>')
     parts.append("</svg>")
     path.write_text("\n".join(parts))
 
@@ -2508,12 +2666,16 @@ def _render_png(
             draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (218, 193, 159), 0)
         else:
             draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (198, 207, 203), 0)
-    for street in streets:
+    for street in [street for street in streets if street.kind != "perimeter"]:
         display_geom = _display_line(street.geom)
         coords = [(float(x), float(y)) for x, y in display_geom.coords]
         outer = (123, 150, 155) if street.kind == "streamline_split" else (143, 162, 165)
-        draw_line(coords, outer, 3 if street.kind == "perimeter" else 2)
+        draw_line(coords, outer, 2)
         draw_line(coords, (255, 253, 246), 1)
+    for street in [street for street in streets if street.kind == "perimeter"]:
+        coords = [(float(x), float(y)) for x, y in street.geom.coords]
+        draw_line(coords, (93, 111, 115), 4)
+        draw_line(coords, (255, 253, 246), 2)
     _write_png(img, path)
 
 
