@@ -78,6 +78,7 @@ def test_street_generation_reports_unreachable_group_repair() -> None:
     assert metrics["unreachable_group_max_size"] >= 1
     assert metrics["street_graph_component_count"] == 1
     assert metrics["parcel_access_ratio_below_tau_count"] == 0
+    assert metrics["access_non_progress_count"] == 0
     assert (
         metrics["access_i_shape_count"]
         + metrics["access_l_shape_count"]
@@ -174,6 +175,13 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
     assert metrics["street_access_path_count"] > 0
     assert "street_graph_component_count" in metrics
     assert "street_short_chain_count" in metrics
+    assert metrics["street_graph_component_count"] == 1
+    assert metrics["parcel_access_ratio_below_tau_count"] == 0
+    assert metrics["access_non_progress_count"] == 0
+    assert (
+        metrics["seed_street_used_edge_count"]
+        < metrics["seed_street_candidate_edge_count"]
+    )
     assert any(s.kind == "street_access" for s in streets)
     assert any(g.kind == "cross_field" for g in guides)
     assert any(g.kind == "streamline_split" for g in guides)

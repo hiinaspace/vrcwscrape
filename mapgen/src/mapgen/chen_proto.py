@@ -73,9 +73,9 @@ class BoundarySpec:
 
 @dataclass(frozen=True)
 class SplitQualityWeights:
-    size: float = 0.25
-    regularity: float = 0.65
-    access: float = 0.10
+    size: float = 0.30
+    regularity: float = 0.50
+    access: float = 0.20
 
 
 CHEN_IRREGULARITY_GAMMA_ANGLE = 0.75
@@ -359,6 +359,62 @@ def _access_penalty(parts: list[Polygon], domain: Polygon, existing_split_lines:
         dist = min(float(part.boundary.distance(line)) for line in access_lines)
         penalties.append(min(1.0, dist / max(threshold, 1e-9)))
     return float(np.mean(penalties)) if penalties else 1.0
+
+
+def _approx_side_lengths(poly: Polygon) -> list[float]:
+    coords = _approx_polygon_coords(poly)
+    if len(coords) < 2:
+        return []
+    return [
+        math.hypot(b[0] - a[0], b[1] - a[1])
+        for a, b in zip(coords, coords[1:] + coords[:1], strict=True)
+    ]
+
+
+def _line_overlap_length(line: LineString, access_lines: list[LineString], tolerance: float) -> float:
+    if line.length <= 1e-9:
+        return 0.0
+    for access_line in access_lines:
+        if line.distance(access_line) <= tolerance:
+            return float(line.length)
+    return 0.0
+
+
+def _street_access_ratio(poly: Polygon, access_lines: list[LineString], tolerance: float) -> float:
+    side_lengths = _approx_side_lengths(poly)
+    avg_side = float(np.mean(side_lengths)) if side_lengths else 0.0
+    if avg_side <= 1e-9:
+        return 0.0
+    access_len = sum(
+        _line_overlap_length(LineString([a, b]), access_lines, tolerance)
+        for a, b in _polygon_edges(poly)
+    )
+    return access_len / avg_side
+
+
+def _chen_split_quality(
+    parts: list[Polygon],
+    domain: Polygon,
+    existing_split_lines: list[LineString],
+    weights: SplitQualityWeights,
+    target_area: float,
+) -> tuple[float, dict[str, float]]:
+    if len(parts) != 2:
+        return -math.inf, {}
+    areas = sorted([part.area for part in parts])
+    q_size = areas[0] / max(areas[1], 1e-9)
+    q_regu = 1.0 / (1.0 + sum(_chen_irregularity(part) for part in parts))
+    access_lines = [domain.boundary, *existing_split_lines]
+    access_tol = math.sqrt(target_area) * 0.08
+    access_ratios = [_street_access_ratio(part, access_lines, access_tol) for part in parts]
+    q_acce = 2.0 if min(access_ratios) >= CHEN_ACCESS_RATIO_THRESHOLD else 1.0
+    quality = weights.size * q_size + weights.regularity * q_regu + weights.access * q_acce
+    return quality, {
+        "q_size": q_size,
+        "q_regu": q_regu,
+        "q_acce": q_acce,
+        "access_ratio_min": min(access_ratios),
+    }
 
 
 def _regularity_penalty(parts: list[Polygon], target_area: float) -> float:
@@ -780,6 +836,7 @@ def _build_corner_graph(
     parcels: list[ParcelRec],
     boundary: Polygon,
     tol: float,
+    seed_street_lines: list[LineString] | None = None,
 ) -> tuple[list[tuple[float, float]], dict[tuple[int, int], dict[str, Any]], dict[int, list[tuple[int, int, float]]]]:
     node_ids: dict[tuple[int, int], int] = {}
     nodes: list[tuple[float, float]] = []
@@ -810,11 +867,53 @@ def _build_corner_graph(
                     "length": float(line.length),
                     "parcels": set(),
                     "boundary": False,
+                    "seed_street": False,
                 },
             )
             rec["parcels"].add(parcel.parcel_id)
-            if line.distance(boundary.boundary) <= tol:
+            endpoint_boundary_tol = max(tol * 4.0, 1e-7)
+            if (
+                shapely.Point(nodes[ia]).distance(boundary.boundary) <= endpoint_boundary_tol
+                and shapely.Point(nodes[ib]).distance(boundary.boundary) <= endpoint_boundary_tol
+            ):
                 rec["boundary"] = True
+
+    boundary_node_ids = [
+        i
+        for i, pt in enumerate(nodes)
+        if shapely.Point(pt).distance(boundary.boundary) <= max(tol * 4.0, 1e-7)
+    ]
+    if len(boundary_node_ids) >= 3:
+        boundary_node_ids.sort(key=lambda i: float(boundary.boundary.project(shapely.Point(nodes[i]))))
+        for ia, ib in zip(boundary_node_ids, boundary_node_ids[1:] + boundary_node_ids[:1], strict=True):
+            if ia == ib:
+                continue
+            key = (ia, ib) if ia < ib else (ib, ia)
+            line = LineString([nodes[ia], nodes[ib]])
+            rec = edges.setdefault(
+                key,
+                {
+                    "nodes": key,
+                    "geom": line,
+                    "length": float(line.length),
+                    "parcels": set(),
+                    "boundary": True,
+                },
+            )
+            rec["boundary"] = True
+
+    if seed_street_lines:
+        seed_tol = max(tol * 8.0, 1e-7)
+        for rec in edges.values():
+            line = rec["geom"]
+            line_angle = _line_mid_angle(line)
+            for seed_line in seed_street_lines:
+                if line.distance(seed_line) > seed_tol:
+                    continue
+                if _axis_delta(line_angle, _line_mid_angle(seed_line)) > math.radians(30):
+                    continue
+                rec["seed_street"] = True
+                break
 
     adjacency: dict[int, list[tuple[int, int, float]]] = {i: [] for i in range(len(nodes))}
     for edge_idx, (key, rec) in enumerate(edges.items()):
@@ -862,6 +961,39 @@ def _shortest_path_to_street(
     return math.inf, []
 
 
+def _shortest_path_to_targets(
+    start: int,
+    target_nodes: set[int],
+    adjacency: dict[int, list[tuple[int, int, float]]],
+    edge_by_idx: dict[int, tuple[int, int]],
+) -> tuple[float, list[tuple[int, int]]]:
+    if start in target_nodes:
+        return 0.0, []
+    heap: list[tuple[float, int]] = [(0.0, start)]
+    dist = {start: 0.0}
+    prev: dict[int, tuple[int, tuple[int, int]]] = {}
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if cost > dist.get(node, math.inf):
+            continue
+        if node in target_nodes:
+            path: list[tuple[int, int]] = []
+            cur = node
+            while cur != start:
+                old, edge_key = prev[cur]
+                path.append(edge_key)
+                cur = old
+            path.reverse()
+            return cost, path
+        for nxt, edge_idx, length in adjacency.get(node, []):
+            new_cost = cost + length
+            if new_cost < dist.get(nxt, math.inf):
+                dist[nxt] = new_cost
+                prev[nxt] = (node, edge_by_idx[edge_idx])
+                heapq.heappush(heap, (new_cost, nxt))
+    return math.inf, []
+
+
 def _street_edge_adjacency(street_edges: set[tuple[int, int]]) -> dict[int, set[int]]:
     selected_adj: dict[int, set[int]] = {}
     for a, b in street_edges:
@@ -888,6 +1020,51 @@ def _street_component_sizes(selected_adj: dict[int, set[int]]) -> list[int]:
                     stack.append(nxt)
         component_sizes.append(size)
     return component_sizes
+
+
+def _street_components(selected_adj: dict[int, set[int]]) -> list[set[int]]:
+    seen: set[int] = set()
+    components: list[set[int]] = []
+    for node in selected_adj:
+        if node in seen:
+            continue
+        stack = [node]
+        seen.add(node)
+        component: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            component.add(cur)
+            for nxt in selected_adj.get(cur, set()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        components.append(component)
+    return components
+
+
+def _connect_street_components(
+    street_edges: set[tuple[int, int]],
+    adjacency: dict[int, list[tuple[int, int, float]]],
+    edge_by_idx: dict[int, tuple[int, int]],
+) -> int:
+    added_paths = 0
+    while True:
+        components = _street_components(_street_edge_adjacency(street_edges))
+        if len(components) <= 1:
+            return added_paths
+        components.sort(key=len, reverse=True)
+        target_nodes = set(components[0])
+        best: tuple[float, list[tuple[int, int]]] = (math.inf, [])
+        for component in components[1:]:
+            for node in component:
+                cost, path = _shortest_path_to_targets(node, target_nodes, adjacency, edge_by_idx)
+                if path and cost < best[0]:
+                    best = (cost, path)
+        if not best[1]:
+            return added_paths
+        for edge in best[1]:
+            street_edges.add(edge)
+        added_paths += 1
 
 
 def _node_pair_angle(nodes: list[tuple[float, float]], center: int, other: int) -> float:
@@ -935,11 +1112,7 @@ def _access_ratio_metrics(
 ) -> dict[str, Any]:
     ratios: list[float] = []
     for parcel in parcels:
-        edges = parcel_edges.get(parcel.parcel_id, [])
-        lengths = [float(edge_data[edge]["length"]) for edge in edges]
-        avg_side = float(np.mean(lengths)) if lengths else 0.0
-        street_len = sum(float(edge_data[edge]["length"]) for edge in edges if edge in street_edges)
-        ratios.append(street_len / max(avg_side, 1e-9))
+        ratios.append(_parcel_access_ratio_value(parcel.parcel_id, parcel_edges, edge_data, street_edges))
     vals = np.asarray(ratios, dtype=np.float64)
     if not len(vals):
         return {
@@ -954,6 +1127,19 @@ def _access_ratio_metrics(
         "parcel_access_ratio_p50": float(np.quantile(vals, 0.50)),
         "parcel_access_ratio_below_tau_count": int(sum(1 for value in vals if value < CHEN_ACCESS_RATIO_THRESHOLD)),
     }
+
+
+def _parcel_access_ratio_value(
+    parcel_id: int,
+    parcel_edges: dict[int, list[tuple[int, int]]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    street_edges: set[tuple[int, int]],
+) -> float:
+    edges = parcel_edges.get(parcel_id, [])
+    lengths = [float(edge_data[edge]["length"]) for edge in edges]
+    avg_side = float(np.mean(lengths)) if lengths else 0.0
+    street_len = sum(float(edge_data[edge]["length"]) for edge in edges if edge in street_edges)
+    return street_len / max(avg_side, 1e-9)
 
 
 def _street_topology_metrics(
@@ -986,19 +1172,215 @@ def _street_topology_metrics(
     }
 
 
+def _edge_angle_from_node(nodes: list[tuple[float, float]], edge: tuple[int, int], node: int) -> float:
+    a, b = edge
+    other = b if node == a else a
+    return _node_pair_angle(nodes, node, other)
+
+
+def _extend_collinear_chain(
+    nodes: list[tuple[float, float]],
+    group_adj: dict[int, list[tuple[int, int]]],
+    start_edge: tuple[int, int],
+) -> set[tuple[int, int]]:
+    chain = {start_edge}
+
+    def extend(prev_node: int, node: int) -> None:
+        while True:
+            current_angle = _node_pair_angle(nodes, node, prev_node)
+            candidates: list[tuple[float, int, tuple[int, int]]] = []
+            for edge in group_adj.get(node, []):
+                if edge in chain:
+                    continue
+                a, b = edge
+                nxt = b if node == a else a
+                delta = _axis_delta(current_angle, _node_pair_angle(nodes, node, nxt))
+                if delta < math.radians(32):
+                    candidates.append((delta, nxt, edge))
+            if not candidates:
+                break
+            _delta, nxt, edge = min(candidates, key=lambda item: item[0])
+            chain.add(edge)
+            prev_node, node = node, nxt
+
+    a, b = start_edge
+    extend(a, b)
+    extend(b, a)
+    return chain
+
+
+def _extend_collinear_ray(
+    nodes: list[tuple[float, float]],
+    group_adj: dict[int, list[tuple[int, int]]],
+    start_node: int,
+    start_edge: tuple[int, int],
+) -> set[tuple[int, int]]:
+    ray = {start_edge}
+    a, b = start_edge
+    prev_node = start_node
+    node = b if start_node == a else a
+    while True:
+        current_angle = _node_pair_angle(nodes, node, prev_node)
+        candidates: list[tuple[float, int, tuple[int, int]]] = []
+        for edge in group_adj.get(node, []):
+            if edge in ray:
+                continue
+            ea, eb = edge
+            nxt = eb if node == ea else ea
+            delta = _axis_delta(current_angle, _node_pair_angle(nodes, node, nxt))
+            if delta < math.radians(32):
+                candidates.append((delta, nxt, edge))
+        if not candidates:
+            break
+        _delta, nxt, edge = min(candidates, key=lambda item: item[0])
+        ray.add(edge)
+        prev_node, node = node, nxt
+    return ray
+
+
+def _access_candidate_reaches(
+    candidate: set[tuple[int, int]],
+    group: set[int],
+    parcel_edges: dict[int, list[tuple[int, int]]],
+) -> set[int]:
+    return {
+        parcel_id
+        for parcel_id in group
+        if any(edge in candidate for edge in parcel_edges.get(parcel_id, []))
+    }
+
+
+def _access_candidate_length(candidate: set[tuple[int, int]], edge_data: dict[tuple[int, int], dict[str, Any]]) -> float:
+    return sum(float(edge_data[edge]["length"]) for edge in candidate)
+
+
+def _access_candidate_cost(candidate: set[tuple[int, int]], edge_data: dict[tuple[int, int], dict[str, Any]]) -> float:
+    cost = 0.0
+    for edge in candidate:
+        rec = edge_data[edge]
+        multiplier = 0.52 if rec.get("seed_street") else 1.0
+        cost += float(rec["length"]) * multiplier
+    return cost
+
+
+def _group_access_candidates(
+    nodes: list[tuple[float, float]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    parcel_edges: dict[int, list[tuple[int, int]]],
+    group: set[int],
+) -> list[tuple[str, set[tuple[int, int]]]]:
+    group_edges = {
+        edge
+        for parcel_id in group
+        for edge in parcel_edges.get(parcel_id, [])
+        if edge in edge_data
+    }
+    group_adj: dict[int, list[tuple[int, int]]] = {}
+    for edge in group_edges:
+        a, b = edge
+        group_adj.setdefault(a, []).append(edge)
+        group_adj.setdefault(b, []).append(edge)
+
+    seen: set[tuple[str, tuple[tuple[int, int], ...]]] = set()
+    candidates: list[tuple[str, set[tuple[int, int]]]] = []
+
+    def add(kind: str, edges: set[tuple[int, int]]) -> None:
+        if not edges:
+            return
+        key = (kind, tuple(sorted(edges)))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((kind, edges))
+
+    for edge in group_edges:
+        add("I", _extend_collinear_chain(nodes, group_adj, edge))
+
+    for node, incident in group_adj.items():
+        for i, edge_a in enumerate(incident):
+            for edge_b in incident[i + 1 :]:
+                delta = _axis_delta(
+                    _edge_angle_from_node(nodes, edge_a, node),
+                    _edge_angle_from_node(nodes, edge_b, node),
+                )
+                if delta < math.radians(35) or abs(delta - math.pi * 0.5) > math.radians(35):
+                    continue
+                add(
+                    "L",
+                    _extend_collinear_ray(nodes, group_adj, node, edge_a)
+                    | _extend_collinear_ray(nodes, group_adj, node, edge_b),
+                )
+    return candidates
+
+
+def _choose_group_access_edges(
+    nodes: list[tuple[float, float]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    parcel_edges: dict[int, list[tuple[int, int]]],
+    group: set[int],
+    street_edges: set[tuple[int, int]],
+) -> tuple[set[tuple[int, int]], dict[str, int]]:
+    remaining = set(group)
+    chosen: set[tuple[int, int]] = set()
+    counts = {"I": 0, "L": 0, "fallback": 0}
+    candidates = _group_access_candidates(nodes, edge_data, parcel_edges, group)
+    while remaining:
+        scored: list[tuple[int, float, float, str, set[tuple[int, int]], set[int]]] = []
+        for kind, edges in candidates:
+            if not (edges - street_edges):
+                continue
+            reached = _access_candidate_reaches(edges, remaining, parcel_edges)
+            if not reached:
+                continue
+            scored.append(
+                (
+                    0 if reached == remaining else 1,
+                    _access_candidate_cost(edges, edge_data),
+                    _access_candidate_length(edges, edge_data),
+                    kind,
+                    edges,
+                    reached,
+                )
+            )
+        if scored:
+            _complete, _cost, _length, kind, edges, reached = min(
+                scored,
+                key=lambda item: (item[0], -len(item[5]), item[1], item[2], 0 if item[3] == "I" else 1),
+            )
+            chosen.update(edges)
+            remaining -= reached
+            counts[kind] += 1
+            continue
+
+        parcel_id = min(remaining)
+        edges = [edge for edge in parcel_edges.get(parcel_id, []) if edge not in street_edges]
+        if not edges:
+            remaining.remove(parcel_id)
+            continue
+        edge = min(edges, key=lambda candidate: _access_candidate_cost({candidate}, edge_data))
+        chosen.add(edge)
+        remaining -= _access_candidate_reaches({edge}, remaining, parcel_edges)
+        counts["fallback"] += 1
+    return chosen, counts
+
+
 def _street_graph_from_parcels(
     parcels: list[ParcelRec],
     boundary: Polygon,
     target_area: float,
+    seed_street_lines: list[LineString] | None = None,
 ) -> tuple[list[StreetRec], dict[str, Any]]:
     tol = math.sqrt(target_area) * 0.025
-    nodes, edge_data, adjacency = _build_corner_graph(parcels, boundary, tol)
+    nodes, edge_data, adjacency = _build_corner_graph(parcels, boundary, tol, seed_street_lines)
     edge_by_idx = {int(rec["edge_idx"]): key for key, rec in edge_data.items()}
+    seed_street_edges = {key for key, rec in edge_data.items() if rec.get("seed_street")}
     street_edges: set[tuple[int, int]] = {key for key, rec in edge_data.items() if rec["boundary"]}
     street_nodes: set[int] = set()
     for a, b in street_edges:
         street_nodes.add(a)
         street_nodes.add(b)
+    component_connection_paths = _connect_street_components(street_edges, adjacency, edge_by_idx)
+    street_nodes = {node for edge in street_edges for node in edge}
 
     parcel_edges: dict[int, list[tuple[int, int]]] = {parcel.parcel_id: [] for parcel in parcels}
     for key, rec in edge_data.items():
@@ -1006,7 +1388,7 @@ def _street_graph_from_parcels(
             parcel_edges[int(parcel_id)].append(key)
 
     def has_frontage(parcel_id: int) -> bool:
-        return any(edge in street_edges for edge in parcel_edges.get(parcel_id, []))
+        return _parcel_access_ratio_value(parcel_id, parcel_edges, edge_data, street_edges) >= CHEN_ACCESS_RATIO_THRESHOLD
 
     parcel_neighbors: dict[int, set[int]] = {parcel.parcel_id: set() for parcel in parcels}
     for rec in edge_data.values():
@@ -1021,10 +1403,18 @@ def _street_graph_from_parcels(
     access_i_shape_count = 0
     access_l_shape_count = 0
     access_greedy_fallback_count = 0
+    access_non_progress_count = 0
+    repair_iterations = 0
     while True:
         unreachable = {parcel.parcel_id for parcel in parcels if not has_frontage(parcel.parcel_id)}
         if not unreachable:
             break
+        repair_iterations += 1
+        if repair_iterations > len(parcels) * 4:
+            access_non_progress_count += len(unreachable)
+            break
+        before_unreachable_count = len(unreachable)
+        before_edge_count = len(street_edges)
         stack = [next(iter(unreachable))]
         group: set[int] = set()
         while stack:
@@ -1036,71 +1426,48 @@ def _street_graph_from_parcels(
         unreachable_group_count += 1
         unreachable_group_max_size = max(unreachable_group_max_size, len(group))
 
-        best: tuple[float, list[tuple[int, int]], tuple[int, int] | None, int] = (math.inf, [], None, -1)
-        for parcel_id in group:
-            for edge in parcel_edges.get(parcel_id, []):
-                a, b = edge
-                for start in (a, b):
-                    path_cost, path = _shortest_path_to_street(start, street_nodes, adjacency, edge_by_idx, street_edges)
-                    rec = edge_data[edge]
-                    total = float(rec["length"]) + path_cost
-                    if total < best[0]:
-                        best = (total, path, edge, parcel_id)
-        if best[2] is None:
+        group_street_edges, access_counts = _choose_group_access_edges(nodes, edge_data, parcel_edges, group, street_edges)
+        if not group_street_edges:
             break
-        group_street_edges = {best[2], *best[1]}
+        access_i_shape_count += access_counts["I"]
+        access_l_shape_count += access_counts["L"]
+        access_greedy_fallback_count += access_counts["fallback"]
 
-        changed = True
-        while changed:
-            changed = False
-            reached = {parcel_id for parcel_id in group if any(edge in street_edges or edge in group_street_edges for edge in parcel_edges.get(parcel_id, []))}
-            if reached == group:
-                break
-            frontier_nodes: set[int] = set()
-            for edge in group_street_edges | street_edges:
-                frontier_nodes.update(edge)
-            for parcel_id in sorted(group - reached):
-                local_best: tuple[float, tuple[int, int] | None] = (math.inf, None)
-                for edge in parcel_edges.get(parcel_id, []):
-                    if edge in group_street_edges:
-                        local_best = (0.0, edge)
-                        break
-                    a, b = edge
-                    dist = 0.0 if a in frontier_nodes or b in frontier_nodes else min(
-                        LineString([nodes[a], nodes[b]]).distance(LineString([nodes[x], nodes[y]]))
-                        for x, y in group_street_edges
-                    )
-                    if dist < local_best[0]:
-                        local_best = (dist, edge)
-                if local_best[1] is not None:
-                    group_street_edges.add(local_best[1])
-                    changed = True
-
-        group_adj = _street_edge_adjacency(group_street_edges)
-        group_degrees = [len(nbrs) for nbrs in group_adj.values()]
-        if group_degrees and max(group_degrees) <= 2:
-            access_i_shape_count += 1
-        elif group_degrees and max(group_degrees) == 3:
-            access_l_shape_count += 1
-        else:
-            access_greedy_fallback_count += 1
+        access_nodes = {node for edge in group_street_edges for node in edge}
+        if not access_nodes & street_nodes:
+            best_path: tuple[float, list[tuple[int, int]]] = (math.inf, [])
+            for start in access_nodes:
+                path_cost, path = _shortest_path_to_street(start, street_nodes, adjacency, edge_by_idx, street_edges)
+                if path and path_cost < best_path[0]:
+                    best_path = (path_cost, path)
+            group_street_edges.update(best_path[1])
 
         for edge in group_street_edges:
             street_edges.add(edge)
             street_nodes.update(edge)
+        component_connection_paths += _connect_street_components(street_edges, adjacency, edge_by_idx)
+        street_nodes = {node for selected_edge in street_edges for node in selected_edge}
         added_access_paths += 1
+        after_unreachable_count = sum(1 for parcel in parcels if not has_frontage(parcel.parcel_id))
+        if after_unreachable_count >= before_unreachable_count and len(street_edges) == before_edge_count:
+            access_non_progress_count += 1
+            break
 
     streets = _merge_street_edges(nodes, edge_data, street_edges)
 
     metrics = {
         "corner_node_count": len(nodes),
         "corner_edge_count": len(edge_data),
+        "seed_street_candidate_edge_count": int(len(seed_street_edges)),
+        "seed_street_used_edge_count": int(sum(1 for edge in street_edges if edge in seed_street_edges)),
         "street_access_path_count": added_access_paths,
+        "street_component_connection_path_count": int(component_connection_paths),
         "unreachable_group_count": int(unreachable_group_count),
         "unreachable_group_max_size": int(unreachable_group_max_size),
         "access_i_shape_count": int(access_i_shape_count),
         "access_l_shape_count": int(access_l_shape_count),
         "access_greedy_fallback_count": int(access_greedy_fallback_count),
+        "access_non_progress_count": int(access_non_progress_count),
         "unreachable_parcel_count": sum(1 for parcel in parcels if not has_frontage(parcel.parcel_id)),
     }
     metrics.update(_street_topology_metrics(nodes, street_edges, streets, target_area))
@@ -1194,6 +1561,28 @@ def _smooth_line(line: LineString) -> LineString:
     return LineString([(float(x), float(y)) for x, y in out])
 
 
+def _display_line(line: LineString) -> LineString:
+    if line.length <= 1e-9:
+        return line
+    simplified = line.simplify(max(0.35, line.length * 0.006), preserve_topology=False)
+    coords = np.asarray(simplified.coords, dtype=np.float64)
+    if len(coords) < 3:
+        return simplified
+    out = coords.copy()
+    for _ in range(4):
+        new = out.copy()
+        for i in range(1, len(out) - 1):
+            new[i] = out[i] * 0.50 + (out[i - 1] + out[i + 1]) * 0.25
+        out = new
+    return LineString([(float(x), float(y)) for x, y in out])
+
+
+def _display_polygon(poly: Polygon, tolerance: float) -> Polygon:
+    simplified = poly.simplify(tolerance, preserve_topology=True)
+    largest = _largest_polygon(simplified)
+    return largest if largest is not None and largest.is_valid else poly
+
+
 def _find_streamline_split(
     poly: Polygon,
     *,
@@ -1218,7 +1607,7 @@ def _find_streamline_split(
         for offset_scale in offset_scales:
             attempts.append((axis + angle_delta, offset_scale * span))
 
-    best: tuple[float, str, LineString, list[Polygon]] | None = None
+    best: tuple[float, str, LineString, list[Polygon], dict[str, float]] | None = None
     for angle, offset in attempts:
         curved = not template_mode and level <= 5
         if curved:
@@ -1246,9 +1635,6 @@ def _find_streamline_split(
         large = max(p.area for p in parts)
         if small < target_area * 0.45 or small / max(large, 1e-9) < 0.22:
             continue
-        size_penalty = abs(parts[0].area - parts[1].area) / max(poly.area, 1e-9)
-        regularity_penalty = _regularity_penalty(parts, target_area)
-        access_penalty = _access_penalty(parts, domain, existing_split_lines, target_area)
         direction_penalty = abs(math.atan2(math.sin(angle - axis), math.cos(angle - axis))) * 0.04
         clipped = curve.intersection(poly)
         line_parts = _line_parts(clipped)
@@ -1260,17 +1646,11 @@ def _find_streamline_split(
         close_parallel = _parallel_split_penalty(split_line, existing_split_lines, math.sqrt(target_area) * 0.90)
         if close_parallel > 0.85:
             continue
-        score = (
-            weights.size * size_penalty
-            + weights.regularity * regularity_penalty
-            + weights.access * access_penalty
-            + direction_penalty
-            + orthogonality * 0.10
-            + parallel * 0.70
-        )
-        if best is None or score < best[0]:
+        quality, quality_parts = _chen_split_quality(parts, domain, existing_split_lines, weights, target_area)
+        score = quality - direction_penalty - orthogonality * 0.10 - parallel * 0.70
+        if best is None or score > best[0]:
             split_kind = "template_split" if template_mode else "streamline_split"
-            best = (score, split_kind, split_line, parts)
+            best = (score, split_kind, split_line, parts, quality_parts)
     if best is None:
         return None
     return best[1], best[2], best[3]
@@ -1360,7 +1740,14 @@ def _generate_crossfield_split_layout(
     _faces, face_metrics = _noded_faces_for_parcels(parcels, boundary_spec.geom)
     parcels, geometry_metrics = _optimize_shared_vertices(parcels, boundary_spec.geom, target_area)
 
-    streets, graph_metrics = _street_graph_from_parcels(parcels, boundary_spec.geom, target_area)
+    coarse_street_seed_count = max(3, min(14, int(math.sqrt(max(parcel_count, 1)) * 1.5)))
+    coarse_street_lines = [line for _kind, line in split_lines[:coarse_street_seed_count]]
+    streets, graph_metrics = _street_graph_from_parcels(
+        parcels,
+        boundary_spec.geom,
+        target_area,
+        seed_street_lines=coarse_street_lines,
+    )
     guides = _crossfield_guides(boundary_spec.geom, parcel_count, seed, base_angle)
     guide_id = len(guides) + 1
     for kind, line in split_lines:
@@ -1375,6 +1762,7 @@ def _generate_crossfield_split_layout(
     metrics["split_weight_access"] = split_weights.access
     metrics["streamline_split_count"] = sum(1 for kind, _line in split_lines if kind == "streamline_split")
     metrics["template_split_count"] = sum(1 for kind, _line in split_lines if kind == "template_split")
+    metrics["coarse_street_seed_count"] = int(len(coarse_street_lines))
     metrics["streamline_curvature_mean"] = _mean_line_curvature([line for kind, line in split_lines if kind == "streamline_split"])
     metrics["short_edge_threshold"] = float(short_edge_threshold)
     metrics["short_edge_count_before"] = int(short_edges_before)
@@ -1762,18 +2150,21 @@ def _render_svg(
     parts.append('<rect width="900" height="900" fill="#f4f0e6"/>')
     bpts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in boundary.geom.exterior.coords])
     parts.append(f'<polygon points="{bpts}" fill="#efe7d3" stroke="#5d6f73" stroke-width="1.8"/>')
+    display_tolerance = max(width, height) * 0.0022
     for parcel in parcels:
-        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in parcel.geom.exterior.coords])
+        geom = _display_polygon(parcel.geom, display_tolerance)
+        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in geom.exterior.coords])
         parts.append(f'<polygon points="{pts}" fill="#fbf7ec" stroke="#9d907f" stroke-width="0.8"/>')
     for guide in guides:
         coords = [pxy(float(x), float(y)) for x, y in guide.geom.coords]
         d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
-        color = "#c47a3d" if guide.kind == "cross_field" else "#b8c4c1"
-        opacity = "0.70" if guide.kind == "cross_field" else "0.24"
-        width_px = "1.2" if guide.kind == "cross_field" else "0.8"
+        color = "#d7b88f" if guide.kind == "cross_field" else "#b8c4c1"
+        opacity = "0.28" if guide.kind == "cross_field" else "0.22"
+        width_px = "0.8" if guide.kind == "cross_field" else "0.8"
         parts.append(f'<polyline points="{d}" fill="none" stroke="{color}" stroke-width="{width_px}" stroke-linecap="round" opacity="{opacity}"/>')
     for street in streets:
-        coords = [pxy(float(x), float(y)) for x, y in street.geom.coords]
+        display_geom = _display_line(street.geom)
+        coords = [pxy(float(x), float(y)) for x, y in display_geom.coords]
         d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
         width_px = 5 if street.kind == "perimeter" else 4 if street.kind == "streamline_split" else 2
         casing = "#7b969b" if street.kind == "streamline_split" else "#8fa2a5"
@@ -1815,15 +2206,18 @@ def _render_png(
                 img[max(0, y - width_px) : min(size, y + width_px + 1), max(0, x - width_px) : min(size, x + width_px + 1)] = color
 
     draw_line([(float(x), float(y)) for x, y in boundary.geom.exterior.coords], (93, 111, 115), 2)
+    display_tolerance = max(width, height) * 0.0022
     for parcel in parcels:
-        draw_line([(float(x), float(y)) for x, y in parcel.geom.exterior.coords], (155, 143, 126), 0)
+        geom = _display_polygon(parcel.geom, display_tolerance)
+        draw_line([(float(x), float(y)) for x, y in geom.exterior.coords], (155, 143, 126), 0)
     for guide in guides:
         if guide.kind == "cross_field":
-            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (196, 122, 61), 1)
+            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (218, 193, 159), 0)
         else:
             draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (198, 207, 203), 0)
     for street in streets:
-        coords = [(float(x), float(y)) for x, y in street.geom.coords]
+        display_geom = _display_line(street.geom)
+        coords = [(float(x), float(y)) for x, y in display_geom.coords]
         outer = (123, 150, 155) if street.kind == "streamline_split" else (143, 162, 165)
         draw_line(coords, outer, 3 if street.kind == "perimeter" else 2)
         draw_line(coords, (255, 253, 246), 1)
