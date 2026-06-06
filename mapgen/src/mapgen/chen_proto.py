@@ -994,6 +994,43 @@ def _shortest_path_to_targets(
     return math.inf, []
 
 
+def _shortest_path_between_nodes(
+    start: int,
+    goal: int,
+    adjacency: dict[int, list[tuple[int, int, float]]],
+    edge_by_idx: dict[int, tuple[int, int]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+) -> tuple[float, list[tuple[int, int]]]:
+    heap: list[tuple[float, int]] = [(0.0, start)]
+    dist = {start: 0.0}
+    prev: dict[int, tuple[int, tuple[int, int]]] = {}
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if cost > dist.get(node, math.inf):
+            continue
+        if node == goal:
+            path: list[tuple[int, int]] = []
+            cur = node
+            while cur != start:
+                old, edge_key = prev[cur]
+                path.append(edge_key)
+                cur = old
+            path.reverse()
+            return cost, path
+        for nxt, edge_idx, length in adjacency.get(node, []):
+            edge_key = edge_by_idx[edge_idx]
+            rec = edge_data[edge_key]
+            multiplier = 0.34 if rec.get("seed_street") else 1.0
+            if rec.get("boundary"):
+                multiplier = 4.0
+            new_cost = cost + length * multiplier
+            if new_cost < dist.get(nxt, math.inf):
+                dist[nxt] = new_cost
+                prev[nxt] = (node, edge_key)
+                heapq.heappush(heap, (new_cost, nxt))
+    return math.inf, []
+
+
 def _street_edge_adjacency(street_edges: set[tuple[int, int]]) -> dict[int, set[int]]:
     selected_adj: dict[int, set[int]] = {}
     for a, b in street_edges:
@@ -1065,6 +1102,51 @@ def _connect_street_components(
         for edge in best[1]:
             street_edges.add(edge)
         added_paths += 1
+
+
+def _select_seed_through_streets(
+    nodes: list[tuple[float, float]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    adjacency: dict[int, list[tuple[int, int, float]]],
+    edge_by_idx: dict[int, tuple[int, int]],
+    seed_street_lines: list[LineString] | None,
+    target_area: float,
+) -> tuple[set[tuple[int, int]], int]:
+    if not seed_street_lines:
+        return set(), 0
+    boundary_nodes = {
+        node
+        for edge, rec in edge_data.items()
+        if rec.get("boundary")
+        for node in edge
+    }
+    if len(boundary_nodes) < 2:
+        return set(), 0
+    selected: set[tuple[int, int]] = set()
+    selected_paths = 0
+    min_path_len = math.sqrt(target_area) * 3.2
+    for seed_line in seed_street_lines[:8]:
+        coords = list(seed_line.coords)
+        if len(coords) < 2:
+            continue
+        endpoints = (shapely.Point(coords[0]), shapely.Point(coords[-1]))
+        endpoint_nodes: list[int] = []
+        for pt in endpoints:
+            node = min(boundary_nodes, key=lambda candidate: shapely.Point(nodes[candidate]).distance(pt))
+            endpoint_nodes.append(node)
+        start, goal = endpoint_nodes
+        if start == goal:
+            continue
+        _cost, path = _shortest_path_between_nodes(start, goal, adjacency, edge_by_idx, edge_data)
+        if not path:
+            continue
+        path_len = sum(float(edge_data[edge]["length"]) for edge in path)
+        seed_len = sum(float(edge_data[edge]["length"]) for edge in path if edge_data[edge].get("seed_street"))
+        if path_len < min_path_len or seed_len / max(path_len, 1e-9) < 0.30:
+            continue
+        selected.update(path)
+        selected_paths += 1
+    return selected, selected_paths
 
 
 def _node_pair_angle(nodes: list[tuple[float, float]], center: int, other: int) -> float:
@@ -1375,6 +1457,15 @@ def _street_graph_from_parcels(
     edge_by_idx = {int(rec["edge_idx"]): key for key, rec in edge_data.items()}
     seed_street_edges = {key for key, rec in edge_data.items() if rec.get("seed_street")}
     street_edges: set[tuple[int, int]] = {key for key, rec in edge_data.items() if rec["boundary"]}
+    seed_through_edges, seed_through_path_count = _select_seed_through_streets(
+        nodes,
+        edge_data,
+        adjacency,
+        edge_by_idx,
+        seed_street_lines,
+        target_area,
+    )
+    street_edges.update(seed_through_edges)
     street_nodes: set[int] = set()
     for a, b in street_edges:
         street_nodes.add(a)
@@ -1453,13 +1544,15 @@ def _street_graph_from_parcels(
             access_non_progress_count += 1
             break
 
-    streets = _merge_street_edges(nodes, edge_data, street_edges)
+    streets = _merge_street_edges(nodes, edge_data, street_edges, boundary)
 
     metrics = {
         "corner_node_count": len(nodes),
         "corner_edge_count": len(edge_data),
         "seed_street_candidate_edge_count": int(len(seed_street_edges)),
         "seed_street_used_edge_count": int(sum(1 for edge in street_edges if edge in seed_street_edges)),
+        "seed_through_street_path_count": int(seed_through_path_count),
+        "seed_through_street_edge_count": int(len(seed_through_edges)),
         "street_access_path_count": added_access_paths,
         "street_component_connection_path_count": int(component_connection_paths),
         "unreachable_group_count": int(unreachable_group_count),
@@ -1479,9 +1572,12 @@ def _merge_street_edges(
     nodes: list[tuple[float, float]],
     edge_data: dict[tuple[int, int], dict[str, Any]],
     street_edges: set[tuple[int, int]],
+    boundary: Polygon,
 ) -> list[StreetRec]:
     selected_adj: dict[int, list[tuple[int, tuple[int, int]]]] = {}
     for edge in street_edges:
+        if edge_data[edge]["boundary"]:
+            continue
         a, b = edge
         selected_adj.setdefault(a, []).append((b, edge))
         selected_adj.setdefault(b, []).append((a, edge))
@@ -1516,8 +1612,9 @@ def _merge_street_edges(
     for edge in start_edges:
         if edge in used:
             continue
-        rec = edge_data[edge]
-        kind = "perimeter" if rec["boundary"] else "street_access"
+        if edge_data[edge]["boundary"]:
+            continue
+        kind = "street_access"
         a, b = edge
         used.add(edge)
         chain = [a, b]
@@ -1526,8 +1623,6 @@ def _merge_street_edges(
             if found is None:
                 break
             nxt, nxt_edge = found
-            if bool(edge_data[nxt_edge]["boundary"]) != bool(rec["boundary"]):
-                break
             used.add(nxt_edge)
             chain.append(nxt)
         while True:
@@ -1535,17 +1630,17 @@ def _merge_street_edges(
             if found is None:
                 break
             nxt, nxt_edge = found
-            if bool(edge_data[nxt_edge]["boundary"]) != bool(rec["boundary"]):
-                break
             used.add(nxt_edge)
             chain.insert(0, nxt)
         chains.append((kind, chain))
 
-    return [
-        StreetRec(i + 1, kind, _smooth_line(LineString([nodes[node] for node in chain])))
+    perimeter = StreetRec(1, "perimeter", LineString([(float(x), float(y)) for x, y in boundary.exterior.coords]))
+    internal = [
+        StreetRec(i + 2, kind, _smooth_line(LineString([nodes[node] for node in chain])))
         for i, (kind, chain) in enumerate(chains)
         if len(chain) >= 2
     ]
+    return [perimeter, *internal]
 
 
 def _smooth_line(line: LineString) -> LineString:
@@ -1564,7 +1659,7 @@ def _smooth_line(line: LineString) -> LineString:
 def _display_line(line: LineString) -> LineString:
     if line.length <= 1e-9:
         return line
-    simplified = line.simplify(max(0.35, line.length * 0.006), preserve_topology=False)
+    simplified = line.simplify(max(0.90, line.length * 0.012), preserve_topology=False)
     coords = np.asarray(simplified.coords, dtype=np.float64)
     if len(coords) < 3:
         return simplified
@@ -2150,7 +2245,7 @@ def _render_svg(
     parts.append('<rect width="900" height="900" fill="#f4f0e6"/>')
     bpts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in boundary.geom.exterior.coords])
     parts.append(f'<polygon points="{bpts}" fill="#efe7d3" stroke="#5d6f73" stroke-width="1.8"/>')
-    display_tolerance = max(width, height) * 0.0022
+    display_tolerance = max(width, height) * 0.0120
     for parcel in parcels:
         geom = _display_polygon(parcel.geom, display_tolerance)
         pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in geom.exterior.coords])
@@ -2206,7 +2301,7 @@ def _render_png(
                 img[max(0, y - width_px) : min(size, y + width_px + 1), max(0, x - width_px) : min(size, x + width_px + 1)] = color
 
     draw_line([(float(x), float(y)) for x, y in boundary.geom.exterior.coords], (93, 111, 115), 2)
-    display_tolerance = max(width, height) * 0.0022
+    display_tolerance = max(width, height) * 0.0120
     for parcel in parcels:
         geom = _display_polygon(parcel.geom, display_tolerance)
         draw_line([(float(x), float(y)) for x, y in geom.exterior.coords], (155, 143, 126), 0)

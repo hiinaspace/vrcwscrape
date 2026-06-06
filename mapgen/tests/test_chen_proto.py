@@ -182,6 +182,9 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
         metrics["seed_street_used_edge_count"]
         < metrics["seed_street_candidate_edge_count"]
     )
+    assert metrics["seed_through_street_path_count"] > 0
+    assert metrics["street_graph_dead_end_count"] <= 8
+    assert any(s.kind == "perimeter" and s.geom.is_ring for s in streets)
     assert any(s.kind == "street_access" for s in streets)
     assert any(g.kind == "cross_field" for g in guides)
     assert any(g.kind == "streamline_split" for g in guides)
