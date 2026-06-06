@@ -40,7 +40,10 @@ def test_street_topology_metrics_detect_components_and_angles() -> None:
         StreetRec(2, "street_access", LineString([nodes[3], nodes[4]])),
     ]
 
-    metrics = _street_topology_metrics(nodes, street_edges, streets, target_area=100.0)
+    boundary = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+    metrics = _street_topology_metrics(
+        nodes, street_edges, streets, boundary, target_area=100.0
+    )
 
     assert metrics["street_graph_component_count"] == 2
     assert metrics["street_graph_dead_end_count"] == 4
@@ -182,8 +185,12 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
         metrics["seed_street_used_edge_count"]
         < metrics["seed_street_candidate_edge_count"]
     )
-    assert metrics["seed_through_street_path_count"] > 0
-    assert metrics["street_graph_dead_end_count"] <= 8
+    assert metrics["seed_boundary_hug_reject_count"] > 0
+    assert metrics["street_graph_dead_end_count"] <= 24
+    assert metrics["boundary_parallel_street_ratio"] < 0.22
+    assert "boundary_hugging_street_ratio" in metrics
+    assert "street_wrinkle_turn_count" in metrics
+    assert "seed_boundary_hug_reject_count" in metrics
     assert any(s.kind == "perimeter" and s.geom.is_ring for s in streets)
     assert any(s.kind == "street_access" for s in streets)
     assert any(g.kind == "cross_field" for g in guides)

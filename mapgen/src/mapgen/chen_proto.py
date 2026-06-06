@@ -1031,6 +1031,29 @@ def _shortest_path_between_nodes(
     return math.inf, []
 
 
+def _path_length(path: set[tuple[int, int]] | list[tuple[int, int]], edge_data: dict[tuple[int, int], dict[str, Any]]) -> float:
+    return sum(float(edge_data[edge]["length"]) for edge in path)
+
+
+def _path_boundary_hug_ratio(
+    path: list[tuple[int, int]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    boundary: Polygon,
+    target_area: float,
+) -> float:
+    band = math.sqrt(target_area) * 2.00
+    path_len = _path_length(path, edge_data)
+    if path_len <= 1e-9:
+        return 0.0
+    hugging = sum(
+        float(edge_data[edge]["length"])
+        for edge in path
+        if not edge_data[edge].get("boundary")
+        and edge_data[edge]["geom"].distance(boundary.boundary) <= band
+    )
+    return hugging / path_len
+
+
 def _street_edge_adjacency(street_edges: set[tuple[int, int]]) -> dict[int, set[int]]:
     selected_adj: dict[int, set[int]] = {}
     for a, b in street_edges:
@@ -1110,10 +1133,11 @@ def _select_seed_through_streets(
     adjacency: dict[int, list[tuple[int, int, float]]],
     edge_by_idx: dict[int, tuple[int, int]],
     seed_street_lines: list[LineString] | None,
+    boundary: Polygon,
     target_area: float,
-) -> tuple[set[tuple[int, int]], int]:
+) -> tuple[set[tuple[int, int]], int, int]:
     if not seed_street_lines:
-        return set(), 0
+        return set(), 0, 0
     boundary_nodes = {
         node
         for edge, rec in edge_data.items()
@@ -1121,11 +1145,12 @@ def _select_seed_through_streets(
         for node in edge
     }
     if len(boundary_nodes) < 2:
-        return set(), 0
+        return set(), 0, 0
     selected: set[tuple[int, int]] = set()
     selected_paths = 0
+    rejected_boundary_hug_paths = 0
     min_path_len = math.sqrt(target_area) * 3.2
-    for seed_line in seed_street_lines[:8]:
+    for seed_line in seed_street_lines[:10]:
         coords = list(seed_line.coords)
         if len(coords) < 2:
             continue
@@ -1140,13 +1165,16 @@ def _select_seed_through_streets(
         _cost, path = _shortest_path_between_nodes(start, goal, adjacency, edge_by_idx, edge_data)
         if not path:
             continue
-        path_len = sum(float(edge_data[edge]["length"]) for edge in path)
+        path_len = _path_length(path, edge_data)
         seed_len = sum(float(edge_data[edge]["length"]) for edge in path if edge_data[edge].get("seed_street"))
         if path_len < min_path_len or seed_len / max(path_len, 1e-9) < 0.30:
             continue
+        if _path_boundary_hug_ratio(path, edge_data, boundary, target_area) > 0.25:
+            rejected_boundary_hug_paths += 1
+            continue
         selected.update(path)
         selected_paths += 1
-    return selected, selected_paths
+    return selected, selected_paths, rejected_boundary_hug_paths
 
 
 def _node_pair_angle(nodes: list[tuple[float, float]], center: int, other: int) -> float:
@@ -1184,6 +1212,72 @@ def _street_smoothness_energy(streets: list[StreetRec]) -> float:
         total += float(np.sum(second * second))
         length += float(street.geom.length)
     return total / max(length, 1e-9)
+
+
+def _street_wrinkle_metrics(streets: list[StreetRec], target_area: float) -> dict[str, Any]:
+    short_threshold = math.sqrt(target_area) * 0.42
+    wrinkle_turns = 0
+    turn_degrees: list[float] = []
+    internal_length = 0.0
+    for street in streets:
+        if street.kind == "perimeter":
+            continue
+        coords = list(street.geom.coords)
+        internal_length += float(street.geom.length)
+        if len(coords) < 3:
+            continue
+        for a, b, c in zip(coords[:-2], coords[1:-1], coords[2:], strict=False):
+            len_a = math.hypot(b[0] - a[0], b[1] - a[1])
+            len_b = math.hypot(c[0] - b[0], c[1] - b[1])
+            if len_a <= 1e-9 or len_b <= 1e-9:
+                continue
+            angle_a = math.atan2(b[1] - a[1], b[0] - a[0])
+            angle_b = math.atan2(c[1] - b[1], c[0] - b[0])
+            turn = abs(math.atan2(math.sin(angle_b - angle_a), math.cos(angle_b - angle_a)))
+            turn_degrees.append(math.degrees(turn))
+            if min(len_a, len_b) < short_threshold and turn > math.radians(45):
+                wrinkle_turns += 1
+    vals = np.asarray(turn_degrees, dtype=np.float64)
+    return {
+        "street_wrinkle_turn_count": int(wrinkle_turns),
+        "street_wrinkle_turns_per_100m": float(wrinkle_turns / max(internal_length, 1e-9) * 100.0),
+        "street_turn_angle_p95_deg": float(np.quantile(vals, 0.95)) if len(vals) else 0.0,
+    }
+
+
+def _boundary_hugging_street_metrics(
+    streets: list[StreetRec],
+    boundary: Polygon,
+    target_area: float,
+) -> dict[str, Any]:
+    band = math.sqrt(target_area) * 2.00
+    internal_length = sum(float(street.geom.length) for street in streets if street.kind != "perimeter")
+    hugging_length = 0.0
+    parallel_hugging_length = 0.0
+    for street in streets:
+        if street.kind == "perimeter" or street.geom.length <= 1e-9:
+            continue
+        coords = list(street.geom.coords)
+        for a, b in zip(coords[:-1], coords[1:], strict=False):
+            segment = LineString([a, b])
+            if segment.length <= 1e-9:
+                continue
+            if segment.distance(boundary.boundary) <= band:
+                hugging_length += float(segment.length)
+                mid = segment.interpolate(0.5, normalized=True)
+                boundary_s = boundary.boundary.project(mid)
+                before = boundary.boundary.interpolate(max(0.0, boundary_s - band * 0.35))
+                after = boundary.boundary.interpolate(min(boundary.boundary.length, boundary_s + band * 0.35))
+                boundary_angle = math.atan2(after.y - before.y, after.x - before.x)
+                segment_angle = _line_mid_angle(segment)
+                if _axis_delta(boundary_angle, segment_angle) < math.radians(25):
+                    parallel_hugging_length += float(segment.length)
+    return {
+        "boundary_hugging_street_length": float(hugging_length),
+        "boundary_hugging_street_ratio": float(hugging_length / max(internal_length, 1e-9)),
+        "boundary_parallel_street_length": float(parallel_hugging_length),
+        "boundary_parallel_street_ratio": float(parallel_hugging_length / max(internal_length, 1e-9)),
+    }
 
 
 def _access_ratio_metrics(
@@ -1228,6 +1322,7 @@ def _street_topology_metrics(
     nodes: list[tuple[float, float]],
     street_edges: set[tuple[int, int]],
     streets: list[StreetRec],
+    boundary: Polygon,
     target_area: float,
 ) -> dict[str, Any]:
     selected_adj = _street_edge_adjacency(street_edges)
@@ -1235,7 +1330,7 @@ def _street_topology_metrics(
     chain_lengths = np.asarray([street.geom.length for street in streets], dtype=np.float64)
     angle_devs = np.asarray(_street_junction_angle_deviations(nodes, selected_adj), dtype=np.float64)
     total_chain_length = float(chain_lengths.sum()) if len(chain_lengths) else 0.0
-    return {
+    metrics = {
         "street_graph_edge_count": len(street_edges),
         "street_graph_chain_count": len(streets),
         "street_graph_component_count": len(component_sizes),
@@ -1252,6 +1347,9 @@ def _street_topology_metrics(
         "street_junction_angle_deviation_p95_deg": float(math.degrees(np.quantile(angle_devs, 0.95))) if len(angle_devs) else 0.0,
         "street_smoothness_energy": float(_street_smoothness_energy(streets)),
     }
+    metrics.update(_street_wrinkle_metrics(streets, target_area))
+    metrics.update(_boundary_hugging_street_metrics(streets, boundary, target_area))
+    return metrics
 
 
 def _edge_angle_from_node(nodes: list[tuple[float, float]], edge: tuple[int, int], node: int) -> float:
@@ -1336,11 +1434,51 @@ def _access_candidate_length(candidate: set[tuple[int, int]], edge_data: dict[tu
     return sum(float(edge_data[edge]["length"]) for edge in candidate)
 
 
-def _access_candidate_cost(candidate: set[tuple[int, int]], edge_data: dict[tuple[int, int], dict[str, Any]]) -> float:
+def _edge_boundary_parallel_penalty(
+    edge: tuple[int, int],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    boundary: Polygon | None,
+    target_area: float | None,
+) -> float:
+    if boundary is None or target_area is None:
+        return 1.0
+    rec = edge_data[edge]
+    if rec.get("boundary"):
+        return 1.0
+    line = rec["geom"]
+    band = math.sqrt(target_area) * 2.00
+    if line.distance(boundary.boundary) > band:
+        return 1.0
+    mid = line.interpolate(0.5, normalized=True)
+    boundary_s = boundary.boundary.project(mid)
+    before = boundary.boundary.interpolate(max(0.0, boundary_s - band * 0.25))
+    after = boundary.boundary.interpolate(min(boundary.boundary.length, boundary_s + band * 0.25))
+    boundary_angle = math.atan2(after.y - before.y, after.x - before.x)
+    if _axis_delta(boundary_angle, _line_mid_angle(line)) < math.radians(35):
+        return 5.0
+    return 1.7
+
+
+def _is_boundary_parallel_edge(
+    edge: tuple[int, int],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    boundary: Polygon,
+    target_area: float,
+) -> bool:
+    return _edge_boundary_parallel_penalty(edge, edge_data, boundary, target_area) >= 5.0
+
+
+def _access_candidate_cost(
+    candidate: set[tuple[int, int]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    boundary: Polygon | None = None,
+    target_area: float | None = None,
+) -> float:
     cost = 0.0
     for edge in candidate:
         rec = edge_data[edge]
         multiplier = 0.52 if rec.get("seed_street") else 1.0
+        multiplier *= _edge_boundary_parallel_penalty(edge, edge_data, boundary, target_area)
         cost += float(rec["length"]) * multiplier
     return cost
 
@@ -1401,6 +1539,8 @@ def _choose_group_access_edges(
     parcel_edges: dict[int, list[tuple[int, int]]],
     group: set[int],
     street_edges: set[tuple[int, int]],
+    boundary: Polygon,
+    target_area: float,
 ) -> tuple[set[tuple[int, int]], dict[str, int]]:
     remaining = set(group)
     chosen: set[tuple[int, int]] = set()
@@ -1417,7 +1557,7 @@ def _choose_group_access_edges(
             scored.append(
                 (
                     0 if reached == remaining else 1,
-                    _access_candidate_cost(edges, edge_data),
+                    _access_candidate_cost(edges, edge_data, boundary, target_area),
                     _access_candidate_length(edges, edge_data),
                     kind,
                     edges,
@@ -1439,11 +1579,50 @@ def _choose_group_access_edges(
         if not edges:
             remaining.remove(parcel_id)
             continue
-        edge = min(edges, key=lambda candidate: _access_candidate_cost({candidate}, edge_data))
+        edge = min(
+            edges,
+            key=lambda candidate: _access_candidate_cost({candidate}, edge_data, boundary, target_area),
+        )
         chosen.add(edge)
         remaining -= _access_candidate_reaches({edge}, remaining, parcel_edges)
         counts["fallback"] += 1
     return chosen, counts
+
+
+def _selected_edges_connected(street_edges: set[tuple[int, int]]) -> bool:
+    component_sizes = _street_component_sizes(_street_edge_adjacency(street_edges))
+    return len(component_sizes) <= 1
+
+
+def _prune_boundary_parallel_edges(
+    street_edges: set[tuple[int, int]],
+    edge_data: dict[tuple[int, int], dict[str, Any]],
+    boundary: Polygon,
+    target_area: float,
+    parcels: list[ParcelRec],
+    has_frontage,
+) -> int:
+    candidates = [
+        edge
+        for edge in street_edges
+        if not edge_data[edge].get("boundary")
+        and _is_boundary_parallel_edge(edge, edge_data, boundary, target_area)
+    ]
+    candidates.sort(key=lambda edge: float(edge_data[edge]["length"]), reverse=True)
+    pruned = 0
+    for edge in candidates:
+        trial = set(street_edges)
+        trial.remove(edge)
+        if not _selected_edges_connected(trial):
+            continue
+        old_edges = set(street_edges)
+        street_edges.remove(edge)
+        if all(has_frontage(parcel.parcel_id) for parcel in parcels):
+            pruned += 1
+            continue
+        street_edges.clear()
+        street_edges.update(old_edges)
+    return pruned
 
 
 def _street_graph_from_parcels(
@@ -1457,12 +1636,13 @@ def _street_graph_from_parcels(
     edge_by_idx = {int(rec["edge_idx"]): key for key, rec in edge_data.items()}
     seed_street_edges = {key for key, rec in edge_data.items() if rec.get("seed_street")}
     street_edges: set[tuple[int, int]] = {key for key, rec in edge_data.items() if rec["boundary"]}
-    seed_through_edges, seed_through_path_count = _select_seed_through_streets(
+    seed_through_edges, seed_through_path_count, seed_boundary_hug_reject_count = _select_seed_through_streets(
         nodes,
         edge_data,
         adjacency,
         edge_by_idx,
         seed_street_lines,
+        boundary,
         target_area,
     )
     street_edges.update(seed_through_edges)
@@ -1517,7 +1697,15 @@ def _street_graph_from_parcels(
         unreachable_group_count += 1
         unreachable_group_max_size = max(unreachable_group_max_size, len(group))
 
-        group_street_edges, access_counts = _choose_group_access_edges(nodes, edge_data, parcel_edges, group, street_edges)
+        group_street_edges, access_counts = _choose_group_access_edges(
+            nodes,
+            edge_data,
+            parcel_edges,
+            group,
+            street_edges,
+            boundary,
+            target_area,
+        )
         if not group_street_edges:
             break
         access_i_shape_count += access_counts["I"]
@@ -1544,6 +1732,14 @@ def _street_graph_from_parcels(
             access_non_progress_count += 1
             break
 
+    boundary_parallel_pruned_edge_count = _prune_boundary_parallel_edges(
+        street_edges,
+        edge_data,
+        boundary,
+        target_area,
+        parcels,
+        has_frontage,
+    )
     streets = _merge_street_edges(nodes, edge_data, street_edges, boundary)
 
     metrics = {
@@ -1553,6 +1749,8 @@ def _street_graph_from_parcels(
         "seed_street_used_edge_count": int(sum(1 for edge in street_edges if edge in seed_street_edges)),
         "seed_through_street_path_count": int(seed_through_path_count),
         "seed_through_street_edge_count": int(len(seed_through_edges)),
+        "seed_boundary_hug_reject_count": int(seed_boundary_hug_reject_count),
+        "boundary_parallel_pruned_edge_count": int(boundary_parallel_pruned_edge_count),
         "street_access_path_count": added_access_paths,
         "street_component_connection_path_count": int(component_connection_paths),
         "unreachable_group_count": int(unreachable_group_count),
@@ -1563,7 +1761,7 @@ def _street_graph_from_parcels(
         "access_non_progress_count": int(access_non_progress_count),
         "unreachable_parcel_count": sum(1 for parcel in parcels if not has_frontage(parcel.parcel_id)),
     }
-    metrics.update(_street_topology_metrics(nodes, street_edges, streets, target_area))
+    metrics.update(_street_topology_metrics(nodes, street_edges, streets, boundary, target_area))
     metrics.update(_access_ratio_metrics(parcels, parcel_edges, edge_data, street_edges))
     return streets, metrics
 
