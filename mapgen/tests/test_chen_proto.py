@@ -185,7 +185,11 @@ def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
     assert metrics["street_access_path_count"] > 0
     assert "street_graph_component_count" in metrics
     assert "street_short_chain_count" in metrics
+    assert "street_streamline_chain_count" in metrics
+    assert "street_fragmented_chain_ratio" in metrics
+    assert "street_long_chain_count" in metrics
     assert metrics["street_graph_component_count"] == 1
+    assert metrics["street_streamline_chain_count"] > 0
     assert metrics["parcel_access_ratio_below_tau_count"] == 0
     assert metrics["access_non_progress_count"] == 0
     assert (

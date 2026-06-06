@@ -1414,11 +1414,33 @@ def _street_topology_metrics(
     selected_adj = _street_edge_adjacency(street_edges)
     component_sizes = _street_component_sizes(selected_adj)
     chain_lengths = np.asarray([street.geom.length for street in streets], dtype=np.float64)
+    internal_streets = [street for street in streets if street.kind != "perimeter"]
+    internal_lengths = np.asarray([street.geom.length for street in internal_streets], dtype=np.float64)
+    internal_vertex_counts = np.asarray([len(street.geom.coords) for street in internal_streets], dtype=np.float64)
+    long_chain_threshold = math.sqrt(target_area) * 2.8
+    short_chain_threshold = math.sqrt(target_area) * 0.75
+    connector_min_length = math.sqrt(target_area) * 1.65
+    short_chain_count = int(sum(1 for length in internal_lengths if length < short_chain_threshold))
+    short_connector_count = int(
+        sum(
+            1
+            for street in internal_streets
+            if street.kind == "streamline_split" and street.geom.length < connector_min_length
+        )
+    )
     angle_devs = np.asarray(_street_junction_angle_deviations(nodes, selected_adj), dtype=np.float64)
     total_chain_length = float(chain_lengths.sum()) if len(chain_lengths) else 0.0
     metrics = {
         "street_graph_edge_count": len(street_edges),
         "street_graph_chain_count": len(streets),
+        "internal_street_chain_count": int(len(internal_streets)),
+        "street_streamline_chain_count": int(sum(1 for street in internal_streets if street.kind == "streamline_split")),
+        "street_short_streamline_chain_count": short_connector_count,
+        "street_access_chain_count": int(sum(1 for street in internal_streets if street.kind == "street_access")),
+        "street_long_chain_count": int(sum(1 for length in internal_lengths if length >= long_chain_threshold)),
+        "street_fragmented_chain_ratio": float(short_chain_count / max(len(internal_streets), 1)),
+        "street_polyline_vertex_p50": float(np.quantile(internal_vertex_counts, 0.50)) if len(internal_vertex_counts) else 0.0,
+        "street_polyline_vertex_p90": float(np.quantile(internal_vertex_counts, 0.90)) if len(internal_vertex_counts) else 0.0,
         "street_graph_component_count": len(component_sizes),
         "street_graph_largest_component_share": float(max(component_sizes) / max(sum(component_sizes), 1)) if component_sizes else 0.0,
         "street_isolated_node_count": int(sum(1 for nbrs in selected_adj.values() if not nbrs)),
@@ -1428,7 +1450,7 @@ def _street_topology_metrics(
         "street_chain_length_total": total_chain_length,
         "street_chain_length_p50": float(np.quantile(chain_lengths, 0.50)) if len(chain_lengths) else 0.0,
         "street_chain_length_p90": float(np.quantile(chain_lengths, 0.90)) if len(chain_lengths) else 0.0,
-        "street_short_chain_count": int(sum(1 for length in chain_lengths if length < math.sqrt(target_area) * 0.75)),
+        "street_short_chain_count": short_chain_count,
         "street_junction_angle_deviation_p50_deg": float(math.degrees(np.quantile(angle_devs, 0.50))) if len(angle_devs) else 0.0,
         "street_junction_angle_deviation_p95_deg": float(math.degrees(np.quantile(angle_devs, 0.95))) if len(angle_devs) else 0.0,
         "street_smoothness_energy": float(_street_smoothness_energy(streets)),
@@ -1827,7 +1849,7 @@ def _street_graph_from_parcels(
         parcels,
         has_frontage,
     )
-    streets = _merge_street_edges(nodes, edge_data, street_edges, boundary)
+    streets = _merge_street_edges(nodes, edge_data, street_edges, boundary, target_area)
     streets, cleanup_metrics = _cleanup_street_geometry(streets, boundary, target_area)
 
     metrics = {
@@ -1860,6 +1882,7 @@ def _merge_street_edges(
     edge_data: dict[tuple[int, int], dict[str, Any]],
     street_edges: set[tuple[int, int]],
     boundary: Polygon,
+    target_area: float,
 ) -> list[StreetRec]:
     selected_adj: dict[int, list[tuple[int, tuple[int, int]]]] = {}
     for edge in street_edges:
@@ -1888,7 +1911,7 @@ def _merge_street_edges(
         return nxt, edge
 
     used: set[tuple[int, int]] = set()
-    chains: list[tuple[str, list[int]]] = []
+    chains: list[tuple[str, list[int], list[tuple[int, int]]]] = []
     start_edges = sorted(
         street_edges,
         key=lambda edge: (
@@ -1905,6 +1928,7 @@ def _merge_street_edges(
         a, b = edge
         used.add(edge)
         chain = [a, b]
+        chain_edges = [edge]
         while True:
             found = next_edge(chain[-2], chain[-1], used)
             if found is None:
@@ -1912,6 +1936,7 @@ def _merge_street_edges(
             nxt, nxt_edge = found
             used.add(nxt_edge)
             chain.append(nxt)
+            chain_edges.append(nxt_edge)
         while True:
             found = next_edge(chain[1], chain[0], used)
             if found is None:
@@ -1919,12 +1944,18 @@ def _merge_street_edges(
             nxt, nxt_edge = found
             used.add(nxt_edge)
             chain.insert(0, nxt)
-        chains.append((kind, chain))
+            chain_edges.insert(0, nxt_edge)
+        seed_len = sum(float(edge_data[chain_edge]["length"]) for chain_edge in chain_edges if edge_data[chain_edge].get("seed_street"))
+        chain_len = sum(float(edge_data[chain_edge]["length"]) for chain_edge in chain_edges)
+        connector_min_length = math.sqrt(target_area) * 1.90
+        if chain_len >= connector_min_length and seed_len / max(chain_len, 1e-9) >= 0.55:
+            kind = "streamline_split"
+        chains.append((kind, chain, chain_edges))
 
     perimeter = StreetRec(1, "perimeter", LineString([(float(x), float(y)) for x, y in boundary.exterior.coords]))
     internal = [
         StreetRec(i + 2, kind, _smooth_line(LineString([nodes[node] for node in chain])))
-        for i, (kind, chain) in enumerate(chains)
+        for i, (kind, chain, _chain_edges) in enumerate(chains)
         if len(chain) >= 2
     ]
     return [perimeter, *internal]
@@ -2595,25 +2626,25 @@ def _render_svg(
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900">']
     parts.append('<rect width="900" height="900" fill="#f4f0e6"/>')
     bpts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in boundary.geom.exterior.coords])
-    parts.append(f'<polygon points="{bpts}" fill="#efe7d3" stroke="#5d6f73" stroke-width="1.8"/>')
+    parts.append(f'<polygon points="{bpts}" fill="#efe7d3" stroke="#5d6f73" stroke-width="1.6"/>')
     display_tolerance = max(width, height) * 0.0120
     for parcel in parcels:
         geom = _display_polygon(parcel.geom, display_tolerance)
         pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in [pxy(float(a), float(b)) for a, b in geom.exterior.coords])
-        parts.append(f'<polygon points="{pts}" fill="#fbf7ec" stroke="#9d907f" stroke-width="0.8"/>')
+        parts.append(f'<polygon points="{pts}" fill="#fbf7ec" stroke="#c9beb0" stroke-width="0.45"/>')
     for guide in guides:
         coords = [pxy(float(x), float(y)) for x, y in guide.geom.coords]
         d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
         color = "#d7b88f" if guide.kind == "cross_field" else "#b8c4c1"
-        opacity = "0.28" if guide.kind == "cross_field" else "0.22"
+        opacity = "0.18" if guide.kind == "cross_field" else "0.16"
         width_px = "0.8" if guide.kind == "cross_field" else "0.8"
         parts.append(f'<polyline points="{d}" fill="none" stroke="{color}" stroke-width="{width_px}" stroke-linecap="round" opacity="{opacity}"/>')
     for street in [street for street in streets if street.kind != "perimeter"]:
         display_geom = _display_line(street.geom)
         coords = [pxy(float(x), float(y)) for x, y in display_geom.coords]
         d = " ".join(f"{x:.2f},{y:.2f}" for x, y in coords)
-        width_px = 4 if street.kind == "streamline_split" else 2
-        casing = "#7b969b" if street.kind == "streamline_split" else "#8fa2a5"
+        width_px = 5 if street.kind == "streamline_split" else 2
+        casing = "#567c85" if street.kind == "streamline_split" else "#9fb0ad"
         parts.append(f'<polyline points="{d}" fill="none" stroke="#8fa2a5" stroke-width="{width_px + 2}" stroke-linecap="round"/>')
         parts[-1] = f'<polyline points="{d}" fill="none" stroke="{casing}" stroke-width="{width_px + 2}" stroke-linecap="round"/>'
         parts.append(f'<polyline points="{d}" fill="none" stroke="#fdfbf4" stroke-width="{width_px}" stroke-linecap="round"/>')
@@ -2660,18 +2691,18 @@ def _render_png(
     display_tolerance = max(width, height) * 0.0120
     for parcel in parcels:
         geom = _display_polygon(parcel.geom, display_tolerance)
-        draw_line([(float(x), float(y)) for x, y in geom.exterior.coords], (155, 143, 126), 0)
+        draw_line([(float(x), float(y)) for x, y in geom.exterior.coords], (202, 192, 178), 0)
     for guide in guides:
         if guide.kind == "cross_field":
-            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (218, 193, 159), 0)
+            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (229, 208, 181), 0)
         else:
-            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (198, 207, 203), 0)
+            draw_line([(float(x), float(y)) for x, y in guide.geom.coords], (213, 220, 216), 0)
     for street in [street for street in streets if street.kind != "perimeter"]:
         display_geom = _display_line(street.geom)
         coords = [(float(x), float(y)) for x, y in display_geom.coords]
-        outer = (123, 150, 155) if street.kind == "streamline_split" else (143, 162, 165)
-        draw_line(coords, outer, 2)
-        draw_line(coords, (255, 253, 246), 1)
+        outer = (86, 124, 133) if street.kind == "streamline_split" else (159, 176, 173)
+        draw_line(coords, outer, 3 if street.kind == "streamline_split" else 2)
+        draw_line(coords, (255, 253, 246), 2 if street.kind == "streamline_split" else 1)
     for street in [street for street in streets if street.kind == "perimeter"]:
         coords = [(float(x), float(y)) for x, y in street.geom.coords]
         draw_line(coords, (93, 111, 115), 4)
