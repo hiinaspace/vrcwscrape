@@ -35,6 +35,22 @@ This creates predictable artifacts:
 The next generator should make a planar street/block graph first, then create
 lots inside those blocks, then assign worlds to lots.
 
+## Current Prototype Direction
+
+The current implementation direction is artifact-first. Prototype commands write
+static GeoJSON/Parquet plus PNG/SVG inspection sheets and metrics before any
+deck.gl wiring. The important new prototype is `mapgen-chen-proto`, an isolated
+single-district harness for reproducing the local layout behavior from Chen
+2024 and Yang 2013 before reintegrating that module into `mapgen-city-proto`.
+
+The prototype should be treated as a testbed, not a production exporter. Its
+job is to make the local street/parcel algorithm measurable on rectangle,
+triangle, oval, and island-shaped boundaries. The current known gap is that the
+street generator still behaves more like frontage repair than Chen's connected
+street-network co-generation. Metrics now expose this directly with connected
+component counts, short street chains, access ratios, and current greedy access
+fallback counts.
+
 ## Sources Reviewed
 
 - Parish and Mueller 2001, "Procedural Modeling of Cities":
@@ -119,6 +135,13 @@ lots inside those blocks, then assign worlds to lots.
   to ensure every parcel has street access. This matches our current failure
   almost exactly.
 
+- Ortner et al. 2023, "Urban Fabric Generation: A comparative analysis of
+  multiple vector field methods":
+  https://www.zebinchen.com/research/urbanfab/ecaade2023_96.pdf
+  restates D-field, B-field, and harmonic-field algorithms with pseudocode and
+  adds field evaluation criteria. It is useful as the bridge between Yang's
+  cross-field theory and a more implementation-oriented urban-fabric tool.
+
 - Jiang and Claramunt 2004/2007, "A Topological Pattern of Urban Street
   Networks":
   https://arxiv.org/pdf/physics/0703223
@@ -194,6 +217,86 @@ The first prototype should avoid a full integer-programming implementation. A
 good enough v3 can likely be built from raster fields, Shapely polygonization,
 shortest paths, streamline/domain splitting, and per-block matching.
 
+## Chen/Yang Implementation Notes
+
+The closer paper pass changed the local-layout target from a vague
+"literature-inspired" approach to a more concrete sequence.
+
+Chen 2024 represents the layout with coupled data structures: parcel mesh,
+parcel corner graph, parcel graph, street network graph, and street graph. The
+street network graph is a connected subgraph of the parcel corner graph. This is
+more than a rendering detail: connected street topology should be maintained as
+a hard invariant during generation, not fixed by drawing roads after parcels
+exist.
+
+Chen's parcel split score is:
+
+```text
+Q = lambda1 * Qsize + lambda2 * Qregu + lambda3 * Qacce
+```
+
+The paper defaults are `lambda1 = 0.3`, `lambda2 = 0.5`, `lambda3 = 0.2`, and
+`tau = 0.5` for the street-access ratio. Parcel irregularity uses angle and side
+length variance on the approximate polygon with `gamma1 = 0.75` and
+`gamma2 = 0.25`. The prototype now has metrics for this exact irregularity, but
+the split selector still needs to use the paper definition instead of its older
+penalty approximation.
+
+Chen's street generation should replace the current greedy repair:
+
+1. Identify parcels unreachable from the existing street network.
+2. Group unreachable parcels by connected components in the parcel corner graph.
+3. Enumerate I-shaped street access candidates, then L-shaped candidates.
+4. Choose the shortest candidate that reaches all parcels in the group. If none
+   does, choose the candidate that reaches the most parcels and recurse.
+5. Use Dijkstra on the parcel corner graph to connect the new access subgraph to
+   the existing street network. The edge cost combines length and a junction
+   penalty, with junction penalty weighted strongly.
+6. Optionally remove cul-de-sacs by connecting street ends back to the street
+   network.
+
+Yang 2013 remains the stronger guide for the road/block field before Chen's
+parcel/street co-generation. The paper combines template-based splitting and
+streamline-based splitting. Template-based splitting is preferred when a
+compatible template can be warped below a deformation threshold; streamline
+splitting is used for coarser or harder regions.
+
+Yang's cross-field work should be implemented as a mesh field, not as local
+angle perturbation. Supplemental material describes:
+
+- D-fields from weighted distance to the boundary, with representation-vector
+  smoothing.
+- H-fields from harmonic functions optimized for low divergence.
+- B-fields from smooth interpolation of boundary orientations, with a weight
+  trading boundary alignment against smoothness.
+
+Candidate streamlines should be traced from constrained-Delaunay interior
+vertices, in both active field orientations, with spacing suppression around
+accepted candidates. Scoring should include divergence, fit to expected
+template/block widths, distance to singularities, and continuity with existing
+split endpoints/directions.
+
+Yang's template system is also more specific than the current fixed 2xN
+procedural templates. Templates encode region labels, hierarchical subregions,
+allowed face deformation modes, boundary semantics (`street`, `no street`,
+unconstrained), vertex semantics, and alignment constraints to lines/curves.
+Warping uses compatible corner/boundary matching, arc-length boundary
+initialization, mean-value coordinates for interiors, and alternating
+registration/regression.
+
+Both Chen and Yang use a global optimization pass after topology generation.
+Chen optimizes parcel regularity, parcel-side smoothness, street smoothness,
+junction orthogonality, and closeness to the initial layout. Yang alternates
+fitting strip targets to road-bounded blocks with a quadratic road-mesh
+optimization, then re-warps templates into the optimized regions. The prototype's
+current smoothing pass is not equivalent to either method.
+
+The terrain/heightmap direction should enter through vector-field constraints or
+weights, especially the B-field-style formulation, rather than by warping roads
+after generation. Dense DR regions should generally favor flatter, easier urban
+growth; sparse/outskirt regions can tolerate more elevation variation and
+windier streets.
+
 ## Quality Gates
 
 Track these metrics for every export and compare against `road-parcels-v2`:
@@ -211,9 +314,26 @@ Track these metrics for every export and compare against `road-parcels-v2`:
 - Bridge length over ocean and count of bridge endpoints not attached to land.
 - Frontend render cost for instanced buildings at high zoom.
 
+For the Chen/Yang local prototype, also track:
+
+- Connected street components; Chen-style runs should target exactly one.
+- Largest connected street component share.
+- Isolated street edge count.
+- Dead-end count, conditioned on loop/cul-de-sac/tree street mode.
+- Street short-chain count and chain length quantiles.
+- Street junction angle deviation from 90 degrees.
+- Street smoothness energy using second-order differences.
+- Chen parcel irregularity average, p50, and p95.
+- Parcel street-access ratio min, p05, and below-threshold count.
+- Unreachable parcel group count and max group size.
+- I-shaped, L-shaped, and greedy-fallback access counts.
+- Short edge count using Chen's short-edge threshold.
+- Field divergence, field continuity, boundary parallelism/perpendicularity,
+  tile convexity, and singularity count once the mesh-field layer exists.
+
 ## Recommended Next Prototype
 
-Start with one or two dense LocalMAP islands:
+For the global city prototype, start with one or two dense LocalMAP islands:
 
 1. Build density raster, land mask, and local cross field.
 2. Generate a few major/collector roads with least-cost paths between density
@@ -225,3 +345,16 @@ Start with one or two dense LocalMAP islands:
 
 Only after that looks sane should the pipeline scale to all islands and replace
 the current road-parcel export.
+
+For the isolated local-layout prototype, the next implementation order is:
+
+1. Replace the greedy street repair with Chen I/L access enumeration plus
+   Dijkstra connection, keeping the new topology metrics as the regression
+   guide.
+2. Replace split scoring with Chen Equation 1/2 metrics and constants.
+3. Add a mesh-field layer with at least D-field and B-field generation,
+   candidate streamline tracing, and field-quality metrics.
+4. Introduce a semantic template data model for a small Yang-style row/spike/area
+   template set.
+5. Implement a real post-topology optimization pass and reapply templates after
+   optimization.

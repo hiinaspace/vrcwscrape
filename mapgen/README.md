@@ -56,6 +56,33 @@ $FHS/bin/mapgen-fhs run_full.sh              # UMAP baseline
 $FHS/bin/mapgen-fhs run_layout_variants.sh   # refresh UMAP, build PaCMAP/LocalMAP
 ```
 
+## Prototype layout work
+
+The current layout replacement work is artifact-first and intentionally stays
+offline until the generated geometry has acceptable metrics and inspection
+sheets. See `../docs/road-layout-research.md` for the paper-grounded direction
+and current quality gates.
+
+Relevant commands:
+
+```bash
+# Dimensional-reduction sweep for LocalMAP parameters.
+uv run mapgen-dr-sweep ...
+
+# Multi-city/crop prototype: writes PNG/SVG inspection sheets, GeoJSON,
+# Parquet, and layout metrics.
+uv run mapgen-city-proto ...
+
+# Isolated Chen/Yang local-layout prototype for a single district boundary.
+uv run mapgen-chen-proto --out-dir artifacts_full/chen_proto_triangle \
+  --boundary triangle --width 220 --height 150 --parcel-count 90
+```
+
+Generated inspection runs live under `mapgen/artifacts_full/` and are disposable.
+Literature PDFs/extracted text used to derive the current implementation notes
+live at repo-root `artifacts_full/literature/`; the durable summary is merged
+into `docs/road-layout-research.md`.
+
 ## Image-caption enrichment (optional)
 
 Caption thin-description worlds' thumbnails with gemma4 (vision) and fold the

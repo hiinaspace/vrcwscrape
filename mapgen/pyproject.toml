@@ -57,6 +57,9 @@ mapgen-land = "mapgen.land:main"
 mapgen-roads = "mapgen.roads:main"
 mapgen-road-layout = "mapgen.road_layout:main"
 mapgen-city-layout = "mapgen.city_layout:main"
+mapgen-dr-sweep = "mapgen.dr_sweep:main"
+mapgen-city-proto = "mapgen.city_proto:main"
+mapgen-chen-proto = "mapgen.chen_proto:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6", "ty", "pre-commit>=3.8"]
