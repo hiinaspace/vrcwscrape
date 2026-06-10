@@ -1,16 +1,40 @@
-"""Chen-style street network selection over parcel corner graphs.
+"""Chen 2024 Section 4.2 per-level street extension over the parcel corner graph.
 
-This keeps streets as a connected subgraph of the parcel corner graph, starts
-from perimeter frontage, repairs unreachable parcel groups with I/L-shaped
-access candidates, adds bounded connected paths that improve useful junction
-structure, and can optionally remove or repair avoidable cul-de-sacs.
+This implements the paper's four-step street generation, run once per
+hierarchical level with the street network that already exists at that level:
+
+1. Identify and group unreachable parcels. A parcel is reachable when at least
+   one of its corner-graph boundary edges is already in the street network.
+   Unreachable parcels are grouped into connected components of the parcel
+   adjacency graph (parcels sharing a corner-graph edge).
+2. Generate a street access for each group. For each corner on the group
+   boundary we enumerate I-shaped accesses (one collinear chain per incident
+   edge of the corner); two consecutive edges are colinear when their included
+   angle is larger than 135 degrees, otherwise the shared vertex is a junction.
+   If an I-shaped access makes every group parcel reachable, the shortest such
+   access is chosen. Otherwise L-shaped accesses (two collinear rays sharing a
+   junction corner) are enumerated and the shortest complete one is chosen. If
+   no single access reaches all parcels, the access reaching the most parcels is
+   chosen and the algorithm recurses on the remaining parcels (paper Fig. 9
+   case #5).
+3. Connect the chosen access to the existing street network with a weighted
+   shortest path (Dijkstra) in the parcel corner graph. Each edge weight is
+   ``length_weight * edge_length + junction_weight * (1 if the included angle
+   with the previous edge is smaller than 135 degrees else 0)``, with the
+   junction component weighted higher.
+4. Optionally avoid cul-de-sacs by connecting each street end back to the
+   network with the same weighted shortest path.
+
+The primary entry point is :func:`extend_street_network`. The legacy
+:func:`generate_street_network` is a thin deprecated wrapper that seeds the
+boundary ring and calls :func:`extend_street_network` once.
 """
 
 from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from mapgen.chen_core import (
@@ -26,33 +50,62 @@ from mapgen.chen_core import (
     normalized_edge,
     parcel_corner_graph,
     ring_edges,
-    street_adjacency,
 )
 
 
 @dataclass(frozen=True)
+class StreetConfig:
+    """Configuration for Chen Section 4.2 street extension.
+
+    The Dijkstra connection weight is the paper's two-component form:
+    ``length_weight * edge_length + junction_weight * junction_indicator`` where
+    the junction indicator is 1 when the included angle with the previous edge is
+    smaller than the collinear threshold (135 degrees). ``junction_weight`` is
+    deliberately the dominant term, matching "we give the second component a
+    larger weight" in the paper.
+    """
+
+    collinear_angle_threshold_rad: float = CHEN_COLLINEAR_THRESHOLD_RAD
+    length_weight: float = 1.0
+    junction_weight: float = 10.0
+    avoid_cul_de_sacs: bool = False
+
+
+# Backwards-compatible alias for the legacy configuration name. The legacy
+# wrapper keeps these extra fields for callers that still construct the old
+# config; only the fields above influence the paper algorithm.
+@dataclass(frozen=True)
 class StreetGenerationConfig:
+    """Deprecated configuration retained for the legacy wrapper.
+
+    Prefer :class:`StreetConfig`. Only ``collinear_angle_threshold_rad``,
+    ``junction_penalty`` (mapped to ``junction_weight``), and
+    ``avoid_cul_de_sacs`` are honoured; the remaining fields are inert and kept
+    so old call sites keep importing.
+    """
+
     selection_strategy: str = "section_4_2_connected_junctions"
     collinear_angle_threshold_rad: float = CHEN_COLLINEAR_THRESHOLD_RAD
-    l_turn_min_angle_rad: float = math.radians(45.0)
-    junction_angle_threshold_rad: float = CHEN_COLLINEAR_THRESHOLD_RAD
+    length_weight: float = 1.0
     junction_penalty: float = 10.0
     avoid_cul_de_sacs: bool = False
-    cul_de_sac_repair_max_path_edges: int = 12
-    cul_de_sac_repair_max_added_edges: int | None = None
-    cul_de_sac_repair_max_added_edge_ratio: float = 0.10
-    complete_junctions: bool = True
-    junction_completion_target_degree: int = 4
-    junction_completion_min_corner_degree: int = 4
-    junction_completion_min_street_degree: int = 2
-    junction_completion_max_path_edges: int = 12
-    junction_completion_max_added_edges: int | None = None
-    junction_completion_max_added_edge_ratio: float = 0.20
-    max_repair_iterations: int | None = None
+
+    def to_street_config(self) -> StreetConfig:
+        return StreetConfig(
+            collinear_angle_threshold_rad=self.collinear_angle_threshold_rad,
+            length_weight=self.length_weight,
+            junction_weight=self.junction_penalty,
+            avoid_cul_de_sacs=self.avoid_cul_de_sacs,
+        )
+
+
+DEFAULT_STREET_CONFIG = StreetConfig()
 
 
 @dataclass(frozen=True)
 class StreetAccessCandidate:
+    """A candidate I/L-shaped street access for a group of parcels."""
+
     kind: str
     edges: frozenset[EdgeKey]
     reached_parcels: frozenset[int]
@@ -62,15 +115,13 @@ class StreetAccessCandidate:
 
 
 @dataclass(frozen=True)
-class StreetGenerationResult:
-    street_edges: frozenset[EdgeKey]
-    seed_edges: frozenset[EdgeKey]
-    selected_access_candidates: tuple[StreetAccessCandidate, ...]
-    evaluated_candidates: tuple[StreetAccessCandidate, ...]
+class StreetExtensionResult:
+    """Result of one :func:`extend_street_network` call."""
+
+    added_edges: set[EdgeKey]
     diagnostics: dict[str, Any]
-
-
-DEFAULT_STREET_GENERATION_CONFIG = StreetGenerationConfig()
+    selected_access_candidates: tuple[StreetAccessCandidate, ...] = ()
+    evaluated_candidates: tuple[StreetAccessCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -82,234 +133,188 @@ class _StreetContext:
     edge_parcels: dict[EdgeKey, frozenset[int]]
     parcel_neighbors: dict[int, set[int]]
     corner_adjacency: dict[int, set[int]]
+    all_edges: frozenset[EdgeKey]
 
 
-@dataclass(frozen=True)
-class _JunctionCompletionCandidate:
-    edges: tuple[EdgeKey, ...]
-    start: int
-    end: int
-    length: float
-    parcel_touch_count: int
-    four_way_gain: int
-    progress_gain: int
-    dead_end_delta: int
-
-
-@dataclass(frozen=True)
-class _CulDeSacRepairCandidate:
-    edges: tuple[EdgeKey, ...]
-    leaf: int
-    end: int
-    length: float
-    parcel_touch_count: int
-    dead_end_delta: int
-
-
-def generate_street_network(
-    layout_or_mesh: ChenLayout | ParcelMesh | ParcelCornerGraph,
-    *,
-    seed_edges: set[EdgeKey] | None = None,
-    config: StreetGenerationConfig = DEFAULT_STREET_GENERATION_CONFIG,
-) -> StreetGenerationResult:
-    """Select a connected Chen street subgraph over the parcel corner graph."""
-    if config.selection_strategy != "section_4_2_connected_junctions":
-        raise ValueError(
-            f"unsupported street selection strategy: {config.selection_strategy!r}"
-        )
-
-    ctx = _street_context(layout_or_mesh)
-    all_edges = {normalized_edge(*edge) for edge in ctx.corner_graph.edges}
-    if seed_edges is None:
-        seed = _perimeter_seed_edges(ctx)
-    else:
-        seed = {normalized_edge(*edge) for edge in seed_edges}
-        unknown = seed - all_edges
-        if unknown:
-            raise ValueError(
-                f"seed edges are not in the parcel corner graph: {unknown}"
-            )
-
-    street_edges = set(seed)
-    reachable_before = _reachable_parcels(ctx, street_edges)
-    unreachable_before = frozenset(ctx.parcel_corner_rings) - reachable_before
-
-    diagnostics: dict[str, Any] = {
-        "street_selection_strategy": config.selection_strategy,
-        "parcel_count": int(len(ctx.parcel_corner_rings)),
-        "seed_edge_count": int(len(seed)),
-        "reachable_parcel_count_before": int(len(reachable_before)),
-        "unreachable_parcel_count_before": int(len(unreachable_before)),
-        "unreachable_parcel_ids_before": tuple(sorted(unreachable_before)),
-        "i_candidate_count": 0,
-        "l_candidate_count": 0,
+def _empty_diagnostics() -> dict[str, Any]:
+    return {
+        "group_count": 0,
+        "i_chosen_count": 0,
+        "l_chosen_count": 0,
+        "recursed_count": 0,
         "dijkstra_connection_count": 0,
         "dijkstra_connection_failure_count": 0,
-        "selected_access_edge_count": 0,
-        "selected_access_candidate_count": 0,
-        "unreachable_group_count": 0,
-        "unreachable_group_max_size": 0,
-        "cul_de_sac_avoidance_enabled": bool(config.avoid_cul_de_sacs),
-        "cul_de_sac_avoidance_applied": False,
-        "cul_de_sac_avoidance_changed_network": False,
-        "cul_de_sac_pruned_edge_count": 0,
-        "cul_de_sac_prune_attempt_count": 0,
-        "cul_de_sac_repair_attempt_count": 0,
-        "cul_de_sac_repair_candidate_count": 0,
-        "cul_de_sac_repair_success_count": 0,
-        "cul_de_sac_repair_added_edge_count": 0,
-        "cul_de_sac_repair_budget_edge_count": 0,
-        "junction_completion_enabled": bool(config.complete_junctions),
-        "junction_completion_applied": False,
-        "junction_completion_candidate_count": 0,
-        "junction_completion_selected_path_count": 0,
-        "junction_completion_added_edge_count": 0,
-        "junction_completion_parcel_touch_count": 0,
-        "junction_completion_budget_edge_count": 0,
+        "cul_de_sacs_repaired_count": 0,
     }
 
-    selected_candidates: list[StreetAccessCandidate] = []
-    evaluated_candidates: list[StreetAccessCandidate] = []
-    repair_limit = config.max_repair_iterations or max(
-        len(ctx.parcel_corner_rings) * 4, 1
-    )
 
-    for _iteration in range(repair_limit):
-        unreachable = frozenset(ctx.parcel_corner_rings) - _reachable_parcels(
-            ctx, street_edges
+def extend_street_network(
+    source: ChenLayout | ParcelMesh | ParcelCornerGraph,
+    existing_street_edges: set[EdgeKey],
+    config: StreetConfig = DEFAULT_STREET_CONFIG,
+) -> StreetExtensionResult:
+    """Extend ``existing_street_edges`` so every parcel becomes reachable.
+
+    ``source`` provides the parcel corner graph (and mesh geometry, if a
+    :class:`ChenLayout`/:class:`ParcelMesh` is given). ``existing_street_edges``
+    is the street edge set at the current hierarchical level. The returned
+    :class:`StreetExtensionResult` holds the edges that were added (not including
+    the input edges) and small count diagnostics.
+
+    Calling this again with the grown edge set is a no-op (no added edges) when
+    all parcels are already reachable.
+    """
+    ctx = _street_context(source)
+    street_edges = {normalized_edge(*edge) for edge in existing_street_edges}
+    unknown = street_edges - ctx.all_edges
+    if unknown:
+        raise ValueError(
+            f"existing street edges are not in the parcel corner graph: {unknown}"
         )
+
+    initial_edges = frozenset(street_edges)
+    diagnostics = _empty_diagnostics()
+    selected: list[StreetAccessCandidate] = []
+    evaluated: list[StreetAccessCandidate] = []
+
+    # Iterate level-locally until no unreachable group remains. Each outer pass
+    # handles one connected group; recursion inside a group (Fig. 9 case #5) is
+    # handled by re-grouping the still-unreachable members on the next pass.
+    safety_limit = max(len(ctx.parcel_corner_rings) * 4, 1)
+    for _ in range(safety_limit):
+        unreachable = _unreachable_parcels(ctx, street_edges)
         if not unreachable:
             break
-
         groups = _unreachable_groups(ctx, unreachable)
         if not groups:
             break
         group = groups[0]
-        diagnostics["unreachable_group_count"] += 1
-        diagnostics["unreachable_group_max_size"] = max(
-            diagnostics["unreachable_group_max_size"], len(group)
+        diagnostics["group_count"] += 1
+        _extend_for_group(
+            ctx, group, street_edges, config, diagnostics, selected, evaluated
         )
 
-        candidates = _access_candidates(ctx, group, street_edges, config)
-        evaluated_candidates.extend(candidates)
-        diagnostics["i_candidate_count"] += sum(1 for c in candidates if c.kind == "I")
-        diagnostics["l_candidate_count"] += sum(1 for c in candidates if c.kind == "L")
+    added_edges = set(street_edges) - initial_edges
+
+    if config.avoid_cul_de_sacs:
+        repaired = _avoid_cul_de_sacs(ctx, street_edges, config)
+        diagnostics["cul_de_sacs_repaired_count"] = repaired
+        added_edges = set(street_edges) - initial_edges
+
+    unreachable_after = _unreachable_parcels(ctx, street_edges)
+    diagnostics.update(
+        {
+            "parcel_count": int(len(ctx.parcel_corner_rings)),
+            "added_edge_count": int(len(added_edges)),
+            "street_network_edge_count": int(len(street_edges)),
+            "unreachable_parcel_count_after": int(len(unreachable_after)),
+            "street_graph_component_count": int(
+                connected_component_count(StreetNetworkGraph(street_edges))
+            ),
+            "street_network_subset_of_corner_graph": bool(
+                street_edges <= set(ctx.all_edges)
+            ),
+        }
+    )
+
+    return StreetExtensionResult(
+        added_edges=added_edges,
+        diagnostics=diagnostics,
+        selected_access_candidates=tuple(selected),
+        evaluated_candidates=tuple(evaluated),
+    )
+
+
+def _extend_for_group(
+    ctx: _StreetContext,
+    group: frozenset[int],
+    street_edges: set[EdgeKey],
+    config: StreetConfig,
+    diagnostics: dict[str, Any],
+    selected: list[StreetAccessCandidate],
+    evaluated: list[StreetAccessCandidate],
+) -> None:
+    """Choose and apply street access(es) that make ``group`` reachable.
+
+    Implements the paper's recurse-on-remainder rule (Fig. 9 case #5) as an
+    in-group loop: pick the shortest complete I- (then L-) access if it exists,
+    otherwise the access reaching the most parcels and repeat on the remainder.
+    """
+    remaining = set(group)
+    is_recursion = False
+    safety_limit = max(len(group) * 2, 1)
+    for _ in range(safety_limit):
+        remaining = {
+            parcel_id
+            for parcel_id in remaining
+            if not _parcel_reachable(ctx, parcel_id, street_edges)
+        }
+        if not remaining:
+            break
+        remaining_frozen = frozenset(remaining)
+        candidates = _access_candidates(ctx, remaining_frozen, street_edges, config)
+        evaluated.extend(candidates)
         if not candidates:
             diagnostics["dijkstra_connection_failure_count"] += 1
             break
 
-        before_unreachable_count = len(unreachable)
-        before_edge_count = len(street_edges)
-        chosen = min(candidates, key=lambda c: _candidate_selection_key(c, group))
+        complete = [c for c in candidates if c.reached_parcels >= remaining_frozen]
+        if complete:
+            chosen = min(complete, key=lambda c: _candidate_key(c, remaining_frozen))
+        else:
+            chosen = min(candidates, key=lambda c: _candidate_key(c, remaining_frozen))
+
+        if is_recursion:
+            diagnostics["recursed_count"] += 1
+        if chosen.kind == "I":
+            diagnostics["i_chosen_count"] += 1
+        else:
+            diagnostics["l_chosen_count"] += 1
+
         connection_edges, connection_cost = _connect_access_to_street(
             ctx, set(chosen.edges), street_edges, config
         )
-        if (
-            street_edges
-            and not connection_edges
-            and not (_edge_nodes(chosen.edges) & _edge_nodes(street_edges))
-        ):
+        access_nodes = _edge_nodes(chosen.edges)
+        street_nodes = _edge_nodes(street_edges)
+        if street_edges and not (access_nodes & street_nodes) and not connection_edges:
             diagnostics["dijkstra_connection_failure_count"] += 1
         elif connection_edges:
             diagnostics["dijkstra_connection_count"] += 1
 
-        selected = StreetAccessCandidate(
-            kind=chosen.kind,
-            edges=chosen.edges,
-            reached_parcels=chosen.reached_parcels,
-            length=chosen.length,
-            connection_edges=tuple(sorted(connection_edges)),
-            connection_cost=connection_cost,
+        selected.append(
+            StreetAccessCandidate(
+                kind=chosen.kind,
+                edges=chosen.edges,
+                reached_parcels=chosen.reached_parcels,
+                length=chosen.length,
+                connection_edges=tuple(sorted(connection_edges)),
+                connection_cost=connection_cost,
+            )
         )
-        selected_candidates.append(selected)
+        before = len(street_edges)
         street_edges.update(chosen.edges)
         street_edges.update(connection_edges)
-        diagnostics["selected_access_edge_count"] += len(chosen.edges)
-        diagnostics["selected_access_candidate_count"] += 1
-
-        after_unreachable_count = len(
-            frozenset(ctx.parcel_corner_rings) - _reachable_parcels(ctx, street_edges)
-        )
-        if (
-            after_unreachable_count >= before_unreachable_count
-            and len(street_edges) == before_edge_count
-        ):
+        if len(street_edges) == before:
+            # No progress is possible; bail to avoid an infinite loop.
             break
-
-    reachability_edges = set(street_edges)
-    reachability_degree_diagnostics = _street_degree_diagnostics(street_edges)
-    diagnostics.update(
-        {
-            "reachability_repair_edge_count": int(len(reachability_edges) - len(seed)),
-            "reachability_repair_dead_end_count": int(
-                reachability_degree_diagnostics["dead_end_node_count"]
-            ),
-            "reachability_repair_junction_count": int(
-                reachability_degree_diagnostics["junction_count"]
-            ),
-            "reachability_repair_four_way_intersection_count": int(
-                reachability_degree_diagnostics["four_way_intersection_count"]
-            ),
-        }
-    )
-
-    completion_diagnostics = _complete_junctions(ctx, street_edges, config)
-    diagnostics.update(completion_diagnostics)
-
-    diagnostics["cul_de_sac_count_before_avoidance"] = int(
-        _dead_end_count(street_edges)
-    )
-    if config.avoid_cul_de_sacs:
-        avoidance_diagnostics = _avoid_cul_de_sacs_preserving_access_and_junctions(
-            ctx, street_edges, config
-        )
-        diagnostics.update(avoidance_diagnostics)
-    diagnostics["cul_de_sac_count_after_avoidance"] = int(_dead_end_count(street_edges))
-
-    reachable_after = _reachable_parcels(ctx, street_edges)
-    unreachable_after = frozenset(ctx.parcel_corner_rings) - reachable_after
-    component_count = connected_component_count(StreetNetworkGraph(street_edges))
-    final_degree_diagnostics = _street_degree_diagnostics(street_edges)
-    diagnostics.update(
-        {
-            "reachable_parcel_count_after": int(len(reachable_after)),
-            "unreachable_parcel_count_after": int(len(unreachable_after)),
-            "unreachable_parcel_ids_after": tuple(sorted(unreachable_after)),
-            "street_network_edge_count": int(len(street_edges)),
-            "street_graph_component_count": int(component_count),
-            "cul_de_sac_count": int(_dead_end_count(street_edges)),
-            "street_network_subset_of_corner_graph": bool(street_edges <= all_edges),
-            **{
-                f"street_{key}": value
-                for key, value in final_degree_diagnostics.items()
-            },
-        }
-    )
-
-    return StreetGenerationResult(
-        street_edges=frozenset(street_edges),
-        seed_edges=frozenset(seed),
-        selected_access_candidates=tuple(selected_candidates),
-        evaluated_candidates=tuple(evaluated_candidates),
-        diagnostics=diagnostics,
-    )
+        is_recursion = True
 
 
 def _street_context(
-    layout_or_mesh: ChenLayout | ParcelMesh | ParcelCornerGraph,
+    source: ChenLayout | ParcelMesh | ParcelCornerGraph,
 ) -> _StreetContext:
-    if isinstance(layout_or_mesh, ChenLayout):
-        mesh = layout_or_mesh.mesh
-        corner = layout_or_mesh.corner_graph
-    elif isinstance(layout_or_mesh, ParcelMesh):
-        mesh = layout_or_mesh
-        corner = parcel_corner_graph(mesh)
-    elif isinstance(layout_or_mesh, ParcelCornerGraph):
+    if isinstance(source, ChenLayout):
+        mesh: ParcelMesh | None = source.mesh
+        corner = source.corner_graph
+    elif isinstance(source, ParcelMesh):
+        mesh = source
+        corner = parcel_corner_graph(source)
+    elif isinstance(source, ParcelCornerGraph):
         mesh = None
-        corner = layout_or_mesh
+        corner = source
     else:
         raise TypeError(
-            "generate_street_network expects a ChenLayout, ParcelMesh, "
+            "extend_street_network expects a ChenLayout, ParcelMesh, "
             "or ParcelCornerGraph"
         )
 
@@ -332,6 +337,7 @@ def _street_context(
         edge_parcels=edge_parcels,
         parcel_neighbors=parcel_neighbors,
         corner_adjacency=_edge_adjacency(corner.edges),
+        all_edges=frozenset(normalized_edge(*edge) for edge in corner.edges),
     )
 
 
@@ -355,25 +361,36 @@ def _edge_adjacency(edges: set[EdgeKey] | frozenset[EdgeKey]) -> dict[int, set[i
     return adjacency
 
 
-def _perimeter_seed_edges(ctx: _StreetContext) -> set[EdgeKey]:
-    seed = {
+def boundary_ring_seed_edges(
+    source: ChenLayout | ParcelMesh | ParcelCornerGraph,
+) -> set[EdgeKey]:
+    """Boundary ring edges used to seed a level-0 street network.
+
+    These are corner-graph edges incident to only one parcel (the perimeter of
+    the parcel mesh). Chen seeds level 0 with the boundary ring; the legacy
+    wrapper uses this so the single-shot pipeline keeps a connected seed.
+    """
+    ctx = _street_context(source)
+    return {
         edge for edge, parcel_ids in ctx.edge_parcels.items() if len(parcel_ids) == 1
     }
-    seed.update(
-        edge
-        for edge in ctx.corner_graph.edges
-        if ctx.vertices[edge[0]].on_boundary and ctx.vertices[edge[1]].on_boundary
+
+
+def _parcel_reachable(
+    ctx: _StreetContext, parcel_id: int, street_edges: set[EdgeKey]
+) -> bool:
+    return any(
+        edge in street_edges for edge in ring_edges(ctx.parcel_corner_rings[parcel_id])
     )
-    return seed
 
 
-def _reachable_parcels(
+def _unreachable_parcels(
     ctx: _StreetContext, street_edges: set[EdgeKey]
 ) -> frozenset[int]:
     return frozenset(
         parcel_id
-        for parcel_id, ring in ctx.parcel_corner_rings.items()
-        if any(edge in street_edges for edge in ring_edges(ring))
+        for parcel_id in ctx.parcel_corner_rings
+        if not _parcel_reachable(ctx, parcel_id, street_edges)
     )
 
 
@@ -404,8 +421,15 @@ def _access_candidates(
     ctx: _StreetContext,
     group: frozenset[int],
     street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> tuple[StreetAccessCandidate, ...]:
+    """Enumerate I-shaped then L-shaped accesses for ``group``.
+
+    I-shaped accesses are collinear chains seeded from each group-boundary edge
+    (paper: for each corner, an I-shaped access per incident edge). L-shaped
+    accesses are pairs of collinear rays that meet at a junction corner (included
+    angle <= 135 degrees) on the group boundary.
+    """
     group_edges = _group_edges(ctx, group) - street_edges
     group_adjacency = _edge_adjacency(group_edges)
     seen: set[tuple[str, tuple[EdgeKey, ...]]] = set()
@@ -434,15 +458,13 @@ def _access_candidates(
     for edge in sorted(group_edges):
         add("I", _extend_collinear_chain(ctx, group_adjacency, edge, config))
 
+    threshold = config.collinear_angle_threshold_rad
     for joint in sorted(group_adjacency):
         neighbors = sorted(group_adjacency[joint])
         for i, left in enumerate(neighbors):
             for right in neighbors[i + 1 :]:
-                angle = _included_angle(ctx, left, joint, right)
-                if (
-                    angle < config.l_turn_min_angle_rad
-                    or angle > config.collinear_angle_threshold_rad
-                ):
+                # A junction corner: the two edges are NOT colinear.
+                if _included_angle(ctx, left, joint, right) > threshold:
                     continue
                 left_ray = _extend_collinear_ray(
                     ctx, group_adjacency, joint, left, config
@@ -459,7 +481,7 @@ def _group_edges(ctx: _StreetContext, parcel_ids: frozenset[int]) -> set[EdgeKey
     edges: set[EdgeKey] = set()
     for parcel_id in parcel_ids:
         edges.update(ring_edges(ctx.parcel_corner_rings[parcel_id]))
-    return {edge for edge in edges if edge in ctx.corner_graph.edges}
+    return {edge for edge in edges if edge in ctx.all_edges}
 
 
 def _candidate_reaches(
@@ -472,16 +494,18 @@ def _candidate_reaches(
     }
 
 
-def _candidate_selection_key(
+def _candidate_key(
     candidate: StreetAccessCandidate, group: frozenset[int]
-) -> tuple[int, int, float, int, tuple[EdgeKey, ...]]:
+) -> tuple[int, int, int, float, tuple[EdgeKey, ...]]:
+    """Selection order: complete first, then I over L, then most parcels, then
+    shortest, then deterministic edge order."""
     complete_rank = 0 if candidate.reached_parcels >= group else 1
     kind_rank = 0 if candidate.kind == "I" else 1
     return (
         complete_rank,
+        kind_rank,
         -len(candidate.reached_parcels),
         candidate.length,
-        kind_rank,
         tuple(sorted(candidate.edges)),
     )
 
@@ -496,7 +520,7 @@ def _extend_collinear_chain(
     ctx: _StreetContext,
     adjacency: dict[int, set[int]],
     edge: EdgeKey,
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> set[EdgeKey]:
     a, b = edge
     nodes = [a, b]
@@ -514,7 +538,7 @@ def _extend_collinear_ray(
     adjacency: dict[int, set[int]],
     joint: int,
     neighbor: int,
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> set[EdgeKey]:
     nodes = [joint, neighbor]
     used = {normalized_edge(joint, neighbor)}
@@ -532,7 +556,7 @@ def _extend_nodes(
     used: set[EdgeKey],
     *,
     forward: bool,
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> None:
     while True:
         prev = nodes[-2] if forward else nodes[1]
@@ -553,14 +577,15 @@ def _next_collinear_node(
     used: set[EdgeKey],
     prev: int,
     node: int,
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> int | None:
+    threshold = config.collinear_angle_threshold_rad
     candidates = [
         nxt
         for nxt in adjacency.get(node, set())
         if nxt != prev
         and normalized_edge(node, nxt) not in used
-        and _included_angle(ctx, prev, node, nxt) > config.collinear_angle_threshold_rad
+        and _included_angle(ctx, prev, node, nxt) > threshold
     ]
     if not candidates:
         return None
@@ -578,15 +603,21 @@ def _connect_access_to_street(
     ctx: _StreetContext,
     access_edges: set[EdgeKey],
     street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> tuple[set[EdgeKey], float]:
+    """Connect the access subgraph to the existing street network (paper step 3).
+
+    Returns the new edges of the weighted shortest path and its cost. If the
+    access already touches the network, or there is no network yet, no
+    connection is needed.
+    """
     access_nodes = _edge_nodes(access_edges)
     street_nodes = _edge_nodes(street_edges)
     if not access_nodes or not street_nodes or access_nodes & street_nodes:
         return set(), 0.0
 
     path, cost = _shortest_path_between_node_sets(
-        ctx, access_nodes, street_nodes, street_edges, config
+        ctx, access_nodes, street_nodes, config
     )
     if not path:
         return set(), math.inf
@@ -594,14 +625,35 @@ def _connect_access_to_street(
     return path_edges - access_edges - street_edges, cost
 
 
+def _edge_weight(
+    ctx: _StreetContext,
+    prev: int | None,
+    node: int,
+    nxt: int,
+    config: StreetConfig,
+) -> tuple[float, float]:
+    """Paper Dijkstra edge weight (cost, geometric length).
+
+    cost = length_weight * length + junction_weight * (1 if the included angle
+    with the previous edge is smaller than 135 degrees else 0).
+    """
+    edge = normalized_edge(node, nxt)
+    length = _edge_length(ctx, edge)
+    cost = config.length_weight * length
+    if (
+        prev is not None
+        and _included_angle(ctx, prev, node, nxt) < config.collinear_angle_threshold_rad
+    ):
+        cost += config.junction_weight
+    return cost, length
+
+
 def _shortest_path_between_node_sets(
     ctx: _StreetContext,
     start_nodes: set[int],
     target_nodes: set[int],
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> tuple[tuple[int, ...], float]:
-    street_graph_adjacency = street_adjacency(StreetNetworkGraph(street_edges))
     heap: list[tuple[float, float, tuple[int, ...], int | None, int]] = []
     best: dict[tuple[int | None, int], float] = {}
     for start in sorted(start_nodes):
@@ -613,25 +665,12 @@ def _shortest_path_between_node_sets(
         cost, length, path, prev, node = heapq.heappop(heap)
         if cost > best.get((prev, node), math.inf) + 1e-12:
             continue
-        if node in target_nodes:
+        if node in target_nodes and prev is not None:
             return path, cost
         for nxt in sorted(ctx.corner_adjacency.get(node, set())):
             if nxt == prev or nxt in path:
                 continue
-            edge = normalized_edge(node, nxt)
-            step_length = _edge_length(ctx, edge)
-            step_cost = step_length
-            if (
-                prev is not None
-                and _included_angle(ctx, prev, node, nxt)
-                <= config.junction_angle_threshold_rad
-            ):
-                step_cost += config.junction_penalty
-            if nxt in target_nodes and _creates_penalized_junction(
-                ctx, node, nxt, street_graph_adjacency, config
-            ):
-                step_cost += config.junction_penalty
-
+            step_cost, step_length = _edge_weight(ctx, prev, node, nxt, config)
             new_cost = cost + step_cost
             new_length = length + step_length
             state = (node, nxt)
@@ -642,557 +681,87 @@ def _shortest_path_between_node_sets(
     return (), math.inf
 
 
-def _creates_penalized_junction(
-    ctx: _StreetContext,
-    incoming: int,
-    node: int,
-    street_graph_adjacency: dict[int, set[int]],
-    config: StreetGenerationConfig,
-) -> bool:
-    return any(
-        _included_angle(ctx, incoming, node, street_neighbor)
-        <= config.junction_angle_threshold_rad
-        for street_neighbor in street_graph_adjacency.get(node, set())
-        if street_neighbor != incoming
-    )
-
-
-def _complete_junctions(
+def _avoid_cul_de_sacs(
     ctx: _StreetContext,
     street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-) -> dict[str, Any]:
-    """Add bounded cross-junction paths between already selected street nodes."""
-    budget = _junction_completion_budget(ctx, config)
-    before = _street_degree_diagnostics(street_edges)
-    diagnostics: dict[str, Any] = {
-        "junction_completion_budget_edge_count": int(budget),
-        "junction_completion_four_way_before": int(
-            before["four_way_intersection_count"]
-        ),
-        "junction_completion_dead_end_before": int(before["dead_end_node_count"]),
-        "junction_completion_candidate_count": 0,
-        "junction_completion_selected_path_count": 0,
-        "junction_completion_added_edge_count": 0,
-        "junction_completion_applied": False,
-    }
-    if not config.complete_junctions or budget <= 0 or not street_edges:
-        after = _street_degree_diagnostics(street_edges)
-        diagnostics.update(
-            {
-                "junction_completion_four_way_after": int(
-                    after["four_way_intersection_count"]
-                ),
-                "junction_completion_dead_end_after": int(after["dead_end_node_count"]),
-            }
-        )
-        return diagnostics
-
-    added_edges: set[EdgeKey] = set()
-    selected_path_count = 0
-    parcel_touch_count = 0
-    evaluated_candidate_count = 0
-    while len(added_edges) < budget:
-        remaining_budget = budget - len(added_edges)
-        candidates = _junction_completion_candidates(
-            ctx, street_edges, config, max_edge_count=remaining_budget
-        )
-        evaluated_candidate_count += len(candidates)
-        if not candidates:
-            break
-
-        chosen = min(candidates, key=_junction_completion_selection_key)
-        before_edges = set(street_edges)
-        street_edges.update(chosen.edges)
-        if not _street_edges_preserve_reachability(ctx, before_edges, street_edges):
-            street_edges.clear()
-            street_edges.update(before_edges)
-            break
-
-        added_edges.update(set(chosen.edges) - before_edges)
-        parcel_touch_count += chosen.parcel_touch_count
-        selected_path_count += 1
-
-    after = _street_degree_diagnostics(street_edges)
-    diagnostics.update(
-        {
-            "junction_completion_candidate_count": int(evaluated_candidate_count),
-            "junction_completion_selected_path_count": int(selected_path_count),
-            "junction_completion_added_edge_count": int(len(added_edges)),
-            "junction_completion_parcel_touch_count": int(parcel_touch_count),
-            "junction_completion_applied": bool(added_edges),
-            "junction_completion_four_way_after": int(
-                after["four_way_intersection_count"]
-            ),
-            "junction_completion_dead_end_after": int(after["dead_end_node_count"]),
-        }
-    )
-    return diagnostics
-
-
-def _junction_completion_budget(
-    ctx: _StreetContext, config: StreetGenerationConfig
+    config: StreetConfig,
 ) -> int:
-    if not config.complete_junctions:
-        return 0
-    ratio = max(config.junction_completion_max_added_edge_ratio, 0.0)
-    ratio_budget = int(math.floor(len(ctx.corner_graph.edges) * ratio))
-    if ratio > 0.0 and ratio_budget == 0:
-        ratio_budget = 1
-    if config.junction_completion_max_added_edges is not None:
-        ratio_budget = min(
-            ratio_budget, max(config.junction_completion_max_added_edges, 0)
-        )
-    return ratio_budget
+    """Connect each street end back to the network (paper step 4, optional).
 
-
-def _junction_completion_candidates(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-    *,
-    max_edge_count: int,
-) -> tuple[_JunctionCompletionCandidate, ...]:
-    if max_edge_count <= 0:
-        return ()
-
-    street_adjacencies = _edge_adjacency(street_edges)
-    street_nodes = set(street_adjacencies)
-    before_four_way = _street_degree_diagnostics(street_edges)[
-        "four_way_intersection_count"
-    ]
-    before_dead_ends = _street_degree_diagnostics(street_edges)["dead_end_node_count"]
-    before_progress = _junction_completion_progress(
-        ctx, street_edges, config, eligible_nodes=street_nodes
-    )
-    candidates: list[_JunctionCompletionCandidate] = []
-    seen: set[tuple[EdgeKey, ...]] = set()
-
-    for start in sorted(street_nodes):
-        corner_degree = len(ctx.corner_adjacency.get(start, set()))
-        street_degree = len(street_adjacencies.get(start, set()))
-        if corner_degree < config.junction_completion_min_corner_degree:
-            continue
-        if street_degree < config.junction_completion_min_street_degree:
-            continue
-        if street_degree >= config.junction_completion_target_degree:
-            continue
-
-        missing_neighbors = ctx.corner_adjacency.get(start, set()) - (
-            street_adjacencies.get(start, set())
-        )
-        for neighbor in sorted(missing_neighbors):
-            path = _trace_completion_path(
-                ctx, start, neighbor, street_nodes, street_edges, config
-            )
-            if path is None:
-                continue
-            edges = tuple(
-                normalized_edge(a, b) for a, b in zip(path, path[1:], strict=False)
-            )
-            new_edges = tuple(edge for edge in edges if edge not in street_edges)
-            if not new_edges or len(new_edges) > max_edge_count:
-                continue
-            key = tuple(sorted(new_edges))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            trial_edges = set(street_edges)
-            trial_edges.update(new_edges)
-            after = _street_degree_diagnostics(trial_edges)
-            progress_gain = (
-                _junction_completion_progress(
-                    ctx, trial_edges, config, eligible_nodes=street_nodes
-                )
-                - before_progress
-            )
-            four_way_gain = int(after["four_way_intersection_count"]) - before_four_way
-            if four_way_gain <= 0 and progress_gain <= 0:
-                continue
-            if not _street_edges_preserve_reachability(ctx, street_edges, trial_edges):
-                continue
-
-            candidates.append(
-                _JunctionCompletionCandidate(
-                    edges=tuple(sorted(new_edges)),
-                    start=start,
-                    end=path[-1],
-                    length=_edge_set_length(ctx, set(new_edges)),
-                    parcel_touch_count=_edge_parcel_touch_count(ctx, new_edges),
-                    four_way_gain=four_way_gain,
-                    progress_gain=progress_gain,
-                    dead_end_delta=int(after["dead_end_node_count"])
-                    - int(before_dead_ends),
-                )
-            )
-
-    return tuple(candidates)
-
-
-def _trace_completion_path(
-    ctx: _StreetContext,
-    start: int,
-    neighbor: int,
-    street_nodes: set[int],
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-) -> tuple[int, ...] | None:
-    first_edge = normalized_edge(start, neighbor)
-    if first_edge in street_edges:
-        return None
-
-    max_edges = max(config.junction_completion_max_path_edges, 1)
-    nodes = [start, neighbor]
-    used = {first_edge}
-    while len(nodes) - 1 <= max_edges:
-        node = nodes[-1]
-        if node in street_nodes and node != start:
-            return tuple(nodes)
-        if len(nodes) - 1 >= max_edges:
-            return None
-
-        prev = nodes[-2]
-        nxt = _next_collinear_node(ctx, ctx.corner_adjacency, used, prev, node, config)
-        if nxt is None:
-            return None
-        edge = normalized_edge(node, nxt)
-        if edge in street_edges and nxt not in street_nodes:
-            return None
-        used.add(edge)
-        nodes.append(nxt)
-    return None
-
-
-def _junction_completion_progress(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-    *,
-    eligible_nodes: set[int],
-) -> int:
-    adjacency = _edge_adjacency(street_edges)
-    score = 0
-    for node in sorted(eligible_nodes):
-        if (
-            len(ctx.corner_adjacency.get(node, set()))
-            < config.junction_completion_min_corner_degree
-        ):
-            continue
-        degree = len(adjacency.get(node, set()))
-        if degree < config.junction_completion_min_street_degree:
-            continue
-        score += min(degree, config.junction_completion_target_degree)
-    return score
-
-
-def _junction_completion_selection_key(
-    candidate: _JunctionCompletionCandidate,
-) -> tuple[int, int, int, int, int, float, int, int, tuple[EdgeKey, ...]]:
-    return (
-        -candidate.four_way_gain,
-        -candidate.progress_gain,
-        candidate.dead_end_delta,
-        len(candidate.edges),
-        -candidate.parcel_touch_count,
-        candidate.length,
-        candidate.start,
-        candidate.end,
-        candidate.edges,
-    )
-
-
-def _street_edges_preserve_reachability(
-    ctx: _StreetContext,
-    before_edges: set[EdgeKey],
-    after_edges: set[EdgeKey],
-) -> bool:
-    before_reachable = _reachable_parcels(ctx, before_edges)
-    after_reachable = _reachable_parcels(ctx, after_edges)
-    if not before_reachable <= after_reachable:
-        return False
-    before_components = connected_component_count(StreetNetworkGraph(before_edges))
-    after_components = connected_component_count(StreetNetworkGraph(after_edges))
-    return after_components <= max(before_components, 1)
-
-
-def _avoid_cul_de_sacs_preserving_access_and_junctions(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-) -> dict[str, Any]:
-    before_edges = set(street_edges)
-    repair_budget = _cul_de_sac_repair_budget(ctx, config)
-
-    pruned_before, prune_attempts_before = _prune_cul_de_sacs_preserving_access(
-        ctx, street_edges, preserve_four_way=True
-    )
-    (
-        repaired_edges,
-        repair_attempt_count,
-        repair_candidate_count,
-        repair_success_count,
-    ) = _repair_cul_de_sacs_preserving_access(
-        ctx, street_edges, config, budget=repair_budget
-    )
-    pruned_after, prune_attempts_after = _prune_cul_de_sacs_preserving_access(
-        ctx, street_edges, preserve_four_way=True
-    )
-
-    pruned_edges = set(pruned_before) | set(pruned_after)
-    changed = street_edges != before_edges
-    return {
-        "cul_de_sac_avoidance_applied": bool(changed),
-        "cul_de_sac_avoidance_changed_network": bool(changed),
-        "cul_de_sac_pruned_edge_count": int(len(pruned_edges)),
-        "cul_de_sac_prune_attempt_count": int(
-            prune_attempts_before + prune_attempts_after
-        ),
-        "cul_de_sac_repair_attempt_count": int(repair_attempt_count),
-        "cul_de_sac_repair_candidate_count": int(repair_candidate_count),
-        "cul_de_sac_repair_success_count": int(repair_success_count),
-        "cul_de_sac_repair_added_edge_count": int(len(repaired_edges)),
-        "cul_de_sac_repair_budget_edge_count": int(repair_budget),
-    }
-
-
-def _cul_de_sac_repair_budget(
-    ctx: _StreetContext, config: StreetGenerationConfig
-) -> int:
-    ratio = max(config.cul_de_sac_repair_max_added_edge_ratio, 0.0)
-    ratio_budget = int(math.floor(len(ctx.corner_graph.edges) * ratio))
-    if ratio > 0.0 and ratio_budget == 0:
-        ratio_budget = 1
-    if config.cul_de_sac_repair_max_added_edges is not None:
-        ratio_budget = min(
-            ratio_budget, max(config.cul_de_sac_repair_max_added_edges, 0)
-        )
-    return ratio_budget
-
-
-def _repair_cul_de_sacs_preserving_access(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-    *,
-    budget: int,
-) -> tuple[frozenset[EdgeKey], int, int, int]:
-    added_edges: set[EdgeKey] = set()
-    attempt_count = 0
-    candidate_count = 0
-    success_count = 0
-
-    while len(added_edges) < budget:
+    A street end is a degree-1 node in the street graph. Each is connected to the
+    rest of the network via the same weighted shortest path. Returns the number
+    of cul-de-sacs successfully repaired.
+    """
+    repaired = 0
+    safety_limit = max(len(ctx.corner_adjacency), 1)
+    for _ in range(safety_limit):
         adjacency = _edge_adjacency(street_edges)
-        dead_end_nodes = sorted(
+        leaves = sorted(
             node for node, neighbors in adjacency.items() if len(neighbors) == 1
         )
-        if not dead_end_nodes:
+        if not leaves:
             break
-
-        remaining_budget = budget - len(added_edges)
-        attempt_count += len(dead_end_nodes)
-        candidates = _cul_de_sac_repair_candidates(
-            ctx,
-            street_edges,
-            config,
-            dead_end_nodes=dead_end_nodes,
-            max_edge_count=remaining_budget,
-        )
-        candidate_count += len(candidates)
-        if not candidates:
-            break
-
-        chosen = min(candidates, key=_cul_de_sac_repair_selection_key)
-        before_edges = set(street_edges)
-        street_edges.update(chosen.edges)
-        if not _street_edges_preserve_reachability(ctx, before_edges, street_edges):
-            street_edges.clear()
-            street_edges.update(before_edges)
-            break
-
-        added_edges.update(set(chosen.edges) - before_edges)
-        success_count += 1
-
-    return frozenset(added_edges), attempt_count, candidate_count, success_count
-
-
-def _cul_de_sac_repair_candidates(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
-    *,
-    dead_end_nodes: list[int],
-    max_edge_count: int,
-) -> tuple[_CulDeSacRepairCandidate, ...]:
-    if max_edge_count <= 0:
-        return ()
-
-    before_dead_ends = _dead_end_count(street_edges)
-    candidates: list[_CulDeSacRepairCandidate] = []
-    seen: set[tuple[EdgeKey, ...]] = set()
-    for leaf in dead_end_nodes:
-        path, length = _shortest_new_path_from_leaf_to_street(
-            ctx, leaf, street_edges, config
-        )
-        if not path:
-            continue
-        edges = tuple(
-            normalized_edge(a, b) for a, b in zip(path, path[1:], strict=False)
-        )
-        new_edges = tuple(edge for edge in edges if edge not in street_edges)
-        if not new_edges or len(new_edges) > max_edge_count:
-            continue
-        key = tuple(sorted(new_edges))
-        if key in seen:
-            continue
-        seen.add(key)
-
-        trial_edges = set(street_edges)
-        trial_edges.update(new_edges)
-        dead_end_delta = _dead_end_count(trial_edges) - before_dead_ends
-        if dead_end_delta >= 0:
-            continue
-        if not _street_edges_preserve_reachability(ctx, street_edges, trial_edges):
-            continue
-
-        candidates.append(
-            _CulDeSacRepairCandidate(
-                edges=tuple(sorted(new_edges)),
-                leaf=leaf,
-                end=path[-1],
-                length=length,
-                parcel_touch_count=_edge_parcel_touch_count(ctx, new_edges),
-                dead_end_delta=dead_end_delta,
+        progressed = False
+        for leaf in leaves:
+            target_nodes = _edge_nodes(street_edges) - {leaf}
+            if not target_nodes:
+                continue
+            path, _cost = _shortest_path_from_leaf(
+                ctx, leaf, target_nodes, street_edges, config
             )
-        )
+            if not path:
+                continue
+            new_edges = {
+                normalized_edge(a, b) for a, b in zip(path, path[1:], strict=False)
+            } - street_edges
+            if not new_edges:
+                continue
+            street_edges.update(new_edges)
+            repaired += 1
+            progressed = True
+        if not progressed:
+            break
+    return repaired
 
-    return tuple(candidates)
 
-
-def _shortest_new_path_from_leaf_to_street(
+def _shortest_path_from_leaf(
     ctx: _StreetContext,
     leaf: int,
+    target_nodes: set[int],
     street_edges: set[EdgeKey],
-    config: StreetGenerationConfig,
+    config: StreetConfig,
 ) -> tuple[tuple[int, ...], float]:
-    street_nodes = _edge_nodes(street_edges)
-    target_nodes = street_nodes - {leaf}
-    if not target_nodes:
-        return (), math.inf
+    """Weighted shortest path from a cul-de-sac end back to the network.
 
-    max_edges = max(config.cul_de_sac_repair_max_path_edges, 1)
-    heap: list[tuple[float, float, tuple[int, ...], int | None, int]] = []
+    Uses the same paper weight as :func:`_shortest_path_between_node_sets` but
+    only traverses corner edges not already in the street network (so the new
+    connection genuinely closes the loop).
+    """
+    heap: list[tuple[float, float, tuple[int, ...], int | None, int]] = [
+        (0.0, 0.0, (leaf,), None, leaf)
+    ]
     best: dict[tuple[int | None, int], float] = {(None, leaf): 0.0}
-    heapq.heappush(heap, (0.0, 0.0, (leaf,), None, leaf))
-
     while heap:
         cost, length, path, prev, node = heapq.heappop(heap)
         if cost > best.get((prev, node), math.inf) + 1e-12:
             continue
-        if len(path) > 1 and node in target_nodes:
-            return path, length
-        if len(path) - 1 >= max_edges:
-            continue
-
+        if node in target_nodes and len(path) > 1:
+            return path, cost
         for nxt in sorted(ctx.corner_adjacency.get(node, set())):
             if nxt == prev or nxt in path:
                 continue
-            edge = normalized_edge(node, nxt)
-            if edge in street_edges:
+            if normalized_edge(node, nxt) in street_edges:
                 continue
-
-            step_length = _edge_length(ctx, edge)
-            step_cost = step_length
-            if (
-                prev is not None
-                and _included_angle(ctx, prev, node, nxt)
-                <= config.junction_angle_threshold_rad
-            ):
-                step_cost += config.junction_penalty
-
+            step_cost, step_length = _edge_weight(ctx, prev, node, nxt, config)
             new_cost = cost + step_cost
             state = (node, nxt)
             if new_cost >= best.get(state, math.inf) - 1e-12:
                 continue
             best[state] = new_cost
             heapq.heappush(
-                heap,
-                (
-                    new_cost,
-                    length + step_length,
-                    (*path, nxt),
-                    node,
-                    nxt,
-                ),
+                heap, (new_cost, length + step_length, (*path, nxt), node, nxt)
             )
-
     return (), math.inf
-
-
-def _cul_de_sac_repair_selection_key(
-    candidate: _CulDeSacRepairCandidate,
-) -> tuple[int, int, int, float, int, int, tuple[EdgeKey, ...]]:
-    return (
-        candidate.dead_end_delta,
-        len(candidate.edges),
-        -candidate.parcel_touch_count,
-        candidate.length,
-        candidate.leaf,
-        candidate.end,
-        candidate.edges,
-    )
-
-
-def _prune_cul_de_sacs_preserving_access(
-    ctx: _StreetContext,
-    street_edges: set[EdgeKey],
-    *,
-    preserve_four_way: bool,
-) -> tuple[frozenset[EdgeKey], int]:
-    baseline_reachable = _reachable_parcels(ctx, street_edges)
-    baseline_components = connected_component_count(StreetNetworkGraph(street_edges))
-    removed: set[EdgeKey] = set()
-    attempt_count = 0
-
-    changed = True
-    while changed:
-        changed = False
-        adjacency = _edge_adjacency(street_edges)
-        dead_end_nodes = sorted(
-            node for node, neighbors in adjacency.items() if len(neighbors) == 1
-        )
-        for node in dead_end_nodes:
-            attempt_count += 1
-            neighbors = adjacency.get(node, set())
-            if len(neighbors) != 1:
-                continue
-            edge = normalized_edge(node, next(iter(neighbors)))
-            if edge not in street_edges:
-                continue
-            trial_edges = set(street_edges)
-            trial_edges.remove(edge)
-            if not trial_edges:
-                continue
-            if _reachable_parcels(ctx, trial_edges) != baseline_reachable:
-                continue
-            if (
-                connected_component_count(StreetNetworkGraph(trial_edges))
-                > baseline_components
-            ):
-                continue
-            if preserve_four_way and (
-                _street_degree_diagnostics(trial_edges)["four_way_intersection_count"]
-                < _street_degree_diagnostics(street_edges)[
-                    "four_way_intersection_count"
-                ]
-            ):
-                continue
-            street_edges.remove(edge)
-            removed.add(edge)
-            changed = True
-
-    return frozenset(removed), attempt_count
 
 
 def _included_angle(ctx: _StreetContext, prev: int, node: int, nxt: int) -> float:
@@ -1218,40 +787,60 @@ def _edge_set_length(ctx: _StreetContext, edges: set[EdgeKey]) -> float:
     return sum(_edge_length(ctx, edge) for edge in edges)
 
 
-def _edge_parcel_touch_count(
-    ctx: _StreetContext,
-    edges: tuple[EdgeKey, ...] | set[EdgeKey] | frozenset[EdgeKey],
-) -> int:
-    return sum(len(ctx.edge_parcels.get(edge, ())) for edge in edges)
-
-
 def _edge_nodes(edges: set[EdgeKey] | frozenset[EdgeKey]) -> set[int]:
     return {node for edge in edges for node in edge}
 
 
-def _dead_end_count(edges: set[EdgeKey]) -> int:
-    adjacency = _edge_adjacency(edges)
-    return sum(1 for neighbors in adjacency.values() if len(neighbors) == 1)
+# ---------------------------------------------------------------------------
+# Deprecated legacy wrapper kept until the hierarchical driver (slice D) calls
+# ``extend_street_network`` per level directly.
+# ---------------------------------------------------------------------------
 
 
-def _street_degree_diagnostics(edges: set[EdgeKey]) -> dict[str, Any]:
-    adjacency = _edge_adjacency(edges)
-    degree_counts: dict[int, int] = {}
-    for neighbors in adjacency.values():
-        degree = len(neighbors)
-        degree_counts[degree] = degree_counts.get(degree, 0) + 1
-    junction_count = sum(
-        count for degree, count in degree_counts.items() if degree >= 3
+@dataclass(frozen=True)
+class StreetGenerationResult:
+    """Deprecated single-shot result. Prefer :class:`StreetExtensionResult`."""
+
+    street_edges: frozenset[EdgeKey]
+    seed_edges: frozenset[EdgeKey]
+    selected_access_candidates: tuple[StreetAccessCandidate, ...]
+    evaluated_candidates: tuple[StreetAccessCandidate, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+def generate_street_network(
+    layout_or_mesh: ChenLayout | ParcelMesh | ParcelCornerGraph,
+    *,
+    seed_edges: set[EdgeKey] | None = None,
+    config: StreetGenerationConfig | StreetConfig | None = None,
+) -> StreetGenerationResult:
+    """Deprecated: seed the boundary ring and run one street extension.
+
+    This preserves the pre-slice-D single-shot entry point that builds an entire
+    level-0 street network from a finished mesh. Prefer
+    :func:`extend_street_network`, called once per hierarchical level with the
+    street edges that already exist at that level. This wrapper exists only so
+    the legacy generation pipeline stays green until the driver is rewritten.
+    """
+    if config is None:
+        street_config = DEFAULT_STREET_CONFIG
+    elif isinstance(config, StreetGenerationConfig):
+        street_config = config.to_street_config()
+    else:
+        street_config = config
+
+    if seed_edges is None:
+        seed = boundary_ring_seed_edges(layout_or_mesh)
+    else:
+        seed = {normalized_edge(*edge) for edge in seed_edges}
+
+    result = extend_street_network(layout_or_mesh, set(seed), street_config)
+    street_edges = set(seed) | result.added_edges
+
+    return StreetGenerationResult(
+        street_edges=frozenset(street_edges),
+        seed_edges=frozenset(seed),
+        selected_access_candidates=result.selected_access_candidates,
+        evaluated_candidates=result.evaluated_candidates,
+        diagnostics=result.diagnostics,
     )
-    return {
-        "node_count": int(len(adjacency)),
-        "dead_end_node_count": int(degree_counts.get(1, 0)),
-        "degree_2_node_count": int(degree_counts.get(2, 0)),
-        "junction_count": int(junction_count),
-        "t_junction_count": int(degree_counts.get(3, 0)),
-        "four_way_intersection_count": int(degree_counts.get(4, 0)),
-        "high_degree_intersection_count": int(
-            sum(count for degree, count in degree_counts.items() if degree >= 5)
-        ),
-        "degree_counts": dict(sorted(degree_counts.items())),
-    }

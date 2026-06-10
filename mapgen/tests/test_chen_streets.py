@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from shapely import Polygon
 
 from mapgen.chen_core import (
@@ -9,7 +11,15 @@ from mapgen.chen_core import (
     normalized_edge,
     parcel_mesh_from_polygons,
 )
-from mapgen.chen_streets import StreetGenerationConfig, generate_street_network
+from mapgen.chen_streets import (
+    StreetConfig,
+    _included_angle,
+    _shortest_path_between_node_sets,
+    _street_context,
+    boundary_ring_seed_edges,
+    extend_street_network,
+    generate_street_network,
+)
 
 
 def _grid_mesh(cols: int, rows: int):
@@ -48,61 +58,68 @@ def _edges_for_coords(
     }
 
 
-def _perimeter_seed(points: dict[tuple[float, float], int], cols: int, rows: int):
-    coords = (
-        [(float(x), 0.0) for x in range(cols + 1)]
-        + [(float(cols), float(y)) for y in range(1, rows + 1)]
-        + [(float(x), float(rows)) for x in range(cols - 1, -1, -1)]
-        + [(0.0, float(y)) for y in range(rows - 1, 0, -1)]
-        + [(0.0, 0.0)]
-    )
-    return _edges_for_coords(points, coords)
+# --------------------------------------------------------------------------
+# Step 1/2: unreachable groups and I/L access selection.
+# --------------------------------------------------------------------------
 
 
-def test_3x3_perimeter_seed_repairs_center_parcel() -> None:
+def test_3x3_center_parcel_is_repaired_to_full_reachability() -> None:
     mesh, boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
 
-    result = generate_street_network(mesh)
-    layout = build_chen_layout(mesh, set(result.street_edges))
+    result = extend_street_network(mesh, set(seed))
+    street_edges = set(seed) | result.added_edges
+    layout = build_chen_layout(mesh, street_edges)
     report = evaluate_layout_invariants(layout, target_boundary=boundary)
 
-    assert result.diagnostics["unreachable_parcel_ids_before"] == (5,)
-    assert result.diagnostics["reachable_parcel_count_before"] == 8
+    assert result.diagnostics["group_count"] == 1
     assert result.diagnostics["unreachable_parcel_count_after"] == 0
-    assert result.diagnostics["reachable_parcel_count_after"] == 9
     assert result.diagnostics["street_graph_component_count"] == 1
+    assert result.diagnostics["street_network_subset_of_corner_graph"]
     assert connected_component_count(layout.street_network) == 1
     assert report.paper_invariant_pass
 
 
-def test_i_shaped_candidate_is_selected_over_longer_l_candidate() -> None:
+def test_center_parcel_repair_prefers_i_shaped_access() -> None:
     mesh, _boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
 
-    result = generate_street_network(mesh)
-    first = result.selected_access_candidates[0]
+    result = extend_street_network(mesh, set(seed))
+
+    # A single I-shaped access edge reaches the center parcel; it must be chosen
+    # over any L-shaped access (which would add a junction).
+    assert result.diagnostics["i_chosen_count"] == 1
+    assert result.diagnostics["l_chosen_count"] == 0
+    chosen = result.selected_access_candidates[0]
+    assert chosen.kind == "I"
+    assert len(chosen.edges) == 1
+
     center_reach = frozenset({5})
     i_lengths = [
-        candidate.length
-        for candidate in result.evaluated_candidates
-        if candidate.kind == "I" and candidate.reached_parcels == center_reach
+        c.length
+        for c in result.evaluated_candidates
+        if c.kind == "I" and c.reached_parcels == center_reach
     ]
     l_lengths = [
-        candidate.length
-        for candidate in result.evaluated_candidates
-        if candidate.kind == "L" and candidate.reached_parcels == center_reach
+        c.length
+        for c in result.evaluated_candidates
+        if c.kind == "L" and c.reached_parcels == center_reach
     ]
-
-    assert result.diagnostics["i_candidate_count"] >= 4
-    assert result.diagnostics["l_candidate_count"] >= 4
-    assert first.kind == "I"
-    assert len(first.edges) == 1
+    assert i_lengths
+    assert l_lengths
     assert min(i_lengths) < min(l_lengths)
 
 
-def test_access_candidate_is_connected_to_seed_network_by_dijkstra() -> None:
-    mesh, _boundary = _grid_mesh(3, 3)
+# --------------------------------------------------------------------------
+# Step 3: Dijkstra connection to the existing network.
+# --------------------------------------------------------------------------
 
-    result = generate_street_network(mesh)
+
+def test_access_is_connected_to_seed_network_by_dijkstra() -> None:
+    mesh, _boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
+
+    result = extend_street_network(mesh, set(seed))
     connection_edges = {
         edge
         for candidate in result.selected_access_candidates
@@ -111,58 +128,203 @@ def test_access_candidate_is_connected_to_seed_network_by_dijkstra() -> None:
 
     assert result.diagnostics["dijkstra_connection_count"] == 1
     assert connection_edges
-    assert connection_edges <= result.street_edges
-    assert connection_edges.isdisjoint(result.seed_edges)
+    assert connection_edges <= result.added_edges
+    assert connection_edges.isdisjoint(seed)
     assert result.diagnostics["street_graph_component_count"] == 1
 
 
-def test_default_square_grid_selection_adds_four_way_and_stays_sparse() -> None:
+def _count_turns(
+    ctx, path: tuple[int, ...], threshold: float = math.radians(135.0)
+) -> int:
+    turns = 0
+    for prev, node, nxt in zip(path, path[1:], path[2:], strict=False):
+        if _included_angle(ctx, prev, node, nxt) < threshold:
+            turns += 1
+    return turns
+
+
+def test_dijkstra_weight_prefers_fewer_junction_turns_over_equal_length_path() -> None:
+    # 2x2 corner graph. Routing from the bottom-left corner to the top-right
+    # corner has two equal-length (4-unit) routes:
+    #   * through the centre: 3 interior turns
+    #   * along the L-perimeter: a single turn at the corner
+    # A dominant junction weight must pick the perimeter route (fewer junctions),
+    # while a zero junction weight is free to cut through the centre.
+    mesh, _boundary = _grid_mesh(2, 2)
+    ctx = _street_context(mesh)
+    points = _point_ids(mesh)
+    start = {points[(0.0, 0.0)]}
+    target = {points[(2.0, 2.0)]}
+
+    straight_path, _c1 = _shortest_path_between_node_sets(
+        ctx, start, target, StreetConfig(junction_weight=100.0)
+    )
+    cheap_path, _c2 = _shortest_path_between_node_sets(
+        ctx, start, target, StreetConfig(junction_weight=0.0)
+    )
+
+    # Same geometric length, but the junction-penalised route has fewer turns.
+    assert _count_turns(ctx, straight_path) < _count_turns(ctx, cheap_path)
+    assert _count_turns(ctx, straight_path) == 1
+
+
+# --------------------------------------------------------------------------
+# Group recursion (paper Fig. 9 case #5).
+# --------------------------------------------------------------------------
+
+
+def _serpentine_polygons():
+    # An S-shaped (serpentine) chain of seven unit parcels: a bottom row, a
+    # one-parcel vertical connector, then a top row running back. The chain needs
+    # two bends, so no single I- (straight) or L- (one bend) access can reach all
+    # seven parcels, forcing the paper's recurse-on-remainder branch (Fig. 9
+    # case #5). Parcel 8 below the start carries the seed edge.
+    boundary = Polygon([(0, -1), (3, -1), (3, 3), (0, 3)])
+    polygons = [
+        (1, Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])),
+        (2, Polygon([(1, 0), (2, 0), (2, 1), (1, 1)])),
+        (3, Polygon([(2, 0), (3, 0), (3, 1), (2, 1)])),
+        (4, Polygon([(2, 1), (3, 1), (3, 2), (2, 2)])),
+        (5, Polygon([(2, 2), (3, 2), (3, 3), (2, 3)])),
+        (6, Polygon([(1, 2), (2, 2), (2, 3), (1, 3)])),
+        (7, Polygon([(0, 2), (1, 2), (1, 3), (0, 3)])),
+        (8, Polygon([(0, -1), (1, -1), (1, 0), (0, 0)])),
+    ]
+    return parcel_mesh_from_polygons(polygons, boundary=boundary), boundary
+
+
+def test_group_recursion_makes_all_parcels_reachable_with_multiple_accesses() -> None:
+    mesh, boundary = _serpentine_polygons()
+    points = _point_ids(mesh)
+    # Seed only the outer edge of parcel 8, leaving the serpentine chain
+    # (parcels 1..7) as one unreachable group with no complete single access.
+    seed = {normalized_edge(points[(0.0, -1.0)], points[(1.0, -1.0)])}
+
+    result = extend_street_network(mesh, set(seed))
+    street_edges = set(seed) | result.added_edges
+    layout = build_chen_layout(mesh, street_edges)
+    report = evaluate_layout_invariants(layout, target_boundary=boundary)
+
+    assert result.diagnostics["unreachable_parcel_count_after"] == 0
+    # No single access could reach every parcel, so the recurse-on-remainder
+    # branch must have fired at least once.
+    assert result.diagnostics["recursed_count"] >= 1
+    assert len(result.selected_access_candidates) >= 2
+    assert result.diagnostics["street_graph_component_count"] == 1
+    assert report.paper_invariant_pass
+
+
+# --------------------------------------------------------------------------
+# Determinism and per-level incrementality.
+# --------------------------------------------------------------------------
+
+
+def test_extension_tie_breaking_is_deterministic() -> None:
+    mesh, _boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
+
+    first = extend_street_network(mesh, set(seed))
+    second = extend_street_network(mesh, set(seed))
+
+    assert first.added_edges == second.added_edges
+    assert first.diagnostics == second.diagnostics
+    assert [
+        (c.kind, tuple(sorted(c.edges)), tuple(sorted(c.connection_edges)))
+        for c in first.selected_access_candidates
+    ] == [
+        (c.kind, tuple(sorted(c.edges)), tuple(sorted(c.connection_edges)))
+        for c in second.selected_access_candidates
+    ]
+
+
+def test_extension_is_noop_when_all_parcels_already_reachable() -> None:
+    mesh, _boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
+
+    first = extend_street_network(mesh, set(seed))
+    grown = set(seed) | first.added_edges
+
+    # Calling again with the grown edge set must add nothing.
+    second = extend_street_network(mesh, grown)
+
+    assert second.added_edges == set()
+    assert second.diagnostics["group_count"] == 0
+    assert second.diagnostics["unreachable_parcel_count_after"] == 0
+    assert second.diagnostics["i_chosen_count"] == 0
+    assert second.diagnostics["l_chosen_count"] == 0
+
+
+def test_unknown_existing_edges_are_rejected() -> None:
+    mesh, _boundary = _grid_mesh(2, 2)
+
+    bogus = {(10_000, 10_001)}
+    try:
+        extend_street_network(mesh, bogus)
+    except ValueError as exc:
+        assert "not in the parcel corner graph" in str(exc)
+    else:  # pragma: no cover - guard
+        raise AssertionError("expected ValueError for unknown edges")
+
+
+# --------------------------------------------------------------------------
+# Step 4: optional cul-de-sac avoidance.
+# --------------------------------------------------------------------------
+
+
+def test_cul_de_sac_avoidance_repairs_street_ends() -> None:
+    mesh, _boundary = _grid_mesh(3, 3)
+    seed = boundary_ring_seed_edges(mesh)
+
+    baseline = extend_street_network(
+        mesh, set(seed), StreetConfig(avoid_cul_de_sacs=False)
+    )
+    repaired = extend_street_network(
+        mesh, set(seed), StreetConfig(avoid_cul_de_sacs=True)
+    )
+
+    def _dead_ends(edges: set) -> int:
+        adjacency: dict[int, set[int]] = {}
+        for a, b in edges:
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+        return sum(1 for n in adjacency.values() if len(n) == 1)
+
+    baseline_edges = set(seed) | baseline.added_edges
+    repaired_edges = set(seed) | repaired.added_edges
+
+    assert _dead_ends(baseline_edges) >= 1
+    assert repaired.diagnostics["cul_de_sacs_repaired_count"] >= 1
+    assert _dead_ends(repaired_edges) < _dead_ends(baseline_edges)
+    assert repaired.diagnostics["unreachable_parcel_count_after"] == 0
+    assert repaired.diagnostics["street_graph_component_count"] == 1
+
+
+def test_cul_de_sac_avoidance_default_is_off() -> None:
+    assert StreetConfig().avoid_cul_de_sacs is False
+
+
+# --------------------------------------------------------------------------
+# Deprecated single-shot wrapper compatibility (drops after slice D).
+# --------------------------------------------------------------------------
+
+
+def test_generate_street_network_wrapper_repairs_3x3() -> None:
     mesh, boundary = _grid_mesh(3, 3)
 
     result = generate_street_network(mesh)
     layout = build_chen_layout(mesh, set(result.street_edges))
     report = evaluate_layout_invariants(layout, target_boundary=boundary)
 
-    assert (
-        result.diagnostics["street_selection_strategy"]
-        == "section_4_2_connected_junctions"
-    )
-    assert result.diagnostics["junction_completion_applied"]
-    assert result.diagnostics["junction_completion_added_edge_count"] > 0
-    assert result.diagnostics["junction_completion_parcel_touch_count"] > 0
-    assert result.diagnostics["street_four_way_intersection_count"] >= 1
     assert result.diagnostics["unreachable_parcel_count_after"] == 0
     assert result.diagnostics["street_graph_component_count"] == 1
+    assert result.diagnostics["street_network_subset_of_corner_graph"]
+    assert result.street_edges < frozenset(mesh.edges) | result.street_edges
     assert len(result.street_edges) < len(mesh.edges)
+    assert connected_component_count(layout.street_network) == 1
     assert report.paper_invariant_pass
 
 
-def test_generation_tie_breaking_is_deterministic() -> None:
-    mesh, _boundary = _grid_mesh(3, 3)
-
-    first = generate_street_network(mesh)
-    second = generate_street_network(mesh)
-
-    assert first.street_edges == second.street_edges
-    assert first.diagnostics == second.diagnostics
-    assert [
-        (
-            candidate.kind,
-            tuple(sorted(candidate.edges)),
-            tuple(sorted(candidate.connection_edges)),
-        )
-        for candidate in first.selected_access_candidates
-    ] == [
-        (
-            candidate.kind,
-            tuple(sorted(candidate.edges)),
-            tuple(sorted(candidate.connection_edges)),
-        )
-        for candidate in second.selected_access_candidates
-    ]
-
-
-def test_explicit_seed_edges_are_validated_against_corner_graph() -> None:
+def test_generate_street_network_accepts_explicit_seed() -> None:
     mesh, _boundary = _grid_mesh(2, 2)
     points = _point_ids(mesh)
     seed = {normalized_edge(points[(0.0, 0.0)], points[(1.0, 0.0)])}
@@ -170,110 +332,11 @@ def test_explicit_seed_edges_are_validated_against_corner_graph() -> None:
     result = generate_street_network(mesh, seed_edges=seed)
 
     assert result.seed_edges == frozenset(seed)
+    assert result.diagnostics["unreachable_parcel_count_after"] == 0
 
 
-def test_junction_completion_adds_bounded_four_way_grid_connection() -> None:
-    mesh, boundary = _grid_mesh(4, 4)
-    points = _point_ids(mesh)
-    seed = _perimeter_seed(points, 4, 4)
-    seed.update(
-        _edges_for_coords(
-            points,
-            [(2.0, float(y)) for y in range(5)],
-        )
+def test_collinear_threshold_is_135_degrees() -> None:
+    # Sanity: the default collinear threshold is the paper's 135 degrees.
+    assert math.isclose(
+        StreetConfig().collinear_angle_threshold_rad, math.radians(135.0)
     )
-    seed.update(
-        _edges_for_coords(
-            points,
-            [(0.0, 2.0), (1.0, 2.0), (2.0, 2.0)],
-        )
-    )
-
-    baseline = generate_street_network(
-        mesh,
-        seed_edges=seed,
-        config=StreetGenerationConfig(complete_junctions=False),
-    )
-    completed = generate_street_network(
-        mesh,
-        seed_edges=seed,
-        config=StreetGenerationConfig(
-            complete_junctions=True,
-            junction_completion_max_added_edges=2,
-            junction_completion_max_added_edge_ratio=1.0,
-        ),
-    )
-    completed_layout = build_chen_layout(mesh, set(completed.street_edges))
-    report = evaluate_layout_invariants(completed_layout, target_boundary=boundary)
-
-    assert baseline.diagnostics["street_four_way_intersection_count"] == 0
-    assert completed.diagnostics["junction_completion_applied"]
-    assert completed.diagnostics["junction_completion_added_edge_count"] == 2
-    assert (
-        completed.diagnostics["street_four_way_intersection_count"]
-        > baseline.diagnostics["street_four_way_intersection_count"]
-    )
-    assert completed.diagnostics["unreachable_parcel_count_after"] == 0
-    assert completed.diagnostics["street_graph_component_count"] == 1
-    assert report.paper_invariant_pass
-
-
-def test_cul_de_sac_pruning_removes_dispensable_leaf_edge() -> None:
-    mesh, _boundary = _grid_mesh(2, 2)
-    points = _point_ids(mesh)
-    seed = _perimeter_seed(points, 2, 2)
-    seed.add(normalized_edge(points[(1.0, 0.0)], points[(1.0, 1.0)]))
-
-    unpruned = generate_street_network(
-        mesh,
-        seed_edges=seed,
-        config=StreetGenerationConfig(
-            complete_junctions=False,
-            avoid_cul_de_sacs=False,
-        ),
-    )
-    pruned = generate_street_network(
-        mesh,
-        seed_edges=seed,
-        config=StreetGenerationConfig(
-            complete_junctions=False,
-            avoid_cul_de_sacs=True,
-        ),
-    )
-
-    assert unpruned.diagnostics["cul_de_sac_count"] == 1
-    assert pruned.diagnostics["cul_de_sac_avoidance_applied"]
-    assert pruned.diagnostics["cul_de_sac_avoidance_changed_network"]
-    assert pruned.diagnostics["cul_de_sac_pruned_edge_count"] == 1
-    assert pruned.diagnostics["cul_de_sac_repair_success_count"] == 0
-    assert pruned.diagnostics["cul_de_sac_count"] == 0
-    assert pruned.diagnostics["reachable_parcel_count_after"] == 4
-    assert pruned.diagnostics["street_graph_component_count"] == 1
-
-
-def test_cul_de_sac_avoidance_repairs_leaf_when_pruning_would_remove_four_way() -> None:
-    mesh, _boundary = _grid_mesh(3, 3)
-
-    baseline = generate_street_network(mesh)
-    repaired = generate_street_network(
-        mesh,
-        config=StreetGenerationConfig(avoid_cul_de_sacs=True),
-    )
-
-    assert baseline.diagnostics["street_four_way_intersection_count"] >= 1
-    assert baseline.diagnostics["cul_de_sac_count"] == 1
-    assert repaired.diagnostics["cul_de_sac_avoidance_applied"]
-    assert repaired.diagnostics["cul_de_sac_avoidance_changed_network"]
-    assert repaired.diagnostics["cul_de_sac_pruned_edge_count"] == 0
-    assert repaired.diagnostics["cul_de_sac_repair_attempt_count"] >= 1
-    assert repaired.diagnostics["cul_de_sac_repair_candidate_count"] >= 1
-    assert repaired.diagnostics["cul_de_sac_repair_success_count"] == 1
-    assert repaired.diagnostics["cul_de_sac_repair_added_edge_count"] == 1
-    assert repaired.diagnostics["cul_de_sac_count"] == 0
-    assert (
-        repaired.diagnostics["street_four_way_intersection_count"]
-        >= baseline.diagnostics["street_four_way_intersection_count"]
-    )
-    assert repaired.diagnostics["unreachable_parcel_count_after"] == 0
-    assert repaired.diagnostics["street_graph_component_count"] == 1
-    assert len(repaired.street_edges) == len(baseline.street_edges) + 1
