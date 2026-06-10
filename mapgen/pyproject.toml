@@ -38,6 +38,10 @@ topo = [
     "sentence-transformers>=3.0",
     "ollama",
 ]
+shapeop = [
+    "compas>=2.15.1",
+    "compas-shapeop>=0.1.2",
+]
 
 [project.scripts]
 mapgen-embed = "mapgen.embed_text:main"
@@ -62,7 +66,12 @@ mapgen-city-proto = "mapgen.city_proto:main"
 mapgen-chen-proto = "mapgen.chen_proto:main"
 
 [dependency-groups]
-dev = ["ruff>=0.6", "ty", "pre-commit>=3.8"]
+dev = [
+    "ruff>=0.6",
+    "ty",
+    "pre-commit>=3.8",
+    "pytest>=9.0.3",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -5,6 +5,7 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
 from shapely import LineString, Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -131,6 +132,7 @@ def test_chen_proto_writes_artifacts(tmp_path: Path) -> None:
     assert (out_dir / "chen_layout.svg").read_text().startswith("<svg")
 
 
+@pytest.mark.slow
 def test_chen_proto_irregular_boundary_stress(tmp_path: Path) -> None:
     out_dir = tmp_path / "chen_island"
     metrics = build_chen_proto(
@@ -152,6 +154,7 @@ def test_chen_proto_irregular_boundary_stress(tmp_path: Path) -> None:
     assert (out_dir / "mesh_guides.geojson").exists()
 
 
+@pytest.mark.slow
 def test_chen_triangle_uses_crossfield_streamline_splits() -> None:
     streets, parcels, guides, metrics = generate_chen_layout(
         width=220.0,
