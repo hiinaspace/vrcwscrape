@@ -235,9 +235,9 @@ def test_oval_artifacts_preserve_curved_split_and_street_polylines(
 
     manifest = write_strict_chen_artifacts(generated, tmp_path)
 
-    assert (
-        manifest["summary"]["implementation_stage"]
-        == "chen_grid_smooth_streamline_bounded_junction_shapeop_like_v1"
+    # Section 4 driver stage + boundary contour fidelity for the oval preset.
+    assert manifest["summary"]["generation_stage"] == (
+        "chen_section4_hierarchical_co_generation_v2"
     )
     assert (
         manifest["summary"]["boundary_contour_fidelity_stage"]
@@ -246,75 +246,9 @@ def test_oval_artifacts_preserve_curved_split_and_street_polylines(
     assert manifest["summary"]["oval_boundary_vertex_count"] == 32
     assert manifest["summary"]["oval_boundary_normalized_radial_error_max"] <= 1e-12
     assert manifest["summary"]["oval_boundary_radial_error_max"] <= 1e-10
-    assert (
-        manifest["summary"]["streamline_field_stage"] == "grid_smooth_4rosy_laplace_v1"
-    )
-    assert (
-        manifest["summary"]["street_selection_mode"]
-        == "chen_section_4_2_reachability_bounded_junctions_v0"
-    )
-    assert manifest["summary"]["curved_split_line_count"] > 0
-    assert manifest["summary"]["streamline_candidate_count"] > 0
     assert manifest["summary"]["street_topology_reachability_pass"]
-    assert manifest["summary"]["deprecated_chen_street_generation_pass_alias"]
-    assert manifest["summary"]["chen_street_generation_scope"] == (
-        "reachability_plus_bounded_junction_completion_v0"
-    )
-    assert (
-        manifest["summary"]["chen_fig7_short_edge_detection_stage"]
-        == generated.metrics["chen_fig7_short_edge_detection_stage"]
-    )
-    assert (
-        manifest["summary"]["chen_fig7_short_edge_cleanup_stage"]
-        == generated.metrics["chen_fig7_short_edge_cleanup_stage"]
-    )
-    assert (
-        manifest["summary"]["chen_fig7_short_edge_cleanup_applied"]
-        == (generated.metrics["chen_fig7_short_edge_cleanup_applied"])
-    )
-    assert (
-        manifest["summary"]["chen_fig7_short_edge_cleanup_midpoint_merge_count"]
-        == (generated.metrics["chen_fig7_short_edge_cleanup_midpoint_merge_count"])
-    )
-    assert (
-        manifest["summary"][
-            "chen_fig7_short_edge_cleanup_boundary_projected_merge_count"
-        ]
-        == generated.metrics[
-            "chen_fig7_short_edge_cleanup_boundary_projected_merge_count"
-        ]
-    )
-    assert (
-        manifest["summary"]["chen_fig7_short_shared_edge_candidate_count"]
-        == (generated.metrics["chen_fig7_short_shared_edge_candidate_count"])
-    )
-    assert (
-        manifest["summary"]["chen_fig7_unexplained_interior_t_junction_count"]
-        == (generated.metrics["chen_fig7_unexplained_interior_t_junction_count"])
-    )
-    assert (
-        manifest["summary"][
-            "chen_fig7_unexplained_straight_through_side_insertion_t_junction_count"
-        ]
-        == generated.metrics[
-            "chen_fig7_unexplained_straight_through_side_insertion_t_junction_count"
-        ]
-    )
-    assert (
-        manifest["summary"][
-            "chen_fig7_unexplained_kinked_split_topology_debt_t_junction_count"
-        ]
-        == generated.metrics[
-            "chen_fig7_unexplained_kinked_split_topology_debt_t_junction_count"
-        ]
-    )
     assert manifest["summary"]["corner_graph_edge_count"] > 0
     assert manifest["summary"]["street_edge_density"] > 0.0
-    assert "chen_street_generation_pass" not in manifest["summary"]
-    assert (
-        manifest["summary"]["optimization_stage"]
-        == "chen_section_5_shapeop_like_projection_v1"
-    )
     assert manifest["summary"]["optimization_applied"]
     assert manifest["summary"]["optimization_geometry_changed"]
     assert manifest["summary"]["optimization_accepted_iteration_count"] > 0
@@ -324,17 +258,12 @@ def test_oval_artifacts_preserve_curved_split_and_street_polylines(
     )
 
     metrics = json.loads((tmp_path / "layout_metrics.json").read_text())
-    assert (
-        metrics["implementation_stage"]
-        == "chen_grid_smooth_streamline_bounded_junction_shapeop_like_v1"
+    assert metrics["generation_stage"] == (
+        "chen_section4_hierarchical_co_generation_v2"
     )
-    assert metrics["streamline_field_stage"] == "grid_smooth_4rosy_laplace_v1"
     assert metrics["street_topology_reachability_pass"]
-    assert metrics["deprecated_chen_street_generation_pass_alias"]
-    assert "chen_street_generation_pass" not in metrics
-    assert metrics["street_generation_diagnostics"][
-        "street_network_subset_of_corner_graph"
-    ]
+    assert metrics["geometry_valid_pass"]
+    assert metrics["paper_invariant_pass"]
     assert metrics["optimization_stage"] == "chen_section_5_shapeop_like_projection_v1"
     assert metrics["optimization_applied"]
     assert metrics["optimization_layout_used"]
@@ -406,9 +335,16 @@ def test_oval_artifacts_preserve_curved_split_and_street_polylines(
 
 
 @pytest.mark.slow
-def test_rectangle_artifact_summary_includes_rectangular_fidelity_diagnostics(
+def test_rectangle_streets_are_axis_aligned(
     tmp_path: Path,
 ) -> None:
+    """An axis-aligned rectangle must produce axis-aligned streets.
+
+    The Section 4 driver scores Q_acce against the real street network and welds
+    short edges locally, so the rectangle no longer needs the old cleanup-debt /
+    rectangular axis-guard diagnostics (those were removed in slice D). The
+    correct expectation is simply that every street segment is axis-aligned.
+    """
     generated = generate_layout_for_boundary(
         BoundarySpec(
             "rectangle",
@@ -418,46 +354,20 @@ def test_rectangle_artifact_summary_includes_rectangular_fidelity_diagnostics(
         seed=5,
     )
 
-    manifest = write_strict_chen_artifacts(generated, tmp_path)
+    write_strict_chen_artifacts(generated, tmp_path)
 
-    summary = manifest["summary"]
-    for key in (
-        "max_mesh_axis_deviation",
-        "max_split_axis_deviation",
-        "max_street_axis_deviation",
-        "interior_corner_graph_t_junction_count",
-        "interior_corner_graph_four_way_intersection_count",
-        "boundary_corner_graph_t_junction_count",
-        "interior_street_t_junction_count",
-        "interior_street_four_way_intersection_count",
-        "corner_graph_t_junction_ratio",
-        "corner_graph_four_way_intersection_ratio",
-        "rectangular_interior_t_junction_points_sample",
-    ):
-        assert key in summary
+    streets = json.loads((tmp_path / "streets.geojson").read_text())
+    tol = 1e-6
+    for feature in streets["features"]:
+        coords = feature["geometry"]["coordinates"]
+        for (ax, ay), (bx, by) in zip(coords, coords[1:], strict=False):
+            assert abs(ax - bx) <= tol or abs(ay - by) <= tol, (
+                f"non-axis-aligned street segment {(ax, ay)}->{(bx, by)}"
+            )
 
-    assert (
-        summary["max_mesh_axis_deviation"]
-        == generated.metrics["max_mesh_axis_deviation"]
-    )
-    assert (
-        summary["interior_corner_graph_t_junction_count"]
-        == generated.metrics["interior_corner_graph_t_junction_count"]
-    )
-    assert summary["rectangular_interior_t_junction_points_sample"] == [
-        list(point)
-        for point in generated.metrics["rectangular_interior_t_junction_points_sample"]
-    ]
-
-    metrics = json.loads((tmp_path / "layout_metrics.json").read_text())
-    assert (
-        metrics["interior_corner_graph_t_junction_count"]
-        == generated.metrics["interior_corner_graph_t_junction_count"]
-    )
-    assert metrics["rectangular_interior_t_junction_points_sample"] == [
-        list(point)
-        for point in generated.metrics["rectangular_interior_t_junction_points_sample"]
-    ]
+    assert generated.metrics["geometry_valid_pass"]
+    assert generated.metrics["paper_invariant_pass"]
+    assert generated.metrics["street_topology_reachability_pass"]
 
 
 def test_yang_streamline_artifact_summary_includes_score_diagnostics(
@@ -473,36 +383,19 @@ def test_yang_streamline_artifact_summary_includes_score_diagnostics(
 
     manifest = write_strict_chen_artifacts(generated, tmp_path)
 
+    # The Section 4 driver records the resolved streamline config used per
+    # parcel. The legacy accepted-streamline score diagnostic sprawl was removed
+    # with the geometry-only scorer rewrite (slice D).
     summary = manifest["summary"]
     assert summary["streamline_config_mode"] == STREAMLINE_MODE_YANG_D_FIELD
     assert summary["streamline_config_field_mode"] == "yang_d_field"
     assert summary["streamline_config_candidate_seed_mode"] == "yang_mesh_vertices"
     assert summary["streamline_config_score_mode"] == "yang_div_db_ds_ct"
-    assert summary["streamline_field_stage"] == "yang_d_field_weighted_footpoint_v1"
-    assert summary["accepted_streamline_candidate_count"] > 0
-    assert summary["accepted_streamline_score_mode_counts"] == {
-        "yang_div_db_ds_ct": summary["accepted_streamline_candidate_count"]
-    }
-    assert (
-        summary["accepted_streamline_yang_score_count"]
-        == summary["accepted_streamline_candidate_count"]
-    )
-    assert summary["accepted_streamline_score_div_mean"] >= 0.0
-    assert summary["accepted_streamline_score_db_mean"] >= 0.0
-    assert summary["accepted_streamline_score_ds_mean"] >= 0.0
-    assert summary["accepted_streamline_score_ct_mean"] >= 0.0
-    assert 0.0 <= summary["accepted_streamline_score_total_normalized_mean"] <= 1.0
-    assert summary["accepted_streamline_score_approximation_scopes"]
 
     metrics = json.loads((tmp_path / "layout_metrics.json").read_text())
-    assert (
-        metrics["accepted_streamline_score_mode_counts"]
-        == summary["accepted_streamline_score_mode_counts"]
-    )
-    assert (
-        metrics["accepted_streamline_score_div_mean"]
-        == summary["accepted_streamline_score_div_mean"]
-    )
+    assert metrics["streamline_config_mode"] == STREAMLINE_MODE_YANG_D_FIELD
+    assert metrics["geometry_valid_pass"]
+    assert metrics["paper_invariant_pass"]
 
 
 def test_artifacts_preserve_fig7_unique_failure_diagnostics(
@@ -605,184 +498,20 @@ def test_yang_b_field_artifact_summary_includes_omega_and_mesh_diagnostics(
 
     manifest = write_strict_chen_artifacts(generated, tmp_path)
 
+    # The Section 4 driver records the resolved streamline config; the legacy
+    # accepted-streamline B-field score sprawl and Fig.7 cleanup-debt metrics
+    # were removed with the geometry-only scorer / local-weld rewrite (slice D).
     summary = manifest["summary"]
     assert summary["streamline_config_mode"] == STREAMLINE_MODE_YANG_B_FIELD
     assert summary["streamline_config_field_mode"] == "yang_b_field"
     assert summary["streamline_config_candidate_seed_mode"] == "yang_mesh_vertices"
     assert summary["streamline_config_score_mode"] == "yang_div_db_ds_ct"
-    assert summary["streamline_field_stage"] == (
-        "yang_b_field_boundary_laplacian_omega_v0"
-    )
-    assert summary["accepted_streamline_candidate_count"] > 0
-    for key in (
-        "accepted_streamline_continuation_split_count",
-        "accepted_axis_fallback_split_count",
-        "candidate_split_reject_count",
-        "candidate_topology_reject_count",
-        "path_access_score_count",
-        "path_access_score_fallback_count",
-    ):
-        assert summary[key] == generated.metrics[key]
-    assert summary["accepted_streamline_field_mode_counts"] == {
-        "yang_b_field": summary["accepted_streamline_candidate_count"]
-    }
-    assert summary["accepted_streamline_trace_mesh_interior_seed_count_min"] > 0
-    assert summary["accepted_streamline_field_mesh_vertex_count_min"] > 0
-    assert summary["accepted_streamline_field_b_boundary_alignment_weight_mean"] == (
-        pytest.approx(0.9)
-    )
-    assert summary["accepted_streamline_field_b_boundary_anchor_count_min"] > 0
-    assert summary["accepted_streamline_field_b_boundary_alignment_error_mean"] >= 0.0
-    assert summary["accepted_streamline_field_b_smoothness_energy_mean"] >= 0.0
-    assert summary["accepted_streamline_field_b_approximation_scopes"] == [
-        "yang2013_supp1_sec4_3_uniform_mesh_graph_laplacian_boundary_vertices"
-    ]
-    assert (
-        summary["chen_fig7_short_edge_cleanup_stage"]
-        == generated.metrics["chen_fig7_short_edge_cleanup_stage"]
-    )
-    assert (
-        summary["chen_fig7_short_edge_cleanup_applied"]
-        == generated.metrics["chen_fig7_short_edge_cleanup_applied"]
-    )
-    for key in (
-        "chen_fig7_short_edge_cleanup_applied_count",
-        "chen_fig7_short_edge_cleanup_midpoint_merge_count",
-        "chen_fig7_short_edge_cleanup_boundary_projected_merge_count",
-        "chen_fig7_short_edge_cleanup_boundary_projection_distance_max",
-        "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_applied_count",
-        "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_parcel_count",
-        "chen_fig7_short_edge_cleanup_failed_count",
-        "chen_fig7_short_edge_cleanup_failed_unique_candidate_count",
-        "chen_fig7_short_edge_cleanup_failed_duplicate_attempt_count",
-        "chen_fig7_short_edge_cleanup_failed_overlap_count",
-        "chen_fig7_short_edge_cleanup_failed_invalid_polygon_count",
-        "chen_fig7_short_edge_cleanup_failed_sliver_or_corner_loss_count",
-        "chen_fig7_short_edge_cleanup_failed_boundary_coverage_count",
-        "chen_fig7_short_edge_cleanup_failed_conforming_graph_count",
-        "chen_fig7_short_edge_cleanup_failed_degenerate_ring_after_merge_count",
-        (
-            "chen_fig7_short_edge_cleanup_failed_fig7_motif_ineligible_"
-            "non_candidate_parcel_ring_after_merge_count"
-        ),
-        "chen_fig7_short_edge_cleanup_failed_non_simple_ring_after_merge_count",
-        "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_count",
-        (
-            "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_"
-            "due_other_shared_edges_count"
-        ),
-        "chen_fig7_short_edge_cleanup_failed_nonlocal_neighbor_delta_count",
-        "chen_fig7_short_edge_cleanup_skipped_boundary_count",
-        "chen_fig7_short_edge_cleanup_pre_candidate_count",
-        "chen_fig7_short_edge_cleanup_post_candidate_count",
-        "chen_fig7_short_edge_cleanup_pre_attached_t_junction_count",
-        "chen_fig7_short_edge_cleanup_post_attached_t_junction_count",
-        "chen_fig7_short_edge_cleanup_pre_unexplained_t_junction_count",
-        "chen_fig7_short_edge_cleanup_post_unexplained_t_junction_count",
-        "chen_fig7_unexplained_straight_through_side_insertion_t_junction_count",
-        "chen_fig7_unexplained_kinked_split_topology_debt_t_junction_count",
-        "chen_fig7_unexplained_t_junction_split_endpoint_count",
-        "chen_fig7_unexplained_t_junction_lies_on_split_line_count",
-        "chen_fig7_unexplained_t_junction_split_unknown_count",
-        "chen_fig7_unexplained_t_junction_split_endpoint_straight_through_count",
-        "chen_fig7_unexplained_t_junction_split_endpoint_kinked_count",
-        "chen_fig7_unexplained_t_junction_lies_on_split_line_straight_through_count",
-        "chen_fig7_unexplained_t_junction_lies_on_split_line_kinked_count",
-        "chen_fig7_unexplained_t_junction_split_unknown_straight_through_count",
-        "chen_fig7_unexplained_t_junction_split_unknown_kinked_count",
-    ):
-        assert summary[key] == generated.metrics[key]
-    assert summary["chen_fig7_unexplained_t_junction_split_provenance_stage"] == (
-        "accepted_split_line_geometry_endpoint_or_interior_v0"
-    )
-    assert summary["chen_fig7_unexplained_t_junction_split_provenance_scope"] == (
-        "geometric_attribution_only_not_paper_violation_proof"
-    )
-    assert (
-        summary["chen_fig7_unexplained_t_junction_split_endpoint_count"]
-        + summary["chen_fig7_unexplained_t_junction_lies_on_split_line_count"]
-        + summary["chen_fig7_unexplained_t_junction_split_unknown_count"]
-        == summary["chen_fig7_unexplained_interior_t_junction_count"]
-    )
-    assert (
-        summary["chen_fig7_unexplained_t_junction_split_endpoint_source_counts"]
-        == generated.metrics[
-            "chen_fig7_unexplained_t_junction_split_endpoint_source_counts"
-        ]
-    )
-    assert (
-        summary["chen_fig7_unexplained_t_junction_lies_on_split_line_source_counts"]
-        == generated.metrics[
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_source_counts"
-        ]
-    )
-    for key in (
-        "chen_fig7_unexplained_t_junction_split_endpoint_straight_through_source_counts",
-        "chen_fig7_unexplained_t_junction_split_endpoint_kinked_source_counts",
-        (
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-            "straight_through_source_counts"
-        ),
-        "chen_fig7_unexplained_t_junction_lies_on_split_line_kinked_source_counts",
-        (
-            "chen_fig7_unexplained_t_junction_split_unknown_"
-            "straight_through_source_counts"
-        ),
-        "chen_fig7_unexplained_t_junction_split_unknown_kinked_source_counts",
-    ):
-        assert summary[key] == generated.metrics[key]
-    assert summary["chen_fig7_short_edge_cleanup_failed_reasons"] == list(
-        generated.metrics["chen_fig7_short_edge_cleanup_failed_reasons"]
-    )
-    assert summary["chen_fig7_short_edge_cleanup_failed_details"] == list(
-        generated.metrics["chen_fig7_short_edge_cleanup_failed_details"]
-    )
-    assert (
-        summary["chen_fig7_short_edge_cleanup_failed_unique_candidate_stage"]
-        == generated.metrics[
-            "chen_fig7_short_edge_cleanup_failed_unique_candidate_stage"
-        ]
-    )
-    assert (
-        summary["chen_fig7_short_edge_cleanup_failed_unique_candidate_counts_by_detail"]
-        == generated.metrics[
-            "chen_fig7_short_edge_cleanup_failed_unique_candidate_counts_by_detail"
-        ]
-    )
-    assert (
-        summary["chen_fig7_short_edge_cleanup_has_labeled_approximations"]
-        == (
-            generated.metrics["chen_fig7_short_edge_cleanup_has_labeled_approximations"]
-        )
-    )
-    assert summary[
-        "chen_fig7_short_edge_cleanup_labeled_approximation_reasons"
-    ] == list(
-        generated.metrics["chen_fig7_short_edge_cleanup_labeled_approximation_reasons"]
-    )
-    assert summary["chen_fig7_short_edge_cleanup_failed_samples"] == _json_round_trip(
-        generated.metrics["chen_fig7_short_edge_cleanup_failed_samples"]
-    )
-    assert summary["chen_fig7_short_edge_cleanup_failed_samples_by_detail"] == (
-        _json_round_trip(
-            generated.metrics["chen_fig7_short_edge_cleanup_failed_samples_by_detail"]
-        )
-    )
-    assert "chen_fig7_unexplained_interior_t_junction_count" in summary
 
     metrics = json.loads((tmp_path / "layout_metrics.json").read_text())
-    assert (
-        metrics["accepted_streamline_field_b_boundary_alignment_weight_mean"]
-        == (summary["accepted_streamline_field_b_boundary_alignment_weight_mean"])
-    )
-    assert (
-        metrics["accepted_streamline_field_b_approximation_scopes"]
-        == summary["accepted_streamline_field_b_approximation_scopes"]
-    )
-    assert (
-        metrics["candidate_topology_reject_count"]
-        == summary["candidate_topology_reject_count"]
-    )
+    assert metrics["streamline_config_mode"] == STREAMLINE_MODE_YANG_B_FIELD
+    assert metrics["geometry_valid_pass"]
+    assert metrics["paper_invariant_pass"]
+    assert metrics["unreachable_parcel_count"] == 0
 
 
 def _json_round_trip(value: Any) -> Any:

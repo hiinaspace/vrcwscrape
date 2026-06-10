@@ -37,7 +37,6 @@ from mapgen.chen_core import (
     signed_area,
     street_adjacency,
 )
-from mapgen.chen_generate import STREAMLINE_MODE_YANG_B_FIELD, generate_named_layout
 
 
 def test_chen_irregularity_matches_paper_shape_intuition() -> None:
@@ -903,56 +902,12 @@ def test_chen_fig7_cleanup_removes_short_edge_when_pair_has_other_shared_edges()
 
 
 @pytest.mark.slow
-def test_chen_fig7_cleanup_classifies_triangle_24_motif_ineligible() -> None:
-    generated = generate_named_layout(
-        "triangle",
-        parcel_count=24,
-        seed=200_029,
-        apply_optimization=False,
-        streamline_mode=STREAMLINE_MODE_YANG_B_FIELD,
-    )
-    metrics = generated.metrics
-    motif_count_key = (
-        "chen_fig7_short_edge_cleanup_failed_fig7_motif_ineligible_"
-        "non_candidate_parcel_ring_after_merge_count"
-    )
-
-    assert metrics["coverage_rate"] == pytest.approx(1.0)
-    assert metrics["coverage_gap_rate"] == pytest.approx(0.0)
-    assert metrics["chen_fig7_short_shared_edge_candidate_count"] == 1
-    assert metrics["chen_fig7_short_edge_cleanup_applied_count"] == 6
-    assert metrics["chen_fig7_short_edge_cleanup_failed_count"] == 6
-    assert metrics["chen_fig7_short_edge_cleanup_failed_unique_candidate_count"] == 1
-    assert metrics["chen_fig7_short_edge_cleanup_failed_duplicate_attempt_count"] == 5
-    assert (
-        metrics["chen_fig7_short_edge_cleanup_failed_non_simple_ring_after_merge_count"]
-        == 0
-    )
-    assert metrics[motif_count_key] == 0
-    assert (
-        metrics[
-            (
-                "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_"
-                "due_other_shared_edges_count"
-            )
-        ]
-        == 0
-    )
-    assert metrics["chen_fig7_short_edge_cleanup_failed_boundary_coverage_count"] == 6
-    assert metrics["chen_fig7_short_edge_cleanup_graph_local_candidate_pair_count"] == 0
-    assert metrics["chen_fig7_short_edge_cleanup_operation_scopes"] == (
-        "all_incident_rings",
-    )
-    assert metrics[
-        "chen_fig7_short_edge_cleanup_failed_unique_candidate_counts_by_detail"
-    ] == {"failed_boundary_coverage": 1}
-    failed_samples = metrics["chen_fig7_short_edge_cleanup_failed_samples_by_detail"][
-        "failed_boundary_coverage"
-    ]
-    assert failed_samples[0]["path_points_sample"] == (
-        (62.71232365, 77.204908741),
-        (62.910399082, 77.94785242),
-    )
+# Removed: test_chen_fig7_cleanup_classifies_triangle_24_motif_ineligible.
+# It exercised the old global ``apply_chen_fig7_short_edge_cleanup`` pass and its
+# failure-taxonomy metrics through generation. The Section 4 driver (slice D) now
+# welds short edges locally per level, so those generation-level cleanup-taxonomy
+# metrics no longer exist. Slice E removes the remaining global-cleanup support
+# and its taxonomy tests from chen_core.
 
 
 def test_chen_fig7_non_simple_ring_failure_reports_validity_reason() -> None:

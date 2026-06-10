@@ -397,6 +397,7 @@ def _manifest(
             "street_edge_count": metrics.get("street_edge_count", 0),
             "corner_graph_edge_count": metrics.get("corner_graph_edge_count", 0),
             "street_edge_density": metrics.get("street_edge_density", 0.0),
+            "generation_stage": metrics.get("generation_stage", "unknown"),
             "implementation_stage": metrics.get("implementation_stage", "unknown"),
             "boundary_contour_fidelity_stage": metrics.get(
                 "boundary_contour_fidelity_stage", "unknown"
