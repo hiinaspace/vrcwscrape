@@ -93,6 +93,47 @@ def test_emergent_count_band_large(name: str) -> None:
     assert generated.metrics["parcel_quad_fraction"] > floor
 
 
+# ---------------------------------------------------------------------------
+# Concave many-vertex island preset (regression for corner-graph conformity)
+#
+# The 48-gon "island" boundary is the first concave preset whose interior
+# splits produce a smoothly curved shared boundary that one parcel simplifies
+# away (135 deg collinearity) while a neighbour retains verbatim (its corner
+# ring would otherwise collapse below three vertices). A single-pass corner
+# propagation left such shared boundaries non-conforming, tripping the
+# parcel_graph conformity validator. These tests pin the fix.
+# ---------------------------------------------------------------------------
+
+
+def test_island_small_generates_and_passes_invariants() -> None:
+    target = 12
+    generated = generate_named_layout("island", parcel_count=target, seed=0)
+    count = len(generated.layout.mesh.parcels)
+    assert _COUNT_LOWER * target <= count <= _COUNT_UPPER * target, (
+        f"island: emergent={count} target={target}"
+    )
+    m = generated.metrics
+    assert m["geometry_valid_pass"]
+    assert m["paper_invariant_pass"]
+    assert m["street_topology_reachability_pass"]
+    assert m["unreachable_parcel_count"] == 0
+    assert m["street_graph_component_count"] == 1
+
+
+@pytest.mark.slow
+def test_island_large_generates_and_passes_invariants() -> None:
+    target = 48
+    generated = generate_named_layout("island", parcel_count=target, seed=0)
+    count = len(generated.layout.mesh.parcels)
+    assert _COUNT_LOWER * target <= count <= _COUNT_UPPER * target, (
+        f"island: emergent={count} target={target}"
+    )
+    m = generated.metrics
+    assert m["geometry_valid_pass"]
+    assert m["paper_invariant_pass"]
+    assert m["street_topology_reachability_pass"]
+
+
 @pytest.mark.parametrize("name", SHAPES)
 def test_street_reachability_single_component(name: str) -> None:
     generated = generate_named_layout(name, parcel_count=12, seed=0)

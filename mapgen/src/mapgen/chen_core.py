@@ -581,14 +581,28 @@ def parcel_corner_edge_paths(
 
 def parcel_corner_graph(mesh: ParcelMesh) -> ParcelCornerGraph:
     corner_ids = parcel_corner_candidate_ids(mesh)
+    # A parcel whose simplified corner ring would collapse below three vertices
+    # retains its full mesh ring (see _parcel_corner_ring_with_retention). Those
+    # retained vertices must be promoted to corners for *every* parcel that
+    # shares them, or the shared boundary becomes non-conforming (one neighbour
+    # simplifies an arc the other keeps verbatim). A single pass only propagates
+    # to parcels visited later in iteration order, so iterate to a fixpoint.
     parcel_corner_rings: dict[int, tuple[int, ...]] = {}
-    for parcel in mesh.parcels.values():
-        ring, _retained_full_mesh_ring = _parcel_corner_ring_with_retention(
-            parcel,
-            corner_ids,
-        )
-        parcel_corner_rings[parcel.parcel_id] = ring
-        corner_ids.update(ring)
+    while True:
+        promoted = False
+        parcel_corner_rings = {}
+        for parcel in mesh.parcels.values():
+            ring, _retained_full_mesh_ring = _parcel_corner_ring_with_retention(
+                parcel,
+                corner_ids,
+            )
+            parcel_corner_rings[parcel.parcel_id] = ring
+            for vertex_id in ring:
+                if vertex_id not in corner_ids:
+                    corner_ids.add(vertex_id)
+                    promoted = True
+        if not promoted:
+            break
     edges: set[EdgeKey] = set()
     edge_paths: dict[EdgeKey, tuple[int, ...]] = {}
     for parcel_id, ring in parcel_corner_rings.items():
