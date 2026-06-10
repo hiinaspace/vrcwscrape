@@ -28,10 +28,12 @@ from mapgen.chen_generate import (
 SHAPES = ["square", "oval", "triangle"]
 
 # Calibration band for emergent parcel counts relative to the requested target.
-# The convenience mapping min_area = area / (2 * target) lands the emergent
-# count near the target; slice G calibrates the exact constant.
-_COUNT_LOWER = 0.5
-_COUNT_UPPER = 1.6
+# The convenience mapping min_area = area / (1.5 * target) was calibrated in
+# slice G.  Square always produces counts at a power-of-2 boundary (structural
+# limit of binary splits), so the 1.33× ratio for squares is expected.
+# oval/triangle land 1.0–1.2×.  The band [0.6, 1.4] covers all three shapes.
+_COUNT_LOWER = 0.6
+_COUNT_UPPER = 1.4
 
 
 def _partition_line_keys(generated) -> list:

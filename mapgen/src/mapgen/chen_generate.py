@@ -88,7 +88,7 @@ _LAMBDA_ACCE = 0.2
 _ACCESS_TAU = 0.5
 
 DEFAULT_GENERATION_OPTIMIZATION_CONFIG = OptimizationConfig()
-DEFAULT_STREET_CONFIG = StreetConfig()
+DEFAULT_STREET_CONFIG = StreetConfig(avoid_cul_de_sacs=True)
 
 STREAMLINE_MODE_BASELINE = "baseline"
 STREAMLINE_MODE_YANG_D_FIELD = "yang_d_field_candidates"
@@ -367,8 +367,8 @@ def generate_layout_for_boundary(
 
     Exactly one of ``min_parcel_area`` / ``parcel_count`` must be given. The
     ``parcel_count`` convenience maps to ``min_parcel_area = area /
-    (2 * parcel_count)`` (the paper's emergent count is ~0.53x of
-    ``area / min_parcel_area``, which lands near the requested target).
+    (1.5 * parcel_count)`` (calibrated so emergent counts land in the
+    [0.6, 1.4]× band around the requested target for the standard shapes).
     """
     if (min_parcel_area is None) == (parcel_count is None):
         raise ValueError("provide exactly one of min_parcel_area or parcel_count")
@@ -378,7 +378,7 @@ def generate_layout_for_boundary(
     if parcel_count is not None:
         if parcel_count < 1:
             raise ValueError("parcel_count must be at least 1")
-        resolved_min_area = boundary_area / (2.0 * float(parcel_count))
+        resolved_min_area = boundary_area / (1.5 * float(parcel_count))
     else:
         if min_parcel_area is None or min_parcel_area <= 0.0:
             raise ValueError("min_parcel_area must be positive")

@@ -42,6 +42,7 @@ ARTIFACT_FILES = {
     "parcels": "parcels.geojson",
     "streets": "streets.geojson",
     "split_lines": "split_lines.geojson",
+    "partition_lines": "partition_lines.geojson",
     "manifest": "manifest.json",
 }
 
@@ -116,6 +117,7 @@ def write_strict_chen_artifacts(
     layout = _layout(generated)
     boundary = _boundary(generated)
     split_lines = _split_lines(generated)
+    partition_lines = _partition_lines(generated)
 
     metrics = _artifact_metrics(generated, boundary, layout)
     _write_json(out_dir / ARTIFACT_FILES["metrics"], metrics)
@@ -156,6 +158,23 @@ def write_strict_chen_artifacts(
             ]
         ),
     )
+    _write_json(
+        out_dir / ARTIFACT_FILES["partition_lines"],
+        _feature_collection(
+            [
+                _geom_feature(
+                    line,
+                    {
+                        "kind": "partition_line",
+                        "split_id": split_id,
+                        "level": level,
+                        "point_count": len(line.coords),
+                    },
+                )
+                for split_id, (level, line) in enumerate(partition_lines, start=1)
+            ]
+        ),
+    )
 
     _render_svg(
         out_dir / ARTIFACT_FILES["svg"], _name(generated), boundary, layout, split_lines
@@ -192,6 +211,30 @@ def _split_lines(generated: GeneratedChenLayout) -> list[LineString]:
         if line is not None and len(line.coords) >= 2 and line.length > 1e-12:
             lines.append(line)
     return lines
+
+
+def _partition_lines(
+    generated: GeneratedChenLayout,
+) -> list[tuple[int, LineString]]:
+    """Return (level, LineString) pairs from GeneratedChenLayout.partition_lines.
+
+    If partition_lines is not available (e.g. stub objects in tests), falls back
+    to split_lines with level=0.
+    """
+    raw = getattr(generated, "partition_lines", None)
+    if raw is not None:
+        result: list[tuple[int, LineString]] = []
+        for item in raw:
+            try:
+                level, line = item
+                line = _as_linestring(line)
+                if line is not None and len(line.coords) >= 2 and line.length > 1e-12:
+                    result.append((int(level), line))
+            except (TypeError, ValueError):
+                pass
+        return result
+    # Fallback: use split_lines with level 0
+    return [(0, line) for line in _split_lines(generated)]
 
 
 def _as_linestring(value: Any) -> LineString | None:
@@ -241,6 +284,31 @@ def _artifact_metrics(
         "diagnostic_metric_pass": report.diagnostic_metric_pass,
         "metrics": report.metrics,
     }
+
+    # Add compare_to_paper output for the three canonical shapes.
+    boundary_name = metrics.get("boundary_name", metrics.get("boundary", ""))
+    shape_to_paper_key = {
+        "square": "rect",
+        "oval": "ellipse",
+        "triangle": "triangle",
+    }
+    paper_key = shape_to_paper_key.get(str(boundary_name))
+    if paper_key is not None:
+        try:
+            from mapgen.chen_metrics import compare_to_paper
+
+            comparator_metrics = dict(metrics)
+            comparator_metrics.setdefault(
+                "boundary_perimeter_world", float(boundary.length)
+            )
+            metrics["compare_to_paper"] = compare_to_paper(
+                comparator_metrics, paper_key
+            )
+        except Exception as exc:  # noqa: BLE001
+            metrics["compare_to_paper"] = {"error": str(exc)}
+    else:
+        metrics["compare_to_paper"] = None
+
     return _json_ready(metrics)
 
 
@@ -392,696 +460,133 @@ def _manifest(
         "layout": "chen-strict",
         "artifact_version": 1,
         "name": _name(generated),
-        "summary": {
-            "parcel_count": metrics.get("parcel_count", 0),
-            "street_edge_count": metrics.get("street_edge_count", 0),
-            "corner_graph_edge_count": metrics.get("corner_graph_edge_count", 0),
-            "street_edge_density": metrics.get("street_edge_density", 0.0),
-            "generation_stage": metrics.get("generation_stage", "unknown"),
-            "implementation_stage": metrics.get("implementation_stage", "unknown"),
-            "boundary_contour_fidelity_stage": metrics.get(
-                "boundary_contour_fidelity_stage", "unknown"
-            ),
-            "oval_boundary_vertex_count": metrics.get("oval_boundary_vertex_count", 0),
-            "oval_boundary_normalized_radial_error_max": metrics.get(
-                "oval_boundary_normalized_radial_error_max", 0.0
-            ),
-            "oval_boundary_normalized_radial_error_mean": metrics.get(
-                "oval_boundary_normalized_radial_error_mean", 0.0
-            ),
-            "oval_boundary_radial_error_max": metrics.get(
-                "oval_boundary_radial_error_max", 0.0
-            ),
-            "oval_boundary_radial_error_mean": metrics.get(
-                "oval_boundary_radial_error_mean", 0.0
-            ),
-            "streamline_field_stage": metrics.get("streamline_field_stage", "unknown"),
-            "streamline_field_scope": metrics.get("streamline_field_scope", "unknown"),
-            "streamline_config_mode": metrics.get("streamline_config_mode", "unknown"),
-            "streamline_config_field_mode": metrics.get(
-                "streamline_config_field_mode", "unknown"
-            ),
-            "streamline_config_candidate_seed_mode": metrics.get(
-                "streamline_config_candidate_seed_mode", "unknown"
-            ),
-            "streamline_config_score_mode": metrics.get(
-                "streamline_config_score_mode", "unknown"
-            ),
-            "street_selection_mode": metrics.get("street_selection_mode", "unknown"),
-            "split_line_count": metrics.get("split_line_count", 0),
-            "axis_aligned_split_line_count": metrics.get(
-                "axis_aligned_split_line_count", 0
-            ),
-            "curved_split_line_count": metrics.get("curved_split_line_count", 0),
-            "non_axis_aligned_split_segment_count": metrics.get(
-                "non_axis_aligned_split_segment_count", 0
-            ),
-            "non_axis_aligned_street_segment_count": metrics.get(
-                "non_axis_aligned_street_segment_count", 0
-            ),
-            "max_mesh_axis_deviation": metrics.get("max_mesh_axis_deviation", 0.0),
-            "max_split_axis_deviation": metrics.get("max_split_axis_deviation", 0.0),
-            "max_street_axis_deviation": metrics.get("max_street_axis_deviation", 0.0),
-            "mean_mesh_axis_deviation": metrics.get("mean_mesh_axis_deviation", 0.0),
-            "mean_split_axis_deviation": metrics.get("mean_split_axis_deviation", 0.0),
-            "mean_street_axis_deviation": metrics.get(
-                "mean_street_axis_deviation", 0.0
-            ),
-            "streamline_candidate_count": metrics.get("streamline_candidate_count", 0),
-            "accepted_streamline_candidate_count": metrics.get(
-                "accepted_streamline_candidate_count", 0
-            ),
-            "accepted_streamline_continuation_split_count": metrics.get(
-                "accepted_streamline_continuation_split_count", 0
-            ),
-            "accepted_axis_fallback_split_count": metrics.get(
-                "accepted_axis_fallback_split_count", 0
-            ),
-            "candidate_split_reject_count": metrics.get(
-                "candidate_split_reject_count", 0
-            ),
-            "candidate_topology_reject_count": metrics.get(
-                "candidate_topology_reject_count", 0
-            ),
-            "path_access_score_count": metrics.get("path_access_score_count", 0),
-            "path_access_score_fallback_count": metrics.get(
-                "path_access_score_fallback_count", 0
-            ),
-            "accepted_streamline_field_mode_counts": metrics.get(
-                "accepted_streamline_field_mode_counts", {}
-            ),
-            "accepted_streamline_trace_seed_source_counts": metrics.get(
-                "accepted_streamline_trace_seed_source_counts", {}
-            ),
-            "accepted_streamline_score_mode_counts": metrics.get(
-                "accepted_streamline_score_mode_counts", {}
-            ),
-            "accepted_streamline_yang_score_count": metrics.get(
-                "accepted_streamline_yang_score_count", 0
-            ),
-            "accepted_streamline_score_approximation_scopes": metrics.get(
-                "accepted_streamline_score_approximation_scopes", []
-            ),
-            "accepted_streamline_score_div_min": metrics.get(
-                "accepted_streamline_score_div_min", 0.0
-            ),
-            "accepted_streamline_score_div_mean": metrics.get(
-                "accepted_streamline_score_div_mean", 0.0
-            ),
-            "accepted_streamline_score_div_max": metrics.get(
-                "accepted_streamline_score_div_max", 0.0
-            ),
-            "accepted_streamline_score_db_min": metrics.get(
-                "accepted_streamline_score_db_min", 0.0
-            ),
-            "accepted_streamline_score_db_mean": metrics.get(
-                "accepted_streamline_score_db_mean", 0.0
-            ),
-            "accepted_streamline_score_db_max": metrics.get(
-                "accepted_streamline_score_db_max", 0.0
-            ),
-            "accepted_streamline_score_ds_min": metrics.get(
-                "accepted_streamline_score_ds_min", 0.0
-            ),
-            "accepted_streamline_score_ds_mean": metrics.get(
-                "accepted_streamline_score_ds_mean", 0.0
-            ),
-            "accepted_streamline_score_ds_max": metrics.get(
-                "accepted_streamline_score_ds_max", 0.0
-            ),
-            "accepted_streamline_score_ct_min": metrics.get(
-                "accepted_streamline_score_ct_min", 0.0
-            ),
-            "accepted_streamline_score_ct_mean": metrics.get(
-                "accepted_streamline_score_ct_mean", 0.0
-            ),
-            "accepted_streamline_score_ct_max": metrics.get(
-                "accepted_streamline_score_ct_max", 0.0
-            ),
-            "accepted_streamline_score_total_normalized_min": metrics.get(
-                "accepted_streamline_score_total_normalized_min", 0.0
-            ),
-            "accepted_streamline_score_total_normalized_mean": metrics.get(
-                "accepted_streamline_score_total_normalized_mean", 0.0
-            ),
-            "accepted_streamline_score_total_normalized_max": metrics.get(
-                "accepted_streamline_score_total_normalized_max", 0.0
-            ),
-            "accepted_streamline_trace_mesh_interior_seed_count_min": metrics.get(
-                "accepted_streamline_trace_mesh_interior_seed_count_min", 0.0
-            ),
-            "accepted_streamline_trace_mesh_interior_seed_count_mean": metrics.get(
-                "accepted_streamline_trace_mesh_interior_seed_count_mean", 0.0
-            ),
-            "accepted_streamline_trace_mesh_interior_seed_count_max": metrics.get(
-                "accepted_streamline_trace_mesh_interior_seed_count_max", 0.0
-            ),
-            "accepted_streamline_field_mesh_kinds": metrics.get(
-                "accepted_streamline_field_mesh_kinds", []
-            ),
-            "accepted_streamline_field_mesh_vertex_count_min": metrics.get(
-                "accepted_streamline_field_mesh_vertex_count_min", 0.0
-            ),
-            "accepted_streamline_field_mesh_vertex_count_mean": metrics.get(
-                "accepted_streamline_field_mesh_vertex_count_mean", 0.0
-            ),
-            "accepted_streamline_field_mesh_vertex_count_max": metrics.get(
-                "accepted_streamline_field_mesh_vertex_count_max", 0.0
-            ),
-            "accepted_streamline_field_mesh_retained_vertex_count_min": metrics.get(
-                "accepted_streamline_field_mesh_retained_vertex_count_min", 0.0
-            ),
-            "accepted_streamline_field_mesh_retained_vertex_count_mean": metrics.get(
-                "accepted_streamline_field_mesh_retained_vertex_count_mean", 0.0
-            ),
-            "accepted_streamline_field_mesh_retained_vertex_count_max": metrics.get(
-                "accepted_streamline_field_mesh_retained_vertex_count_max", 0.0
-            ),
-            "accepted_streamline_field_mesh_triangle_count_min": metrics.get(
-                "accepted_streamline_field_mesh_triangle_count_min", 0.0
-            ),
-            "accepted_streamline_field_mesh_triangle_count_mean": metrics.get(
-                "accepted_streamline_field_mesh_triangle_count_mean", 0.0
-            ),
-            "accepted_streamline_field_mesh_triangle_count_max": metrics.get(
-                "accepted_streamline_field_mesh_triangle_count_max", 0.0
-            ),
-            "accepted_streamline_field_b_approximation_scopes": metrics.get(
-                "accepted_streamline_field_b_approximation_scopes", []
-            ),
-            "accepted_streamline_field_b_boundary_anchor_methods": metrics.get(
-                "accepted_streamline_field_b_boundary_anchor_methods", []
-            ),
-            "accepted_streamline_field_b_boundary_alignment_weight_min": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_weight_min", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_alignment_weight_mean": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_weight_mean", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_alignment_weight_max": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_weight_max", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_anchor_count_min": metrics.get(
-                "accepted_streamline_field_b_boundary_anchor_count_min", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_anchor_count_mean": metrics.get(
-                "accepted_streamline_field_b_boundary_anchor_count_mean", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_anchor_count_max": metrics.get(
-                "accepted_streamline_field_b_boundary_anchor_count_max", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_alignment_error_min": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_error_min", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_alignment_error_mean": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_error_mean", 0.0
-            ),
-            "accepted_streamline_field_b_boundary_alignment_error_max": metrics.get(
-                "accepted_streamline_field_b_boundary_alignment_error_max", 0.0
-            ),
-            "accepted_streamline_field_b_smoothness_energy_min": metrics.get(
-                "accepted_streamline_field_b_smoothness_energy_min", 0.0
-            ),
-            "accepted_streamline_field_b_smoothness_energy_mean": metrics.get(
-                "accepted_streamline_field_b_smoothness_energy_mean", 0.0
-            ),
-            "accepted_streamline_field_b_smoothness_energy_max": metrics.get(
-                "accepted_streamline_field_b_smoothness_energy_max", 0.0
-            ),
-            "accepted_streamline_field_b_solver_residual_max": metrics.get(
-                "accepted_streamline_field_b_solver_residual_max", 0.0
-            ),
-            "street_topology_reachability_pass": metrics.get(
-                "street_topology_reachability_pass", False
-            ),
-            "deprecated_chen_street_generation_pass_alias": metrics.get(
-                "deprecated_chen_street_generation_pass_alias", False
-            ),
-            "chen_street_generation_scope": metrics.get(
-                "chen_street_generation_scope", "unknown"
-            ),
-            "corner_graph_t_junction_count": metrics.get(
-                "corner_graph_t_junction_count", 0
-            ),
-            "corner_graph_four_way_intersection_count": metrics.get(
-                "corner_graph_four_way_intersection_count", 0
-            ),
-            "corner_graph_t_junction_ratio": metrics.get(
-                "corner_graph_t_junction_ratio", 0.0
-            ),
-            "corner_graph_four_way_intersection_ratio": metrics.get(
-                "corner_graph_four_way_intersection_ratio", 0.0
-            ),
-            "interior_corner_graph_t_junction_count": metrics.get(
-                "interior_corner_graph_t_junction_count", 0
-            ),
-            "interior_corner_graph_four_way_intersection_count": metrics.get(
-                "interior_corner_graph_four_way_intersection_count", 0
-            ),
-            "boundary_corner_graph_t_junction_count": metrics.get(
-                "boundary_corner_graph_t_junction_count", 0
-            ),
-            "boundary_corner_graph_four_way_intersection_count": metrics.get(
-                "boundary_corner_graph_four_way_intersection_count", 0
-            ),
-            "street_t_junction_count": metrics.get("street_t_junction_count", 0),
-            "street_four_way_intersection_count": metrics.get(
-                "street_four_way_intersection_count", 0
-            ),
-            "street_t_junction_ratio": metrics.get("street_t_junction_ratio", 0.0),
-            "street_four_way_intersection_ratio": metrics.get(
-                "street_four_way_intersection_ratio", 0.0
-            ),
-            "interior_street_t_junction_count": metrics.get(
-                "interior_street_t_junction_count", 0
-            ),
-            "interior_street_four_way_intersection_count": metrics.get(
-                "interior_street_four_way_intersection_count", 0
-            ),
-            "boundary_street_t_junction_count": metrics.get(
-                "boundary_street_t_junction_count", 0
-            ),
-            "boundary_street_four_way_intersection_count": metrics.get(
-                "boundary_street_four_way_intersection_count", 0
-            ),
-            "rectangular_interior_t_junction_points_sample": metrics.get(
-                "rectangular_interior_t_junction_points_sample", []
-            ),
-            "chen_fig7_short_edge_detection_stage": metrics.get(
-                "chen_fig7_short_edge_detection_stage", "unknown"
-            ),
-            "chen_fig7_short_edge_cleanup_stage": metrics.get(
-                "chen_fig7_short_edge_cleanup_stage", "unknown"
-            ),
-            "chen_fig7_short_edge_cleanup_applied": metrics.get(
-                "chen_fig7_short_edge_cleanup_applied", False
-            ),
-            "chen_fig7_short_edge_cleanup_scope": metrics.get(
-                "chen_fig7_short_edge_cleanup_scope", "unknown"
-            ),
-            "chen_fig7_short_edge_cleanup_blocking_reason": metrics.get(
-                "chen_fig7_short_edge_cleanup_blocking_reason", "unknown"
-            ),
-            "chen_fig7_short_edge_cleanup_has_labeled_approximations": metrics.get(
-                "chen_fig7_short_edge_cleanup_has_labeled_approximations", False
-            ),
-            "chen_fig7_short_edge_cleanup_labeled_approximation_reasons": metrics.get(
-                "chen_fig7_short_edge_cleanup_labeled_approximation_reasons", []
-            ),
-            "chen_fig7_short_edge_cleanup_applied_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_applied_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_midpoint_merge_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_midpoint_merge_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_boundary_projected_merge_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_boundary_projected_merge_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_merge_point_modes": metrics.get(
-                "chen_fig7_short_edge_cleanup_merge_point_modes", []
-            ),
-            "chen_fig7_short_edge_cleanup_boundary_projection_distance_min": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_boundary_projection_distance_min",
-                    0.0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_boundary_projection_distance_mean": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_boundary_projection_distance_mean",
-                    0.0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_boundary_projection_distance_max": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_boundary_projection_distance_max",
-                    0.0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_stage": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_stage",
-                    "unknown",
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_applied_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_applied_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_parcel_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_parcel_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_parcel_ids_sample": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_full_mesh_ring_retention_parcel_ids_sample",
-                    [],
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_unique_candidate_stage": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_unique_candidate_stage", "unknown"
-            ),
-            "chen_fig7_short_edge_cleanup_failed_unique_candidate_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_unique_candidate_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_duplicate_attempt_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_duplicate_attempt_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_unique_candidate_counts_by_detail": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_unique_candidate_counts_by_detail",
-                    {},
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_reasons": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_reasons", []
-            ),
-            "chen_fig7_short_edge_cleanup_failed_details": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_details", []
-            ),
-            "chen_fig7_short_edge_cleanup_failed_overlap_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_overlap_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_invalid_polygon_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_invalid_polygon_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_sliver_or_corner_loss_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_sliver_or_corner_loss_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_boundary_coverage_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_boundary_coverage_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_conforming_graph_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_conforming_graph_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_failed_degenerate_ring_after_merge_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_degenerate_ring_after_merge_count",
-                    0,
-                )
-            ),
-            (
-                "chen_fig7_short_edge_cleanup_failed_fig7_motif_ineligible_"
-                "non_candidate_parcel_ring_after_merge_count"
-            ): metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_fig7_motif_ineligible_"
-                "non_candidate_parcel_ring_after_merge_count",
-                0,
-            ),
-            "chen_fig7_short_edge_cleanup_failed_non_simple_ring_after_merge_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_non_simple_ring_after_merge_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_count",
-                    0,
-                )
-            ),
-            (
-                "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_"
-                "due_other_shared_edges_count"
-            ): metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_candidate_pair_still_adjacent_"
-                "due_other_shared_edges_count",
-                0,
-            ),
-            "chen_fig7_short_edge_cleanup_failed_nonlocal_neighbor_delta_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_failed_nonlocal_neighbor_delta_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_skipped_boundary_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_skipped_boundary_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_pre_candidate_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_pre_candidate_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_post_candidate_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_post_candidate_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_pre_attached_t_junction_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_pre_attached_t_junction_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_post_attached_t_junction_count": metrics.get(
-                "chen_fig7_short_edge_cleanup_post_attached_t_junction_count", 0
-            ),
-            "chen_fig7_short_edge_cleanup_pre_unexplained_t_junction_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_pre_unexplained_t_junction_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_post_unexplained_t_junction_count": (
-                metrics.get(
-                    "chen_fig7_short_edge_cleanup_post_unexplained_t_junction_count",
-                    0,
-                )
-            ),
-            "chen_fig7_short_edge_cleanup_failed_samples": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_samples", []
-            ),
-            "chen_fig7_short_edge_cleanup_failed_samples_by_detail": metrics.get(
-                "chen_fig7_short_edge_cleanup_failed_samples_by_detail", {}
-            ),
-            "chen_fig7_short_shared_edge_candidate_count": metrics.get(
-                "chen_fig7_short_shared_edge_candidate_count", 0
-            ),
-            "chen_fig7_short_shared_edge_length_min": metrics.get(
-                "chen_fig7_short_shared_edge_length_min", 0.0
-            ),
-            "chen_fig7_short_shared_edge_length_mean": metrics.get(
-                "chen_fig7_short_shared_edge_length_mean", 0.0
-            ),
-            "chen_fig7_short_shared_edge_length_max": metrics.get(
-                "chen_fig7_short_shared_edge_length_max", 0.0
-            ),
-            "chen_fig7_short_shared_edge_threshold_max": metrics.get(
-                "chen_fig7_short_shared_edge_threshold_max", 0.0
-            ),
-            "chen_fig7_short_shared_edge_length_threshold_ratio_max": metrics.get(
-                "chen_fig7_short_shared_edge_length_threshold_ratio_max", 0.0
-            ),
-            "chen_fig7_raw_interior_t_junction_count": metrics.get(
-                "chen_fig7_raw_interior_t_junction_count", 0
-            ),
-            "chen_fig7_short_edge_attached_interior_t_junction_count": metrics.get(
-                "chen_fig7_short_edge_attached_interior_t_junction_count", 0
-            ),
-            "chen_fig7_unexplained_interior_t_junction_count": metrics.get(
-                "chen_fig7_unexplained_interior_t_junction_count", 0
-            ),
-            "chen_fig7_unexplained_t_junction_classification_stage": metrics.get(
-                "chen_fig7_unexplained_t_junction_classification_stage",
-                "unknown",
-            ),
-            (
-                "chen_fig7_unexplained_straight_through_side_insertion_t_junction_count"
-            ): (
-                metrics.get(
-                    "chen_fig7_unexplained_straight_through_side_insertion_t_junction_count",
-                    0,
-                )
-            ),
-            ("chen_fig7_unexplained_kinked_split_topology_debt_t_junction_count"): (
-                metrics.get(
-                    "chen_fig7_unexplained_kinked_split_topology_debt_t_junction_count",
-                    0,
-                )
-            ),
-            "chen_fig7_unexplained_t_junction_split_provenance_stage": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_provenance_stage",
-                "unknown",
-            ),
-            "chen_fig7_unexplained_t_junction_split_provenance_scope": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_provenance_scope",
-                "unknown",
-            ),
-            "chen_fig7_unexplained_t_junction_split_provenance_tolerance": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_provenance_tolerance",
-                0.0,
-            ),
-            "chen_fig7_unexplained_t_junction_split_endpoint_count": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_endpoint_count"
-            ),
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_count": metrics.get(
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_count"
-            ),
-            "chen_fig7_unexplained_t_junction_split_unknown_count": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_unknown_count"
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_split_endpoint_straight_through_count"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_split_endpoint_straight_through_count"
-            ),
-            "chen_fig7_unexplained_t_junction_split_endpoint_kinked_count": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_split_endpoint_kinked_count"
-                )
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-                "straight_through_count"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_straight_through_count"
-            ),
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_kinked_count": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_lies_on_split_line_kinked_count"
-                )
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_split_unknown_straight_through_count"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_split_unknown_straight_through_count"
-            ),
-            "chen_fig7_unexplained_t_junction_split_unknown_kinked_count": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_split_unknown_kinked_count"
-                )
-            ),
-            "chen_fig7_unexplained_t_junction_split_endpoint_source_counts": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_split_endpoint_source_counts",
-                    {},
-                )
-            ),
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_source_counts": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_lies_on_split_line_source_counts",
-                    {},
-                )
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_split_endpoint_"
-                "straight_through_source_counts"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_split_endpoint_"
-                "straight_through_source_counts",
-                {},
-            ),
-            "chen_fig7_unexplained_t_junction_split_endpoint_kinked_source_counts": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_split_endpoint_kinked_source_counts",
-                    {},
-                )
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-                "straight_through_source_counts"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-                "straight_through_source_counts",
-                {},
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-                "kinked_source_counts"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_lies_on_split_line_"
-                "kinked_source_counts",
-                {},
-            ),
-            (
-                "chen_fig7_unexplained_t_junction_split_unknown_"
-                "straight_through_source_counts"
-            ): metrics.get(
-                "chen_fig7_unexplained_t_junction_split_unknown_"
-                "straight_through_source_counts",
-                {},
-            ),
-            "chen_fig7_unexplained_t_junction_split_unknown_kinked_source_counts": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_split_unknown_kinked_source_counts",
-                    {},
-                )
-            ),
-            "chen_fig7_short_shared_edge_samples": metrics.get(
-                "chen_fig7_short_shared_edge_samples", []
-            ),
-            "chen_fig7_short_edge_attached_interior_t_junction_points_sample": (
-                metrics.get(
-                    "chen_fig7_short_edge_attached_interior_t_junction_points_sample",
-                    [],
-                )
-            ),
-            "chen_fig7_unexplained_interior_t_junction_points_sample": metrics.get(
-                "chen_fig7_unexplained_interior_t_junction_points_sample", []
-            ),
-            (
-                "chen_fig7_unexplained_straight_through_side_insertion_"
-                "t_junction_points_sample"
-            ): (
-                metrics.get(
-                    "chen_fig7_unexplained_straight_through_side_insertion_t_junction_points_sample",
-                    [],
-                )
-            ),
-            (
-                "chen_fig7_unexplained_kinked_split_topology_debt_"
-                "t_junction_points_sample"
-            ): (
-                metrics.get(
-                    "chen_fig7_unexplained_kinked_split_topology_debt_t_junction_points_sample",
-                    [],
-                )
-            ),
-            "chen_fig7_unexplained_t_junction_split_endpoint_samples": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_endpoint_samples", []
-            ),
-            "chen_fig7_unexplained_t_junction_lies_on_split_line_samples": (
-                metrics.get(
-                    "chen_fig7_unexplained_t_junction_lies_on_split_line_samples", []
-                )
-            ),
-            "chen_fig7_unexplained_t_junction_split_unknown_samples": metrics.get(
-                "chen_fig7_unexplained_t_junction_split_unknown_samples", []
-            ),
-            "optimization_stage": metrics.get("optimization_stage", "unknown"),
-            "optimization_applied": metrics.get("optimization_applied", False),
-            "optimization_geometry_changed": metrics.get(
-                "optimization_geometry_changed", False
-            ),
-            "optimization_accepted_iteration_count": metrics.get(
-                "optimization_accepted_iteration_count", 0
-            ),
-            "optimization_energy_before": metrics.get("optimization_energy_before", 0),
-            "optimization_energy_after": metrics.get("optimization_energy_after", 0),
-            **_summary_metric_defaults(
-                metrics, _OPTIMIZATION_REGULARITY_SUMMARY_DEFAULTS
-            ),
-            "street_generation_diagnostics": metrics.get(
-                "street_generation_diagnostics", {}
-            ),
-            "paper_invariant_pass": metrics.get("strict_invariants", {}).get(
-                "paper_invariant_pass", False
-            ),
-            "geometry_valid_pass": metrics.get("strict_invariants", {}).get(
-                "geometry_valid_pass", False
-            ),
-        },
+        "summary": _slimmed_summary(metrics),
         "files": dict(ARTIFACT_FILES),
     }
+
+
+def _slimmed_summary(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Build the slimmed summary dict for manifest.json.
+
+    Keeps: Table-1 metric keys, invariant passes, generation_stage,
+    streamline_config_* fields, oval contour metrics,
+    optimization_* (including optimization_regularity_*).
+    Drops: chen_fig7_* cleanup diagnostic sprawl, accepted_streamline_* score
+    diagnostic sprawl, axis-deviation/degree-metric/rectangular blocks.
+    """
+    s: dict[str, Any] = {}
+
+    # --- core parcel/layout counts ---
+    s["parcel_count"] = metrics.get("parcel_count", 0)
+    s["street_edge_count"] = metrics.get("street_edge_count", 0)
+    s["corner_graph_edge_count"] = metrics.get("corner_graph_edge_count", 0)
+    s["street_edge_density"] = metrics.get("street_edge_density", 0.0)
+    s["split_line_count"] = metrics.get("split_line_count", 0)
+    s["interpolation_edge_count"] = metrics.get("interpolation_edge_count", 0)
+    # Note: interpolation_edges not yet plumbed to GeoJSON layer (deferred).
+
+    # --- generation provenance ---
+    s["generation_stage"] = metrics.get("generation_stage", "unknown")
+    s["boundary"] = metrics.get("boundary", "unknown")
+    s["boundary_name"] = metrics.get("boundary_name", "unknown")
+    s["boundary_area"] = metrics.get("boundary_area", 0.0)
+    s["boundary_perimeter_world"] = metrics.get("boundary_perimeter_world", 0.0)
+    s["requested_parcel_count"] = metrics.get("requested_parcel_count")
+    s["min_parcel_area"] = metrics.get("min_parcel_area", 0.0)
+    s["seed"] = metrics.get("seed", 0)
+    s["max_hierarchical_level"] = metrics.get("max_hierarchical_level", 0)
+    s["level_count"] = metrics.get("level_count", 0)
+    s["accepted_split_count"] = metrics.get("accepted_split_count", 0)
+    s["weld_applied_count"] = metrics.get("weld_applied_count", 0)
+    s["weld_rejected_count"] = metrics.get("weld_rejected_count", 0)
+
+    # --- streamline config ---
+    s["streamline_config_mode"] = metrics.get("streamline_config_mode", "unknown")
+    s["streamline_config_field_mode"] = metrics.get(
+        "streamline_config_field_mode", "unknown"
+    )
+    s["streamline_config_candidate_seed_mode"] = metrics.get(
+        "streamline_config_candidate_seed_mode", "unknown"
+    )
+    s["streamline_config_score_mode"] = metrics.get(
+        "streamline_config_score_mode", "unknown"
+    )
+    s["street_selection_mode"] = metrics.get("street_selection_mode", "unknown")
+
+    # --- Table-1 paper metrics ---
+    s["parcel_tri_count"] = metrics.get("parcel_tri_count", 0)
+    s["parcel_quad_count"] = metrics.get("parcel_quad_count", 0)
+    s["parcel_pent_count"] = metrics.get("parcel_pent_count", 0)
+    s["parcel_hex_count"] = metrics.get("parcel_hex_count", 0)
+    s["parcel_hept_count"] = metrics.get("parcel_hept_count", 0)
+    s["parcel_other_count"] = metrics.get("parcel_other_count", 0)
+    s["parcel_total_count"] = metrics.get("parcel_total_count", 0)
+    s["parcel_quad_fraction"] = metrics.get("parcel_quad_fraction", 0.0)
+    s["irregularity_min"] = metrics.get("irregularity_min", 0.0)
+    s["irregularity_max"] = metrics.get("irregularity_max", 0.0)
+    s["irregularity_avg"] = metrics.get("irregularity_avg", 0.0)
+    s["street_count"] = metrics.get("street_count", 0)
+    s["street_junction_count"] = metrics.get("street_junction_count", 0)
+    s["street_end_count"] = metrics.get("street_end_count", 0)
+    s["street_length_total"] = metrics.get("street_length_total", 0.0)
+    s["street_length_avg"] = metrics.get("street_length_avg", 0.0)
+    s["junction_angle_dev_from_90_avg"] = metrics.get(
+        "junction_angle_dev_from_90_avg", 0.0
+    )
+
+    # --- invariant passes ---
+    s["paper_invariant_pass"] = metrics.get("strict_invariants", {}).get(
+        "paper_invariant_pass", False
+    )
+    s["geometry_valid_pass"] = metrics.get("strict_invariants", {}).get(
+        "geometry_valid_pass", False
+    )
+    s["street_topology_reachability_pass"] = metrics.get(
+        "street_topology_reachability_pass", False
+    )
+
+    # --- oval boundary contour metrics ---
+    s["boundary_contour_fidelity_stage"] = metrics.get(
+        "boundary_contour_fidelity_stage", "unknown"
+    )
+    s["oval_boundary_vertex_count"] = metrics.get("oval_boundary_vertex_count", 0)
+    s["oval_boundary_normalized_radial_error_max"] = metrics.get(
+        "oval_boundary_normalized_radial_error_max", 0.0
+    )
+    s["oval_boundary_normalized_radial_error_mean"] = metrics.get(
+        "oval_boundary_normalized_radial_error_mean", 0.0
+    )
+    s["oval_boundary_radial_error_max"] = metrics.get(
+        "oval_boundary_radial_error_max", 0.0
+    )
+    s["oval_boundary_radial_error_mean"] = metrics.get(
+        "oval_boundary_radial_error_mean", 0.0
+    )
+
+    # --- optimization ---
+    s["optimization_stage"] = metrics.get("optimization_stage", "unknown")
+    s["optimization_applied"] = metrics.get("optimization_applied", False)
+    s["optimization_layout_used"] = metrics.get("optimization_layout_used", False)
+    s["optimization_geometry_changed"] = metrics.get(
+        "optimization_geometry_changed", False
+    )
+    s["optimization_accepted_iteration_count"] = metrics.get(
+        "optimization_accepted_iteration_count", 0
+    )
+    s["optimization_energy_before"] = metrics.get("optimization_energy_before", 0.0)
+    s["optimization_energy_after"] = metrics.get("optimization_energy_after", 0.0)
+    s.update(
+        _summary_metric_defaults(metrics, _OPTIMIZATION_REGULARITY_SUMMARY_DEFAULTS)
+    )
+
+    # --- timing ---
+    s["generation_seconds"] = metrics.get("generation_seconds", 0.0)
+    s["optimization_seconds"] = metrics.get("optimization_seconds", 0.0)
+
+    # --- compare_to_paper ---
+    s["compare_to_paper"] = metrics.get("compare_to_paper")
+
+    return s
 
 
 def _summary_metric_defaults(

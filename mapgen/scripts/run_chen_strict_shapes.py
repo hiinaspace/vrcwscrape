@@ -32,22 +32,45 @@ def _load_generate_named_layout() -> Callable[..., Any]:
     return generate_named_layout
 
 
+def _load_generate_layout_for_boundary() -> Callable[..., Any]:
+    try:
+        from mapgen.chen_generate import generate_layout_for_boundary
+    except ModuleNotFoundError as exc:
+        if exc.name == "mapgen.chen_generate":
+            raise SystemExit(
+                "mapgen.chen_generate is not available yet; run this after the "
+                "strict Chen generation slice lands."
+            ) from exc
+        raise
+    return generate_layout_for_boundary
+
+
+def _load_boundary_preset() -> Callable[..., Any]:
+    from mapgen.chen_generate import boundary_preset
+
+    return boundary_preset
+
+
 def run_shapes(
     *,
     out_dir: Path,
-    parcel_count: int,
+    parcel_count: int | None = None,
+    min_parcel_area: float | None = None,
     seed: int,
     width: float,
     height: float,
     streamline_mode: str = "baseline",
 ) -> dict[str, Any]:
-    generate_named_layout = _load_generate_named_layout()
+    if (parcel_count is None) == (min_parcel_area is None):
+        raise ValueError("provide exactly one of parcel_count or min_parcel_area")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = {
         "layout": "chen-strict-shape-suite",
         "shapes": [],
         "parameters": {
             "parcel_count": parcel_count,
+            "min_parcel_area": min_parcel_area,
             "seed": seed,
             "width": width,
             "height": height,
@@ -55,26 +78,53 @@ def run_shapes(
         },
         "limitations": _limitations(streamline_mode),
     }
-    for index, name in enumerate(SHAPES):
-        generated = generate_named_layout(
-            name,
-            parcel_count=parcel_count,
-            seed=seed + index,
-            width=width,
-            height=height,
-            streamline_mode=streamline_mode,
-        )
-        shape_dir = out_dir / name
-        artifacts = write_strict_chen_artifacts(generated, shape_dir)
-        manifest["shapes"].append(
-            {
-                "name": name,
-                "seed": seed + index,
-                "dir": shape_dir.name,
-                "files": artifacts["files"],
-                "summary": artifacts["summary"],
-            }
-        )
+
+    if min_parcel_area is not None:
+        generate_layout_for_boundary = _load_generate_layout_for_boundary()
+        boundary_preset = _load_boundary_preset()
+        for index, name in enumerate(SHAPES):
+            bp = boundary_preset(name, width=width, height=height)
+            generated = generate_layout_for_boundary(
+                bp,
+                min_parcel_area=min_parcel_area,
+                seed=seed + index,
+                streamline_mode=streamline_mode,
+            )
+            shape_dir = out_dir / name
+            artifacts = write_strict_chen_artifacts(generated, shape_dir)
+            manifest["shapes"].append(
+                {
+                    "name": name,
+                    "seed": seed + index,
+                    "dir": shape_dir.name,
+                    "files": artifacts["files"],
+                    "summary": artifacts["summary"],
+                }
+            )
+    else:
+        generate_named_layout = _load_generate_named_layout()
+        assert parcel_count is not None
+        for index, name in enumerate(SHAPES):
+            generated = generate_named_layout(
+                name,
+                parcel_count=parcel_count,
+                seed=seed + index,
+                width=width,
+                height=height,
+                streamline_mode=streamline_mode,
+            )
+            shape_dir = out_dir / name
+            artifacts = write_strict_chen_artifacts(generated, shape_dir)
+            manifest["shapes"].append(
+                {
+                    "name": name,
+                    "seed": seed + index,
+                    "dir": shape_dir.name,
+                    "files": artifacts["files"],
+                    "summary": artifacts["summary"],
+                }
+            )
+
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -91,7 +141,17 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/chen_strict_shapes"),
         help="output directory for shape subdirectories",
     )
-    parser.add_argument("--parcel-count", type=int, default=48)
+    count_group = parser.add_mutually_exclusive_group()
+    count_group.add_argument("--parcel-count", type=int, default=None)
+    count_group.add_argument(
+        "--min-parcel-area",
+        type=float,
+        default=None,
+        help=(
+            "minimum parcel area in world units (mutually exclusive with "
+            "--parcel-count); bypasses the count-based convenience mapping"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=float, default=180.0)
     parser.add_argument("--height", type=float, default=140.0)
@@ -128,9 +188,15 @@ def _limitations(streamline_mode: str) -> list[str]:
 
 def main() -> None:
     args = parse_args()
+    # If neither is specified, default to parcel_count=48
+    parcel_count = args.parcel_count
+    min_parcel_area = args.min_parcel_area
+    if parcel_count is None and min_parcel_area is None:
+        parcel_count = 48
     manifest = run_shapes(
         out_dir=args.out_dir,
-        parcel_count=args.parcel_count,
+        parcel_count=parcel_count,
+        min_parcel_area=min_parcel_area,
         seed=args.seed,
         width=args.width,
         height=args.height,
