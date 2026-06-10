@@ -25,16 +25,14 @@ hierarchical level with the street network that already exists at that level:
 4. Optionally avoid cul-de-sacs by connecting each street end back to the
    network with the same weighted shortest path.
 
-The primary entry point is :func:`extend_street_network`. The legacy
-:func:`generate_street_network` is a thin deprecated wrapper that seeds the
-boundary ring and calls :func:`extend_street_network` once.
+The primary entry point is :func:`extend_street_network`.
 """
 
 from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from mapgen.chen_core import (
@@ -69,34 +67,6 @@ class StreetConfig:
     length_weight: float = 1.0
     junction_weight: float = 10.0
     avoid_cul_de_sacs: bool = False
-
-
-# Backwards-compatible alias for the legacy configuration name. The legacy
-# wrapper keeps these extra fields for callers that still construct the old
-# config; only the fields above influence the paper algorithm.
-@dataclass(frozen=True)
-class StreetGenerationConfig:
-    """Deprecated configuration retained for the legacy wrapper.
-
-    Prefer :class:`StreetConfig`. Only ``collinear_angle_threshold_rad``,
-    ``junction_penalty`` (mapped to ``junction_weight``), and
-    ``avoid_cul_de_sacs`` are honoured; the remaining fields are inert and kept
-    so old call sites keep importing.
-    """
-
-    selection_strategy: str = "section_4_2_connected_junctions"
-    collinear_angle_threshold_rad: float = CHEN_COLLINEAR_THRESHOLD_RAD
-    length_weight: float = 1.0
-    junction_penalty: float = 10.0
-    avoid_cul_de_sacs: bool = False
-
-    def to_street_config(self) -> StreetConfig:
-        return StreetConfig(
-            collinear_angle_threshold_rad=self.collinear_angle_threshold_rad,
-            length_weight=self.length_weight,
-            junction_weight=self.junction_penalty,
-            avoid_cul_de_sacs=self.avoid_cul_de_sacs,
-        )
 
 
 DEFAULT_STREET_CONFIG = StreetConfig()
@@ -789,58 +759,3 @@ def _edge_set_length(ctx: _StreetContext, edges: set[EdgeKey]) -> float:
 
 def _edge_nodes(edges: set[EdgeKey] | frozenset[EdgeKey]) -> set[int]:
     return {node for edge in edges for node in edge}
-
-
-# ---------------------------------------------------------------------------
-# Deprecated legacy wrapper kept until the hierarchical driver (slice D) calls
-# ``extend_street_network`` per level directly.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class StreetGenerationResult:
-    """Deprecated single-shot result. Prefer :class:`StreetExtensionResult`."""
-
-    street_edges: frozenset[EdgeKey]
-    seed_edges: frozenset[EdgeKey]
-    selected_access_candidates: tuple[StreetAccessCandidate, ...]
-    evaluated_candidates: tuple[StreetAccessCandidate, ...]
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-
-def generate_street_network(
-    layout_or_mesh: ChenLayout | ParcelMesh | ParcelCornerGraph,
-    *,
-    seed_edges: set[EdgeKey] | None = None,
-    config: StreetGenerationConfig | StreetConfig | None = None,
-) -> StreetGenerationResult:
-    """Deprecated: seed the boundary ring and run one street extension.
-
-    This preserves the pre-slice-D single-shot entry point that builds an entire
-    level-0 street network from a finished mesh. Prefer
-    :func:`extend_street_network`, called once per hierarchical level with the
-    street edges that already exist at that level. This wrapper exists only so
-    the legacy generation pipeline stays green until the driver is rewritten.
-    """
-    if config is None:
-        street_config = DEFAULT_STREET_CONFIG
-    elif isinstance(config, StreetGenerationConfig):
-        street_config = config.to_street_config()
-    else:
-        street_config = config
-
-    if seed_edges is None:
-        seed = boundary_ring_seed_edges(layout_or_mesh)
-    else:
-        seed = {normalized_edge(*edge) for edge in seed_edges}
-
-    result = extend_street_network(layout_or_mesh, set(seed), street_config)
-    street_edges = set(seed) | result.added_edges
-
-    return StreetGenerationResult(
-        street_edges=frozenset(street_edges),
-        seed_edges=frozenset(seed),
-        selected_access_candidates=result.selected_access_candidates,
-        evaluated_candidates=result.evaluated_candidates,
-        diagnostics=result.diagnostics,
-    )

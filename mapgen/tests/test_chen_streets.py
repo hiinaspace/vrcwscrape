@@ -18,7 +18,6 @@ from mapgen.chen_streets import (
     _street_context,
     boundary_ring_seed_edges,
     extend_street_network,
-    generate_street_network,
 )
 
 
@@ -301,38 +300,6 @@ def test_cul_de_sac_avoidance_repairs_street_ends() -> None:
 
 def test_cul_de_sac_avoidance_default_is_off() -> None:
     assert StreetConfig().avoid_cul_de_sacs is False
-
-
-# --------------------------------------------------------------------------
-# Deprecated single-shot wrapper compatibility (drops after slice D).
-# --------------------------------------------------------------------------
-
-
-def test_generate_street_network_wrapper_repairs_3x3() -> None:
-    mesh, boundary = _grid_mesh(3, 3)
-
-    result = generate_street_network(mesh)
-    layout = build_chen_layout(mesh, set(result.street_edges))
-    report = evaluate_layout_invariants(layout, target_boundary=boundary)
-
-    assert result.diagnostics["unreachable_parcel_count_after"] == 0
-    assert result.diagnostics["street_graph_component_count"] == 1
-    assert result.diagnostics["street_network_subset_of_corner_graph"]
-    assert result.street_edges < frozenset(mesh.edges) | result.street_edges
-    assert len(result.street_edges) < len(mesh.edges)
-    assert connected_component_count(layout.street_network) == 1
-    assert report.paper_invariant_pass
-
-
-def test_generate_street_network_accepts_explicit_seed() -> None:
-    mesh, _boundary = _grid_mesh(2, 2)
-    points = _point_ids(mesh)
-    seed = {normalized_edge(points[(0.0, 0.0)], points[(1.0, 0.0)])}
-
-    result = generate_street_network(mesh, seed_edges=seed)
-
-    assert result.seed_edges == frozenset(seed)
-    assert result.diagnostics["unreachable_parcel_count_after"] == 0
 
 
 def test_collinear_threshold_is_135_degrees() -> None:
