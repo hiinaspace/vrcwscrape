@@ -253,14 +253,20 @@ def _junction_angle_devs(layout: ChenLayout, streets: list[StreetPath]) -> list[
 
 
 def _parcel_corner_count(parcel_id: int, layout: ChenLayout) -> int:
-    """Return the number of corners in the approximate polygon for this parcel."""
-    ring = layout.corner_graph.parcel_corner_rings.get(parcel_id)
-    if ring is not None:
-        return len(ring)
-    # Fallback: use approx_points from parcel_approx_points
+    """Return the number of corners in the approximate polygon for this parcel.
+
+    Per Chen 2024 Fig. 4, corner-ness is decided per parcel by the 135-degree
+    collinearity rule: a corner-graph node on a parcel's near-straight side
+    (e.g. a neighbor's T-junction) is NOT a corner of that parcel. The
+    corner-graph ring keeps such nodes, so it must not be used for type
+    counting.
+    """
     approx = layout.parcel_graph.parcel_approx_points.get(parcel_id)
     if approx is not None:
         return len(approx)
+    ring = layout.corner_graph.parcel_corner_rings.get(parcel_id)
+    if ring is not None:
+        return len(ring)
     return len(layout.mesh.parcels[parcel_id].ring)
 
 

@@ -79,6 +79,25 @@ def _build_2x2_grid_layout():
     return layout, boundary, point_to_id
 
 
+def _build_t_junction_layout():
+    """Two top quarters over one bottom half (paper Fig. 4 P1 case).
+
+    The bottom parcel's top side carries the T-junction node (1,1) from the
+    divider between the two top parcels. Per the 135-degree rule that node is
+    a corner of the top parcels but NOT of the bottom parcel, so all three
+    parcels are quads.
+    """
+    boundary = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+    polys = [
+        (1, Polygon([(0, 1), (1, 1), (1, 2), (0, 2)])),
+        (2, Polygon([(1, 1), (2, 1), (2, 2), (1, 2)])),
+        (3, Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (0, 1)])),
+    ]
+    mesh = parcel_mesh_from_polygons(polys, boundary=boundary)
+    layout = build_chen_layout(mesh, set())
+    return layout, boundary
+
+
 def _build_boundary_only_layout():
     """Single parcel == boundary; streets == boundary ring only."""
     boundary = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
@@ -105,6 +124,18 @@ def _build_single_parcel_no_streets():
 # ---------------------------------------------------------------------------
 # 2x2 grid tests
 # ---------------------------------------------------------------------------
+
+
+class TestTJunctionCornerCounting:
+    """Regression: neighbor T-junction nodes must not inflate corner counts."""
+
+    def test_all_three_parcels_count_as_quads(self):
+        layout, boundary = _build_t_junction_layout()
+        metrics = paper_table1_metrics(layout, boundary=boundary)
+        assert metrics["parcel_total_count"] == 3
+        assert metrics["parcel_quad_count"] == 3
+        assert metrics["parcel_pent_count"] == 0
+        assert metrics["parcel_quad_fraction"] == 1.0
 
 
 class TestGridLayout:
