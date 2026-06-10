@@ -60,6 +60,7 @@ def run_shapes(
     width: float,
     height: float,
     streamline_mode: str = "baseline",
+    shapes: tuple[str, ...] = SHAPES,
 ) -> dict[str, Any]:
     if (parcel_count is None) == (min_parcel_area is None):
         raise ValueError("provide exactly one of parcel_count or min_parcel_area")
@@ -82,7 +83,7 @@ def run_shapes(
     if min_parcel_area is not None:
         generate_layout_for_boundary = _load_generate_layout_for_boundary()
         boundary_preset = _load_boundary_preset()
-        for index, name in enumerate(SHAPES):
+        for index, name in enumerate(shapes):
             bp = boundary_preset(name, width=width, height=height)
             generated = generate_layout_for_boundary(
                 bp,
@@ -104,7 +105,7 @@ def run_shapes(
     else:
         generate_named_layout = _load_generate_named_layout()
         assert parcel_count is not None
-        for index, name in enumerate(SHAPES):
+        for index, name in enumerate(shapes):
             generated = generate_named_layout(
                 name,
                 parcel_count=parcel_count,
@@ -156,6 +157,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=float, default=180.0)
     parser.add_argument("--height", type=float, default=140.0)
     parser.add_argument(
+        "--shapes",
+        nargs="+",
+        default=list(SHAPES),
+        help="boundary preset names to generate (default: square oval triangle)",
+    )
+    parser.add_argument(
         "--streamline-mode",
         choices=STREAMLINE_MODES,
         default="baseline",
@@ -201,6 +208,7 @@ def main() -> None:
         width=args.width,
         height=args.height,
         streamline_mode=args.streamline_mode,
+        shapes=tuple(args.shapes),
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 

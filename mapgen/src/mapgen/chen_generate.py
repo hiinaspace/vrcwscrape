@@ -232,6 +232,22 @@ def boundary_preset(
                 (width * 0.50, height * 0.94),
             ]
         )
+    elif name == "island":
+        points = []
+        for index in range(48):
+            theta = math.tau * index / 48
+            wave = (
+                1.0
+                + 0.13 * math.sin(theta * 3.0 + 1.3)
+                + 0.07 * math.cos(theta * 5.0 - 0.7)
+            )
+            points.append(
+                (
+                    width * (0.5 + 0.46 * wave * math.cos(theta)),
+                    height * (0.5 + 0.42 * wave * math.sin(theta)),
+                )
+            )
+        geom = Polygon(points)
     else:
         raise ValueError(f"unknown Chen boundary preset: {name}")
 
