@@ -9,6 +9,38 @@ Pure-CPU Python venv (numpy/umap/pacmap/hdbscan/datamapplot); all model inferenc
 goes through **ollama** (bge-m3 embeddings + gemma4 labels) so there's no
 torch/CUDA to set up. The GPU box `<gpu-host>` runs ollama; run the whole pipeline there.
 
+## Sample data (for VMs / fresh checkouts without a Dolt clone)
+
+The pipeline inputs (`mapgen/data/`, `mapgen/artifacts/`, the `web/public/...`
+exports) are large and git-ignored; they're rebuilt from a 10GB Dolt clone +
+the GPU box. To iterate on a machine without that (CI, a cloud VM, a fresh
+checkout), grab a small sample bundle of **public** VRChat world metadata:
+
+```bash
+bash mapgen/scripts/fetch-sample-data.sh   # ~161 MB, lands at repo-relative paths
+```
+
+It pulls from `https://file.hiina.space/vrcwscrape-mapgen/` (a disposable
+convenience mirror — *not* the canonical source; that's the
+[Dolt DB](https://www.dolthub.com/repositories/hiinaspace/vrcwscrape), and final
+site hosting will use something else). Set `BASE_URL=...` to rehost. What it
+unlocks:
+
+- **Unit tests need none of this** — `uv run pytest` is fully self-contained
+  (synthetic fixtures). The bundle is only for running the actual pipeline.
+- `mapgen/data/worlds_search.parquet` — raw ETL output; the input to the embed
+  stage (Stage A below). Re-embedding still needs ollama/GPU.
+- `mapgen/artifacts/{embeddings.npy,embed_meta.parquet,clusters.parquet,cluster_labels.json,coords_*.parquet}`
+  — pre-computed embed/reduce/cluster outputs, so you can run the **CPU-only**
+  `mapgen-render` / `mapgen-regions` / `mapgen-dr-sweep` stages on real data
+  without the GPU box.
+- `web/public/full-nolabs-localmap-island-toponymy-city-mesh/{app_points.parquet,land.geojson}`
+  — the input layer for the regional **R1 probe**
+  (`scripts/run_r1_island_inputs.py` → `arm_a`/`arm_b`/`compare`); everything
+  else R1 needs is generated from these two.
+
+`MANIFEST.sha256` on the mirror is checked automatically after download.
+
 ## Data prep (Stage A, in the root project)
 
 ```bash
