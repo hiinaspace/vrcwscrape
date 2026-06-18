@@ -53,6 +53,9 @@ from mapgen.r1_macro import (  # noqa: E402
     DEFAULT_COST_FLOOR,
     DEFAULT_MERGE_RADIUS,
     DEFAULT_MIN_BLOCK_AREA,
+    DEFAULT_N_CITIES,
+    DEFAULT_PEAK_MIN_DISTANCE_UNITS,
+    DEFAULT_PEAK_THRESHOLD_FRAC,
     DEFAULT_SEED,
     DEFAULT_SIMPLIFY_TOLERANCE,
     DEFAULT_W_DENSITY,
@@ -74,7 +77,7 @@ _DEFAULT_OUT = _REPO / "artifacts/r1/macro"
 # Tier styling (highway = thick warm, major = thinner cool).
 _TIER_STYLE: dict[int, dict[str, Any]] = {
     2: {"color": "#b30000", "lw": 3.2, "label": "Highway (city–city)"},
-    1: {"color": "#1f5fb0", "lw": 1.6, "label": "Major (city/town)"},
+    1: {"color": "#1f5fb0", "lw": 1.4, "label": "Major (city–town / town–town)"},
 }
 
 
@@ -224,7 +227,7 @@ def render_macro_overview(
             markerfacecolor="#ffd000",
             markeredgecolor="black",
             markersize=14,
-            label="City (L0 centroid)",
+            label="City (σ=2, top L0 by mass)",
         ),
         plt.Line2D(
             [0],
@@ -233,7 +236,7 @@ def render_macro_overview(
             color="w",
             markerfacecolor="#222222",
             markersize=7,
-            label="Town (density peak)",
+            label="Town (σ=1: peak or minor L0)",
         ),
         plt.Line2D([0], [0], color="#777777", lw=0.9, label="Macro-block edge"),
     ]
@@ -248,9 +251,10 @@ def run_macro(
     in_dir: Path,
     out_dir: Path,
     *,
+    n_cities: int = DEFAULT_N_CITIES,
     merge_radius: float = DEFAULT_MERGE_RADIUS,
-    peak_min_distance_units: float = 10.0,
-    peak_threshold_frac: float = 0.03,
+    peak_min_distance_units: float = DEFAULT_PEAK_MIN_DISTANCE_UNITS,
+    peak_threshold_frac: float = DEFAULT_PEAK_THRESHOLD_FRAC,
     cost_base: float = 1.0,
     w_slope: float = 8.0,
     w_river: float = 6.0,
@@ -289,6 +293,7 @@ def run_macro(
         y0,
         cell,
         points,
+        n_cities=n_cities,
         merge_radius=merge_radius,
         peak_min_distance_units=peak_min_distance_units,
         peak_threshold_frac=peak_threshold_frac,
@@ -363,6 +368,7 @@ def run_macro(
         "description": "Galin 2011 + Arm B tiered arterials + macro-blocks",
         "seed": seed,
         "params": {
+            "n_cities": n_cities,
             "merge_radius": merge_radius,
             "peak_min_distance_units": peak_min_distance_units,
             "peak_threshold_frac": peak_threshold_frac,
@@ -418,9 +424,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--in-dir", type=Path, default=_DEFAULT_IN)
     parser.add_argument("--out-dir", type=Path, default=_DEFAULT_OUT)
+    parser.add_argument("--n-cities", type=int, default=DEFAULT_N_CITIES)
     parser.add_argument("--merge-radius", type=float, default=DEFAULT_MERGE_RADIUS)
-    parser.add_argument("--peak-min-distance", type=float, default=10.0)
-    parser.add_argument("--peak-threshold-frac", type=float, default=0.03)
+    parser.add_argument(
+        "--peak-min-distance", type=float, default=DEFAULT_PEAK_MIN_DISTANCE_UNITS
+    )
+    parser.add_argument(
+        "--peak-threshold-frac", type=float, default=DEFAULT_PEAK_THRESHOLD_FRAC
+    )
     parser.add_argument("--cost-base", type=float, default=1.0)
     parser.add_argument("--w-slope", type=float, default=8.0)
     parser.add_argument("--w-river", type=float, default=6.0)
@@ -442,6 +453,7 @@ def main(argv: list[str] | None = None) -> None:
     manifest = run_macro(
         args.in_dir,
         args.out_dir,
+        n_cities=args.n_cities,
         merge_radius=args.merge_radius,
         peak_min_distance_units=args.peak_min_distance,
         peak_threshold_frac=args.peak_threshold_frac,

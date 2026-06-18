@@ -62,9 +62,23 @@ DEFAULT_SEED: int = 1234
 CITY_SIGMA: int = 2
 TOWN_SIGMA: int = 1
 
+# Number of L0 centroids that stay Tier-1 "cities" (sigma=2), ranked by cluster
+# mass (visit sum). The remaining centroids are demoted to Tier-2 "towns"
+# (sigma=1) so the network shows a primary highway skeleton between the few big
+# cities plus a denser web of major roads, instead of every centroid-centroid
+# edge becoming a highway.
+DEFAULT_N_CITIES: int = 6
+
 # Drop a density-peak town within this radius (island units) of an existing
 # city node, so peaks don't duplicate visit-weighted cluster centroids.
-DEFAULT_MERGE_RADIUS: float = 6.0
+# Smaller than the original 6.0 so more genuine local cores survive as towns
+# (which both adds major roads and breaks up oversized macro-blocks).
+DEFAULT_MERGE_RADIUS: float = 4.0
+
+# Peak detection for town seeds (looser than Arm B's arterial-probe defaults so
+# more secondary cores become Tier-2 town nodes).
+DEFAULT_PEAK_MIN_DISTANCE_UNITS: float = 7.0
+DEFAULT_PEAK_THRESHOLD_FRAC: float = 0.02
 
 # Density-attracting cost term: cost = base_cost - w_density * norm_density,
 # clamped to DEFAULT_COST_FLOOR inside the mask. w_density defaults to ~0.8 of
@@ -164,8 +178,8 @@ def town_nodes_from_peaks(
     cities: list[MacroNode],
     *,
     merge_radius: float = DEFAULT_MERGE_RADIUS,
-    peak_min_distance_units: float = 10.0,
-    peak_threshold_frac: float = 0.03,
+    peak_min_distance_units: float = DEFAULT_PEAK_MIN_DISTANCE_UNITS,
+    peak_threshold_frac: float = DEFAULT_PEAK_THRESHOLD_FRAC,
 ) -> list[MacroNode]:
     """Return Tier-2 town nodes: density peaks not co-located with a city.
 
@@ -173,7 +187,7 @@ def town_nodes_from_peaks(
     ``merge_radius`` island units of an already-added city centroid is dropped
     so cities and towns don't duplicate.
     """
-    peak_xs, peak_ys, _peak_ds = find_density_peaks(
+    peak_xs, peak_ys, peak_ds = find_density_peaks(
         density,
         x0,
         y0,
@@ -189,13 +203,57 @@ def town_nodes_from_peaks(
 
     r2 = merge_radius * merge_radius
     towns: list[MacroNode] = []
-    for px, py in zip(peak_xs.tolist(), peak_ys.tolist(), strict=True):
+    for px, py, pd in zip(
+        peak_xs.tolist(), peak_ys.tolist(), peak_ds.tolist(), strict=True
+    ):
         if city_xy.shape[0] > 0:
             d2 = (city_xy[:, 0] - px) ** 2 + (city_xy[:, 1] - py) ** 2
             if float(d2.min()) <= r2:
                 continue
-        towns.append(MacroNode(x=float(px), y=float(py), sigma=TOWN_SIGMA, kind="town"))
+        towns.append(
+            MacroNode(
+                x=float(px), y=float(py), sigma=TOWN_SIGMA, kind="town", mass=float(pd)
+            )
+        )
     return towns
+
+
+def grade_cities(
+    cities: list[MacroNode], n_cities: int = DEFAULT_N_CITIES
+) -> list[MacroNode]:
+    """Keep the top ``n_cities`` centroids (by mass) as cities; demote the rest.
+
+    Ranks city nodes by ``mass`` (cluster visit sum) descending; the top
+    ``n_cities`` stay Tier-1 (``sigma=2``, ``kind="city"``) and the remainder are
+    demoted to Tier-2 towns (``sigma=1``, ``kind="town"``), keeping their label
+    and mass. Original list order is preserved for determinism. This is what
+    spreads edges across the highway/major tiers instead of making every
+    centroid-centroid edge a highway.
+    """
+    if n_cities >= len(cities):
+        return cities
+    ranked = sorted(
+        range(len(cities)),
+        key=lambda i: (cities[i].mass or 0.0, -i),
+        reverse=True,
+    )
+    keep = set(ranked[:n_cities])
+    graded: list[MacroNode] = []
+    for i, c in enumerate(cities):
+        if i in keep:
+            graded.append(c)
+        else:
+            graded.append(
+                MacroNode(
+                    x=c.x,
+                    y=c.y,
+                    sigma=TOWN_SIGMA,
+                    kind="town",
+                    label=c.label,
+                    mass=c.mass,
+                )
+            )
+    return graded
 
 
 def build_macro_nodes(
@@ -205,12 +263,13 @@ def build_macro_nodes(
     cell: float,
     points: pl.DataFrame,
     *,
+    n_cities: int = DEFAULT_N_CITIES,
     merge_radius: float = DEFAULT_MERGE_RADIUS,
-    peak_min_distance_units: float = 10.0,
-    peak_threshold_frac: float = 0.03,
+    peak_min_distance_units: float = DEFAULT_PEAK_MIN_DISTANCE_UNITS,
+    peak_threshold_frac: float = DEFAULT_PEAK_THRESHOLD_FRAC,
 ) -> list[MacroNode]:
-    """Build the full macro node list: cities first, then deduped towns."""
-    cities = visit_weighted_centroids(points)
+    """Build the full macro node list: graded cities first, then deduped towns."""
+    cities = grade_cities(visit_weighted_centroids(points), n_cities=n_cities)
     towns = town_nodes_from_peaks(
         density,
         x0,
@@ -300,8 +359,36 @@ def tier_for_tau(tau: int) -> int:
     """Map an edge ``tau = min(sigma)`` onto a tier label.
 
     With sigma in {1, 2}, tau in {1, 2}: tau == 2 -> highway (2), else major (1).
+
+    Note: the network is built *per level* (see ``compute_macro_arterials``), so
+    an edge's tier is its construction level, not necessarily ``tier_for_tau`` of
+    its endpoints. This helper is retained for the nominal tau→tier mapping.
     """
     return 2 if tau >= 2 else 1
+
+
+def _delaunay_edges(
+    indices: list[int], xs: np.ndarray, ys: np.ndarray
+) -> set[tuple[int, int]]:
+    """Delaunay edge set (global node-index pairs) over a node subset."""
+    m = len(indices)
+    if m < 2:
+        return set()
+
+    def _pair(a: int, b: int) -> tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
+
+    if m == 2:
+        return {_pair(int(indices[0]), int(indices[1]))}
+    sub = np.column_stack([xs[indices], ys[indices]])
+    tri = Delaunay(sub)
+    edges: set[tuple[int, int]] = set()
+    for simplex in tri.simplices:
+        for i in range(3):
+            a = int(indices[int(simplex[i])])
+            b = int(indices[int(simplex[(i + 1) % 3])])
+            edges.add(_pair(a, b))
+    return edges
 
 
 def compute_macro_arterials(
@@ -314,12 +401,19 @@ def compute_macro_arterials(
     beta_ratio: float = DEFAULT_BETA_RATIO,
     simplify_tolerance: float = DEFAULT_SIMPLIFY_TOLERANCE,
 ) -> tuple[list[sg.LineString], list[MacroEdge]]:
-    """Build the importance-typed arterial network over all macro nodes.
+    """Build the importance-typed arterial network *per level* (Galin 2011).
 
-    Mirrors Arm B ``compute_arterials`` (Delaunay → ``route_through_array``
-    geodesic path per edge → ``_prune_edges`` beta-ratio pruning), reusing the
-    Arm B raster<->xy helpers, but additionally tags each kept edge with
-    ``tau = min(sigma_a, sigma_b)`` and a tier.
+    Unlike a single Delaunay over all nodes (which makes city–city edges rare and
+    starves the highway tier), this builds one network per importance level:
+
+    - **Highways (tier 2):** Delaunay over the city subset (sigma=2) → a connected
+      backbone between the major cluster centroids.
+    - **Majors (tier 1):** Delaunay over *all* nodes, minus pairs already realized
+      as highways → the secondary web feeding into the backbone.
+
+    Each level routes least-cost geodesic paths (Arm B ``route_through_array``)
+    and is beta-ratio pruned (Arm B ``_prune_edges``) independently. Edge ``tier``
+    is its construction level; ``tau`` records ``min(sigma_a, sigma_b)``.
 
     Returns the kept LineStrings and parallel ``MacroEdge`` records.
     """
@@ -331,66 +425,61 @@ def compute_macro_arterials(
     xs = np.array([nd.x for nd in nodes], dtype=float)
     ys = np.array([nd.y for nd in nodes], dtype=float)
     sigmas = [nd.sigma for nd in nodes]
-    pts = np.column_stack([xs, ys])
-
-    # Delaunay edge set over all nodes.
-    if n == 2:
-        edge_set: set[tuple[int, int]] = {(0, 1)}
-    else:
-        tri = Delaunay(pts)
-        edge_set = set()
-        for simplex in tri.simplices:
-            for i in range(3):
-                a, b = sorted((int(simplex[i]), int(simplex[(i + 1) % 3])))
-                edge_set.add((a, b))
-
     rows, cols = _xy_to_rowcol(xs, ys, x0, y0, cell, nrows, ncols)
 
-    edge_list = sorted(edge_set)
-    edge_paths: list[list[tuple[int, int]]] = []
-    edge_costs: list[float] = []
-    for i_a, i_b in edge_list:
-        ra, ca = int(rows[i_a]), int(cols[i_a])
-        rb, cb = int(rows[i_b]), int(cols[i_b])
-        path, path_cost = route_through_array(
-            cost, (ra, ca), (rb, cb), fully_connected=True, geometric=True
-        )
-        edge_paths.append(path)
-        edge_costs.append(float(path_cost))
-
-    kept = _prune_edges(edge_list, edge_costs, beta_ratio)
+    city_idx = [i for i in range(n) if nodes[i].kind == "city"]
+    highway_edges = _delaunay_edges(city_idx, xs, ys)
+    major_edges = _delaunay_edges(list(range(n)), xs, ys) - highway_edges
 
     lines: list[sg.LineString] = []
     records: list[MacroEdge] = []
-    for idx, (i_a, i_b) in enumerate(edge_list):
-        if not kept[idx]:
-            continue
-        path = edge_paths[idx]
-        rows_p = np.array([p[0] for p in path])
-        cols_p = np.array([p[1] for p in path])
-        xs_p, ys_p = _rowcol_to_xy(rows_p, cols_p, x0, y0, cell)
-        coords = list(zip(xs_p.tolist(), ys_p.tolist(), strict=True))
-        if len(coords) < 2:
-            continue
 
-        line = sg.LineString(coords)
-        if simplify_tolerance > 0:
-            line = line.simplify(simplify_tolerance, preserve_topology=False)
-        if line.is_empty or line.length < cell:
+    # Build each level independently (tier 2 first so highways sort ahead).
+    for tier, edge_set in ((2, highway_edges), (1, major_edges)):
+        edge_list = sorted(edge_set)
+        if not edge_list:
             continue
-
-        tau = min(sigmas[i_a], sigmas[i_b])
-        lines.append(line)
-        records.append(
-            MacroEdge(
-                node_a=i_a,
-                node_b=i_b,
-                tau=tau,
-                tier=tier_for_tau(tau),
-                path_cost=round(edge_costs[idx], 4),
-                length=round(float(line.length), 3),
+        edge_paths: list[list[tuple[int, int]]] = []
+        edge_costs: list[float] = []
+        for i_a, i_b in edge_list:
+            ra, ca = int(rows[i_a]), int(cols[i_a])
+            rb, cb = int(rows[i_b]), int(cols[i_b])
+            path, path_cost = route_through_array(
+                cost, (ra, ca), (rb, cb), fully_connected=True, geometric=True
             )
-        )
+            edge_paths.append(path)
+            edge_costs.append(float(path_cost))
+
+        kept = _prune_edges(edge_list, edge_costs, beta_ratio)
+
+        for idx, (i_a, i_b) in enumerate(edge_list):
+            if not kept[idx]:
+                continue
+            path = edge_paths[idx]
+            rows_p = np.array([p[0] for p in path])
+            cols_p = np.array([p[1] for p in path])
+            xs_p, ys_p = _rowcol_to_xy(rows_p, cols_p, x0, y0, cell)
+            coords = list(zip(xs_p.tolist(), ys_p.tolist(), strict=True))
+            if len(coords) < 2:
+                continue
+
+            line = sg.LineString(coords)
+            if simplify_tolerance > 0:
+                line = line.simplify(simplify_tolerance, preserve_topology=False)
+            if line.is_empty or line.length < cell:
+                continue
+
+            lines.append(line)
+            records.append(
+                MacroEdge(
+                    node_a=i_a,
+                    node_b=i_b,
+                    tau=min(sigmas[i_a], sigmas[i_b]),
+                    tier=tier,
+                    path_cost=round(edge_costs[idx], 4),
+                    length=round(float(line.length), 3),
+                )
+            )
 
     return lines, records
 

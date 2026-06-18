@@ -11,10 +11,28 @@ from mapgen.r1_macro import (
     MacroNode,
     build_density_cost_field,
     compute_macro_arterials,
+    grade_cities,
     tier_for_tau,
     town_nodes_from_peaks,
     visit_weighted_centroids,
 )
+
+
+def test_grade_cities_keeps_top_mass_demotes_rest() -> None:
+    """Top-n by mass stay sigma=2 cities; the rest become sigma=1 towns."""
+    cities = [
+        MacroNode(x=0.0, y=0.0, sigma=CITY_SIGMA, kind="city", label="a", mass=5.0),
+        MacroNode(x=1.0, y=1.0, sigma=CITY_SIGMA, kind="city", label="b", mass=50.0),
+        MacroNode(x=2.0, y=2.0, sigma=CITY_SIGMA, kind="city", label="c", mass=20.0),
+    ]
+    graded = grade_cities(cities, n_cities=2)
+    # Order preserved; b (50) and c (20) stay cities, a (5) demoted to town.
+    assert [g.kind for g in graded] == ["town", "city", "city"]
+    assert [g.sigma for g in graded] == [TOWN_SIGMA, CITY_SIGMA, CITY_SIGMA]
+    # Demoted node keeps its label/mass and position.
+    assert graded[0].label == "a" and graded[0].mass == 5.0 and graded[0].x == 0.0
+    # n_cities >= len is a no-op.
+    assert grade_cities(cities, n_cities=9) == cities
 
 
 def test_visit_weighted_centroid_math() -> None:
