@@ -129,8 +129,47 @@ and discards the local engine we already trust.
 points where arterials enter a macro-block — is unspecified in all the papers and
 is where prototype effort will concentrate. Worth a small spike before committing.
 
+## Decisions locked in (2026-06-18, user)
+
+- **Direction:** macro+micro hybrid (Galin-style macro hierarchy + Chen micro).
+- **Seeding:** density peaks **+** L0 cluster centroids.
+  - **Tier-1 "city" nodes** = L0 cluster centroids (visit-weighted mean position
+    of each cluster's worlds), importance σ=2.
+  - **Tier-2 "town" nodes** = density peaks (`find_density_peaks`) not already
+    co-located with a centroid, σ=1. (Room for σ=0 "village" nodes later from
+    finer clusters / minor peaks.)
+  - Edge type `τ = min(σ_a, σ_b)`: city–city → highway, city–town → major,
+    town–town → minor. Tiers drive arterial width/style and which faces become
+    macro-blocks.
+- **Cost field is density-ATTRACTING** (opposite of Galin's between-cities
+  routing): arterials should hug dense ridges and run *toward* cores. Start from
+  Arm B `build_cost_field` (slope + river) and **subtract** a normalized-density
+  term so high-density cells are cheap.
+- **Terrain is co-designed, inverted from the earlier 2.5D doc:** height ≈
+  f(**inverse** density) + roughness — high DR density = basin/valley, low
+  density = rugged uplands. Periphery roughness is what *motivates* switchback /
+  wiggly local roads and irregular country lots. The same terrain feeds the road
+  cost field, so surface and roads are co-generated.
+- **Latitude:** world points may be **moved/relaxed** if it improves a style;
+  generation may take **hours** (offline, re-run periodically as new worlds
+  appear — not realtime/incremental). Technique is otherwise unconstrained.
+
+## Staged build plan
+
+1. **Macro hierarchy layer** (`r1_macro.py` + `run_r1_macro.py`): nodes →
+   density-attracting cost field → importance-typed proximity graph (reuse Arm B
+   Delaunay+β / geodesic paths) → tiered arterials → polygonize → macro-blocks.
+   Checkpoint: render arterials (colored by tier) + macro-blocks over density.
+   *(in progress)*
+2. **Seam spike** — stitch Chen/R2 inside one macro-block, connecting local
+   streets to arterial entry points. This is the known risk; validate early.
+3. **Full hybrid** — Chen/R2 in every macro-block; assemble + render at scale.
+4. **Terrain co-generation** — inverse-density height + periphery roughness;
+   feed back into cost field; optional switchback styling for steep local roads.
+5. **Point relaxation (optional)** — nudge world points toward generated lots.
+
 ## Status
 
-Evaluation only; no code yet. Prototype scope is the open decision (see session).
-Arm B (`r1_arm_b.py`) and the zoom-review harness (`run_r1_zoom_review.py`) are
-the existing footholds for a macro-layer spike.
+Evaluation complete; macro-layer build (stage 1) in progress. Arm B
+(`r1_arm_b.py`) and the zoom-review harness (`run_r1_zoom_review.py`) are the
+existing footholds.
