@@ -125,9 +125,54 @@ scale even with tuned weights; that's exactly what Arm B is for. The two arms
 share the field/terrain layer, so the comparison isolates the partitioning
 strategy.
 
+## R1 results (2026-06-10)
+
+Probe ran on island 4 (12,311 worlds, highest core/fringe density contrast
+8.3×). Artifacts: `mapgen/artifacts/r1/{inputs,arm_a,arm_b,compare}/`; scripts:
+`mapgen/scripts/run_r1_{island_inputs,arm_a_chen,arm_b_baseline,compare}.py`.
+Chen gained two optional, default-off extensions (`split_weights`,
+`RasterGuidanceField` terrain guidance into the grid-smooth field; default path
+byte-identical, noted in the contract doc).
+
+Answers to the R1 question ("recursive Chen at district scale: interesting or
+too regular?"):
+
+1. **Robustness: pass.** All four Chen configs generated cleanly on the real
+   99-vertex concave boundary (thin peninsulas included), zero invariant
+   violations, ~21–45 s per run.
+2. **Regularity: tunable, mostly.** Stock Chen (control) is visibly grid-like.
+   Terrain guidance + size/access-weighted splits + cul-de-sac avoidance
+   (`regional_strong`: guidance strength 6 + density-ridge boost) produce
+   organic, terrain-aligned district edges that read as a plausible regional
+   map. Residual orthogonal bias near the boundary remains. Guidance saturates
+   at the internal cap (0.5× boundary weight); raising it is the next lever if
+   needed.
+3. **The real gap is density adaptivity, not regularity.** Chen's size term
+   balances *geometric* area, which actively fights the dense-core→small-
+   districts structure we want: density–area Spearman ρ is ≈0..+0.29 across
+   all Arm A configs vs −0.93 for Arm B (degenerate: 9 districts, one fringe
+   district is 66% of the island) and −0.43 for KMeans l0. Arm A wins on
+   area balance (CV 0.17 vs 1.77/0.52) and arterial terrain alignment
+   (74–79% of arterial length in low-slope cells vs Arm B's 63%); KMeans
+   wins on world-count balance (CV 0.52) but has no cartographic structure.
+4. **Deviation:** the "loop street pattern" knob assumed above does not exist
+   in the implementation; `avoid_cul_de_sacs` is the closest lever and was
+   used.
+
+Conclusion: neither arm is the answer alone. Chen brings structure and
+robustness; the density adaptivity must come from the split criterion itself.
+**R2 direction:** a density-mass split/termination mode for Chen — measure
+parcel "size" as integrated density mass (≈ world count) instead of geometric
+area, so `min_parcel_area` becomes "max worlds per district" and splits chase
+density automatically. Same extension pattern as guidance (optional,
+default-off, byte-identical default). Secondary: seed level-0 streets from
+Arm B-style least-cost arterials between density peaks, letting Chen recurse
+inside the resulting macro-blocks.
+
 ## Sequencing
 
-island-preset fix (in flight) → R1 probe → spike-parcel/field fidelity wave →
+island-preset fix (done) → R1 probe (done, see results above) → R2
+density-mass split criterion + rerun Arm A → spike-parcel/field fidelity wave →
 efficiency/profiling wave (thousands of districts; districts are
 embarrassingly parallel) → world→lot assignment + rural ladder → full
 archipelago integration.
