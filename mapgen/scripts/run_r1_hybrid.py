@@ -65,16 +65,15 @@ from mapgen.r1_compare import (  # noqa: E402
 from mapgen.r1_macro import (  # noqa: E402
     DEFAULT_BETA_RATIO,
     DEFAULT_COST_FLOOR,
-    DEFAULT_MERGE_RADIUS,
     DEFAULT_MIN_BLOCK_AREA,
-    DEFAULT_N_CITIES,
-    DEFAULT_PEAK_MIN_DISTANCE_UNITS,
-    DEFAULT_PEAK_THRESHOLD_FRAC,
     DEFAULT_SIMPLIFY_TOLERANCE,
+    DEFAULT_VILLAGE_MERGE_RADIUS,
+    DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+    DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
     DEFAULT_W_DENSITY,
     MacroEdge,
     build_density_cost_field,
-    build_macro_nodes,
+    build_macro_nodes_hierarchical,
     compute_macro_arterials,
     polygonize_macro_blocks,
 )
@@ -89,10 +88,11 @@ from mapgen.r1_zoom import load_points_with_labels, zoom_window  # noqa: E402
 _DEFAULT_IN = _REPO / "artifacts/r1/inputs"
 _DEFAULT_OUT = _REPO / "artifacts/r1/hybrid"
 
-# Tier styling, matching run_r1_macro (highway = thick warm, major = cool).
+# Tier styling, matching run_r1_macro (highway red, major blue, local teal).
 _TIER_STYLE: dict[int, dict[str, Any]] = {
     2: {"color": "#b30000", "label": "Highway (city–city)"},
-    1: {"color": "#1f5fb0", "label": "Major (city–town / town–town)"},
+    1: {"color": "#1f5fb0", "label": "Major (≥ town)"},
+    0: {"color": "#138d75", "label": "Local (incl. village)"},
 }
 
 
@@ -115,16 +115,15 @@ def build_macro_layer(in_dir: Path) -> dict[str, Any]:
 
     mask = boundary_mask(boundary, x0, y0, cell, nrows, ncols)
 
-    nodes = build_macro_nodes(
+    nodes = build_macro_nodes_hierarchical(
         density,
         x0,
         y0,
         cell,
         points,
-        n_cities=DEFAULT_N_CITIES,
-        merge_radius=DEFAULT_MERGE_RADIUS,
-        peak_min_distance_units=DEFAULT_PEAK_MIN_DISTANCE_UNITS,
-        peak_threshold_frac=DEFAULT_PEAK_THRESHOLD_FRAC,
+        merge_radius=DEFAULT_VILLAGE_MERGE_RADIUS,
+        peak_min_distance_units=DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+        peak_threshold_frac=DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
     )
     cost = build_density_cost_field(
         slope,
@@ -344,8 +343,10 @@ def _draw_layers(
             lx, ly = line.xy
             ax.plot(lx, ly, color="#1a1a1a", lw=street_lw, alpha=0.85, zorder=4)
 
-    # Macro arterials on top, tier-colored (majors then highways).
-    for tier in (1, 2):
+    # Macro arterials on top, tier-colored (locals, then majors, then highways).
+    for tier in (0, 1, 2):
+        if tier not in _TIER_STYLE or tier not in arterial_lw:
+            continue
         style = _TIER_STYLE[tier]
         for line, rec in zip(arterial_lines, edges, strict=True):
             if rec.tier != tier or line.geom_type != "LineString":
@@ -366,6 +367,7 @@ def _legend_handles() -> list[Any]:
     return [
         mpatches.Patch(color=_TIER_STYLE[2]["color"], label=_TIER_STYLE[2]["label"]),
         mpatches.Patch(color=_TIER_STYLE[1]["color"], label=_TIER_STYLE[1]["label"]),
+        mpatches.Patch(color=_TIER_STYLE[0]["color"], label=_TIER_STYLE[0]["label"]),
         plt.Line2D([0], [0], color="#1a1a1a", lw=1.2, label="Chen street (local)"),
         plt.Line2D([0], [0], color="#555555", lw=0.8, label="Chen district edge"),
     ]
@@ -403,17 +405,19 @@ def render_overview(
         district_lw=0.25,
         district_alpha=0.35,
         street_lw=0.4,
-        arterial_lw={2: 2.6, 1: 1.2},
+        arterial_lw={2: 2.6, 1: 1.2, 0: 0.6},
         point_size=1.2,
         point_alpha=0.18,
     )
     _set_extent(ax, boundary, pad=2.0)
     n_hwy = sum(1 for e in edges if e.tier == 2)
     n_major = sum(1 for e in edges if e.tier == 1)
+    n_local = sum(1 for e in edges if e.tier == 0)
     ax.set_title(
         "R1 hybrid — macro arterials + per-block Chen fabric (island-wide)\n"
         f"{len(results)} macro-blocks, {total_districts} districts, "
-        f"{total_streets} Chen streets, {n_hwy} highways, {n_major} majors",
+        f"{total_streets} Chen streets, {n_hwy} highways, {n_major} majors, "
+        f"{n_local} locals",
         fontsize=13,
     )
     ax.legend(handles=_legend_handles(), loc="upper left", fontsize=9, framealpha=0.9)
@@ -456,7 +460,7 @@ def render_core(
         district_lw=0.6,
         district_alpha=0.7,
         street_lw=1.1,
-        arterial_lw={2: 3.6, 1: 2.2},
+        arterial_lw={2: 3.6, 1: 2.2, 0: 1.3},
         point_size=14.0,
         point_alpha=0.85,
     )
@@ -587,6 +591,7 @@ def run_hybrid(
 
     n_hwy = sum(1 for e in edges if e.tier == 2)
     n_major = sum(1 for e in edges if e.tier == 1)
+    n_local = sum(1 for e in edges if e.tier == 0)
 
     # Invariant pass rate over the blocks where Chen actually ran (non-fallback).
     ran = [r for r in results if not r.failed]
@@ -618,6 +623,7 @@ def run_hybrid(
         "total_chen_streets": total_streets,
         "n_highway_arterials": n_hwy,
         "n_major_arterials": n_major,
+        "n_local_arterials": n_local,
         "per_block_district_counts": [r.district_count for r in results],
         "per_block_seed_used": [r.seed_used for r in results],
         "invariant_pass_rate": pass_rate,
@@ -644,7 +650,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--total-target",
         type=int,
-        default=600,
+        default=1200,
         help="Island-wide district target; sets global M = total_mass / target",
     )
     parser.add_argument("--n-cores", type=int, default=3)

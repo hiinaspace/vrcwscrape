@@ -59,8 +59,20 @@ from mapgen.r1_arm_b import (
 DEFAULT_SEED: int = 1234
 
 # Importance (sigma) per node kind.
+#
+# Two seeding modes exist:
+#
+# * The legacy graded-l0 mode (``build_macro_nodes``): cities are the top L0
+#   centroids by mass (sigma=2), towns are density peaks / minor L0 (sigma=1).
+# * The 3-tier SEMANTIC hierarchy (``build_macro_nodes_hierarchical``): cities
+#   are the 7 L1 cluster centroids (sigma=2), towns are the 18 L0 cluster
+#   centroids (sigma=1), villages are density peaks (sigma=0). NB on this island
+#   the cluster hierarchy is INVERTED from naive expectation — L0 (18) is the
+#   FINEST tier and L1 (7) is coarser sub-regions — so L1=city / L0=town gives
+#   the finer macro structure.
 CITY_SIGMA: int = 2
 TOWN_SIGMA: int = 1
+VILLAGE_SIGMA: int = 0
 
 # Number of L0 centroids that stay Tier-1 "cities" (sigma=2), ranked by cluster
 # mass (visit sum). The remaining centroids are demoted to Tier-2 "towns"
@@ -86,6 +98,16 @@ DEFAULT_PEAK_THRESHOLD_FRAC: float = 0.02
 DEFAULT_W_DENSITY: float = 0.8
 DEFAULT_COST_FLOOR: float = 0.05
 
+# --- 3-tier semantic hierarchy defaults (build_macro_nodes_hierarchical) ---
+#
+# Villages are density peaks, LOOSENED so there are plenty of them (the L1/L0
+# centroids already cover the major/minor cores, so villages are the fine grain
+# that breaks up macro-blocks to neighborhood scale).
+DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS: float = 4.0
+DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC: float = 0.012
+# Drop a village peak within this radius of any city/town centroid.
+DEFAULT_VILLAGE_MERGE_RADIUS: float = 3.0
+
 # Beta-ratio pruning (Arm B convention; inf keeps all edges).
 DEFAULT_BETA_RATIO: float = 1.2
 
@@ -96,7 +118,7 @@ DEFAULT_SIMPLIFY_TOLERANCE: float = 1.5
 # floor because macro-blocks are coarse by construction.
 DEFAULT_MIN_BLOCK_AREA: float = 60.0
 
-NodeKind = Literal["city", "town"]
+NodeKind = Literal["city", "town", "village"]
 
 
 # ---------------------------------------------------------------------------
@@ -116,36 +138,46 @@ class MacroNode:
     mass: float | None = None
 
 
-def visit_weighted_centroids(
+def cluster_centroids(
     points: pl.DataFrame,
+    id_col: str,
+    name_col: str,
+    sigma: int,
+    kind: NodeKind,
 ) -> list[MacroNode]:
-    """Return one Tier-1 city node per L0 cluster (visit-weighted centroid).
+    """Return one visit-weighted centroid ``MacroNode`` per distinct cluster.
 
-    The position is the visit-weighted mean of each cluster's ``(x, y)``; the
-    ``mass`` is the cluster's total ``visits`` and ``label`` its ``l0_name``.
-    Clusters are emitted in ascending ``l0_id`` order for determinism.
+    Generic over the cluster tier: pass ``("l0_id", "l0_name")`` for L0 towns,
+    ``("l1_id", "l1_name")`` for L1 cities, etc. The node position is the
+    visit-weighted mean of each cluster's ``(x, y)``; ``mass`` is the cluster's
+    total ``visits`` and ``label`` its ``name_col`` value. Clusters are emitted
+    in ascending ``id_col`` order for determinism.
+
+    A cluster whose visit weights sum to ``<= 0`` falls back to an unweighted
+    mean position (guards against NaN centroids).
 
     Parameters
     ----------
-    points : polars frame with columns ``l0_id, l0_name, visits, x, y``.
+    points : polars frame with at least ``id_col, name_col, visits, x, y``.
+    id_col, name_col : the cluster id / human-name columns for this tier.
+    sigma : importance assigned to every emitted node.
+    kind : the ``NodeKind`` tag for every emitted node.
     """
-    # Guard against zero/negative visit weights collapsing a cluster to NaN by
-    # falling back to an unweighted mean when the cluster's weight sums to <= 0.
     grouped = (
         points.with_columns(
             (pl.col("x") * pl.col("visits")).alias("_wx"),
             (pl.col("y") * pl.col("visits")).alias("_wy"),
         )
-        .group_by("l0_id")
+        .group_by(id_col)
         .agg(
-            pl.col("l0_name").first().alias("l0_name"),
+            pl.col(name_col).first().alias("_name"),
             pl.col("visits").sum().alias("mass"),
             pl.col("_wx").sum().alias("wx"),
             pl.col("_wy").sum().alias("wy"),
             pl.col("x").mean().alias("x_mean"),
             pl.col("y").mean().alias("y_mean"),
         )
-        .sort("l0_id")
+        .sort(id_col)
     )
 
     nodes: list[MacroNode] = []
@@ -161,13 +193,31 @@ def visit_weighted_centroids(
             MacroNode(
                 x=cx,
                 y=cy,
-                sigma=CITY_SIGMA,
-                kind="city",
-                label=str(row["l0_name"]),
+                sigma=sigma,
+                kind=kind,
+                label=str(row["_name"]),
                 mass=mass,
             )
         )
     return nodes
+
+
+def visit_weighted_centroids(
+    points: pl.DataFrame,
+) -> list[MacroNode]:
+    """Return one Tier-1 city node per L0 cluster (visit-weighted centroid).
+
+    Thin wrapper over :func:`cluster_centroids` for the legacy L0-as-city path
+    (importance ``sigma = CITY_SIGMA``, ``kind = "city"``). The position is the
+    visit-weighted mean of each cluster's ``(x, y)``; the ``mass`` is the
+    cluster's total ``visits`` and ``label`` its ``l0_name``. Clusters are
+    emitted in ascending ``l0_id`` order for determinism.
+
+    Parameters
+    ----------
+    points : polars frame with columns ``l0_id, l0_name, visits, x, y``.
+    """
+    return cluster_centroids(points, "l0_id", "l0_name", CITY_SIGMA, "city")
 
 
 def town_nodes_from_peaks(
@@ -283,6 +333,100 @@ def build_macro_nodes(
     return [*cities, *towns]
 
 
+def village_nodes_from_peaks(
+    density: np.ndarray,
+    x0: float,
+    y0: float,
+    cell: float,
+    anchors: list[MacroNode],
+    *,
+    merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS,
+    peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+    peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
+) -> list[MacroNode]:
+    """Return Tier-3 village nodes (``sigma=0``): density peaks not near anchors.
+
+    Peaks are found with Arm B ``find_density_peaks`` using loosened parameters
+    (so there are plenty of villages); any peak within ``merge_radius`` island
+    units of an ``anchors`` node (the city/town centroids) is dropped so
+    villages don't duplicate the higher tiers.
+    """
+    peak_xs, peak_ys, peak_ds = find_density_peaks(
+        density,
+        x0,
+        y0,
+        cell,
+        min_distance_units=peak_min_distance_units,
+        threshold_frac=peak_threshold_frac,
+    )
+
+    if anchors:
+        anchor_xy = np.array([(a.x, a.y) for a in anchors], dtype=float)
+    else:
+        anchor_xy = np.empty((0, 2), dtype=float)
+
+    r2 = merge_radius * merge_radius
+    villages: list[MacroNode] = []
+    for px, py, pd in zip(
+        peak_xs.tolist(), peak_ys.tolist(), peak_ds.tolist(), strict=True
+    ):
+        if anchor_xy.shape[0] > 0:
+            d2 = (anchor_xy[:, 0] - px) ** 2 + (anchor_xy[:, 1] - py) ** 2
+            if float(d2.min()) <= r2:
+                continue
+        villages.append(
+            MacroNode(
+                x=float(px),
+                y=float(py),
+                sigma=VILLAGE_SIGMA,
+                kind="village",
+                mass=float(pd),
+            )
+        )
+    return villages
+
+
+def build_macro_nodes_hierarchical(
+    density: np.ndarray,
+    x0: float,
+    y0: float,
+    cell: float,
+    points: pl.DataFrame,
+    *,
+    merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS,
+    peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+    peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
+) -> list[MacroNode]:
+    """Build the 3-tier SEMANTIC macro node hierarchy (L1 / L0 / peaks).
+
+    - **Cities (sigma=2):** the 7 L1 cluster centroids (visit-weighted).
+    - **Towns (sigma=1):** the 18 L0 cluster centroids (visit-weighted).
+    - **Villages (sigma=0):** loosened density peaks, deduped against any
+      city/town within ``merge_radius``.
+
+    NB: on this island the cluster hierarchy is INVERTED — L0 (18) is the finest
+    tier and L1 (7) is coarser sub-regions — so using L1 as cities and L0 as
+    towns yields finer macro structure (more nodes -> finer macro-blocks) than
+    the legacy graded-L0 seeding.
+
+    Nodes are returned cities-then-towns-then-villages (each block in its own
+    deterministic cluster-id / peak order).
+    """
+    cities = cluster_centroids(points, "l1_id", "l1_name", CITY_SIGMA, "city")
+    towns = cluster_centroids(points, "l0_id", "l0_name", TOWN_SIGMA, "town")
+    villages = village_nodes_from_peaks(
+        density,
+        x0,
+        y0,
+        cell,
+        [*cities, *towns],
+        merge_radius=merge_radius,
+        peak_min_distance_units=peak_min_distance_units,
+        peak_threshold_frac=peak_threshold_frac,
+    )
+    return [*cities, *towns, *villages]
+
+
 # ---------------------------------------------------------------------------
 # 2. Density-attracting cost field
 # ---------------------------------------------------------------------------
@@ -350,7 +494,7 @@ class MacroEdge:
     node_a: int
     node_b: int
     tau: int  # min(sigma_a, sigma_b)
-    tier: int  # 2 = highway, 1 = major
+    tier: int  # construction level: 2 = highway, 1 = major, 0 = local
     path_cost: float
     length: float
 
@@ -403,17 +547,23 @@ def compute_macro_arterials(
 ) -> tuple[list[sg.LineString], list[MacroEdge]]:
     """Build the importance-typed arterial network *per level* (Galin 2011).
 
-    Unlike a single Delaunay over all nodes (which makes city–city edges rare and
-    starves the highway tier), this builds one network per importance level:
+    Generalized to N levels: one network per distinct sigma present, highest
+    first. For each level ``L`` (descending distinct sigma) a Delaunay is built
+    over the nodes with ``sigma >= L``, geodesic least-cost paths are routed
+    (Arm B ``route_through_array``), the level is beta-ratio pruned (Arm B
+    ``_prune_edges``) independently, and node-pairs already realized at a higher
+    level are excluded. Edge ``tier`` is its construction level ``L``; ``tau``
+    records ``min(sigma_a, sigma_b)``.
 
-    - **Highways (tier 2):** Delaunay over the city subset (sigma=2) → a connected
-      backbone between the major cluster centroids.
-    - **Majors (tier 1):** Delaunay over *all* nodes, minus pairs already realized
-      as highways → the secondary web feeding into the backbone.
+    For semantic sigmas ``{0, 1, 2}`` this yields three tiers:
 
-    Each level routes least-cost geodesic paths (Arm B ``route_through_array``)
-    and is beta-ratio pruned (Arm B ``_prune_edges``) independently. Edge ``tier``
-    is its construction level; ``tau`` records ``min(sigma_a, sigma_b)``.
+    - **Highways (tier 2):** network over cities (sigma>=2).
+    - **Majors (tier 1):** network over cities+towns (sigma>=1) minus highways.
+    - **Locals (tier 0):** network over all nodes (sigma>=0) minus the above.
+
+    With only sigmas ``{1, 2}`` present (legacy graded-L0 seeding) it reduces to
+    the previous 2-tier behavior (highways = city subset; majors = all minus
+    highways), so existing tests stay green.
 
     Returns the kept LineStrings and parallel ``MacroEdge`` records.
     """
@@ -427,16 +577,22 @@ def compute_macro_arterials(
     sigmas = [nd.sigma for nd in nodes]
     rows, cols = _xy_to_rowcol(xs, ys, x0, y0, cell, nrows, ncols)
 
-    city_idx = [i for i in range(n) if nodes[i].kind == "city"]
-    highway_edges = _delaunay_edges(city_idx, xs, ys)
-    major_edges = _delaunay_edges(list(range(n)), xs, ys) - highway_edges
+    # One level per distinct sigma, highest first. The Delaunay at level L spans
+    # all nodes with sigma >= L; pairs realized at a higher level are excluded.
+    distinct_levels = sorted({int(s) for s in sigmas}, reverse=True)
+    realized: set[tuple[int, int]] = set()
+    level_edges: list[tuple[int, list[tuple[int, int]]]] = []
+    for level in distinct_levels:
+        subset = [i for i in range(n) if sigmas[i] >= level]
+        edge_set = _delaunay_edges(subset, xs, ys) - realized
+        realized |= edge_set
+        level_edges.append((level, sorted(edge_set)))
 
     lines: list[sg.LineString] = []
     records: list[MacroEdge] = []
 
-    # Build each level independently (tier 2 first so highways sort ahead).
-    for tier, edge_set in ((2, highway_edges), (1, major_edges)):
-        edge_list = sorted(edge_set)
+    # Build each level independently (highest tier first so it sorts ahead).
+    for tier, edge_list in level_edges:
         if not edge_list:
             continue
         edge_paths: list[list[tuple[int, int]]] = []
@@ -510,6 +666,9 @@ def polygonize_macro_blocks(
 # GeoJSON serialization
 # ---------------------------------------------------------------------------
 
+# Tier -> human name (construction level). 2=highway, 1=major, 0=local.
+_TIER_NAME: dict[int, str] = {2: "highway", 1: "major", 0: "local"}
+
 
 def nodes_to_geojson(nodes: list[MacroNode]) -> dict[str, Any]:
     features = []
@@ -548,7 +707,7 @@ def arterials_to_geojson(
                     "node_b": rec.node_b,
                     "tau": rec.tau,
                     "tier": rec.tier,
-                    "tier_name": "highway" if rec.tier == 2 else "major",
+                    "tier_name": _TIER_NAME.get(rec.tier, f"tier{rec.tier}"),
                     "path_cost": rec.path_cost,
                     "length": rec.length,
                 },

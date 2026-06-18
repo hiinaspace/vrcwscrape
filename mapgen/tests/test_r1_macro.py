@@ -8,8 +8,10 @@ import polars as pl
 from mapgen.r1_macro import (
     CITY_SIGMA,
     TOWN_SIGMA,
+    VILLAGE_SIGMA,
     MacroNode,
     build_density_cost_field,
+    cluster_centroids,
     compute_macro_arterials,
     grade_cities,
     tier_for_tau,
@@ -57,6 +59,83 @@ def test_visit_weighted_centroid_math() -> None:
     assert node.mass == 4.0
     assert node.x == 2.5
     assert node.y == 3.0
+
+
+def test_cluster_centroids_generic_level() -> None:
+    """``cluster_centroids`` works on any tier (here L1) with the given sigma/kind.
+
+    Two L1 clusters, each visit-weighted; emitted in ascending l1_id order with
+    the requested sigma=CITY_SIGMA and kind="city".
+    """
+    points = pl.DataFrame(
+        {
+            "l1_id": [3, 3, 1],
+            "l1_name": ["region-b", "region-b", "region-a"],
+            "visits": [1, 3, 5],
+            "x": [10.0, 0.0, 7.0],
+            "y": [0.0, 4.0, 9.0],
+        }
+    )
+    nodes = cluster_centroids(points, "l1_id", "l1_name", CITY_SIGMA, "city")
+    assert len(nodes) == 2
+    # Ascending l1_id: id=1 first (region-a), then id=3 (region-b).
+    a, b = nodes
+    assert a.label == "region-a" and a.kind == "city" and a.sigma == CITY_SIGMA
+    # Single-point cluster -> centroid is that point.
+    assert a.x == 7.0 and a.y == 9.0 and a.mass == 5.0
+    # region-b weighted: x=(10*1+0*3)/4=2.5, y=(0*1+4*3)/4=3.0, mass=4.
+    assert b.label == "region-b"
+    assert b.x == 2.5 and b.y == 3.0 and b.mass == 4.0
+    # Same machinery as visit_weighted_centroids when pointed at L0.
+    l0_points = points.rename({"l1_id": "l0_id", "l1_name": "l0_name"})
+    assert cluster_centroids(
+        l0_points, "l0_id", "l0_name", CITY_SIGMA, "city"
+    ) == visit_weighted_centroids(l0_points)
+
+
+def test_n_level_network_three_tiers_for_sigmas_012() -> None:
+    """With sigmas {0,1,2} present the network builds 3 distinct tiers.
+
+    One city (σ=2), one town (σ=1) and one village (σ=0) placed as a triangle on
+    a flat cost field. Per-level construction (highest first, higher-level pairs
+    excluded) must yield exactly one edge at each of tiers 2-absent... here the
+    city subset is a single node (no highway), the city+town subset gives a major
+    (tier 1), and the all-node subset adds the village's two local edges (tier 0).
+    """
+    cost = np.ones((60, 60), dtype=float)
+    nodes = [
+        MacroNode(x=10.0, y=10.0, sigma=CITY_SIGMA, kind="city"),
+        MacroNode(x=45.0, y=10.0, sigma=TOWN_SIGMA, kind="town"),
+        MacroNode(x=27.0, y=45.0, sigma=VILLAGE_SIGMA, kind="village"),
+    ]
+    _lines, edges = compute_macro_arterials(
+        nodes, cost, x0=0.0, y0=0.0, cell=1.0, beta_ratio=np.inf
+    )
+    tiers = sorted(e.tier for e in edges)
+    # city+town (σ>=1) Delaunay over 2 nodes -> 1 major edge (tier 1).
+    # all-nodes (σ>=0) Delaunay (triangle) has 3 edges minus the realized major
+    # -> 2 local edges (tier 0). City subset alone has 1 node -> no highway.
+    assert tiers == [0, 0, 1]
+    # tau is min(sigma) across endpoints; the major connects city(2)+town(1).
+    major = next(e for e in edges if e.tier == 1)
+    assert major.tau == 1
+    # Each local touches the village (σ=0) so tau==0.
+    assert all(e.tau == 0 for e in edges if e.tier == 0)
+
+
+def test_two_tier_behavior_preserved_for_sigmas_12() -> None:
+    """Sigmas {1,2} only -> legacy 2-tier split (highway over cities, major rest)."""
+    cost = np.ones((60, 60), dtype=float)
+    nodes = [
+        MacroNode(x=10.0, y=10.0, sigma=CITY_SIGMA, kind="city"),
+        MacroNode(x=45.0, y=10.0, sigma=CITY_SIGMA, kind="city"),
+        MacroNode(x=27.0, y=45.0, sigma=TOWN_SIGMA, kind="town"),
+    ]
+    _lines, edges = compute_macro_arterials(
+        nodes, cost, x0=0.0, y0=0.0, cell=1.0, beta_ratio=np.inf
+    )
+    # 1 highway (city-city) + 2 majors (town to each city). No tier-0 edges.
+    assert sorted(e.tier for e in edges) == [1, 1, 2]
 
 
 def test_town_peak_dedup_near_city() -> None:

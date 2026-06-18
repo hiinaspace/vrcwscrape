@@ -197,6 +197,22 @@ is where prototype effort will concentrate. Worth a small spike before committin
      30+ districts, so Chen is still partly out of distribution and the fabric
      reads as large regional super-districts, not neighborhoods. Need finer
      macro-blocks (more town/village nodes, or recursive block subdivision).
+     **STAGE 3.5a DONE (2026-06-18).** Replaced graded-L0 seeding with a 3-tier
+     SEMANTIC node hierarchy in `build_macro_nodes_hierarchical` (cities = 7 L1
+     centroids σ=2; towns = 18 L0 centroids σ=1; villages = 23 loosened density
+     peaks σ=0). Key data fact: on this island the cluster hierarchy is INVERTED
+     — L0 (18) is the FINEST tier, L1 (7) coarser sub-regions — so L1=city /
+     L0=town is what yields the *finer* structure. `compute_macro_arterials`
+     generalized to N levels (one Galin network per distinct σ, highest first,
+     higher-level pairs excluded): 8 highways / 37 majors / 68 locals. Blocks
+     polygonized over ALL three tiers ⇒ **30 macro-blocks** (was 13; median area
+     160 vs the old coarse blocks). Re-rendered hybrid at `--total-target 1200`
+     (was 600): **599 districts, 0 Chen failures, 30/30 invariants pass, 414 s**.
+     Result: most blocks now read at neighborhood scale (core #3 especially —
+     varied irregular districts, all-tier convergence at a node). Remaining: the
+     finer blocks did NOT fix artifact (c) — see below; cores #1/#2 still show a
+     density ridge as a block *edge* with a degenerate parallel-district fan in
+     the acute wedge beside it. (c) is now the dominant macro artifact.
    - **(c) Density-attracting arterials bisect cores.** Because arterials hug
      density ridges and block boundaries are polygonized *along* arterials, the
      densest ridges become block *edges* that split a core across two blocks
@@ -210,10 +226,16 @@ is where prototype effort will concentrate. Worth a small spike before committin
 
 ## Status
 
-Stages 1–3 done (macro hierarchy + seam spike + full assembly). The hybrid is
-mechanically sound and viable (192 districts, all invariants pass) but reads as a
-road skeleton over coarse Chen patches, not a city. Stage-3.5 work, in priority
-order: (a) arterial↔local T-junction connectivity, (b) finer macro-blocks, (c)
-stop density ridges from becoming block boundaries. Footholds: `r1_macro.py`,
-`r1_seam.py` (incl. `chen_in_block`), `run_r1_macro.py`, `run_r1_seam_spike.py`,
-`run_r1_hybrid.py`, plus the zoom-review harness.
+Stages 1–3 + stage-3.5a done. The hybrid now uses a 3-tier semantic node
+hierarchy (L1 cities / L0 towns / peak villages) → 30 macro-blocks (was 13) →
+599 districts at total-target 1200, 30/30 invariants pass, 414 s. The 3-tier
+road hierarchy reads clearly and most blocks are at neighborhood scale.
+Remaining stage-3.5 work, in priority order: (a) arterial↔local T-junction
+connectivity (still the dominant artifact — arterials run parallel to local Chen
+streets, no junctions); (c) density ridges still become block boundaries that
+bisect cores, with acute-wedge parallel-district fans beside them (finer blocks
+did NOT fix this — needs route-around-summit or peak-snap-to-center). Footholds:
+`r1_macro.py` (incl. `cluster_centroids`, `build_macro_nodes_hierarchical`,
+N-level `compute_macro_arterials`), `r1_seam.py` (incl. `chen_in_block`),
+`run_r1_macro.py`, `run_r1_seam_spike.py`, `run_r1_hybrid.py`, plus the
+zoom-review harness.
