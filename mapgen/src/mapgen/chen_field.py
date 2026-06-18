@@ -3,10 +3,20 @@
 The functions here intentionally stop before Chen Eq. 2 scoring. They provide
 deterministic candidate curves and diagnostics so the generator can score and
 select split results in a separate step.
+
+R1 regional extension (not Chen/Yang paper machinery): an optional
+``RasterGuidanceField`` can be blended into the default ``grid_smooth`` field as
+a weighted 4-RoSy alignment constraint (e.g. terrain-gradient / density-ridge
+guidance for the regional probe). It is off by default; with ``guidance=None``
+the field is byte-identical to the strict implementation. Boundary alignment
+still dominates inside the boundary radius. The opt-in ``yang_*`` field modes
+ignore guidance and record a ``guidance_ignored_*`` diagnostic.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import math
 from dataclasses import dataclass, replace
 from typing import Any
@@ -17,6 +27,8 @@ from shapely import LineString, Point, Polygon
 
 PointLike = tuple[float, float] | Point
 XY = tuple[float, float]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,42 @@ class StreamlineConfig:
 
 
 DEFAULT_STREAMLINE_CONFIG = StreamlineConfig()
+
+
+@dataclass(frozen=True, eq=False)
+class RasterGuidanceField:
+    """Optional external 4-RoSy alignment guidance for ``grid_smooth`` fields.
+
+    R1 regional extension, **not** Chen/Yang paper machinery. When supplied to
+    ``generate_layout_for_boundary`` / the cross-field builders, the guidance is
+    blended into the default ``grid_smooth`` solve as an extra weighted unit
+    vector in the doubled/quadrupled ``(cos 4t, sin 4t)`` space, analogous to how
+    boundary constraints enter. Boundary alignment still dominates within the
+    boundary radius.
+
+    ``angle`` is a preferred street direction in radians (4-RoSy: only its value
+    mod ``pi/2`` matters). ``weight`` is a non-negative constraint strength; 0 (or
+    sampling outside the raster) means no influence. The cell-center transform is
+    ``x = x0 + col*cell``, ``y = y0 + row*cell``. ``eq=False`` keeps the frozen
+    dataclass from trying to compare/hash its numpy arrays.
+    """
+
+    angle: np.ndarray  # (H, W) preferred street direction, radians
+    weight: np.ndarray  # (H, W) >= 0 constraint strength; 0 = no influence
+    x0: float
+    y0: float
+    cell: float
+
+    def digest(self) -> bytes:
+        """Content digest for cache keying (arrays are not hashable)."""
+        hasher = hashlib.sha1()
+        angle = np.ascontiguousarray(self.angle, dtype=float)
+        weight = np.ascontiguousarray(self.weight, dtype=float)
+        hasher.update(repr(angle.shape).encode("ascii"))
+        hasher.update(angle.tobytes())
+        hasher.update(weight.tobytes())
+        hasher.update(repr((float(self.x0), float(self.y0), float(self.cell))).encode())
+        return hasher.digest()
 
 
 @dataclass(frozen=True)
@@ -235,7 +283,7 @@ class _YangBField:
 
 _CrossField = _BoundaryBlendField | _GridSmoothField | _YangDField | _YangBField
 _YangMeshField = _YangDField | _YangBField
-_FIELD_CACHE: dict[tuple[bytes, StreamlineConfig, str], _CrossField] = {}
+_FIELD_CACHE: dict[tuple[bytes, StreamlineConfig, str, bytes], _CrossField] = {}
 
 
 def cross_field_angle(
@@ -244,6 +292,7 @@ def cross_field_angle(
     *,
     mode: str | None = None,
     config: StreamlineConfig = DEFAULT_STREAMLINE_CONFIG,
+    guidance: RasterGuidanceField | None = None,
 ) -> float:
     """Return a deterministic 4-RoSy cross-field base orientation at ``point``.
 
@@ -252,8 +301,11 @@ def cross_field_angle(
     nearest boundary tangent and interior nodes are smoothed with a weak global
     domain-axis prior. ``mode="boundary_blend"`` keeps the previous direct
     approximation available for compatibility.
+
+    ``guidance`` (R1 regional extension, off by default) blends an external
+    ``RasterGuidanceField`` into the ``grid_smooth`` solve; other modes ignore it.
     """
-    field = _build_cross_field(boundary, config=config, mode=mode)
+    field = _build_cross_field(boundary, config=config, mode=mode, guidance=guidance)
     return field.angle_at(_xy(point))
 
 
@@ -262,6 +314,8 @@ def trace_streamline(
     seed: XY,
     angle: float,
     config: StreamlineConfig = DEFAULT_STREAMLINE_CONFIG,
+    *,
+    guidance: RasterGuidanceField | None = None,
 ) -> LineString:
     """Trace a field streamline in both directions until it reaches boundary."""
     if not boundary.is_valid or boundary.is_empty or boundary.area <= 1e-12:
@@ -269,7 +323,7 @@ def trace_streamline(
     if not boundary.covers(Point(seed)):
         raise ValueError("streamline seed must be inside or on the boundary")
 
-    field = _build_cross_field(boundary, config=config)
+    field = _build_cross_field(boundary, config=config, guidance=guidance)
     return _trace_streamline_with_field(boundary, seed, angle, config, field)
 
 
@@ -299,8 +353,13 @@ def candidate_streamlines(
     seed: int = 0,
     existing_lines: tuple[LineString, ...] = (),
     config: StreamlineConfig = DEFAULT_STREAMLINE_CONFIG,
+    guidance: RasterGuidanceField | None = None,
 ) -> tuple[StreamlineCandidate, ...]:
-    """Return deterministic Yang-style streamline candidates for ``boundary``."""
+    """Return deterministic Yang-style streamline candidates for ``boundary``.
+
+    ``guidance`` (R1 regional extension, off by default) blends an external
+    ``RasterGuidanceField`` into the ``grid_smooth`` field used for tracing.
+    """
     if target_count <= 0:
         return ()
     if not boundary.is_valid or boundary.is_empty or boundary.area <= 1e-12:
@@ -314,7 +373,7 @@ def candidate_streamlines(
     )
     min_length = config.min_length_fraction * scale
     duplicate_distance = config.duplicate_distance_fraction * scale
-    field = _build_cross_field(boundary, config=config)
+    field = _build_cross_field(boundary, config=config, guidance=guidance)
     field_diagnostics = field.diagnostics
     seed_plan = _candidate_seed_plan(
         boundary,
@@ -885,21 +944,46 @@ def _build_cross_field(
     *,
     config: StreamlineConfig,
     mode: str | None = None,
+    guidance: RasterGuidanceField | None = None,
 ) -> _CrossField:
     selected_mode = config.field_mode if mode is None else mode
-    cache_key = (bytes(boundary.wkb), config, selected_mode)
+    # The guidance digest keeps the cache key hashable (numpy arrays are not) and
+    # distinct per guidance content. guidance=None ⇒ empty digest ⇒ the exact
+    # pre-extension cache key, so default behaviour is byte-identical.
+    guidance_digest = b"" if guidance is None else guidance.digest()
+    cache_key = (bytes(boundary.wkb), config, selected_mode, guidance_digest)
     cached = _FIELD_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     base_angle = _principal_cross_axis(boundary)
     if selected_mode == _FIELD_MODE_BOUNDARY_BLEND:
+        if guidance is not None:
+            _LOGGER.warning(
+                "guidance_ignored_for_field_mode: RasterGuidanceField is only "
+                "blended into the grid_smooth field; mode=%s ignores it",
+                selected_mode,
+            )
         field: _CrossField = _BoundaryBlendField(boundary, config, base_angle)
     elif selected_mode == _FIELD_MODE_GRID_SMOOTH:
-        field = _build_grid_smooth_field(boundary, config=config, base_angle=base_angle)
+        field = _build_grid_smooth_field(
+            boundary, config=config, base_angle=base_angle, guidance=guidance
+        )
     elif selected_mode == _FIELD_MODE_YANG_D_FIELD:
+        if guidance is not None:
+            _LOGGER.warning(
+                "guidance_ignored_for_field_mode: RasterGuidanceField is only "
+                "blended into the grid_smooth field; mode=%s ignores it",
+                selected_mode,
+            )
         field = _build_yang_d_field(boundary, config=config, base_angle=base_angle)
     elif selected_mode == _FIELD_MODE_YANG_B_FIELD:
+        if guidance is not None:
+            _LOGGER.warning(
+                "guidance_ignored_for_field_mode: RasterGuidanceField is only "
+                "blended into the grid_smooth field; mode=%s ignores it",
+                selected_mode,
+            )
         field = _build_yang_b_field(boundary, config=config, base_angle=base_angle)
     else:
         raise ValueError(f"unknown cross-field mode: {selected_mode}")
@@ -925,7 +1009,11 @@ def _boundary_blend_angle(
 
 
 def _build_grid_smooth_field(
-    boundary: Polygon, *, config: StreamlineConfig, base_angle: float
+    boundary: Polygon,
+    *,
+    config: StreamlineConfig,
+    base_angle: float,
+    guidance: RasterGuidanceField | None = None,
 ) -> _CrossField:
     minx, miny, maxx, maxy = boundary.bounds
     width = max(maxx - minx, 1e-9)
@@ -940,8 +1028,11 @@ def _build_grid_smooth_field(
     vectors = np.zeros((ny, nx, 2), dtype=float)
     boundary_vectors = np.zeros((ny, nx, 2), dtype=float)
     boundary_weights = np.zeros((ny, nx), dtype=float)
+    guidance_vectors = np.zeros((ny, nx, 2), dtype=float)
+    guidance_weights = np.zeros((ny, nx), dtype=float)
     base_vector = _cross_vector(base_angle)
     boundary_constraint_count = 0
+    field_boundary_weight = max(0.0, float(config.field_boundary_weight))
 
     interior_weight = max(0.0, float(config.field_interior_weight))
     for iy, y in enumerate(ys):
@@ -961,8 +1052,19 @@ def _build_grid_smooth_field(
                 boundary_constraint_count += 1
             boundary_vectors[iy, ix] = boundary_vector
             boundary_weights[iy, ix] = boundary_weight
+            if guidance is not None:
+                guide_vector, guide_weight = _guidance_constraint(
+                    guidance,
+                    point,
+                    boundary_weight=boundary_weight,
+                    field_boundary_weight=field_boundary_weight,
+                )
+                guidance_vectors[iy, ix] = guide_vector
+                guidance_weights[iy, ix] = guide_weight
             vectors[iy, ix] = _normalize_vector(
-                boundary_vector * boundary_weight + base_vector * interior_weight,
+                boundary_vector * boundary_weight
+                + guidance_vectors[iy, ix] * guidance_weights[iy, ix]
+                + base_vector * interior_weight,
                 base_vector,
             )
 
@@ -997,6 +1099,7 @@ def _build_grid_smooth_field(
                 target = (
                     smooth_target
                     + boundary_vectors[iy, ix] * boundary_weights[iy, ix]
+                    + guidance_vectors[iy, ix] * guidance_weights[iy, ix]
                     + base_vector * interior_weight
                 )
                 normalized = _normalize_vector(target, old[iy, ix])
@@ -1020,6 +1123,93 @@ def _build_grid_smooth_field(
         residual=residual,
         boundary_constraint_count=boundary_constraint_count,
     )
+
+
+def _guidance_constraint(
+    guidance: RasterGuidanceField,
+    point: XY,
+    *,
+    boundary_weight: float,
+    field_boundary_weight: float,
+) -> tuple[np.ndarray, float]:
+    """Return the (4-RoSy unit vector, effective weight) for external guidance.
+
+    R1 regional extension. The raster angle/weight are sampled bilinearly (0
+    outside the raster). The returned weight is attenuated so boundary alignment
+    still dominates within the boundary radius: it is capped below
+    ``field_boundary_weight`` and faded out as the local boundary constraint
+    grows. With ``boundary_weight >= field_boundary_weight`` (right at the
+    boundary) the guidance is fully suppressed.
+    """
+    angle, raw_weight = _sample_guidance(guidance, point)
+    if raw_weight <= 0.0:
+        return np.zeros(2, dtype=float), 0.0
+    # Keep guidance strictly weaker than the full boundary constraint so it can
+    # never out-vote a boundary-aligned node.
+    cap = 0.5 * field_boundary_weight if field_boundary_weight > 0.0 else raw_weight
+    capped = min(float(raw_weight), cap) if cap > 0.0 else float(raw_weight)
+    if field_boundary_weight > 0.0:
+        fade = max(0.0, 1.0 - boundary_weight / field_boundary_weight)
+    else:
+        fade = 1.0
+    effective = capped * fade
+    if effective <= 0.0:
+        return np.zeros(2, dtype=float), 0.0
+    return _cross_vector(angle), effective
+
+
+def _sample_guidance(guidance: RasterGuidanceField, point: XY) -> tuple[float, float]:
+    """Bilinearly sample (angle, weight); weight 0 outside the raster.
+
+    Cell-center transform: ``x = x0 + col*cell``, ``y = y0 + row*cell``. Angle is
+    interpolated in the doubled-angle ``(cos 4t, sin 4t)`` space so the 4-RoSy
+    periodicity is respected; weight is interpolated linearly. Nearest-cell is
+    used at the raster edges.
+    """
+    angle_raster = guidance.angle
+    weight_raster = guidance.weight
+    rows, cols = angle_raster.shape
+    if rows == 0 or cols == 0 or guidance.cell <= 0.0:
+        return 0.0, 0.0
+    px, py = point
+    fc = (px - guidance.x0) / guidance.cell
+    fr = (py - guidance.y0) / guidance.cell
+    # Outside the raster footprint ⇒ no influence.
+    if fc < -0.5 or fc > cols - 0.5 or fr < -0.5 or fr > rows - 0.5:
+        return 0.0, 0.0
+    fc = float(np.clip(fc, 0.0, cols - 1))
+    fr = float(np.clip(fr, 0.0, rows - 1))
+    c0 = min(max(int(math.floor(fc)), 0), cols - 1)
+    r0 = min(max(int(math.floor(fr)), 0), rows - 1)
+    c1 = min(c0 + 1, cols - 1)
+    r1 = min(r0 + 1, rows - 1)
+    tc = fc - c0
+    tr = fr - r0
+    corners = (
+        (r0, c0, (1.0 - tc) * (1.0 - tr)),
+        (r0, c1, tc * (1.0 - tr)),
+        (r1, c0, (1.0 - tc) * tr),
+        (r1, c1, tc * tr),
+    )
+    cross = np.zeros(2, dtype=float)
+    weight_total = 0.0
+    blend_norm = 0.0
+    for r, c, blend in corners:
+        if blend <= 0.0:
+            continue
+        cell_weight = float(weight_raster[r, c])
+        weight_total += cell_weight * blend
+        blend_norm += blend
+        cross += _cross_vector(float(angle_raster[r, c])) * blend
+    if blend_norm <= 0.0:
+        return 0.0, 0.0
+    sampled_weight = max(0.0, weight_total / blend_norm)
+    # A near-zero cross vector means the interpolated angles cancel (ambiguous
+    # direction); contribute no constraint rather than a spurious axis pull.
+    if sampled_weight <= 0.0 or float(np.linalg.norm(cross)) <= 1e-12:
+        return 0.0, 0.0
+    angle = _angle_from_cross_vector(cross, 0.0)
+    return angle, sampled_weight
 
 
 def _boundary_constraint_weight(

@@ -45,7 +45,13 @@ optimization.
   `evaluate_layout_invariants`.
 - `chen_field.py` — per-parcel streamline candidates: default grid-smoothed
   4-RoSy; opt-in `yang_d_field` / `yang_b_field` modes (approximations,
-  labeled).
+  labeled). Optional `RasterGuidanceField` blend (R1 regional extension, off by
+  default, not Chen/Yang paper machinery): adds a weighted 4-RoSy alignment
+  constraint to the `grid_smooth` field, attenuated so boundary alignment
+  dominates inside the boundary radius; `yang_*`/`boundary_blend` modes ignore
+  it with a logged diagnostic. `generate_layout_for_boundary` also exposes
+  `split_weights` (Eq. 2 lambda override). Both default to byte-identical
+  behaviour.
 - `chen_streets.py` — `extend_street_network` per Section 4.2: unreachable
   grouping, strict I-then-L access enumeration (Fig. 9, incl. case-5
   recursion), junction-weighted Dijkstra connection, cul-de-sac avoidance

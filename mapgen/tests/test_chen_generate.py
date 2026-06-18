@@ -9,9 +9,12 @@ count assertions use ranges rather than exact values.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from shapely import LineString, Polygon
 
+from mapgen.chen_core import ChenSplitWeights
+from mapgen.chen_field import RasterGuidanceField
 from mapgen.chen_generate import (
     GENERATION_STAGE,
     STREAMLINE_MODE_YANG_B_FIELD,
@@ -291,6 +294,127 @@ def test_score_rejects_undersized_child() -> None:
     # A cut very close to an edge produces a sliver below min area.
     sliver_cut = LineString([(0.01, -0.1), (0.01, 1.1)])
     assert _score_candidate(square, sliver_cut, [], min_parcel_area=0.1) is None
+
+
+# ---------------------------------------------------------------------------
+# Part A: ChenSplitWeights plumbing through _score_candidate.
+# ---------------------------------------------------------------------------
+
+
+def test_split_weights_default_matches_paper_lambdas() -> None:
+    """split_weights=None must reproduce the inline Eq. 2 (0.3/0.5/0.2) score."""
+    square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+    cut = LineString([(1.0, -0.1), (1.0, 2.1)])
+    streets = [((0.0, 0.0), (2.0, 0.0))]
+    implicit = _score_candidate(square, cut, streets, min_parcel_area=0.01)
+    explicit = _score_candidate(
+        square,
+        cut,
+        streets,
+        min_parcel_area=0.01,
+        split_weights=ChenSplitWeights(),
+    )
+    assert implicit is not None and explicit is not None
+    assert explicit[0] == pytest.approx(implicit[0], abs=1e-12)
+
+
+def test_split_weights_change_selected_candidate() -> None:
+    """Extreme weights flip the argmax between two constructed candidates.
+
+    Cut A splits the square into two equal-area triangles (balanced size, higher
+    irregularity); cut B into a thin slab + larger rectangle (unbalanced size,
+    lower irregularity). Size-heavy weights must prefer A; regularity-heavy
+    weights must prefer B. This proves the weights reach _score_candidate and
+    drive selection.
+    """
+    square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+    cut_balanced = LineString([(-0.1, -0.1), (2.1, 2.1)])
+    cut_regular = LineString([(0.6, -0.1), (0.6, 2.1)])
+
+    size_heavy = ChenSplitWeights(size=1.0, regularity=0.0, access=0.0)
+    regu_heavy = ChenSplitWeights(size=0.0, regularity=1.0, access=0.0)
+
+    def score(cut: LineString, weights: ChenSplitWeights) -> float:
+        scored = _score_candidate(
+            square, cut, [], min_parcel_area=0.01, split_weights=weights
+        )
+        assert scored is not None
+        return scored[0]
+
+    assert score(cut_balanced, size_heavy) > score(cut_regular, size_heavy)
+    assert score(cut_regular, regu_heavy) > score(cut_balanced, regu_heavy)
+
+
+def test_generate_accepts_custom_split_weights_and_surfaces_them() -> None:
+    boundary = boundary_preset("square")
+    custom = ChenSplitWeights(size=0.6, regularity=0.3, access=0.1)
+    generated = generate_layout_for_boundary(
+        boundary, parcel_count=12, seed=0, split_weights=custom
+    )
+    m = generated.metrics
+    assert m["split_weight_size"] == pytest.approx(0.6)
+    assert m["split_weight_regularity"] == pytest.approx(0.3)
+    assert m["split_weight_access"] == pytest.approx(0.1)
+    assert m["guidance_field_applied"] is False
+    assert generated.layout.mesh.parcels
+
+
+# ---------------------------------------------------------------------------
+# Part B: RasterGuidanceField is off by default and identity-preserving.
+# ---------------------------------------------------------------------------
+
+
+def _layout_signature(generated) -> tuple:
+    parcels = tuple(
+        tuple(round(c, 9) for c in parcel.geom.exterior.coords[0])
+        + (round(parcel.geom.area, 9),)
+        for parcel in sorted(
+            generated.layout.mesh.parcels.values(), key=lambda p: p.parcel_id
+        )
+    )
+    streets = tuple(sorted(generated.layout.street_network.edges))
+    lines = tuple(
+        (level, tuple(round(c, 9) for xy in line.coords for c in xy))
+        for level, line in generated.partition_lines
+    )
+    return parcels, streets, lines
+
+
+@pytest.mark.parametrize("name", SHAPES)
+def test_guidance_and_weights_none_is_identical_to_pre_change_signature(
+    name: str,
+) -> None:
+    boundary = boundary_preset(name)
+    # The pre-change call signature (no split_weights / guidance kwargs).
+    baseline = generate_layout_for_boundary(boundary, parcel_count=12, seed=0)
+    # Explicitly None for both new kwargs.
+    with_none = generate_layout_for_boundary(
+        boundary, parcel_count=12, seed=0, split_weights=None, guidance=None
+    )
+    assert _layout_signature(with_none) == _layout_signature(baseline)
+
+
+def test_generate_with_guidance_runs_and_flags_metric() -> None:
+    boundary = boundary_preset("square")
+    geom = boundary.geom
+    minx, miny, maxx, maxy = geom.bounds
+    cells = 16
+    cell = max(maxx - minx, maxy - miny) / (cells - 1)
+    guidance = RasterGuidanceField(
+        angle=np.full((cells, cells), np.radians(45.0)),
+        weight=np.full((cells, cells), 4.0),
+        x0=minx,
+        y0=miny,
+        cell=cell,
+    )
+    generated = generate_layout_for_boundary(
+        boundary, parcel_count=12, seed=0, guidance=guidance
+    )
+    assert generated.metrics["guidance_field_applied"] is True
+    assert generated.layout.mesh.parcels
+    # Invariants must still hold with guidance active.
+    assert generated.metrics["paper_invariant_pass"] is True
+    assert generated.metrics["geometry_valid_pass"] is True
 
 
 # ---------------------------------------------------------------------------

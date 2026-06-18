@@ -34,7 +34,9 @@ from shapely import LineString, MultiLineString, Polygon
 from shapely.ops import linemerge, split
 
 from mapgen.chen_core import (
+    DEFAULT_SPLIT_WEIGHTS,
     ChenLayout,
+    ChenSplitWeights,
     EdgeKey,
     ParcelMesh,
     build_chen_layout,
@@ -46,7 +48,11 @@ from mapgen.chen_core import (
     normalized_edge,
     polygon_street_access_ratio,
 )
-from mapgen.chen_field import StreamlineConfig, candidate_streamlines
+from mapgen.chen_field import (
+    RasterGuidanceField,
+    StreamlineConfig,
+    candidate_streamlines,
+)
 from mapgen.chen_mesh import ParcelMeshEditor, ShortEdgeMergeRejected
 from mapgen.chen_optimize import (
     OptimizationConfig,
@@ -81,10 +87,9 @@ _OPTIMIZATION_REGULARITY_DIAGNOSTIC_DEFAULTS: dict[str, Any] = {
 
 GENERATION_STAGE = "chen_section4_hierarchical_co_generation_v2"
 
-#: Paper-faithful Eq. 2 weights and threshold.
-_LAMBDA_SIZE = 0.3
-_LAMBDA_REGU = 0.5
-_LAMBDA_ACCE = 0.2
+#: Paper-faithful Eq. 2 access threshold. The size/regularity/access lambda
+#: weights live in ``chen_core.ChenSplitWeights`` (default 0.3/0.5/0.2) and are
+#: threaded through ``_score_candidate`` so callers can override them.
 _ACCESS_TAU = 0.5
 
 DEFAULT_GENERATION_OPTIMIZATION_CONFIG = OptimizationConfig()
@@ -378,6 +383,8 @@ def generate_layout_for_boundary(
     streamline_mode: str = STREAMLINE_MODE_BASELINE,
     streamline_config: StreamlineConfig | None = None,
     street_config: StreetConfig | None = None,
+    split_weights: ChenSplitWeights | None = None,
+    guidance: RasterGuidanceField | None = None,
 ) -> GeneratedChenLayout:
     """Generate a deterministic Chen layout for ``boundary``.
 
@@ -385,6 +392,12 @@ def generate_layout_for_boundary(
     ``parcel_count`` convenience maps to ``min_parcel_area = area /
     (1.5 * parcel_count)`` (calibrated so emergent counts land in the
     [0.6, 1.4]× band around the requested target for the standard shapes).
+
+    ``split_weights`` overrides the paper Eq. 2 ``(size, regularity, access)``
+    lambda weights; ``None`` uses the paper defaults. ``guidance`` (R1 regional
+    extension, off by default, not Chen/Yang paper machinery) blends an external
+    ``RasterGuidanceField`` into the default ``grid_smooth`` field. With both
+    ``None`` the result is byte-identical to the pre-extension generator.
     """
     if (min_parcel_area is None) == (parcel_count is None):
         raise ValueError("provide exactly one of min_parcel_area or parcel_count")
@@ -401,6 +414,9 @@ def generate_layout_for_boundary(
         resolved_min_area = float(min_parcel_area)
 
     street_cfg = street_config if street_config is not None else DEFAULT_STREET_CONFIG
+    resolved_split_weights = (
+        split_weights if split_weights is not None else DEFAULT_SPLIT_WEIGHTS
+    )
     resolved_streamline_config, resolved_streamline_mode = _resolve_streamline_config(
         streamline_mode=streamline_mode,
         streamline_config=streamline_config,
@@ -419,6 +435,8 @@ def generate_layout_for_boundary(
         seed=seed,
         streamline_config=streamline_config_for_candidates,
         street_config=street_cfg,
+        split_weights=resolved_split_weights,
+        guidance=guidance,
     )
     generation_seconds = time.perf_counter() - generation_start
 
@@ -491,6 +509,10 @@ def generate_layout_for_boundary(
                 if resolved_streamline_config is not None
                 else "default"
             ),
+            "split_weight_size": float(resolved_split_weights.size),
+            "split_weight_regularity": float(resolved_split_weights.regularity),
+            "split_weight_access": float(resolved_split_weights.access),
+            "guidance_field_applied": bool(guidance is not None),
             "max_hierarchical_level": int(loop_result.max_level),
             "level_count": int(loop_result.max_level + 1),
             "accepted_split_count": int(loop_result.total_splits),
@@ -561,6 +583,8 @@ def _run_level_loop(
     seed: int,
     streamline_config: StreamlineConfig,
     street_config: StreetConfig,
+    split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
+    guidance: RasterGuidanceField | None = None,
 ) -> _LevelLoopResult:
     editor = ParcelMeshEditor.from_boundary(boundary_geom)
     # Level-0 street = the whole input boundary ring (mesh edges).
@@ -598,6 +622,8 @@ def _run_level_loop(
                 seed=seed,
                 level=level,
                 streamline_config=streamline_config,
+                split_weights=split_weights,
+                guidance=guidance,
             )
             if applied is None:
                 continue
@@ -641,6 +667,8 @@ def _try_split_parcel(
     seed: int,
     level: int,
     streamline_config: StreamlineConfig,
+    split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
+    guidance: RasterGuidanceField | None = None,
 ) -> tuple[LineString, tuple[int, int], int, int] | None:
     """Score candidates, apply the best split, and weld new short edges.
 
@@ -655,6 +683,7 @@ def _try_split_parcel(
             seed=candidate_seed,
             existing_lines=(),
             config=streamline_config,
+            guidance=guidance,
         )
     except ValueError:
         return None
@@ -670,6 +699,7 @@ def _try_split_parcel(
             candidate.line,
             street_segments,
             min_parcel_area=min_parcel_area,
+            split_weights=split_weights,
         )
         if scored is None:
             continue
@@ -707,11 +737,13 @@ def _score_candidate(
     street_segments: list[tuple[tuple[float, float], tuple[float, float]]],
     *,
     min_parcel_area: float,
+    split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
 ) -> tuple[float, LineString] | None:
     """Geometry-only Eq. 2 scoring of a candidate partition line.
 
     Returns ``(Q, clipped_segment)`` or ``None`` when the split is invalid (a
-    child below the minimum parcel area, or a degenerate cut).
+    child below the minimum parcel area, or a degenerate cut). ``split_weights``
+    defaults to the paper Eq. 2 ``(0.3, 0.5, 0.2)`` lambdas.
     """
     split_result = _split_face(parcel_poly, line)
     if split_result is None:
@@ -734,7 +766,11 @@ def _score_candidate(
         part_a, part_b, street_segments, min_parcel_area=min_parcel_area
     )
 
-    q_total = _LAMBDA_SIZE * q_size + _LAMBDA_REGU * q_regu + _LAMBDA_ACCE * q_acce
+    q_total = (
+        split_weights.size * q_size
+        + split_weights.regularity * q_regu
+        + split_weights.access * q_acce
+    )
     return q_total, segment
 
 
@@ -1121,7 +1157,9 @@ def _canonical_line(line: LineString) -> LineString:
 
 __all__ = [
     "BoundarySpec",
+    "ChenSplitWeights",
     "GeneratedChenLayout",
+    "RasterGuidanceField",
     "STREAMLINE_MODE_BASELINE",
     "STREAMLINE_MODE_YANG_B_FIELD",
     "STREAMLINE_MODE_YANG_D_FIELD",

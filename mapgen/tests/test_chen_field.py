@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import shapely.affinity
 from shapely import LineString, Point, Polygon
 
 from mapgen.chen_field import (
+    RasterGuidanceField,
     StreamlineConfig,
     candidate_streamlines,
     cross_field_angle,
@@ -723,3 +725,130 @@ def test_existing_line_suppression_removes_near_duplicate_candidates() -> None:
 def test_candidate_streamlines_validates_boundary() -> None:
     with pytest.raises(ValueError, match="valid non-empty"):
         candidate_streamlines(Polygon(), target_count=4)
+
+
+# ---------------------------------------------------------------------------
+# R1 regional extension: RasterGuidanceField (off by default, not paper).
+# ---------------------------------------------------------------------------
+
+
+def _constant_guidance(
+    *,
+    angle: float,
+    weight: float,
+    minx: float,
+    miny: float,
+    maxx: float,
+    maxy: float,
+    cells: int = 12,
+) -> RasterGuidanceField:
+    """A uniform guidance raster covering the [min, max] world box."""
+    span = max(maxx - minx, maxy - miny)
+    cell = span / max(cells - 1, 1)
+    angle_raster = np.full((cells, cells), float(angle), dtype=float)
+    weight_raster = np.full((cells, cells), float(weight), dtype=float)
+    return RasterGuidanceField(
+        angle=angle_raster,
+        weight=weight_raster,
+        x0=minx,
+        y0=miny,
+        cell=cell,
+    )
+
+
+def test_guidance_none_is_byte_identical_to_default_field() -> None:
+    square = Polygon([(0.0, 0.0), (120.0, 0.0), (120.0, 120.0), (0.0, 120.0)])
+    samples = [(30.0, 30.0), (60.0, 60.0), (90.0, 40.0), (45.0, 95.0)]
+    for sample in samples:
+        baseline = cross_field_angle(square, sample)
+        with_none = cross_field_angle(square, sample, guidance=None)
+        assert with_none == baseline
+
+
+def test_guidance_rotates_interior_field_angles() -> None:
+    square = Polygon([(0.0, 0.0), (120.0, 0.0), (120.0, 120.0), (0.0, 120.0)])
+    guidance = _constant_guidance(
+        angle=math.radians(45.0),
+        weight=6.0,
+        minx=0.0,
+        miny=0.0,
+        maxx=120.0,
+        maxy=120.0,
+    )
+    interior = (60.0, 60.0)
+
+    baseline_angle = cross_field_angle(square, interior)
+    guided_angle = cross_field_angle(square, interior, guidance=guidance)
+
+    # The default square field is axis-aligned at the center; 45 deg guidance
+    # must pull the interior 4-RoSy orientation measurably off-axis toward 45.
+    assert _axis_delta(baseline_angle) <= math.radians(5.0)
+    assert _cross_delta(guided_angle, math.radians(45.0)) < _cross_delta(
+        baseline_angle, math.radians(45.0)
+    )
+    assert _cross_delta(guided_angle, baseline_angle) >= math.radians(10.0)
+
+
+def test_guidance_does_not_override_boundary_alignment() -> None:
+    square = Polygon([(0.0, 0.0), (120.0, 0.0), (120.0, 120.0), (0.0, 120.0)])
+    guidance = _constant_guidance(
+        angle=math.radians(45.0),
+        weight=50.0,  # deliberately huge; must still not flip the boundary
+        minx=0.0,
+        miny=0.0,
+        maxx=120.0,
+        maxy=120.0,
+    )
+    # A node hard against the bottom edge: boundary tangent is horizontal.
+    near_boundary = (60.0, 1.0)
+
+    guided_angle = cross_field_angle(square, near_boundary, guidance=guidance)
+    # Despite 45 deg guidance at 50x weight, the near-boundary orientation stays
+    # boundary-aligned (axis), not rotated to 45.
+    assert _axis_delta(guided_angle) <= math.radians(12.0)
+    assert _cross_delta(guided_angle, math.radians(45.0)) > math.radians(20.0)
+
+
+def test_guidance_zero_weight_leaves_field_unchanged() -> None:
+    square = Polygon([(0.0, 0.0), (120.0, 0.0), (120.0, 120.0), (0.0, 120.0)])
+    guidance = _constant_guidance(
+        angle=math.radians(45.0),
+        weight=0.0,
+        minx=0.0,
+        miny=0.0,
+        maxx=120.0,
+        maxy=120.0,
+    )
+    for sample in [(60.0, 60.0), (30.0, 90.0)]:
+        baseline = cross_field_angle(square, sample)
+        zero_weight = cross_field_angle(square, sample, guidance=guidance)
+        assert zero_weight == pytest.approx(baseline, abs=1e-9)
+
+
+def test_guidance_outside_raster_has_no_influence() -> None:
+    square = Polygon([(0.0, 0.0), (120.0, 0.0), (120.0, 120.0), (0.0, 120.0)])
+    # Raster footprint covers only the lower-left corner of the square.
+    guidance = _constant_guidance(
+        angle=math.radians(45.0),
+        weight=8.0,
+        minx=0.0,
+        miny=0.0,
+        maxx=30.0,
+        maxy=30.0,
+        cells=6,
+    )
+    far_interior = (100.0, 100.0)
+    baseline = cross_field_angle(square, far_interior)
+    guided = cross_field_angle(square, far_interior, guidance=guidance)
+    # The far node is outside the raster footprint, so the solved field there is
+    # only weakly perturbed via smoothing; assert it stays near the baseline.
+    assert _cross_delta(guided, baseline) <= math.radians(8.0)
+
+
+def test_guidance_field_eq_does_not_compare_arrays() -> None:
+    # eq=False keeps the frozen dataclass from raising on array comparison.
+    guidance = _constant_guidance(
+        angle=0.0, weight=1.0, minx=0.0, miny=0.0, maxx=10.0, maxy=10.0
+    )
+    assert guidance == guidance  # identity-based, no ValueError
+    assert isinstance(guidance.digest(), bytes)
