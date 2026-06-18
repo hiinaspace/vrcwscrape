@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 from scipy.spatial import Delaunay, QhullError
-from shapely import LineString, Point, Polygon
+from shapely import LineString, Point, Polygon, contains_xy
 
 PointLike = tuple[float, float] | Point
 XY = tuple[float, float]
@@ -98,6 +98,76 @@ class RasterGuidanceField:
         hasher.update(repr(angle.shape).encode("ascii"))
         hasher.update(angle.tobytes())
         hasher.update(weight.tobytes())
+        hasher.update(repr((float(self.x0), float(self.y0), float(self.cell))).encode())
+        return hasher.digest()
+
+
+@dataclass(frozen=True, eq=False)
+class RasterDensityField:
+    """Optional density raster for the density-mass split/termination mode.
+
+    R1/R2 regional extension, **not** Chen/Yang paper machinery. The Chen split
+    criterion balances geometric *area*; supplying this field to
+    ``generate_layout_for_boundary`` switches the size measure to integrated
+    density *mass*, so termination chases a "max worlds per district" target and
+    splits get denser where the population surface is denser (see
+    ``docs/regional-2_5d-research.md``, R2).
+
+    ``density`` is a non-negative ``(H, W)`` raster (e.g. the smoothed
+    ``r1_inputs.compute_density`` output). The cell-center transform matches the
+    raster builders: the center of cell ``(row, col)`` is at
+    ``x = x0 + (col + 0.5) * cell``, ``y = y0 + (row + 0.5) * cell`` (row 0 =
+    bottom). ``mass`` integrates density over a polygon by midpoint rule (sum of
+    the density of cells whose center falls inside, times ``cell**2``), so its
+    units are ``density * cell**2``; ``max_parcel_mass`` is interpreted in the
+    same units. ``eq=False`` keeps the frozen dataclass from comparing/hashing
+    its numpy array.
+    """
+
+    density: np.ndarray  # (H, W) >= 0 density surface
+    x0: float
+    y0: float
+    cell: float
+
+    def mass(self, polygon: Polygon) -> float:
+        """Integrated density mass of ``polygon`` (midpoint rule, ``density*cell^2``).
+
+        Restricts the work to the polygon's bbox sub-window of the raster, then
+        sums the density of cells whose center falls inside the polygon (the same
+        ``contains_xy`` test the raster builders use for the island mask). Returns
+        ``0.0`` for an empty/degenerate polygon or one that misses the raster.
+        """
+        nrows, ncols = self.density.shape
+        if nrows == 0 or ncols == 0 or self.cell <= 0.0:
+            return 0.0
+        minx, miny, maxx, maxy = polygon.bounds
+        # Cell-center col index c satisfies x0 + (c + 0.5)*cell == center_x.
+        col_lo = int(np.floor((minx - self.x0) / self.cell - 0.5))
+        col_hi = int(np.ceil((maxx - self.x0) / self.cell - 0.5))
+        row_lo = int(np.floor((miny - self.y0) / self.cell - 0.5))
+        row_hi = int(np.ceil((maxy - self.y0) / self.cell - 0.5))
+        col_lo = max(col_lo, 0)
+        row_lo = max(row_lo, 0)
+        col_hi = min(col_hi, ncols - 1)
+        row_hi = min(row_hi, nrows - 1)
+        if col_hi < col_lo or row_hi < row_lo:
+            return 0.0
+
+        cols = np.arange(col_lo, col_hi + 1)
+        rows = np.arange(row_lo, row_hi + 1)
+        cx = self.x0 + (cols + 0.5) * self.cell
+        cy = self.y0 + (rows + 0.5) * self.cell
+        gx, gy = np.meshgrid(cx, cy)
+        inside = contains_xy(polygon, gx.ravel(), gy.ravel()).reshape(gx.shape)
+        window = self.density[row_lo : row_hi + 1, col_lo : col_hi + 1]
+        return float(window[inside].sum()) * self.cell * self.cell
+
+    def digest(self) -> bytes:
+        """Content digest for cache keying (the array is not hashable)."""
+        hasher = hashlib.sha1()
+        density = np.ascontiguousarray(self.density, dtype=float)
+        hasher.update(repr(density.shape).encode("ascii"))
+        hasher.update(density.tobytes())
         hasher.update(repr((float(self.x0), float(self.y0), float(self.cell))).encode())
         return hasher.digest()
 

@@ -14,7 +14,7 @@ import pytest
 from shapely import LineString, Polygon
 
 from mapgen.chen_core import ChenSplitWeights
-from mapgen.chen_field import RasterGuidanceField
+from mapgen.chen_field import RasterDensityField, RasterGuidanceField
 from mapgen.chen_generate import (
     GENERATION_STAGE,
     STREAMLINE_MODE_YANG_B_FIELD,
@@ -387,9 +387,15 @@ def test_guidance_and_weights_none_is_identical_to_pre_change_signature(
     boundary = boundary_preset(name)
     # The pre-change call signature (no split_weights / guidance kwargs).
     baseline = generate_layout_for_boundary(boundary, parcel_count=12, seed=0)
-    # Explicitly None for both new kwargs.
+    # Explicitly None for all extension kwargs (split_weights / guidance / R2).
     with_none = generate_layout_for_boundary(
-        boundary, parcel_count=12, seed=0, split_weights=None, guidance=None
+        boundary,
+        parcel_count=12,
+        seed=0,
+        split_weights=None,
+        guidance=None,
+        density_field=None,
+        max_parcel_mass=None,
     )
     assert _layout_signature(with_none) == _layout_signature(baseline)
 
@@ -415,6 +421,108 @@ def test_generate_with_guidance_runs_and_flags_metric() -> None:
     # Invariants must still hold with guidance active.
     assert generated.metrics["paper_invariant_pass"] is True
     assert generated.metrics["geometry_valid_pass"] is True
+
+
+# ---------------------------------------------------------------------------
+# Part C: RasterDensityField density-mass split/termination (R2 extension).
+# ---------------------------------------------------------------------------
+
+
+def _corner_blob_density_field(
+    geom: Polygon, *, cells: int = 64, blob_fraction: float = 0.30
+) -> RasterDensityField:
+    """Density raster: a high plateau in the lower-left corner, low elsewhere."""
+    minx, miny, maxx, maxy = geom.bounds
+    cell = max(maxx - minx, maxy - miny) / (cells - 1)
+    density = np.full((cells, cells), 0.05, dtype=float)
+    blob = max(int(cells * blob_fraction), 1)
+    density[:blob, :blob] = 1.0  # rows = +y (bottom), cols = +x (left): corner
+    return RasterDensityField(density=density, x0=minx, y0=miny, cell=cell)
+
+
+def test_density_field_and_max_mass_must_be_supplied_together() -> None:
+    boundary = boundary_preset("square")
+    field = _corner_blob_density_field(boundary.geom)
+    with pytest.raises(ValueError, match="supplied together"):
+        generate_layout_for_boundary(
+            boundary, parcel_count=12, seed=0, density_field=field
+        )
+    with pytest.raises(ValueError, match="supplied together"):
+        generate_layout_for_boundary(
+            boundary, parcel_count=12, seed=0, max_parcel_mass=1.0
+        )
+
+
+def test_max_parcel_mass_must_be_positive() -> None:
+    boundary = boundary_preset("square")
+    field = _corner_blob_density_field(boundary.geom)
+    with pytest.raises(ValueError, match="max_parcel_mass must be positive"):
+        generate_layout_for_boundary(
+            boundary,
+            parcel_count=12,
+            seed=0,
+            density_field=field,
+            max_parcel_mass=0.0,
+        )
+
+
+def test_density_mode_off_by_default_metrics() -> None:
+    boundary = boundary_preset("square")
+    generated = generate_layout_for_boundary(boundary, parcel_count=12, seed=0)
+    assert generated.metrics["density_mass_mode"] is False
+    assert generated.metrics["max_parcel_mass"] is None
+    assert generated.metrics["density_field_digest"] is None
+
+
+@pytest.mark.slow
+def test_density_mass_mode_makes_dense_regions_smaller() -> None:
+    """Density-mass mode subdivides the dense corner finer than the sparse fringe.
+
+    Concretely: with a corner density blob, the Spearman correlation between a
+    parcel's mean density and its area must be clearly more negative under the
+    density-mass criterion than under stock geometric-area splitting (which has
+    no reason to make dense parcels smaller).
+    """
+    from scipy.stats import spearmanr
+
+    boundary = boundary_preset("square")
+    field = _corner_blob_density_field(boundary.geom)
+    total_mass = field.mass(boundary.geom)
+    # Geometric floor fine enough that the mass gate, not the floor, governs;
+    # mass target ~16 districts' worth of worlds.
+    floor_count = 48
+    max_parcel_mass = total_mass / 16.0
+
+    def density_area_corr(generated) -> float:
+        areas: list[float] = []
+        mean_densities: list[float] = []
+        for parcel in generated.layout.mesh.parcels.values():
+            area = float(parcel.geom.area)
+            if area <= 0.0:
+                continue
+            areas.append(area)
+            mean_densities.append(field.mass(parcel.geom) / area)
+        rho, _ = spearmanr(mean_densities, areas)
+        return float(rho)
+
+    area_mode = generate_layout_for_boundary(boundary, parcel_count=floor_count, seed=0)
+    density_mode = generate_layout_for_boundary(
+        boundary,
+        parcel_count=floor_count,
+        seed=0,
+        density_field=field,
+        max_parcel_mass=max_parcel_mass,
+    )
+
+    assert density_mode.metrics["density_mass_mode"] is True
+    assert density_mode.metrics["max_parcel_mass"] == pytest.approx(max_parcel_mass)
+    assert density_mode.metrics["geometry_valid_pass"] is True
+
+    rho_area = density_area_corr(area_mode)
+    rho_density = density_area_corr(density_mode)
+    # Density mode chases density: dense parcels get smaller, sparse stay large.
+    assert rho_density < rho_area
+    assert rho_density < -0.2
 
 
 # ---------------------------------------------------------------------------

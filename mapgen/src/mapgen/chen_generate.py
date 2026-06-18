@@ -49,6 +49,7 @@ from mapgen.chen_core import (
     polygon_street_access_ratio,
 )
 from mapgen.chen_field import (
+    RasterDensityField,
     RasterGuidanceField,
     StreamlineConfig,
     candidate_streamlines,
@@ -385,6 +386,8 @@ def generate_layout_for_boundary(
     street_config: StreetConfig | None = None,
     split_weights: ChenSplitWeights | None = None,
     guidance: RasterGuidanceField | None = None,
+    density_field: RasterDensityField | None = None,
+    max_parcel_mass: float | None = None,
 ) -> GeneratedChenLayout:
     """Generate a deterministic Chen layout for ``boundary``.
 
@@ -396,11 +399,27 @@ def generate_layout_for_boundary(
     ``split_weights`` overrides the paper Eq. 2 ``(size, regularity, access)``
     lambda weights; ``None`` uses the paper defaults. ``guidance`` (R1 regional
     extension, off by default, not Chen/Yang paper machinery) blends an external
-    ``RasterGuidanceField`` into the default ``grid_smooth`` field. With both
-    ``None`` the result is byte-identical to the pre-extension generator.
+    ``RasterGuidanceField`` into the default ``grid_smooth`` field.
+
+    ``density_field`` + ``max_parcel_mass`` (R2 regional extension, off by
+    default, not Chen/Yang paper machinery) switch the parcel-"size" measure from
+    geometric area to integrated density mass: a parcel keeps splitting while its
+    mass exceeds ``2 * max_parcel_mass`` and Eq. 2's size term scores the
+    *mass* balance of the two children, so dense regions subdivide into smaller
+    districts while sparse fringe terminates early as a few large ones. They must
+    be supplied together. ``min_parcel_area`` / ``parcel_count`` are still
+    required even in density mode: they set the streamline candidate spacing and
+    a geometric robustness floor (keep the area target small enough that the mass
+    gate, not the floor, governs termination). With ``density_field`` /
+    ``guidance`` / ``split_weights`` all ``None`` the result is byte-identical to
+    the pre-extension generator.
     """
     if (min_parcel_area is None) == (parcel_count is None):
         raise ValueError("provide exactly one of min_parcel_area or parcel_count")
+    if (density_field is None) != (max_parcel_mass is None):
+        raise ValueError("density_field and max_parcel_mass must be supplied together")
+    if max_parcel_mass is not None and max_parcel_mass <= 0.0:
+        raise ValueError("max_parcel_mass must be positive")
 
     boundary_geom = _clean_polygon(boundary.geom)
     boundary_area = float(boundary_geom.area)
@@ -437,6 +456,8 @@ def generate_layout_for_boundary(
         street_config=street_cfg,
         split_weights=resolved_split_weights,
         guidance=guidance,
+        density_field=density_field,
+        max_parcel_mass=max_parcel_mass,
     )
     generation_seconds = time.perf_counter() - generation_start
 
@@ -513,6 +534,13 @@ def generate_layout_for_boundary(
             "split_weight_regularity": float(resolved_split_weights.regularity),
             "split_weight_access": float(resolved_split_weights.access),
             "guidance_field_applied": bool(guidance is not None),
+            "density_mass_mode": bool(density_field is not None),
+            "max_parcel_mass": (
+                float(max_parcel_mass) if max_parcel_mass is not None else None
+            ),
+            "density_field_digest": (
+                density_field.digest().hex() if density_field is not None else None
+            ),
             "max_hierarchical_level": int(loop_result.max_level),
             "level_count": int(loop_result.max_level + 1),
             "accepted_split_count": int(loop_result.total_splits),
@@ -585,6 +613,8 @@ def _run_level_loop(
     street_config: StreetConfig,
     split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
     guidance: RasterGuidanceField | None = None,
+    density_field: RasterDensityField | None = None,
+    max_parcel_mass: float | None = None,
 ) -> _LevelLoopResult:
     editor = ParcelMeshEditor.from_boundary(boundary_geom)
     # Level-0 street = the whole input boundary ring (mesh edges).
@@ -596,6 +626,13 @@ def _run_level_loop(
     weld_applied = 0
     weld_rejected = 0
     splittable_threshold = 2.0 * min_parcel_area
+    # Density-mass mode (R2): on top of the geometric floor, a parcel is only
+    # splittable while its integrated density mass exceeds 2x the per-district
+    # mass target, so splits chase the population surface and sparse fringe
+    # parcels terminate early. ``None`` => the gate is geometry-only (paper mode).
+    splittable_mass_threshold = (
+        2.0 * max_parcel_mass if max_parcel_mass is not None else None
+    )
 
     level = 0
     # Hard ceiling on levels; the paper's max hierarchical level is single digits
@@ -613,6 +650,15 @@ def _run_level_loop(
             )
             if parcel_poly.area < splittable_threshold:
                 continue
+            # Mass gate is checked only after the geometric floor passes (the
+            # mass integral is the expensive part, and a sub-floor parcel can
+            # never split regardless of its mass).
+            if (
+                splittable_mass_threshold is not None
+                and density_field is not None
+                and density_field.mass(parcel_poly) < splittable_mass_threshold
+            ):
+                continue
             applied = _try_split_parcel(
                 editor,
                 parcel_id,
@@ -624,6 +670,7 @@ def _run_level_loop(
                 streamline_config=streamline_config,
                 split_weights=split_weights,
                 guidance=guidance,
+                density_field=density_field,
             )
             if applied is None:
                 continue
@@ -669,6 +716,7 @@ def _try_split_parcel(
     streamline_config: StreamlineConfig,
     split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
     guidance: RasterGuidanceField | None = None,
+    density_field: RasterDensityField | None = None,
 ) -> tuple[LineString, tuple[int, int], int, int] | None:
     """Score candidates, apply the best split, and weld new short edges.
 
@@ -700,6 +748,7 @@ def _try_split_parcel(
             street_segments,
             min_parcel_area=min_parcel_area,
             split_weights=split_weights,
+            density_field=density_field,
         )
         if scored is None:
             continue
@@ -738,12 +787,19 @@ def _score_candidate(
     *,
     min_parcel_area: float,
     split_weights: ChenSplitWeights = DEFAULT_SPLIT_WEIGHTS,
+    density_field: RasterDensityField | None = None,
 ) -> tuple[float, LineString] | None:
-    """Geometry-only Eq. 2 scoring of a candidate partition line.
+    """Eq. 2 scoring of a candidate partition line.
 
     Returns ``(Q, clipped_segment)`` or ``None`` when the split is invalid (a
-    child below the minimum parcel area, or a degenerate cut). ``split_weights``
-    defaults to the paper Eq. 2 ``(0.3, 0.5, 0.2)`` lambdas.
+    child below the geometric minimum parcel area, or a degenerate cut).
+    ``split_weights`` defaults to the paper Eq. 2 ``(0.3, 0.5, 0.2)`` lambdas.
+
+    With a ``density_field`` (R2 density-mass mode) the size term Q_size scores
+    the *mass* balance of the two children rather than their area balance; child
+    validity still uses only the geometric floor, so a large-area/low-mass fringe
+    child is allowed (that is what lets sparse regions become a few big
+    districts).
     """
     split_result = _split_face(parcel_poly, line)
     if split_result is None:
@@ -754,8 +810,14 @@ def _score_candidate(
     if area_a < min_parcel_area or area_b < min_parcel_area:
         return None
 
-    s_small = min(area_a, area_b)
-    s_large = max(area_a, area_b)
+    if density_field is not None:
+        size_a = density_field.mass(part_a)
+        size_b = density_field.mass(part_b)
+    else:
+        size_a = area_a
+        size_b = area_b
+    s_small = min(size_a, size_b)
+    s_large = max(size_a, size_b)
     q_size = s_small / s_large if s_large > 0.0 else 0.0
 
     irr_a = chen_irregularity(part_a)
@@ -1159,6 +1221,7 @@ __all__ = [
     "BoundarySpec",
     "ChenSplitWeights",
     "GeneratedChenLayout",
+    "RasterDensityField",
     "RasterGuidanceField",
     "STREAMLINE_MODE_BASELINE",
     "STREAMLINE_MODE_YANG_B_FIELD",
