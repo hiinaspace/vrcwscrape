@@ -24,13 +24,34 @@ Coordinate convention: island frame (``x = x0 + (col + 0.5) * cell``), same as
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import time
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import shapely
 import shapely.geometry as sg
 from shapely.ops import unary_union
+
+from mapgen.chen_artifacts import _street_lines
+from mapgen.chen_generate import (
+    BoundarySpec,
+    GeneratedChenLayout,
+    generate_layout_for_boundary,
+)
+from mapgen.chen_streets import StreetConfig
+from mapgen.r1_arm_a import (
+    REGIONAL_SPLIT_WEIGHTS,
+    IslandFields,
+    build_density_field,
+    build_terrain_guidance,
+)
+
+# Seeds tried in order by :func:`chen_in_block`. A concave block breaking Chen on
+# seed 7 but working on a later seed IS a finding, surfaced in the returned info.
+DEFAULT_RETRY_SEEDS: tuple[int, ...] = (7, 1, 2, 13)
 
 # ---------------------------------------------------------------------------
 # Boundary / mask helpers (mirror scripts/run_r1_macro.py)
@@ -261,3 +282,124 @@ def seam_gap(
         overshoot_area=overshoot,
         n_boundary_samples=n_samples,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-block Chen/R2 (the reusable hybrid micro-engine)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChenInBlockResult:
+    """Outcome of running Chen/R2 inside one macro-block.
+
+    Attributes
+    ----------
+    generated:
+        The :class:`GeneratedChenLayout` on success, else ``None`` (every seed
+        raised). On failure the caller typically falls back to treating the block
+        polygon itself as a single district.
+    districts:
+        Chen district polygons (empty on failure).
+    streets:
+        Chen street ``LineString`` s (empty on failure).
+    info:
+        Per-run record: the calibration inputs (``max_parcel_mass``,
+        ``min_parcel_area``), the seed that worked (or ``"all_failed"``),
+        per-seed attempts/errors, the emergent ``district_count``, and the
+        cheap invariant flags (``geometry_valid_pass`` / ``paper_invariant_pass``).
+    """
+
+    generated: GeneratedChenLayout | None
+    districts: list[sg.Polygon] = field(default_factory=list)
+    streets: list[sg.LineString] = field(default_factory=list)
+    info: dict[str, Any] = field(default_factory=dict)
+
+
+def chen_in_block(
+    block: sg.Polygon,
+    fields: IslandFields,
+    *,
+    max_parcel_mass: float,
+    min_parcel_area: float,
+    seeds: tuple[int, ...] = DEFAULT_RETRY_SEEDS,
+    guidance_strength: float = 6.0,
+    density_ridge_boost: float = 2.0,
+) -> ChenInBlockResult:
+    """Run Chen/R2 (density-mass mode) inside ``block``, retrying across seeds.
+
+    This is the per-block micro-engine of the macro+micro hybrid
+    (``docs/large-scale-growth-research.md``, stages 2-3). The terrain guidance
+    and density field are the island-wide R2 fields; only the boundary is the
+    block. The two calibration knobs are passed in explicitly so the caller owns
+    the policy:
+
+    - ``max_parcel_mass`` — the density-mass cap. The seam spike (stage 2) passes
+      a *block-local* cap (``density_field.mass(block) / target``); the full
+      hybrid (stage 3) passes a *single global* district mass so district size
+      stays consistent island-wide and dense blocks split into more districts.
+    - ``min_parcel_area`` — a geometric robustness floor + streamline spacing.
+      Keep it small so the mass gate (not the floor) governs termination.
+
+    Everything else matches the validated R2 call: ``REGIONAL_SPLIT_WEIGHTS``,
+    ``StreetConfig(avoid_cul_de_sacs=True)``, and the standard guidance/density
+    fields. Returns a :class:`ChenInBlockResult`; never raises for a per-block
+    Chen failure (the seed errors are captured in ``info`` instead), so a caller
+    assembling many blocks can fall back per block without aborting the run.
+    """
+    if max_parcel_mass <= 0.0:
+        raise ValueError("max_parcel_mass must be positive")
+    if min_parcel_area <= 0.0:
+        raise ValueError("min_parcel_area must be positive")
+
+    spec = BoundarySpec(name="hybrid_block", geom=block)
+    guidance = build_terrain_guidance(
+        fields, strength=guidance_strength, density_ridge_boost=density_ridge_boost
+    )
+    density_field = build_density_field(fields)
+
+    info: dict[str, Any] = {
+        "max_parcel_mass": round(float(max_parcel_mass), 6),
+        "min_parcel_area": round(float(min_parcel_area), 6),
+        "block_mass": round(float(density_field.mass(block)), 4),
+        "seeds_tried": [],
+        "seed_used": "all_failed",
+    }
+
+    for seed in seeds:
+        attempt: dict[str, Any] = {"seed": seed}
+        start = time.perf_counter()
+        try:
+            generated = generate_layout_for_boundary(
+                spec,
+                min_parcel_area=min_parcel_area,
+                seed=seed,
+                split_weights=REGIONAL_SPLIT_WEIGHTS,
+                guidance=guidance,
+                density_field=density_field,
+                max_parcel_mass=max_parcel_mass,
+                street_config=StreetConfig(avoid_cul_de_sacs=True),
+            )
+        except Exception as exc:  # noqa: BLE001
+            attempt["status"] = "error"
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+            attempt["traceback"] = traceback.format_exc()
+            attempt["seconds"] = round(time.perf_counter() - start, 2)
+            info["seeds_tried"].append(attempt)
+            continue
+        attempt["status"] = "ok"
+        attempt["seconds"] = round(time.perf_counter() - start, 2)
+        info["seeds_tried"].append(attempt)
+        info["seed_used"] = seed
+        districts = [p.geom for p in generated.layout.mesh.parcels.values()]
+        streets = [line for line, _props in _street_lines(generated.layout)]
+        info["district_count"] = len(districts)
+        info["geometry_valid_pass"] = bool(generated.metrics.get("geometry_valid_pass"))
+        info["paper_invariant_pass"] = bool(
+            generated.metrics.get("paper_invariant_pass")
+        )
+        return ChenInBlockResult(
+            generated=generated, districts=districts, streets=streets, info=info
+        )
+
+    return ChenInBlockResult(generated=None, info=info)

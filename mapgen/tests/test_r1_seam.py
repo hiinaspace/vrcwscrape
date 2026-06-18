@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import shapely.geometry as sg
 
-from mapgen.r1_seam import seam_gap, select_block_by_rank
+from mapgen.r1_arm_a import IslandFields
+from mapgen.r1_seam import chen_in_block, seam_gap, select_block_by_rank
 
 
 def _square(x0: float, y0: float, side: float) -> sg.Polygon:
@@ -57,3 +59,43 @@ def test_seam_gap_no_districts_reports_fully_bare() -> None:
     gap = seam_gap([], block, sample_spacing=2.0)
     assert gap.uncovered_frac == 1.0
     assert gap.max_boundary_gap > 0.0
+
+
+def _flat_fields(side: float, *, ncells: int = 40) -> IslandFields:
+    """Synthetic IslandFields: a uniform unit-density square, flat terrain.
+
+    The raster spans ``[0, side]^2`` with ``ncells`` cells per axis so a small
+    ``max_parcel_mass`` can force the density-mass gate to split.
+    """
+    shape = (ncells, ncells)
+    density = np.ones(shape, dtype=float)
+    flat = np.zeros(shape, dtype=float)
+    return IslandFields(
+        density=density,
+        height=flat,
+        flow_accum=flat,
+        height_carved=flat,
+        slope=flat,
+        x0=0.0,
+        y0=0.0,
+        cell=side / ncells,
+    )
+
+
+def test_chen_in_block_splits_square_for_small_mass() -> None:
+    # A flat unit-density 10x10 square has total mass ~100. A per-district mass
+    # cap of ~12 should force the density-mass gate to split it into >1 district.
+    block = _square(0, 0, 10)
+    fields = _flat_fields(10.0)
+    result = chen_in_block(
+        block,
+        fields,
+        max_parcel_mass=12.0,
+        min_parcel_area=10.0 * 10.0 / (40 * 4),
+    )
+    assert result.generated is not None, result.info
+    assert len(result.districts) > 1
+    assert len(result.streets) >= 1
+    # Districts should tile (roughly) the block: union covers most of its area.
+    union_area = sum(p.area for p in result.districts)
+    assert union_area > 0.8 * block.area

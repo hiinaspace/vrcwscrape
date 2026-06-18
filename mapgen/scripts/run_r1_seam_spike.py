@@ -30,7 +30,6 @@ import argparse
 import json
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -50,17 +49,10 @@ if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 from mapgen.chen_artifacts import _street_lines  # noqa: E402
-from mapgen.chen_generate import (  # noqa: E402
-    BoundarySpec,
-    GeneratedChenLayout,
-    generate_layout_for_boundary,
-)
-from mapgen.chen_streets import StreetConfig  # noqa: E402
+from mapgen.chen_generate import GeneratedChenLayout  # noqa: E402
 from mapgen.r1_arm_a import (  # noqa: E402
-    REGIONAL_SPLIT_WEIGHTS,
     IslandFields,
     build_density_field,
-    build_terrain_guidance,
     default_max_parcel_mass,
 )
 from mapgen.r1_compare import (  # noqa: E402
@@ -87,6 +79,7 @@ from mapgen.r1_macro import (  # noqa: E402
 from mapgen.r1_seam import (  # noqa: E402
     SeamGap,
     boundary_mask,
+    chen_in_block,
     load_boundary,
     seam_gap,
     select_block_by_rank,
@@ -184,12 +177,10 @@ def run_chen_in_block(
     Returns ``(generated_or_None, info)`` where ``info`` records the seed that
     worked (or ``"all_failed"``) and per-seed errors.
     """
-    spec = BoundarySpec(name="seam_block", geom=block)
-    guidance = build_terrain_guidance(fields, strength=6.0, density_ridge_boost=2.0)
     density_field = build_density_field(fields)
     parcel_count = max(target * 2, target + 1)
 
-    # SEAM FINDING (calibration seam): the spec's island-wide
+    # SEAM FINDING (calibration seam): the island-wide
     # default_max_parcel_mass(density_field, target) = total_island_mass / target
     # sizes a parcel against the WHOLE island. One macro-block holds only a small
     # fraction of that mass (~2% here), so its entire mass falls below a single
@@ -205,6 +196,19 @@ def run_chen_in_block(
         # Degenerate (no density in block): fall back to the island calibration.
         max_parcel_mass = island_max_parcel_mass
 
+    # Preserve the original ``parcel_count`` -> ``min_parcel_area`` mapping that
+    # ``generate_layout_for_boundary`` applies (area / (1.5 * parcel_count)), so
+    # delegating to the shared ``chen_in_block`` helper is behavior-preserving.
+    min_parcel_area = float(block.area) / (1.5 * float(parcel_count))
+
+    result = chen_in_block(
+        block,
+        fields,
+        max_parcel_mass=max_parcel_mass,
+        min_parcel_area=min_parcel_area,
+        seeds=seeds,
+    )
+
     info: dict[str, Any] = {
         "target": target,
         "parcel_count_floor": parcel_count,
@@ -212,43 +216,14 @@ def run_chen_in_block(
         "max_parcel_mass": round(float(max_parcel_mass), 4),
         "island_default_max_parcel_mass": round(float(island_max_parcel_mass), 4),
         "max_parcel_mass_calibration": "block" if block_mass > 0 else "island_fallback",
-        "seeds_tried": [],
-        "seed_used": "all_failed",
+        "seeds_tried": result.info["seeds_tried"],
+        "seed_used": result.info["seed_used"],
     }
-
-    for seed in seeds:
-        attempt: dict[str, Any] = {"seed": seed}
-        start = time.perf_counter()
-        try:
-            generated = generate_layout_for_boundary(
-                spec,
-                parcel_count=parcel_count,
-                seed=seed,
-                split_weights=REGIONAL_SPLIT_WEIGHTS,
-                guidance=guidance,
-                density_field=density_field,
-                max_parcel_mass=max_parcel_mass,
-                street_config=StreetConfig(avoid_cul_de_sacs=True),
-            )
-        except Exception as exc:  # noqa: BLE001
-            attempt["status"] = "error"
-            attempt["error"] = f"{type(exc).__name__}: {exc}"
-            attempt["traceback"] = traceback.format_exc()
-            attempt["seconds"] = round(time.perf_counter() - start, 2)
-            info["seeds_tried"].append(attempt)
-            continue
-        attempt["status"] = "ok"
-        attempt["seconds"] = round(time.perf_counter() - start, 2)
-        info["seeds_tried"].append(attempt)
-        info["seed_used"] = seed
-        info["district_count"] = len(generated.layout.mesh.parcels)
-        info["geometry_valid_pass"] = bool(generated.metrics.get("geometry_valid_pass"))
-        info["paper_invariant_pass"] = bool(
-            generated.metrics.get("paper_invariant_pass")
-        )
-        return generated, info
-
-    return None, info
+    if result.generated is not None:
+        info["district_count"] = result.info["district_count"]
+        info["geometry_valid_pass"] = result.info["geometry_valid_pass"]
+        info["paper_invariant_pass"] = result.info["paper_invariant_pass"]
+    return result.generated, info
 
 
 def _district_polys(generated: GeneratedChenLayout) -> list[sg.Polygon]:
