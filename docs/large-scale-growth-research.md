@@ -163,13 +163,34 @@ is where prototype effort will concentrate. Worth a small spike before committin
    *(in progress)*
 2. **Seam spike** — stitch Chen/R2 inside one macro-block, connecting local
    streets to arterial entry points. This is the known risk; validate early.
-3. **Full hybrid** — Chen/R2 in every macro-block; assemble + render at scale.
+   **DONE (2026-06-18).** Chen runs cleanly inside a median-area block (invariants
+   pass). Findings, which reshape stage 3:
+   - *Geometric seam is a non-issue.* Chen is seeded from the block polygon, so
+     the district union IS the block — outer edges coincide with the bounding
+     arterials, zero gap/overshoot. A coverage/Hausdorff seam metric therefore
+     can't see the real problem.
+   - *The real seam is CONNECTIVITY.* Bounding arterials run alongside the block
+     edge but form no T-junctions into the local grid; arterial and local network
+     are parallel neighbors that never connect as roads. Stage 3 must explicitly
+     create arterial↔local junctions (and a useful seam metric counts those, not
+     area).
+   - *Calibration seam.* The island-wide `default_max_parcel_mass` collapses
+     per-block Chen to a single district (a block holds ~2% of island mass). The
+     full hybrid needs **per-block mass calibration** (`density_field.mass(block)
+     / target`), applied in the spike.
+   - *Block shape matters.* Acute concave macro-block wedges produce
+     near-degenerate fans of parallel districts → regularize / split very concave
+     blocks before per-block Chen at scale.
+3. **Full hybrid** — Chen/R2 in every macro-block (per-block mass calibration);
+   add arterial↔local T-junctions at the seam; assemble + render at scale.
 4. **Terrain co-generation** — inverse-density height + periphery roughness;
    feed back into cost field; optional switchback styling for steep local roads.
 5. **Point relaxation (optional)** — nudge world points toward generated lots.
 
 ## Status
 
-Evaluation complete; macro-layer build (stage 1) in progress. Arm B
-(`r1_arm_b.py`) and the zoom-review harness (`run_r1_zoom_review.py`) are the
-existing footholds.
+Stages 1–2 done (macro hierarchy + seam spike). The hybrid is geometrically
+viable; the open work is connectivity (arterial↔local junctions), per-block mass
+calibration (solved in the spike), and macro-block shape regularization. Footholds:
+`r1_macro.py`, `run_r1_macro.py`, `r1_seam.py`, `run_r1_seam_spike.py`, plus the
+zoom-review harness.
