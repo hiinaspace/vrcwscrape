@@ -183,14 +183,37 @@ is where prototype effort will concentrate. Worth a small spike before committin
      blocks before per-block Chen at scale.
 3. **Full hybrid** — Chen/R2 in every macro-block (per-block mass calibration);
    add arterial↔local T-junctions at the seam; assemble + render at scale.
+   **ASSEMBLY DONE (2026-06-18).** Single global district mass `M = total_mass /
+   total_target` (default 600) applied uniformly to every block → consistent
+   district size + automatic density grading. Result: 13 blocks, 192 districts,
+   13/13 invariants pass, 127 s, 0 Chen failures (blocks were convex enough that
+   the acute-wedge risk didn't fire). Mechanically sound and confirms viability,
+   but does **not yet read as a coherent city**. Three artifacts, in stage-3.5
+   priority order:
+   - **(a) Connectivity is the dominant artifact.** Arterials run *parallel* to
+     local Chen streets with no T-junctions — the deferred seam, and at scale it's
+     what the eye lands on. Highest priority.
+   - **(b) Macro-blocks too coarse.** Only 13 blocks ⇒ each holds 200+ worlds /
+     30+ districts, so Chen is still partly out of distribution and the fabric
+     reads as large regional super-districts, not neighborhoods. Need finer
+     macro-blocks (more town/village nodes, or recursive block subdivision).
+   - **(c) Density-attracting arterials bisect cores.** Because arterials hug
+     density ridges and block boundaries are polygonized *along* arterials, the
+     densest ridges become block *edges* that split a core across two blocks
+     (each then calibrated separately, subdividing coarsely). Peaks should sit in
+     block *interiors*. Fix candidates: route arterials to skirt the very densest
+     cells (connect peaks without crossing their summit), or snap peaks to block
+     centers.
 4. **Terrain co-generation** — inverse-density height + periphery roughness;
    feed back into cost field; optional switchback styling for steep local roads.
 5. **Point relaxation (optional)** — nudge world points toward generated lots.
 
 ## Status
 
-Stages 1–2 done (macro hierarchy + seam spike). The hybrid is geometrically
-viable; the open work is connectivity (arterial↔local junctions), per-block mass
-calibration (solved in the spike), and macro-block shape regularization. Footholds:
-`r1_macro.py`, `run_r1_macro.py`, `r1_seam.py`, `run_r1_seam_spike.py`, plus the
-zoom-review harness.
+Stages 1–3 done (macro hierarchy + seam spike + full assembly). The hybrid is
+mechanically sound and viable (192 districts, all invariants pass) but reads as a
+road skeleton over coarse Chen patches, not a city. Stage-3.5 work, in priority
+order: (a) arterial↔local T-junction connectivity, (b) finer macro-blocks, (c)
+stop density ridges from becoming block boundaries. Footholds: `r1_macro.py`,
+`r1_seam.py` (incl. `chen_in_block`), `run_r1_macro.py`, `run_r1_seam_spike.py`,
+`run_r1_hybrid.py`, plus the zoom-review harness.
