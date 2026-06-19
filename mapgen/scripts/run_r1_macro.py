@@ -50,6 +50,9 @@ from mapgen.r1_compare import (  # noqa: E402
 )
 from mapgen.r1_macro import (  # noqa: E402
     DEFAULT_BETA_RATIO,
+    DEFAULT_CORE_FRAC,
+    DEFAULT_CORE_MAX_RADIUS_UNITS,
+    DEFAULT_CORE_MIN_AREA_UNITS2,
     DEFAULT_COST_FLOOR,
     DEFAULT_MERGE_RADIUS,
     DEFAULT_MIN_BLOCK_AREA,
@@ -66,12 +69,13 @@ from mapgen.r1_macro import (  # noqa: E402
     MacroNode,
     arterials_to_geojson,
     build_density_cost_field,
+    build_macro_blocks_with_cores,
     build_macro_nodes,
     build_macro_nodes_hierarchical,
     compute_macro_arterials,
+    core_rings_to_geojson,
     macro_blocks_to_geojson,
     nodes_to_geojson,
-    polygonize_macro_blocks,
 )
 from mapgen.r1_zoom import load_points_with_labels  # noqa: E402
 
@@ -128,6 +132,7 @@ def render_macro_overview(
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
     macro_blocks: list[sg.Polygon],
+    core_polys: list[sg.Polygon],
     points_path: Path,
     x0: float,
     y0: float,
@@ -136,7 +141,12 @@ def render_macro_overview(
     dpi: int = 220,
     draw_points: bool = True,
 ) -> None:
-    """Render the macro checkpoint overview PNG."""
+    """Render the macro checkpoint overview PNG.
+
+    ``arterial_lines`` / ``edges`` are the CLIPPED arterials (interiors of dense
+    cores removed); ``core_polys`` are the ringed downtown blocks, drawn as
+    dashed dark-orange ring roads.
+    """
     nrows, ncols = density.shape
     fig, ax = plt.subplots(figsize=(13, 9))
 
@@ -181,6 +191,22 @@ def render_macro_overview(
                     zorder=5 + tier,
                     solid_capstyle="round",
                 )
+
+    # Core ring roads: dashed dark-orange exterior rings (the "downtown" ring).
+    for poly in core_polys:
+        if poly.is_empty:
+            continue
+        rx, ry = poly.exterior.xy
+        ax.plot(
+            rx,
+            ry,
+            color="#d35400",
+            lw=2.2,
+            ls=(0, (5, 2)),
+            alpha=0.95,
+            zorder=8,
+            solid_capstyle="round",
+        )
 
     # Macro nodes by kind: city = large star, town = medium dot, village = small.
     village_x = [nd.x for nd in nodes if nd.kind == "village"]
@@ -232,10 +258,10 @@ def render_macro_overview(
     n_major = sum(1 for e in edges if e.tier == 1)
     n_local = sum(1 for e in edges if e.tier == 0)
     ax.set_title(
-        "R1 macro hierarchy — 3-tier semantic nodes + tiered arterials\n"
+        "R1 macro hierarchy — 3-tier nodes + tiered arterials + core ring-roads\n"
         f"({n_city} cities, {n_town} towns, {n_village} villages, "
         f"{n_hwy} highways, {n_major} majors, {n_local} locals, "
-        f"{len(macro_blocks)} macro-blocks)",
+        f"{len(core_polys)} cores, {len(macro_blocks)} macro-blocks)",
         fontsize=11,
     )
 
@@ -243,6 +269,14 @@ def render_macro_overview(
         mpatches.Patch(color=_TIER_STYLE[2]["color"], label=_TIER_STYLE[2]["label"]),
         mpatches.Patch(color=_TIER_STYLE[1]["color"], label=_TIER_STYLE[1]["label"]),
         mpatches.Patch(color=_TIER_STYLE[0]["color"], label=_TIER_STYLE[0]["label"]),
+        plt.Line2D(
+            [0],
+            [0],
+            color="#d35400",
+            lw=2.2,
+            ls=(0, (5, 2)),
+            label="Core ring road",
+        ),
         plt.Line2D(
             [0],
             [0],
@@ -300,6 +334,9 @@ def run_macro(
     beta_ratio: float = DEFAULT_BETA_RATIO,
     simplify_tolerance: float = DEFAULT_SIMPLIFY_TOLERANCE,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
+    core_frac: float = DEFAULT_CORE_FRAC,
+    core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS,
+    core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
     seed: int = DEFAULT_SEED,
     draw_points: bool = True,
 ) -> dict[str, Any]:
@@ -383,19 +420,37 @@ def run_macro(
     n_local = sum(1 for e in edges if e.tier == 0)
     print(f"  {len(edges)} edges: {n_hwy} highways, {n_major} majors, {n_local} locals")
 
-    print("Polygonizing macro-blocks…")
-    macro_blocks = polygonize_macro_blocks(
-        arterial_lines, boundary, min_block_area=min_block_area
+    print("Detecting dense cores + folding into ringed blocks…")
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        arterial_lines,
+        edges,
+        boundary,
+        x0,
+        y0,
+        cell,
+        core_frac=core_frac,
+        core_max_radius_units=core_max_radius_units,
+        core_min_area_units2=core_min_area_units2,
+        min_block_area=min_block_area,
     )
-    print(f"  {len(macro_blocks)} macro-blocks")
+    core_polys = bundle.core_polys
+    clipped_lines = bundle.clipped_lines
+    clipped_edges = bundle.clipped_edges
+    macro_blocks = bundle.blocks
+    print(f"  {len(core_polys)} cores, {len(macro_blocks)} macro-blocks")
 
     print("Writing GeoJSON…")
     with (out_dir / "macro_nodes.geojson").open("w") as f:
         json.dump(nodes_to_geojson(nodes), f, indent=2)
+    # arterials.geojson holds the CLIPPED arterials (core interiors removed).
     with (out_dir / "arterials.geojson").open("w") as f:
-        json.dump(arterials_to_geojson(arterial_lines, edges), f, indent=2)
+        json.dump(arterials_to_geojson(clipped_lines, clipped_edges), f, indent=2)
     with (out_dir / "macro_blocks.geojson").open("w") as f:
         json.dump(macro_blocks_to_geojson(macro_blocks), f, indent=2)
+    with (out_dir / "core_rings.geojson").open("w") as f:
+        json.dump(core_rings_to_geojson(core_polys), f, indent=2)
 
     print("Rendering macro_overview.png…")
     render_macro_overview(
@@ -403,9 +458,10 @@ def run_macro(
         height_carved=height_carved,
         boundary=boundary,
         nodes=nodes,
-        arterial_lines=arterial_lines,
-        edges=edges,
+        arterial_lines=clipped_lines,
+        edges=clipped_edges,
         macro_blocks=macro_blocks,
+        core_polys=core_polys,
         points_path=in_dir / "island_points.parquet",
         x0=x0,
         y0=y0,
@@ -441,6 +497,9 @@ def run_macro(
             "beta_ratio": beta_ratio,
             "simplify_tolerance": simplify_tolerance,
             "min_block_area": min_block_area,
+            "core_frac": core_frac,
+            "core_max_radius_units": core_max_radius_units,
+            "core_min_area_units2": core_min_area_units2,
         },
         "cost_field_note": (
             "cost = (base + w_slope*norm_slope + w_river*(flow>p99)) "
@@ -454,6 +513,7 @@ def run_macro(
             "n_highway_edges": n_hwy,
             "n_major_edges": n_major,
             "n_local_edges": n_local,
+            "n_cores": len(core_polys),
             "n_macro_blocks": len(macro_blocks),
         },
         "macro_block_area_stats": (
@@ -471,6 +531,7 @@ def run_macro(
             "macro_nodes.geojson",
             "arterials.geojson",
             "macro_blocks.geojson",
+            "core_rings.geojson",
             "macro_overview.png",
             "macro_manifest.json",
         ],
@@ -524,6 +585,13 @@ def main(argv: list[str] | None = None) -> None:
         default=DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
     )
     parser.add_argument("--min-block-area", type=float, default=DEFAULT_MIN_BLOCK_AREA)
+    parser.add_argument("--core-frac", type=float, default=DEFAULT_CORE_FRAC)
+    parser.add_argument(
+        "--core-max-radius", type=float, default=DEFAULT_CORE_MAX_RADIUS_UNITS
+    )
+    parser.add_argument(
+        "--core-min-area", type=float, default=DEFAULT_CORE_MIN_AREA_UNITS2
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--no-points",
@@ -551,6 +619,9 @@ def main(argv: list[str] | None = None) -> None:
         beta_ratio=args.beta_ratio,
         simplify_tolerance=args.simplify_tolerance,
         min_block_area=args.min_block_area,
+        core_frac=args.core_frac,
+        core_max_radius_units=args.core_max_radius,
+        core_min_area_units2=args.core_min_area,
         seed=args.seed,
         draw_points=not args.no_points,
     )
@@ -563,6 +634,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  highways:     {c['n_highway_edges']}")
     print(f"  majors:       {c['n_major_edges']}")
     print(f"  locals:       {c.get('n_local_edges', 0)}")
+    print(f"  cores:        {c.get('n_cores', 0)}")
     print(f"  macro-blocks: {c['n_macro_blocks']}")
     print(f"  runtime:      {manifest['runtime_seconds']}s")
     print(f"\nOutputs in: {args.out_dir}")

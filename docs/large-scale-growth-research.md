@@ -220,22 +220,56 @@ is where prototype effort will concentrate. Worth a small spike before committin
      block *interiors*. Fix candidates: route arterials to skirt the very densest
      cells (connect peaks without crossing their summit), or snap peaks to block
      centers.
+     **STAGE 3.5b DONE (2026-06-19).** Implemented "core ring-roads" (the
+     Benes 2014 "route AROUND built-up blocks" idea) rather than route-around or
+     peak-snap. New pure helpers in `r1_macro.py`: `detect_core_regions`
+     (region-grow a connected dense core on the density raster around each
+     CITY/TOWN node — `density >= core_frac*local_peak`, `core_frac=0.45`, capped
+     at `core_max_radius_units=6.0`, dropped below `core_min_area_units2=8.0`,
+     overlapping/touching cores UNIONED into one downtown block),
+     `core_ring_boundaries`, `clip_arterials_to_cores` (subtract
+     `unary_union(cores)` from each arterial, preserving tier/tau on surviving
+     segments → arterials now terminate ON the ring as T-junctions), and the
+     `build_macro_blocks_with_cores` wrapper (polygonizes
+     `clipped_arterials ∪ core_rings ∪ island_exterior`). `compute_macro_arterials`
+     is UNCHANGED (clipping is a new step), so the 2-tier/N-level tests stay
+     green; added merge/separate core-detection and clip tests. Macro:
+     **13 cores, 35 macro-blocks** (was 30). Hybrid (total_target 1200):
+     **701 districts, 0 Chen failures, 35/35 geometry-valid, 34/35
+     paper-invariant, 518 s**. Skeptical read: the dense cores ARE now block
+     INTERIORS — each densest summit sits inside a dashed ring with coherent
+     radial downtown fabric (core #1, the worst case before, is fixed: its bright
+     peak no longer hosts a multi-arterial junction with a parallel-sliver fan).
+     Ring roads read as realistic bypasses and clipping yields clean T-junctions
+     where arterials meet the rings (helps the deferred connectivity story).
+     Remaining: a few residual acute-wedge parallel-district fans persist in
+     NON-core blocks beside the rings (e.g. just outside core #1/#3) — milder and
+     no longer at the summit, but artifact (c)'s wedge problem isn't 100% gone;
+     the largest core (632 units², a merge of nearby summits) splits into ~129
+     districts and dominates runtime (~100 s of 518 s). Net: 3.5b is a clear
+     keeper. Open work shifts back to (a) arterial↔local T-junctions for the
+     non-core fabric, and regularizing the few remaining concave wedge blocks.
 4. **Terrain co-generation** — inverse-density height + periphery roughness;
    feed back into cost field; optional switchback styling for steep local roads.
 5. **Point relaxation (optional)** — nudge world points toward generated lots.
 
 ## Status
 
-Stages 1–3 + stage-3.5a done. The hybrid now uses a 3-tier semantic node
-hierarchy (L1 cities / L0 towns / peak villages) → 30 macro-blocks (was 13) →
-599 districts at total-target 1200, 30/30 invariants pass, 414 s. The 3-tier
-road hierarchy reads clearly and most blocks are at neighborhood scale.
-Remaining stage-3.5 work, in priority order: (a) arterial↔local T-junction
-connectivity (still the dominant artifact — arterials run parallel to local Chen
-streets, no junctions); (c) density ridges still become block boundaries that
-bisect cores, with acute-wedge parallel-district fans beside them (finer blocks
-did NOT fix this — needs route-around-summit or peak-snap-to-center). Footholds:
-`r1_macro.py` (incl. `cluster_centroids`, `build_macro_nodes_hierarchical`,
-N-level `compute_macro_arterials`), `r1_seam.py` (incl. `chen_in_block`),
+Stages 1–3 + stage-3.5a + stage-3.5b done. The hybrid uses a 3-tier semantic
+node hierarchy (L1 cities / L0 towns / peak villages), now with dense cores
+folded into ringed "downtown" blocks: arterials are CLIPPED to core exteriors
+(T-junctions on the ring) and core rings + clipped arterials are polygonized →
+13 cores, 35 macro-blocks (was 30) → 701 districts at total-target 1200, 35/35
+geometry-valid, 34/35 paper-invariant, 518 s. The densest cores now read as
+coherent ringed downtowns (artifact (c) substantially fixed — peaks are block
+interiors, no more parallel-sliver fan AT the summit). Remaining stage-3.5 work,
+in priority order: (a) arterial↔local T-junction connectivity for the non-core
+fabric (still the dominant remaining artifact — arterials run parallel to local
+Chen streets); residual acute-wedge parallel-district fans in a few non-core
+blocks beside the rings (milder than before; regularize/split very concave
+blocks). Footholds: `r1_macro.py` (incl. `cluster_centroids`,
+`build_macro_nodes_hierarchical`, N-level `compute_macro_arterials`,
+`detect_core_regions` / `clip_arterials_to_cores` /
+`build_macro_blocks_with_cores`), `r1_seam.py` (incl. `chen_in_block`),
 `run_r1_macro.py`, `run_r1_seam_spike.py`, `run_r1_hybrid.py`, plus the
 zoom-review harness.

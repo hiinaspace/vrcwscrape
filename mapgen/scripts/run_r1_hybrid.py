@@ -73,9 +73,9 @@ from mapgen.r1_macro import (  # noqa: E402
     DEFAULT_W_DENSITY,
     MacroEdge,
     build_density_cost_field,
+    build_macro_blocks_with_cores,
     build_macro_nodes_hierarchical,
     compute_macro_arterials,
-    polygonize_macro_blocks,
 )
 from mapgen.r1_seam import (  # noqa: E402
     DEFAULT_RETRY_SEEDS,
@@ -145,16 +145,29 @@ def build_macro_layer(in_dir: Path) -> dict[str, Any]:
         beta_ratio=DEFAULT_BETA_RATIO,
         simplify_tolerance=DEFAULT_SIMPLIFY_TOLERANCE,
     )
-    macro_blocks = polygonize_macro_blocks(
-        arterial_lines, boundary, min_block_area=DEFAULT_MIN_BLOCK_AREA
+    # Stage 3.5b: fold dense cores into ringed downtown blocks. The block set is
+    # polygonized over CLIPPED arterials + core rings + boundary, and the drawn
+    # arterials are the clipped ones (no convergence on a core summit).
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        arterial_lines,
+        edges,
+        boundary,
+        x0,
+        y0,
+        cell,
+        min_block_area=DEFAULT_MIN_BLOCK_AREA,
     )
 
     return {
         "fields": fields,
         "boundary": boundary,
-        "arterial_lines": arterial_lines,
-        "edges": edges,
-        "macro_blocks": macro_blocks,
+        "arterial_lines": bundle.clipped_lines,
+        "edges": bundle.clipped_edges,
+        "core_polys": bundle.core_polys,
+        "ring_lines": bundle.ring_lines,
+        "macro_blocks": bundle.blocks,
     }
 
 
@@ -286,6 +299,7 @@ def _draw_layers(
     results: list[BlockResult],
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
     lp_xs: np.ndarray,
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
@@ -294,6 +308,7 @@ def _draw_layers(
     district_alpha: float,
     street_lw: float,
     arterial_lw: dict[int, float],
+    ring_lw: float,
     point_size: float,
     point_alpha: float,
 ) -> None:
@@ -362,12 +377,31 @@ def _draw_layers(
                 solid_capstyle="round",
             )
 
+    # Core ring roads on top: dashed dark-orange downtown rings.
+    for poly in core_polys:
+        if poly.is_empty:
+            continue
+        rx, ry = poly.exterior.xy
+        ax.plot(
+            rx,
+            ry,
+            color="#d35400",
+            lw=ring_lw,
+            ls=(0, (5, 2)),
+            alpha=0.95,
+            zorder=9,
+            solid_capstyle="round",
+        )
+
 
 def _legend_handles() -> list[Any]:
     return [
         mpatches.Patch(color=_TIER_STYLE[2]["color"], label=_TIER_STYLE[2]["label"]),
         mpatches.Patch(color=_TIER_STYLE[1]["color"], label=_TIER_STYLE[1]["label"]),
         mpatches.Patch(color=_TIER_STYLE[0]["color"], label=_TIER_STYLE[0]["label"]),
+        plt.Line2D(
+            [0], [0], color="#d35400", lw=2.0, ls=(0, (5, 2)), label="Core ring road"
+        ),
         plt.Line2D([0], [0], color="#1a1a1a", lw=1.2, label="Chen street (local)"),
         plt.Line2D([0], [0], color="#555555", lw=0.8, label="Chen district edge"),
     ]
@@ -380,6 +414,7 @@ def render_overview(
     results: list[BlockResult],
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
     lp_xs: np.ndarray,
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
@@ -398,6 +433,7 @@ def render_overview(
         results=results,
         arterial_lines=arterial_lines,
         edges=edges,
+        core_polys=core_polys,
         lp_xs=lp_xs,
         lp_ys=lp_ys,
         lp_l0=lp_l0,
@@ -406,6 +442,7 @@ def render_overview(
         district_alpha=0.35,
         street_lw=0.4,
         arterial_lw={2: 2.6, 1: 1.2, 0: 0.6},
+        ring_lw=1.6,
         point_size=1.2,
         point_alpha=0.18,
     )
@@ -414,10 +451,10 @@ def render_overview(
     n_major = sum(1 for e in edges if e.tier == 1)
     n_local = sum(1 for e in edges if e.tier == 0)
     ax.set_title(
-        "R1 hybrid — macro arterials + per-block Chen fabric (island-wide)\n"
-        f"{len(results)} macro-blocks, {total_districts} districts, "
-        f"{total_streets} Chen streets, {n_hwy} highways, {n_major} majors, "
-        f"{n_local} locals",
+        "R1 hybrid — macro arterials + core ring-roads + per-block Chen fabric\n"
+        f"{len(results)} macro-blocks, {len(core_polys)} core rings, "
+        f"{total_districts} districts, {total_streets} Chen streets, "
+        f"{n_hwy} highways, {n_major} majors, {n_local} locals",
         fontsize=13,
     )
     ax.legend(handles=_legend_handles(), loc="upper left", fontsize=9, framealpha=0.9)
@@ -433,6 +470,7 @@ def render_core(
     results: list[BlockResult],
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
     lp_xs: np.ndarray,
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
@@ -453,6 +491,7 @@ def render_core(
         results=results,
         arterial_lines=arterial_lines,
         edges=edges,
+        core_polys=core_polys,
         lp_xs=lp_xs,
         lp_ys=lp_ys,
         lp_l0=lp_l0,
@@ -461,6 +500,7 @@ def render_core(
         district_alpha=0.7,
         street_lw=1.1,
         arterial_lw={2: 3.6, 1: 2.2, 0: 1.3},
+        ring_lw=2.8,
         point_size=14.0,
         point_alpha=0.85,
     )
@@ -498,9 +538,14 @@ def run_hybrid(
     boundary: sg.Polygon = macro["boundary"]
     arterial_lines: list[sg.LineString] = macro["arterial_lines"]
     edges: list[MacroEdge] = macro["edges"]
+    core_polys: list[sg.Polygon] = macro["core_polys"]
     macro_blocks: list[sg.Polygon] = macro["macro_blocks"]
     n_blocks = len(macro_blocks)
-    print(f"  {n_blocks} macro-blocks, {len(edges)} arterials", flush=True)
+    print(
+        f"  {n_blocks} macro-blocks, {len(core_polys)} core rings, "
+        f"{len(edges)} arterial segments",
+        flush=True,
+    )
 
     # Global calibration (LOCKED): single district mass M over every block.
     density_field = build_density_field(fields)
@@ -542,6 +587,7 @@ def run_hybrid(
         results=results,
         arterial_lines=arterial_lines,
         edges=edges,
+        core_polys=core_polys,
         lp_xs=lp.xs,
         lp_ys=lp.ys,
         lp_l0=lp.l0_ids,
@@ -574,6 +620,7 @@ def run_hybrid(
             results=results,
             arterial_lines=arterial_lines,
             edges=edges,
+            core_polys=core_polys,
             lp_xs=lp.xs,
             lp_ys=lp.ys,
             lp_l0=lp.l0_ids,
@@ -606,16 +653,18 @@ def run_hybrid(
     }
 
     manifest: dict[str, Any] = {
-        "stage": "3 (full hybrid assembly)",
+        "stage": "3 (full hybrid assembly, stage-3.5b core ring-roads)",
         "description": (
             "Chen/R2 in every macro-block (global district mass) + macro "
-            "arterials; arterial<->local junctions deliberately deferred"
+            "arterials clipped to dense-core ring-roads (downtown blocks); "
+            "arterial<->local junctions deliberately deferred"
         ),
         "total_target": total_target,
         "M": round(global_m, 6),
         "min_parcel_area": round(min_parcel_area, 6),
         "total_mass": round(total_mass, 4),
         "island_area": round(island_area, 4),
+        "n_core_rings": len(core_polys),
         "n_macro_blocks": n_blocks,
         "n_blocks_failed": n_failed,
         "failed_block_ids": [r.block_id for r in results if r.failed],

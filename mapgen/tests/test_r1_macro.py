@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import shapely.geometry as sg
 
 from mapgen.r1_macro import (
     CITY_SIGMA,
     TOWN_SIGMA,
     VILLAGE_SIGMA,
+    MacroEdge,
     MacroNode,
     build_density_cost_field,
+    clip_arterials_to_cores,
     cluster_centroids,
     compute_macro_arterials,
+    detect_core_regions,
     grade_cities,
     tier_for_tau,
     town_nodes_from_peaks,
@@ -209,3 +213,106 @@ def test_edge_tier_is_min_sigma() -> None:
     # min(city=2, town=1) = 1 → major tier.
     assert edges[0].tau == 1
     assert edges[0].tier == 1
+
+
+# ---------------------------------------------------------------------------
+# Core ring-roads (stage 3.5b)
+# ---------------------------------------------------------------------------
+
+
+def _two_peak_raster(
+    sep_cells: int, *, shape: tuple[int, int] = (60, 60)
+) -> np.ndarray:
+    """Raster with two Gaussian-ish peaks separated by ``sep_cells`` columns."""
+    nrows, ncols = shape
+    rr, cc = np.mgrid[0:nrows, 0:ncols]
+    cr = nrows // 2
+    c1 = ncols // 2 - sep_cells // 2
+    c2 = ncols // 2 + sep_cells // 2
+
+    def blob(r0: int, c0: int) -> np.ndarray:
+        return np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2 * 3.0**2)))
+
+    return (blob(cr, c1) + blob(cr, c2)).astype(float)
+
+
+def test_detect_core_regions_separate_peaks_two_cores() -> None:
+    """Two well-separated peaks → two distinct core polygons."""
+    # cell=1 so 6.0-unit max radius easily contains each ~3-cell blob but not the
+    # gap between peaks 24 cells apart.
+    density = _two_peak_raster(sep_cells=24)
+    nodes = [
+        MacroNode(x=18.5, y=30.5, sigma=TOWN_SIGMA, kind="town"),
+        MacroNode(x=42.5, y=30.5, sigma=TOWN_SIGMA, kind="town"),
+    ]
+    cores = detect_core_regions(
+        density,
+        nodes,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+    )
+    assert len(cores) == 2
+    assert all(c.geom_type == "Polygon" and c.area > 0 for c in cores)
+
+
+def test_detect_core_regions_adjacent_peaks_merge_to_one() -> None:
+    """Two peaks within max-radius (touching grown regions) → merged into 1 core."""
+    density = _two_peak_raster(sep_cells=6)
+    nodes = [
+        MacroNode(x=27.5, y=30.5, sigma=TOWN_SIGMA, kind="town"),
+        MacroNode(x=33.5, y=30.5, sigma=TOWN_SIGMA, kind="town"),
+    ]
+    cores = detect_core_regions(
+        density,
+        nodes,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+    )
+    assert len(cores) == 1
+
+
+def test_detect_core_regions_skips_villages() -> None:
+    """sigma=0 village nodes never seed a core."""
+    density = _two_peak_raster(sep_cells=24)
+    nodes = [
+        MacroNode(x=18.5, y=30.5, sigma=VILLAGE_SIGMA, kind="village"),
+        MacroNode(x=42.5, y=30.5, sigma=VILLAGE_SIGMA, kind="village"),
+    ]
+    cores = detect_core_regions(
+        density, nodes, x0=0.0, y0=0.0, cell=1.0, core_min_area_units2=4.0
+    )
+    assert cores == []
+
+
+def test_clip_arterials_to_cores_removes_interior_keeps_tier() -> None:
+    """A line crossing a core loses its interior portion but keeps tier/tau."""
+    core = sg.box(40.0, 40.0, 60.0, 60.0)
+    # Horizontal line at y=50 spanning x in [0, 100], straight through the core.
+    line = sg.LineString([(0.0, 50.0), (100.0, 50.0)])
+    edge = MacroEdge(node_a=0, node_b=1, tau=1, tier=2, path_cost=1.0, length=100.0)
+    clipped_lines, clipped_edges = clip_arterials_to_cores([line], [edge], [core])
+    # Splits into two segments either side of the core.
+    assert len(clipped_lines) == 2
+    assert len(clipped_edges) == 2
+    # Tier/tau/node ids preserved on every surviving segment.
+    assert all(e.tier == 2 and e.tau == 1 for e in clipped_edges)
+    assert all(e.node_a == 0 and e.node_b == 1 for e in clipped_edges)
+    # No surviving segment lies inside the core interior.
+    assert all(not core.buffer(-1e-6).intersects(ln) for ln in clipped_lines)
+    # Lengths sum to less than the original (interior removed).
+    assert sum(e.length for e in clipped_edges) < 100.0
+
+
+def test_clip_arterials_to_cores_no_cores_is_identity() -> None:
+    """With no cores, clipping returns the inputs unchanged."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 10.0)])
+    edge = MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=14.0)
+    lines, edges = clip_arterials_to_cores([line], [edge], [])
+    assert lines == [line]
+    assert edges == [edge]

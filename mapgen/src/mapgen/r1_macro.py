@@ -34,6 +34,7 @@ set so any future jitter stays reproducible.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -41,6 +42,7 @@ import numpy as np
 import polars as pl
 import shapely.geometry as sg
 from scipy.spatial import Delaunay
+from shapely.ops import unary_union
 from skimage.graph import route_through_array
 
 from mapgen.r1_arm_b import (
@@ -117,6 +119,25 @@ DEFAULT_SIMPLIFY_TOLERANCE: float = 1.5
 # Macro-block sliver-merge floor (island units²). Larger than Arm B's district
 # floor because macro-blocks are coarse by construction.
 DEFAULT_MIN_BLOCK_AREA: float = 60.0
+
+# --- Core ring-road defaults (stage 3.5b) ---
+#
+# A dense CITY/TOWN core is region-grown on the density raster and turned into a
+# ringed "downtown" block: arterials are clipped to its exterior (T-junctions on
+# the ring) instead of converging on the summit.
+#
+# core_frac: a cell joins the core if density >= core_frac * local_peak.
+DEFAULT_CORE_FRAC: float = 0.45
+# Cap the grown region at this radius (island units) from the seed so cores stay
+# downtown-scale rather than swallowing a whole region.
+DEFAULT_CORE_MAX_RADIUS_UNITS: float = 6.0
+# Drop grown regions whose area (island units²) is below this floor.
+DEFAULT_CORE_MIN_AREA_UNITS2: float = 8.0
+# Half-width (island units) of the window used to find the robust local peak
+# around a seed (so the node need not sit exactly on the summit).
+DEFAULT_CORE_PEAK_WINDOW_UNITS: float = 3.0
+# Boundary simplification tolerance (island units) for the extracted ring.
+DEFAULT_CORE_SIMPLIFY_TOLERANCE: float = 1.0
 
 NodeKind = Literal["city", "town", "village"]
 
@@ -663,6 +684,373 @@ def polygonize_macro_blocks(
 
 
 # ---------------------------------------------------------------------------
+# 5. Core ring-roads (stage 3.5b)
+# ---------------------------------------------------------------------------
+
+
+def _grow_core_region(
+    density: np.ndarray,
+    seed_rc: tuple[int, int],
+    *,
+    core_frac: float,
+    peak_window_cells: int,
+    max_radius_cells: float,
+) -> set[tuple[int, int]]:
+    """Region-grow a connected dense core on the density raster.
+
+    Flood-fills (8-connectivity) outward from ``seed_rc`` over cells whose
+    density is ``>= core_frac * local_peak``, where ``local_peak`` is the maximum
+    density within a ``peak_window_cells`` window around the seed (robust to the
+    seed not sitting exactly on the summit). Growth is capped at
+    ``max_radius_cells`` (Euclidean, in cells) from the seed so cores stay
+    downtown-scale.
+
+    Returns the set of ``(row, col)`` cells in the region (always includes the
+    seed).
+    """
+    nrows, ncols = density.shape
+    sr, sc = seed_rc
+    sr = int(np.clip(sr, 0, nrows - 1))
+    sc = int(np.clip(sc, 0, ncols - 1))
+
+    r0 = max(0, sr - peak_window_cells)
+    r1 = min(nrows, sr + peak_window_cells + 1)
+    c0 = max(0, sc - peak_window_cells)
+    c1 = min(ncols, sc + peak_window_cells + 1)
+    window = density[r0:r1, c0:c1]
+    local_peak = float(window.max()) if window.size else float(density[sr, sc])
+    if local_peak <= 0.0:
+        return {(sr, sc)}
+
+    threshold = core_frac * local_peak
+    max_r2 = max_radius_cells * max_radius_cells
+
+    region: set[tuple[int, int]] = {(sr, sc)}
+    queue: deque[tuple[int, int]] = deque([(sr, sc)])
+    while queue:
+        r, c = queue.popleft()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < nrows and 0 <= nc < ncols):
+                    continue
+                if (nr, nc) in region:
+                    continue
+                if float(density[nr, nc]) < threshold:
+                    continue
+                if (nr - sr) ** 2 + (nc - sc) ** 2 > max_r2:
+                    continue
+                region.add((nr, nc))
+                queue.append((nr, nc))
+    return region
+
+
+def _cells_to_polygon(
+    cells: set[tuple[int, int]],
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    simplify_tolerance: float,
+) -> sg.Polygon | None:
+    """Union the cell squares of ``cells`` into a single simplified core polygon.
+
+    Each ``(row, col)`` becomes its cell-centre-aligned square box; the union's
+    largest exterior ring is taken (interior holes dropped) and simplified. Cell
+    boxes span ``[x0 + col*cell, x0 + (col+1)*cell]`` etc., consistent with the
+    cell-centre convention ``x = x0 + (col + 0.5) * cell``.
+    """
+    if not cells:
+        return None
+    boxes = [
+        sg.box(
+            x0 + c * cell,
+            y0 + r * cell,
+            x0 + (c + 1) * cell,
+            y0 + (r + 1) * cell,
+        )
+        for (r, c) in cells
+    ]
+    merged = unary_union(boxes)
+    if merged.is_empty:
+        return None
+    if merged.geom_type == "MultiPolygon":
+        merged = max(merged.geoms, key=lambda p: p.area)
+    if merged.geom_type != "Polygon":
+        return None
+    # Drop holes: keep only the exterior ring.
+    poly = sg.Polygon(merged.exterior)
+    if simplify_tolerance > 0:
+        poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+    if poly.is_empty or not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.geom_type != "Polygon":
+        return None
+    return poly
+
+
+def detect_core_regions(
+    density: np.ndarray,
+    nodes: list[MacroNode],
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    core_frac: float = DEFAULT_CORE_FRAC,
+    core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS,
+    core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
+    peak_window_units: float = DEFAULT_CORE_PEAK_WINDOW_UNITS,
+    simplify_tolerance: float = DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+) -> list[sg.Polygon]:
+    """Detect dense "downtown" core regions around CITY/TOWN nodes.
+
+    For each node with ``sigma >= 1`` (cities and towns; villages skipped), a
+    connected dense region is grown on ``density`` from the node's nearest cell
+    (see :func:`_grow_core_region`). Regions whose island-frame area is below
+    ``core_min_area_units2`` are dropped. Overlapping or touching regions from
+    different nodes are UNIONED into a single core (so two nearby cores share one
+    downtown block). Each surviving core is returned as a simplified shapely
+    Polygon (largest ring only), in descending area order.
+
+    Pure/deterministic: depends only on the raster, node positions and params.
+    """
+    max_radius_cells = core_max_radius_units / cell
+    peak_window_cells = max(1, int(round(peak_window_units / cell)))
+    cell_area = cell * cell
+    min_cells = core_min_area_units2 / cell_area if cell_area > 0 else 0.0
+
+    nrows, ncols = density.shape
+    regions: list[set[tuple[int, int]]] = []
+    for nd in nodes:
+        if nd.sigma < 1:
+            continue
+        rows, cols = _xy_to_rowcol(
+            np.array([nd.x]), np.array([nd.y]), x0, y0, cell, nrows, ncols
+        )
+        seed = (int(rows[0]), int(cols[0]))
+        region = _grow_core_region(
+            density,
+            seed,
+            core_frac=core_frac,
+            peak_window_cells=peak_window_cells,
+            max_radius_cells=max_radius_cells,
+        )
+        if len(region) < min_cells:
+            continue
+        regions.append(region)
+
+    # Union overlapping/touching cell-regions (8-connectivity) into single cores.
+    merged_regions = _union_touching_regions(regions)
+
+    polys: list[sg.Polygon] = []
+    for region in merged_regions:
+        poly = _cells_to_polygon(
+            region, x0, y0, cell, simplify_tolerance=simplify_tolerance
+        )
+        if poly is None:
+            continue
+        if poly.area < core_min_area_units2:
+            continue
+        polys.append(poly)
+    polys.sort(key=lambda p: p.area, reverse=True)
+    return polys
+
+
+def _union_touching_regions(
+    regions: list[set[tuple[int, int]]],
+) -> list[set[tuple[int, int]]]:
+    """Merge cell-regions that overlap or touch (8-connectivity) into one set.
+
+    Two regions are merged if any cell of one is within the 8-neighbourhood of
+    any cell of the other (so adjacent or overlapping cores from different nodes
+    become a single downtown block). Union-find over region indices.
+    """
+    n = len(regions)
+    if n <= 1:
+        return [set(r) for r in regions]
+
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    # Map each cell (and its 8-neighbourhood) to the regions that claim it.
+    expanded: list[set[tuple[int, int]]] = []
+    for region in regions:
+        exp: set[tuple[int, int]] = set()
+        for r, c in region:
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    exp.add((r + dr, c + dc))
+        expanded.append(exp)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if regions[i] & expanded[j]:
+                union(i, j)
+
+    grouped: dict[int, set[tuple[int, int]]] = {}
+    for i in range(n):
+        root = find(i)
+        grouped.setdefault(root, set()).update(regions[i])
+    return list(grouped.values())
+
+
+def core_ring_boundaries(core_polys: list[sg.Polygon]) -> list[sg.LineString]:
+    """Return each core polygon's exterior ring as a LineString (the ring road)."""
+    rings: list[sg.LineString] = []
+    for poly in core_polys:
+        if poly.is_empty:
+            continue
+        rings.append(sg.LineString(list(poly.exterior.coords)))
+    return rings
+
+
+def clip_arterials_to_cores(
+    lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
+) -> tuple[list[sg.LineString], list[MacroEdge]]:
+    """Clip arterials to the exterior of dense cores, preserving tier/tau.
+
+    Subtracts ``unary_union(core_polys)`` from each arterial LineString so
+    arterials STOP at ring boundaries (forming T-junctions) instead of spiking
+    to a core's summit; the segment between two cores stays intact. A single
+    input arterial may split into several surviving segments — each is emitted as
+    its own LineString carrying the SAME ``MacroEdge`` attributes (tier, tau,
+    node ids; ``length`` updated to the surviving segment length).
+
+    With no cores this is an identity pass (returns the inputs unchanged).
+    """
+    if not core_polys:
+        return list(lines), list(edges)
+
+    cores_union = unary_union(core_polys)
+    out_lines: list[sg.LineString] = []
+    out_edges: list[MacroEdge] = []
+    for line, rec in zip(lines, edges, strict=True):
+        remainder = line.difference(cores_union)
+        if remainder.is_empty:
+            continue
+        if remainder.geom_type == "LineString":
+            parts: list[sg.LineString] = [remainder]
+        elif remainder.geom_type == "MultiLineString":
+            parts = [g for g in remainder.geoms if g.geom_type == "LineString"]
+        else:  # GeometryCollection or Point fragments — keep only line parts.
+            parts = [
+                g
+                for g in getattr(remainder, "geoms", [])
+                if g.geom_type == "LineString"
+            ]
+        for part in parts:
+            if part.is_empty or part.length <= 0.0:
+                continue
+            out_lines.append(part)
+            out_edges.append(
+                MacroEdge(
+                    node_a=rec.node_a,
+                    node_b=rec.node_b,
+                    tau=rec.tau,
+                    tier=rec.tier,
+                    path_cost=rec.path_cost,
+                    length=round(float(part.length), 3),
+                )
+            )
+    return out_lines, out_edges
+
+
+@dataclass(frozen=True)
+class MacroBlockBundle:
+    """Result of :func:`build_macro_blocks_with_cores`.
+
+    Attributes
+    ----------
+    core_polys : detected dense-core "downtown" polygons (ringed blocks).
+    ring_lines : each core's exterior ring as a LineString (drawn as ring roads).
+    clipped_lines / clipped_edges : arterials with their core interiors removed.
+    blocks : polygonized macro-blocks over clipped arterials + rings + boundary.
+    """
+
+    core_polys: list[sg.Polygon]
+    ring_lines: list[sg.LineString]
+    clipped_lines: list[sg.LineString]
+    clipped_edges: list[MacroEdge]
+    blocks: list[sg.Polygon]
+
+
+def build_macro_blocks_with_cores(
+    density: np.ndarray,
+    nodes: list[MacroNode],
+    arterial_lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    boundary: sg.Polygon,
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    core_frac: float = DEFAULT_CORE_FRAC,
+    core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS,
+    core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
+    peak_window_units: float = DEFAULT_CORE_PEAK_WINDOW_UNITS,
+    core_simplify_tolerance: float = DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
+) -> MacroBlockBundle:
+    """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
+
+    A NEW step on top of the unchanged :func:`compute_macro_arterials` output:
+
+    1. Detect dense core regions around CITY/TOWN nodes
+       (:func:`detect_core_regions`).
+    2. Clip arterials to the cores' exterior (:func:`clip_arterials_to_cores`)
+       so density-attracting arterials terminate ON the ring (T-junctions)
+       rather than converging on the summit.
+    3. Polygonize ``clipped_arterials ∪ core_rings ∪ island_exterior`` (reusing
+       Arm B ``polygonize_districts`` + sliver merge) so each core interior is
+       its own block and non-core space splits along the clipped arterial web.
+
+    Returns a :class:`MacroBlockBundle`. With no cores detected, the block set
+    matches the pre-3.5b polygonization (arterials + boundary).
+    """
+    core_polys = detect_core_regions(
+        density,
+        nodes,
+        x0,
+        y0,
+        cell,
+        core_frac=core_frac,
+        core_max_radius_units=core_max_radius_units,
+        core_min_area_units2=core_min_area_units2,
+        peak_window_units=peak_window_units,
+        simplify_tolerance=core_simplify_tolerance,
+    )
+    ring_lines = core_ring_boundaries(core_polys)
+    clipped_lines, clipped_edges = clip_arterials_to_cores(
+        arterial_lines, edges, core_polys
+    )
+    block_lines = [*clipped_lines, *ring_lines]
+    blocks = polygonize_districts(
+        block_lines, boundary, min_district_area=min_block_area
+    )
+    return MacroBlockBundle(
+        core_polys=core_polys,
+        ring_lines=ring_lines,
+        clipped_lines=clipped_lines,
+        clipped_edges=clipped_edges,
+        blocks=blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
 # GeoJSON serialization
 # ---------------------------------------------------------------------------
 
@@ -725,6 +1113,23 @@ def macro_blocks_to_geojson(blocks: list[sg.Polygon]) -> dict[str, Any]:
                 "geometry": sg.mapping(poly),
                 "properties": {
                     "block_id": i,
+                    "area": round(float(poly.area), 3),
+                },
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
+
+
+def core_rings_to_geojson(core_polys: list[sg.Polygon]) -> dict[str, Any]:
+    """Serialize dense-core ring polygons (the ringed downtown blocks)."""
+    features = []
+    for i, poly in enumerate(core_polys):
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": sg.mapping(poly),
+                "properties": {
+                    "core_id": i,
                     "area": round(float(poly.area), 3),
                 },
             }
