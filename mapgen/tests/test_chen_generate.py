@@ -9,6 +9,8 @@ count assertions use ranges rather than exact values.
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pytest
 from shapely import LineString, Polygon
@@ -400,6 +402,50 @@ def test_guidance_and_weights_none_is_identical_to_pre_change_signature(
     assert _layout_signature(with_none) == _layout_signature(baseline)
 
 
+def _default_path_digest(generated) -> str:
+    """Stable content digest of a generated layout for golden pinning.
+
+    SHA-256 over: sorted mesh vertex coordinates rounded to 1e-6, parcel ring
+    vertex-id tuples sorted by parcel id, and sorted street-network edge keys.
+    """
+    mesh = generated.layout.mesh
+    vertices = tuple(
+        (vertex_id, round(float(vertex.point[0]), 6), round(float(vertex.point[1]), 6))
+        for vertex_id, vertex in sorted(mesh.vertices.items())
+    )
+    rings = tuple(
+        (parcel_id, parcel.ring) for parcel_id, parcel in sorted(mesh.parcels.items())
+    )
+    streets = tuple(sorted(generated.layout.street_network.edges))
+    return hashlib.sha256(repr((vertices, rings, streets)).encode("ascii")).hexdigest()
+
+
+# Golden digest of the paper-default square layout (parcel_count=12, seed=0)
+# with every extension kwarg left at its default. This MUST only change when
+# the paper-default generation path is INTENTIONALLY changed — it is the
+# byte-identity contract that the default-off extensions (split_weights /
+# guidance / density_field) hang off. If it changes unexpectedly, a default
+# path perturbation leaked in. To regenerate after an INTENTIONAL default-path
+# change: run the pinned test below and copy the actual digest from the
+# assertion failure (it is _default_path_digest of the square parcel_count=12
+# seed=0 default-kwargs layout), then note the intentional change in the diff.
+_SQUARE_12_SEED0_GOLDEN_DIGEST = (
+    "d04f64111b6ca0cbf029828191152e96904a0b7e6356a4dc9655ba8befb269f7"
+)
+
+
+def test_default_path_matches_pinned_golden_digest() -> None:
+    """The kwargs-omitted default path reproduces the pinned golden layout.
+
+    Unlike the omitted-vs-None comparison above (which would silently pass if
+    the default path itself were perturbed), this pins the actual default
+    output across time.
+    """
+    boundary = boundary_preset("square")
+    generated = generate_layout_for_boundary(boundary, parcel_count=12, seed=0)
+    assert _default_path_digest(generated) == _SQUARE_12_SEED0_GOLDEN_DIGEST
+
+
 def test_generate_with_guidance_runs_and_flags_metric() -> None:
     boundary = boundary_preset("square")
     geom = boundary.geom
@@ -472,6 +518,93 @@ def test_density_mode_off_by_default_metrics() -> None:
     assert generated.metrics["density_mass_mode"] is False
     assert generated.metrics["max_parcel_mass"] is None
     assert generated.metrics["density_field_digest"] is None
+
+
+def test_score_candidate_mass_size_term_prefers_mass_balance() -> None:
+    """Eq. 2's Q_size scores child MASS balance when a density_field is given.
+
+    Rectangle [0,4]x[0,1] with density 3.0 for x < 1 and 1.0 elsewhere: the cut
+    at x=1 balances mass (3 vs 3) but not area (1 vs 3); the cut at x=2
+    balances area (2 vs 2) but not mass (4 vs 2). Size-only weights isolate
+    Q_size (established pattern above), so the argmax must flip between area
+    mode and density-mass mode. This pins the scoring mechanism independently
+    of the termination gate.
+    """
+    rect = Polygon([(0.0, 0.0), (4.0, 0.0), (4.0, 1.0), (0.0, 1.0)])
+    # 2x8 raster, cell 0.5, covering [0,4]x[0,1]; column centers 0.25..3.75.
+    density = np.full((2, 8), 1.0)
+    density[:, :2] = 3.0  # centers x = 0.25, 0.75 -> the x < 1 strip
+    field = RasterDensityField(density=density, x0=0.0, y0=0.0, cell=0.5)
+    mass_balanced_cut = LineString([(1.0, -0.1), (1.0, 1.1)])
+    area_balanced_cut = LineString([(2.0, -0.1), (2.0, 1.1)])
+    size_only = ChenSplitWeights(size=1.0, regularity=0.0, access=0.0)
+
+    def score(cut: LineString, density_field: RasterDensityField | None) -> float:
+        scored = _score_candidate(
+            rect,
+            cut,
+            [],
+            min_parcel_area=0.05,
+            split_weights=size_only,
+            density_field=density_field,
+        )
+        assert scored is not None
+        return scored[0]
+
+    # Sanity: the construction disagrees (area mode prefers the x=2 cut).
+    assert score(area_balanced_cut, None) > score(mass_balanced_cut, None)
+    # Density-mass mode must flip the preference to the mass-balanced cut ...
+    assert score(mass_balanced_cut, field) > score(area_balanced_cut, field)
+    # ... with exact mass ratios (3/3=1.0, 2/4=0.5), not area ratios (1/3, 1).
+    assert score(mass_balanced_cut, field) == pytest.approx(1.0)
+    assert score(area_balanced_cut, field) == pytest.approx(0.5)
+
+
+def _uniform_density_field(geom: Polygon, *, cells: int = 32) -> RasterDensityField:
+    """Uniform density 1.0 raster covering ``geom``'s bounding box."""
+    minx, miny, maxx, maxy = geom.bounds
+    cell = max(maxx - minx, maxy - miny) / (cells - 1)
+    return RasterDensityField(
+        density=np.full((cells, cells), 1.0), x0=minx, y0=miny, cell=cell
+    )
+
+
+def test_mass_gate_governs_termination_and_tracks_total_mass() -> None:
+    """The mass gate (not the geometric floor) terminates splitting.
+
+    Uniform density over the square: the geometric floor (parcel_count=48)
+    would allow ~48-64 parcels, but the mass gate must stop binary splitting
+    once every parcel's mass drops below 2*max_parcel_mass, so the emergent
+    district count tracks N = total_mass / max_parcel_mass (loose band; the
+    targets total/6 and total/12 sit off the power-of-two boundaries the
+    square's near-perfect halving produces, so termination is unambiguous)
+    and shrinking max_parcel_mass must increase the count. This pins the gate
+    mechanism independently of the Eq. 2 scoring term.
+    """
+    boundary = boundary_preset("square")
+    field = _uniform_density_field(boundary.geom)
+    total_mass = field.mass(boundary.geom)
+    floor_count = 48  # floor fine enough that only the mass gate can stop early
+
+    def emergent_count(target_districts: float) -> int:
+        generated = generate_layout_for_boundary(
+            boundary,
+            parcel_count=floor_count,
+            seed=0,
+            density_field=field,
+            max_parcel_mass=total_mass / target_districts,
+        )
+        assert generated.metrics["density_mass_mode"] is True
+        return len(generated.layout.mesh.parcels)
+
+    count_coarse = emergent_count(6.0)
+    count_fine = emergent_count(12.0)
+
+    # Loose band around N = total_mass / max_parcel_mass. Without the gate both
+    # runs would grind down to the geometric floor (~48-64 parcels).
+    assert 0.4 * 6.0 <= count_coarse <= 1.2 * 6.0, f"coarse={count_coarse}"
+    assert 0.4 * 12.0 <= count_fine <= 1.2 * 12.0, f"fine={count_fine}"
+    assert count_fine > count_coarse
 
 
 @pytest.mark.slow

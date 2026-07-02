@@ -882,6 +882,25 @@ def test_density_mass_picks_out_single_hot_cell() -> None:
     assert field.mass(cold) == pytest.approx(0.0)
 
 
+def test_density_mass_hot_cell_with_nonzero_origin() -> None:
+    """Same hot-cell integral with a shifted raster origin (x0, y0 != 0).
+
+    The other mass tests all use x0 = y0 = 0, so a sign/offset bug in the
+    row/col bbox-window or cell-center arithmetic would still pass them.
+    """
+    density = np.zeros((10, 10))
+    density[5, 7] = 4.0  # center at (x0 + 7.5, y0 + 5.5) = (10.5, -14.5)
+    field = RasterDensityField(density=density, x0=3.0, y0=-20.0, cell=1.0)
+    hot = Polygon([(10.0, -15.0), (11.0, -15.0), (11.0, -14.0), (10.0, -14.0)])
+    assert field.mass(hot) == pytest.approx(4.0)
+    # The same window one cell up in y (row 6) is cold.
+    cold = Polygon([(10.0, -14.0), (11.0, -14.0), (11.0, -13.0), (10.0, -13.0)])
+    assert field.mass(cold) == pytest.approx(0.0)
+    # Whole-raster integral must be independent of the origin shift.
+    whole = Polygon([(3.0, -20.0), (13.0, -20.0), (13.0, -10.0), (3.0, -10.0)])
+    assert field.mass(whole) == pytest.approx(4.0)
+
+
 def test_density_mass_scales_with_cell_area() -> None:
     # Same density, cell=2 -> each cell carries 4x the mass of a unit cell.
     field = RasterDensityField(density=np.full((10, 10), 1.0), x0=0.0, y0=0.0, cell=2.0)

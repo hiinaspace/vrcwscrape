@@ -121,6 +121,7 @@ uv run ruff check .          # 2 pre-existing errors outside chen_* are known
 uv run ty check              # pre-existing diagnostics outside chen_* are known
 uv run python -m pytest tests/test_chen_*.py -m "not slow"   # quick lane
 uv run python -m pytest tests/test_chen_*.py                 # full, pre-wave-end
+uv run python -m pytest tests/test_r1_*.py -m "not slow"     # regional probe layer
 uv run python scripts/run_chen_strict_shapes.py --out-dir artifacts/chen_strict_shapes
 uv run python scripts/run_chen_strict_scale_suite.py --out-dir artifacts/chen_strict_scale_suite
 ```
