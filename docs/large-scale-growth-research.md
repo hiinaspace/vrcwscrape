@@ -297,21 +297,44 @@ upheld; two corrections of record.**
    "0 Chen failures" tallies), missing `test_r1_arm_a.py` for the calibration
    helpers, zoom-review harness coverage.
 
+## Sliver-fan wave (2026-07-01, done)
+
+Diagnosis (ablation probe `scripts/run_r2_fan_probe.py`, then paper audit):
+the fans needed BOTH split repetition (mass gate concentrating splits at
+summits; boundary offsets in geometric mode) AND an all-parallel candidate
+set. The all-parallel candidate set turned out to be a **paper-fidelity bug**,
+not an extension problem: a `min_length_fraction = 0.18 × bbox diagonal`
+candidate gate with no basis in Yang §5/Chen §4.1 deleted the entire
+perpendicular RoSy family above ~5.5:1 parcel aspect — a ratchet (paper-mode
+8:1 rectangle → 128:1 slivers). Fixed on the paper path (Yang's rejection
+set + orientation-fair candidate budget + direction-neutral tiebreak); strict
+shapes bit-identical, pinned golden unchanged, full chen suite green. Fan
+probe: core1 control elongation>4 share 20.2%→1.6%; noncore no-guidance
+46.2%→19.2%. Hybrid rerun (698 districts): summit fabric inside core rings
+#1 and the twin ring by #2 is now clean cellular downtown.
+
+**Residual (non-blocking):** ridge-guidance-driven fans persist in a few
+small, very dense blocks (core #2's center ring: control 26.8%→25.0%, but
+2.4% with guidance off) and some corridor bands — an R2/guidance-extension
+interplay, not paper machinery. Candidate levers when picked up: per-block
+guidance attenuation (strength or weight cap scaled by block size/mass),
+or bounding guidance weight where density curvature is high.
+
 ## Status
 
 Stages 1–3 + stage-3.5a + stage-3.5b done and merged after the 2026-07-01
-re-review above. The hybrid uses a 3-tier semantic node hierarchy (L1 cities /
+re-review above. The sliver-fan wave (above) then fixed the dominant fabric
+artifact at its paper-fidelity root. The hybrid uses a 3-tier semantic node hierarchy (L1 cities /
 L0 towns / peak villages) with dense cores folded into ringed "downtown"
 blocks: arterials are CLIPPED to core exteriors (T-junctions on the ring) and
 core rings + clipped arterials are polygonized → 13 cores, 36 macro-blocks →
 697 districts at total-target 1200 (post beta-prune fix; the reviewed 3.5b
 runs were 35/701), 0 Chen failures, ~330–520 s depending on host. Remaining work, in priority
-order (revised by the re-review): **(1) summit sliver-fan fabric defect** (R2
-mass-split × ridge-aligned guidance interaction; dominant visual artifact,
-sits on the density peaks themselves); **(2) arterial↔local T-junction
-connectivity** for the non-core fabric (spec'd wave, plan exists — gates
-already terminate on block boundaries; fuse/export/render + metric);
-(3) concave-wedge block regularization and over-merged-downtown tuning.
+order: **(1) arterial↔local T-junction connectivity** for the non-core
+fabric (spec'd wave, plan exists — gates already terminate on block
+boundaries; fuse/export/render + metric); (2) residual guidance-driven fans
+in small dense blocks (sliver-fan wave residual above); (3) concave-wedge
+block regularization and over-merged-downtown tuning.
 Footholds: `r1_macro.py` (incl. `cluster_centroids`,
 `build_macro_nodes_hierarchical`, N-level `compute_macro_arterials`,
 `detect_core_regions` / `clip_arterials_to_cores` / `build_macro_layer`),
