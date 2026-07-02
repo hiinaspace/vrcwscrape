@@ -80,7 +80,7 @@ existing outputs:
 - `streets.geojson` — per-block Chen local street polylines
   (perimeter-duplicate paths excluded, as in the connectivity wave).
 - `lots.parquet` — one row per world: `world_id, district_id, footprint_wkb,
-  lot_wkb, height, name, visits, x, y`.
+  lot_wkb, height, name, visits, x, y, assigned` (direct | snapped).
 - `greybox_manifest.json` — counts, config (heights, inset, widths), the
   island-frame affine copied from the inputs manifest, and the source hybrid
   manifest reference.

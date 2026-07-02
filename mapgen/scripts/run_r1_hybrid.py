@@ -81,8 +81,20 @@ from mapgen.r1_connect import (  # noqa: E402
     graph_connectivity_summary,
     snap_gates_to_macro,
 )
+from mapgen.r1_lots import (  # noqa: E402
+    DEFAULT_H_BASE,
+    DEFAULT_H_SCALE,
+    DEFAULT_INSET,
+    DEFAULT_MIN_LOT_AREA_FRAC,
+    Lot,
+    assign_worlds_to_districts,
+    build_lots,
+    count_sliver_reassignments,
+    select_member_points,
+)
 from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
+    MacroLayer,
     MacroParams,
     build_macro_layer,
     load_boundary,
@@ -665,6 +677,286 @@ def _select_seam_block(
     return block_id, count
 
 
+# ---------------------------------------------------------------------------
+# Stage G0 — greybox geometry + lots export (docs/greybox-plan.md).
+#
+# Off by default (``--greybox-out`` is ``None``): nothing below this comment
+# runs, and nothing above it changes, so the pre-G0 hybrid output stays
+# byte-identical when the flag is omitted.
+# ---------------------------------------------------------------------------
+
+_GREYBOX_TIER_NAME: dict[int, str] = {2: "highway", 1: "major", 0: "local"}
+
+
+def _feature_collection(
+    records: list[tuple[int, Any, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Build a GeoJSON FeatureCollection from ``(id, geometry, properties)``.
+
+    Every feature's ``properties`` gets an explicit ``"id"`` entry (in
+    addition to whatever semantic properties the caller supplies), and the
+    feature list is sorted by it -- so every greybox export is stable
+    regardless of any upstream construction-order subtlety, per the stage-G0
+    determinism contract (same inputs/seed -> byte-identical export).
+    """
+    features = []
+    for feature_id, geom, props in records:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": sg.mapping(geom),
+                "properties": {"id": feature_id, **props},
+            }
+        )
+    features.sort(key=lambda feat: feat["properties"]["id"])
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _greybox_island_geojson(boundary: sg.Polygon) -> dict[str, Any]:
+    """Single-feature island boundary FeatureCollection."""
+    return _feature_collection([(0, boundary, {})])
+
+
+def _greybox_arterials_geojson(
+    arterial_lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    ring_lines: list[sg.LineString],
+) -> dict[str, Any]:
+    """Clipped arterials (``tier``: highway/major/local) + core rings (``ring``)."""
+    records: list[tuple[int, Any, dict[str, Any]]] = []
+    feature_id = 0
+    for line, rec in zip(arterial_lines, edges, strict=True):
+        tier_name = _GREYBOX_TIER_NAME.get(rec.tier, str(rec.tier))
+        records.append((feature_id, line, {"tier": tier_name}))
+        feature_id += 1
+    for line in ring_lines:
+        records.append((feature_id, line, {"tier": "ring"}))
+        feature_id += 1
+    return _feature_collection(records)
+
+
+def _greybox_blocks_geojson(macro_blocks: list[sg.Polygon]) -> dict[str, Any]:
+    """Macro-block polygons, ``block_id`` == the export's own feature id."""
+    return _feature_collection(
+        [(i, poly, {"block_id": i}) for i, poly in enumerate(macro_blocks)]
+    )
+
+
+def _greybox_districts_geojson(
+    district_records: list[tuple[int, int, sg.Polygon, int]],
+) -> dict[str, Any]:
+    """``district_records``: ``(district_id, block_id, polygon, world_count)``."""
+    records: list[tuple[int, Any, dict[str, Any]]] = []
+    for district_id, block_id, poly, world_count in district_records:
+        kind = "fabric" if world_count > 0 else "park"
+        records.append(
+            (
+                district_id,
+                poly,
+                {
+                    "block_id": block_id,
+                    "district_id": district_id,
+                    "kind": kind,
+                    "world_count": world_count,
+                },
+            )
+        )
+    return _feature_collection(records)
+
+
+def _greybox_streets_geojson(results: list[BlockResult]) -> dict[str, Any]:
+    """Per-block Chen streets, excluding perimeter-duplicate paths."""
+    records: list[tuple[int, Any, dict[str, Any]]] = []
+    feature_id = 0
+    for res in results:
+        flags = res.street_perimeter_flags or [False] * len(res.streets)
+        for line, is_perimeter in zip(res.streets, flags, strict=True):
+            if is_perimeter or line.geom_type != "LineString":
+                continue
+            records.append((feature_id, line, {"block_id": res.block_id}))
+            feature_id += 1
+    return _feature_collection(records)
+
+
+def export_greybox(
+    out_dir: Path,
+    in_dir: Path,
+    *,
+    boundary: sg.Polygon,
+    layer: MacroLayer,
+    results: list[BlockResult],
+    points: pl.DataFrame,
+    inset: float = DEFAULT_INSET,
+    min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
+    h_base: float = DEFAULT_H_BASE,
+    h_scale: float = DEFAULT_H_SCALE,
+) -> dict[str, Any]:
+    """Write the Stage-G0 greybox export (geometry + lots) to ``out_dir``.
+
+    Assembles a GLOBAL district list by walking ``results`` in ``block_id``
+    order (already the order ``run_all_blocks`` built them in) and, within a
+    block, in that block's own ``districts`` list order -- both deterministic
+    given fixed inputs/seeds, so the resulting ``district_id`` (its position
+    in that walk) is stable across runs. Every world in ``points`` is then
+    assigned to exactly one district (``mapgen.r1_lots
+    .assign_worlds_to_districts``, direct point-in-polygon or nearest-snap),
+    and every district with at least one world gets its lots tessellated
+    (``mapgen.r1_lots.build_lots``); a district with zero worlds is exported
+    as ``kind="park"`` with no lots, per ``docs/greybox-plan.md`` Stage G0.
+
+    Writes ``island.geojson``, ``arterials.geojson`` (clipped arterials +
+    core rings), ``blocks.geojson``, ``districts.geojson``, ``streets.geojson``
+    (perimeter-duplicate paths excluded, reusing the connectivity wave's
+    ``street_perimeter_flags``), ``lots.parquet``, and
+    ``greybox_manifest.json``. Returns the manifest dict.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    district_entries: list[tuple[int, sg.Polygon]] = []  # (block_id, polygon)
+    for res in results:
+        for poly in res.districts:
+            district_entries.append((res.block_id, poly))
+    district_polys = [poly for _block_id, poly in district_entries]
+
+    assignment, assigned_kind = assign_worlds_to_districts(points, district_polys)
+    n_direct = sum(1 for kind in assigned_kind if kind == "direct")
+    n_snapped = sum(1 for kind in assigned_kind if kind == "snapped")
+
+    all_lots: list[Lot] = []
+    district_records: list[tuple[int, int, sg.Polygon, int]] = []
+    n_park = 0
+    for district_id, (block_id, poly) in enumerate(district_entries):
+        row_indices = assignment.get(district_id, [])
+        world_count = len(row_indices)
+        district_records.append((district_id, block_id, poly, world_count))
+        if world_count == 0:
+            n_park += 1
+            continue
+        member = select_member_points(points, row_indices, assigned_kind)
+        all_lots.extend(
+            build_lots(
+                poly,
+                district_id,
+                member,
+                inset=inset,
+                min_lot_area_frac=min_lot_area_frac,
+                h_base=h_base,
+                h_scale=h_scale,
+            )
+        )
+    n_sliver = count_sliver_reassignments(all_lots)
+
+    with (out_dir / "island.geojson").open("w") as f:
+        json.dump(_greybox_island_geojson(boundary), f, indent=2, sort_keys=True)
+    with (out_dir / "arterials.geojson").open("w") as f:
+        json.dump(
+            _greybox_arterials_geojson(
+                layer.arterial_lines, layer.edges, layer.ring_lines
+            ),
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+    with (out_dir / "blocks.geojson").open("w") as f:
+        json.dump(_greybox_blocks_geojson(layer.blocks), f, indent=2, sort_keys=True)
+    with (out_dir / "districts.geojson").open("w") as f:
+        json.dump(
+            _greybox_districts_geojson(district_records), f, indent=2, sort_keys=True
+        )
+    with (out_dir / "streets.geojson").open("w") as f:
+        json.dump(_greybox_streets_geojson(results), f, indent=2, sort_keys=True)
+
+    # lots.parquet — sorted by world_id so the table is deterministic
+    # independent of district/build_lots internal ordering.
+    all_lots.sort(key=lambda lot: lot.world_id)
+    lots_df = pl.DataFrame(
+        {
+            "world_id": [lot.world_id for lot in all_lots],
+            "district_id": [lot.district_id for lot in all_lots],
+            "footprint_wkb": [lot.footprint.wkb for lot in all_lots],
+            "lot_wkb": [lot.lot.wkb for lot in all_lots],
+            "height": [lot.height for lot in all_lots],
+            # Explicit Utf8: island_points.parquet has no ``name`` column today
+            # (see mapgen.r1_lots module docstring), so every Lot.name is
+            # None -- without an explicit dtype polars would otherwise infer
+            # an all-null column as its own Null dtype, which downstream
+            # parquet readers may not expect for a "should be a string" column.
+            "name": pl.Series("name", [lot.name for lot in all_lots], dtype=pl.Utf8),
+            "visits": [lot.visits for lot in all_lots],
+            "x": [lot.x for lot in all_lots],
+            "y": [lot.y for lot in all_lots],
+            "assigned": [lot.assigned for lot in all_lots],
+        }
+    )
+    lots_df.write_parquet(out_dir / "lots.parquet")
+
+    island_frame: dict[str, Any] = {}
+    inputs_manifest_path = in_dir / "inputs_manifest.json"
+    if inputs_manifest_path.exists():
+        inputs_manifest = json.loads(inputs_manifest_path.read_text())
+        island_frame = inputs_manifest.get("island_frame", {})
+
+    n_streets_exported = sum(
+        1
+        for res in results
+        for is_perimeter in (res.street_perimeter_flags or [False] * len(res.streets))
+        if not is_perimeter
+    )
+
+    manifest: dict[str, Any] = {
+        "stage": "G0 (greybox geometry + lots export)",
+        "description": (
+            "Island/arterial/block/district/street geometry + per-world "
+            "Voronoi lot tessellation and building footprints, exported from "
+            "the hybrid pipeline for the G1 mesh bake / track-W 2D site view "
+            "(docs/greybox-plan.md)"
+        ),
+        "counts": {
+            "n_worlds": points.height,
+            "n_direct": n_direct,
+            "n_snapped": n_snapped,
+            "n_blocks": len(layer.blocks),
+            "n_arterials": len(layer.arterial_lines),
+            "n_ring_roads": len(layer.ring_lines),
+            "n_streets_exported": n_streets_exported,
+            "n_districts": len(district_entries),
+            "n_park_districts": n_park,
+            "n_fabric_districts": len(district_entries) - n_park,
+            "n_lots": len(all_lots),
+            "n_sliver_reassignments": n_sliver,
+        },
+        "lot_config": {
+            "inset": inset,
+            "min_lot_area_frac": min_lot_area_frac,
+            "h_base": h_base,
+            "h_scale": h_scale,
+        },
+        "island_frame": island_frame,
+        "coordinate_note": (
+            "Planar geometry in every greybox export file (island/arterials/"
+            "blocks/districts/streets, and lots.parquet's x/y/footprint_wkb/"
+            "lot_wkb) is in ISLAND UNITS -- the same frame as "
+            "island_points.parquet / hybrid_manifest.json -- NOT meters. "
+            "lots.parquet's 'height' column IS already in meters (h_base/"
+            "h_scale are meter constants, docs/greybox-plan.md Stage G0); "
+            "G1's mesh bake applies --meters-per-unit to the planar geometry "
+            "only, not to height."
+        ),
+        "outputs": [
+            "island.geojson",
+            "arterials.geojson",
+            "blocks.geojson",
+            "districts.geojson",
+            "streets.geojson",
+            "lots.parquet",
+            "greybox_manifest.json",
+        ],
+    }
+    with (out_dir / "greybox_manifest.json").open("w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest
+
+
 def run_hybrid(
     in_dir: Path,
     out_dir: Path,
@@ -673,6 +965,11 @@ def run_hybrid(
     n_cores: int = 3,
     dpi: int = 240,
     max_gate_spacing: float | None = None,
+    greybox_out: Path | None = None,
+    greybox_inset: float = DEFAULT_INSET,
+    greybox_min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
+    greybox_h_base: float = DEFAULT_H_BASE,
+    greybox_h_scale: float = DEFAULT_H_SCALE,
 ) -> dict[str, Any]:
     """Full hybrid assembly: macro layer -> per-block Chen -> assemble -> render.
 
@@ -680,6 +977,13 @@ def run_hybrid(
     (``mapgen.r1_connect.densify_gates``, wired in ``run_all_blocks``);
     ``None`` (the default) leaves it OFF, so the connectivity numbers are
     byte-identical to the pre-stage-4 hybrid.
+
+    ``greybox_out`` (stage G0, optional; ``None`` is OFF by default) writes
+    the geometry + lots export (:func:`export_greybox`) to that directory
+    alongside the existing PNG/junctions/manifest outputs, once assembly is
+    done. Leaving it ``None`` runs exactly the pre-G0 code path -- this
+    parameter and the ``greybox_*`` knobs are read nowhere else in this
+    function.
     """
     t_start = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -941,6 +1245,33 @@ def run_hybrid(
     with (out_dir / "hybrid_manifest.json").open("w") as f:
         json.dump(manifest, f, indent=2)
     print(f"Wrote hybrid_manifest.json (runtime {runtime_s}s)", flush=True)
+
+    if greybox_out is not None:
+        print(f"Writing greybox export to {greybox_out}…", flush=True)
+        greybox_manifest = export_greybox(
+            greybox_out,
+            in_dir,
+            boundary=boundary,
+            layer=layer,
+            results=results,
+            points=points,
+            inset=greybox_inset,
+            min_lot_area_frac=greybox_min_lot_area_frac,
+            h_base=greybox_h_base,
+            h_scale=greybox_h_scale,
+        )
+        counts = greybox_manifest["counts"]
+        print(
+            f"  greybox: {counts['n_worlds']} worlds "
+            f"({counts['n_direct']} direct, {counts['n_snapped']} snapped), "
+            f"{counts['n_districts']} districts "
+            f"({counts['n_fabric_districts']} fabric, "
+            f"{counts['n_park_districts']} park), "
+            f"{counts['n_lots']} lots "
+            f"({counts['n_sliver_reassignments']} sliver reassignments)",
+            flush=True,
+        )
+
     return manifest
 
 
@@ -971,6 +1302,41 @@ def main(argv: list[str] | None = None) -> None:
             "pre-stage-4 hybrid)."
         ),
     )
+    parser.add_argument(
+        "--greybox-out",
+        type=Path,
+        default=None,
+        help=(
+            "Stage-G0 geometry + lots export directory (docs/greybox-plan.md): "
+            "island/arterials/blocks/districts/streets geojson + lots.parquet "
+            "+ greybox_manifest.json. Default None writes nothing (the "
+            "pre-G0 hybrid run is unaffected)."
+        ),
+    )
+    parser.add_argument(
+        "--greybox-inset",
+        type=float,
+        default=DEFAULT_INSET,
+        help="Building footprint inward-buffer inset, island units (stage G0).",
+    )
+    parser.add_argument(
+        "--greybox-min-lot-area-frac",
+        type=float,
+        default=DEFAULT_MIN_LOT_AREA_FRAC,
+        help="Sliver-lot floor as a fraction of the median cell area (stage G0).",
+    )
+    parser.add_argument(
+        "--greybox-h-base",
+        type=float,
+        default=DEFAULT_H_BASE,
+        help="Building height base, meters: h_base + h_scale*log10(1+visits).",
+    )
+    parser.add_argument(
+        "--greybox-h-scale",
+        type=float,
+        default=DEFAULT_H_SCALE,
+        help="Building height scale, meters: h_base + h_scale*log10(1+visits).",
+    )
     args = parser.parse_args(argv)
 
     manifest = run_hybrid(
@@ -980,6 +1346,11 @@ def main(argv: list[str] | None = None) -> None:
         n_cores=args.n_cores,
         dpi=args.dpi,
         max_gate_spacing=args.max_gate_spacing,
+        greybox_out=args.greybox_out,
+        greybox_inset=args.greybox_inset,
+        greybox_min_lot_area_frac=args.greybox_min_lot_area_frac,
+        greybox_h_base=args.greybox_h_base,
+        greybox_h_scale=args.greybox_h_scale,
     )
 
     print("\n--- Hybrid stage 3 summary ---")
@@ -998,6 +1369,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"  runtime:         {manifest['runtime_seconds']}s")
     print(f"\nOutputs in: {args.out_dir}")
+    if args.greybox_out is not None:
+        print(f"Greybox export in: {args.greybox_out}")
     print("Done.")
 
 
