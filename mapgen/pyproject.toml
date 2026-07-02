@@ -19,6 +19,8 @@ dependencies = [
     "hdbscan>=0.8.38",
     "datamapplot>=0.4",
     "shapely>=2.0",
+    "trimesh>=4.12.2",
+    "mapbox-earcut>=2.0.0",
 ]
 
 [project.optional-dependencies]

@@ -995,6 +995,35 @@ wheels = [
 ]
 
 [[package]]
+name = "mapbox-earcut"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bc/7b/bbf6b00488662be5d2eb7a188222c264b6f713bac10dc4a77bf37a4cb4b6/mapbox_earcut-2.0.0.tar.gz", hash = "sha256:81eab6b86cf99551deb698b98e3f7502c57900e5c479df15e1bdaf1a57f0f9d6", size = 39934, upload-time = "2025-11-16T18:41:27.251Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/9f/fbd15d9e348e75e986d6912c4eab99888106b7e5fb0a01e765422f7cd464/mapbox_earcut-2.0.0-cp311-cp311-macosx_10_13_x86_64.whl", hash = "sha256:9b5040e79e3783295e99c90277f31c1cbaddd3335297275331995ba5680e3649", size = 55773, upload-time = "2025-11-16T18:40:20.045Z" },
+    { url = "https://files.pythonhosted.org/packages/72/40/be761298704fbbaa81c5618bb306f1510fb068e482f6a1c8b3b6c1b31479/mapbox_earcut-2.0.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:1cf43baafec3ef1e967319d9b5da96bc6ddf3dbb204b6f3535275eda4b519a72", size = 52444, upload-time = "2025-11-16T18:40:21.501Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/0b/0c0c08db9663238ffb82c48259582dc0047a3255d98c0ac83c48026b7544/mapbox_earcut-2.0.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3a283531847f603dd9d69afb75b21bd009d385ca9485fcd3e5a7fa5db1ccd913", size = 56803, upload-time = "2025-11-16T18:40:22.891Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/4a/86796859383d7d11fa5d4bcf1983f94c6cbb9eeb60fb3bab527fec4b32fa/mapbox_earcut-2.0.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ab697676f4cec4572d4e941b7a3429a6687bf2ac6e8db3f3781024e3239ae3a0", size = 59403, upload-time = "2025-11-16T18:40:24.021Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/db/adaf981ab3bcfcf993ef317636b1f27210d6834bb1e8d63db6ad7c08214a/mapbox_earcut-2.0.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:f1bdac76e048f4299accf4eaf797079ddfc330442e7231c15535ed198100d6c5", size = 152876, upload-time = "2025-11-16T18:40:25.588Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/83/86417974039e7554c9e1e55c852a7e9c2a1390d64675eb85d70e5fa7eb37/mapbox_earcut-2.0.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:4a6945b23f859bef11ce3194303d17bd371c86b637e7029f81b1feaff3db3758", size = 157548, upload-time = "2025-11-16T18:40:27.202Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/4c/c82a292bb21e5c651d81334123db2d654c5c9d19b2197080d3429dc1e49a/mapbox_earcut-2.0.0-cp311-cp311-win32.whl", hash = "sha256:8e119524c29406afb5eaa15e933f297d35679293a3ca62ced22f97a14c484cb5", size = 51424, upload-time = "2025-11-16T18:40:28.415Z" },
+    { url = "https://files.pythonhosted.org/packages/30/57/6c39d7db81f72a3e4814ef152c8fb8dfe275dc4b03c9bfa073d251e3755f/mapbox_earcut-2.0.0-cp311-cp311-win_amd64.whl", hash = "sha256:378bbbb3304e446023752db8f44ecd6e7ef965bcbda36541d2ae64442ba94254", size = 56662, upload-time = "2025-11-16T18:40:29.863Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/d6/a1ef6e196b3d6968bf6546d4f7e54c559f9cff8991fdb880df0ba1618f52/mapbox_earcut-2.0.0-cp311-cp311-win_arm64.whl", hash = "sha256:6d249a431abd6bbff36f1fd0493247a86de962244cc4081b4d5050b02ed48fb1", size = 50505, upload-time = "2025-11-16T18:40:30.992Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/93/846804029d955c3c841d8efff77c2b0e8d9aab057d3a077dc8e3f88b5ea4/mapbox_earcut-2.0.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:db55ce18e698bc9d90914ee7d4f8c3e4d23827456ece7c5d7a1ec91e90c7122b", size = 55623, upload-time = "2025-11-16T18:40:32.113Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/f6/cc9ece104bc3876b350dba6fef7f34fb7b20ecc028d2cdbdbecb436b1ed1/mapbox_earcut-2.0.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:01dd6099d16123baf582a11b2bd1d59ce848498cf0cdca3812fd1f8b20ff33b7", size = 52028, upload-time = "2025-11-16T18:40:33.516Z" },
+    { url = "https://files.pythonhosted.org/packages/88/6e/230da4aabcc56c99e9bddb4c43ce7d4ba3609c0caf2d316fb26535d7c60c/mapbox_earcut-2.0.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2d5a098aae26a52282bc981a38e7bf6b889d2ea7442f2cd1903d2ba842f4ff07", size = 56351, upload-time = "2025-11-16T18:40:35.217Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/f7/5cdd3752526e91d91336c7263af7767b291d21e63c89d7190a60051f0f87/mapbox_earcut-2.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:de35f241d0b9110ad9260f295acedd9d7cc0d7acfe30d36b1b3ee8419c2caba1", size = 59209, upload-time = "2025-11-16T18:40:36.634Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/a2/b7781416cb93b37b95d0444e03f87184de8815e57ff202ce4105fa921325/mapbox_earcut-2.0.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:6cb63ab85e2e430c350f93e75c13f8b91cb8c8a045f3cd714c390b69a720368a", size = 152316, upload-time = "2025-11-16T18:40:38.147Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/74/396338e3d345e4e36fb23a0380921098b6a95ce7fb19c4777f4185a5974e/mapbox_earcut-2.0.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:fb3c9f069fc3795306db87f8139f70c4f047532f897a3de05f54dc1faebc97f6", size = 157268, upload-time = "2025-11-16T18:40:39.753Z" },
+    { url = "https://files.pythonhosted.org/packages/56/2c/66fd137ea86c508f6cd7247f7f6e2d1dabffc9f0e9ccf14c71406b197af1/mapbox_earcut-2.0.0-cp312-cp312-win32.whl", hash = "sha256:eb290e6676217707ed238dd55e07b0a8ca3ab928f6a27c4afefb2ff3af08d7cb", size = 51226, upload-time = "2025-11-16T18:40:41.018Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/84/7b78e37b0c2109243c0dad7d9ba9774b02fcee228bf61cf727a5aa1702e2/mapbox_earcut-2.0.0-cp312-cp312-win_amd64.whl", hash = "sha256:5ef5b3319a43375272ad2cad9333ed16e569b5102e32a4241451358897e6f6ee", size = 56417, upload-time = "2025-11-16T18:40:42.173Z" },
+    { url = "https://files.pythonhosted.org/packages/75/7f/cd7195aa27c1c8f2b9d38025a5a8663f32cd01c07b648a54b1308ab26c15/mapbox_earcut-2.0.0-cp312-cp312-win_arm64.whl", hash = "sha256:a4a3706feb5cc8c782d8f68bb0110c8d551304043f680a87a54b0651a2c208c3", size = 50111, upload-time = "2025-11-16T18:40:43.334Z" },
+]
+
+[[package]]
 name = "mapgen"
 version = "0.1.0"
 source = { editable = "." }
@@ -1002,6 +1031,7 @@ dependencies = [
     { name = "datamapplot" },
     { name = "hdbscan" },
     { name = "httpx" },
+    { name = "mapbox-earcut" },
     { name = "networkx" },
     { name = "numpy" },
     { name = "pacmap" },
@@ -1012,6 +1042,7 @@ dependencies = [
     { name = "scipy" },
     { name = "shapely" },
     { name = "tqdm" },
+    { name = "trimesh" },
     { name = "umap-learn" },
 ]
 
@@ -1046,6 +1077,7 @@ requires-dist = [
     { name = "datamapplot", specifier = ">=0.4" },
     { name = "hdbscan", specifier = ">=0.8.38" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "mapbox-earcut", specifier = ">=2.0.0" },
     { name = "networkx", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "ollama", marker = "extra == 'topo'" },
@@ -1062,6 +1094,7 @@ requires-dist = [
     { name = "toponymy", marker = "extra == 'topo'" },
     { name = "torch", marker = "extra == 'image'", specifier = ">=2.2" },
     { name = "tqdm", specifier = ">=4.66" },
+    { name = "trimesh", specifier = ">=4.12.2" },
     { name = "umap-learn", specifier = ">=0.5.6" },
 ]
 provides-extras = ["image", "topo", "shapeop"]
@@ -2615,6 +2648,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c4/35/67252acc1b929dc88b6602e8c4a982e64f31e733b804c14bc24b47da35e6/transformers-4.57.6.tar.gz", hash = "sha256:55e44126ece9dc0a291521b7e5492b572e6ef2766338a610b9ab5afbb70689d3", size = 10134912, upload-time = "2026-01-16T10:38:39.284Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/b8/e484ef633af3887baeeb4b6ad12743363af7cce68ae51e938e00aaa0529d/transformers-4.57.6-py3-none-any.whl", hash = "sha256:4c9e9de11333ddfe5114bc872c9f370509198acf0b87a832a0ab9458e2bd0550", size = 11993498, upload-time = "2026-01-16T10:38:31.289Z" },
+]
+
+[[package]]
+name = "trimesh"
+version = "4.12.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/79/37/5cb90f04990260d2caceb6093560c6cefafca1ec522c1e43be01ca658244/trimesh-4.12.2.tar.gz", hash = "sha256:c8ca31571ac00b112e4e160e66a2d4c3491df321f056bd33806be0485d1af9d9", size = 842220, upload-time = "2026-05-01T00:57:43.333Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/98/716a473cfb24750858ddd5d14e6527539dd206583a46408d08eeb2844a75/trimesh-4.12.2-py3-none-any.whl", hash = "sha256:b5b5afa63c5272345f2858f7676bc8c217dc8a89f4fadf6193fe10a81b5ff2aa", size = 741043, upload-time = "2026-05-01T00:57:40.763Z" },
 ]
 
 [[package]]
