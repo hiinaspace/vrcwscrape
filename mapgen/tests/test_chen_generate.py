@@ -168,6 +168,49 @@ def test_termination_respects_min_parcel_area(name: str) -> None:
         )
 
 
+def _max_parcel_elongation(generated) -> float:
+    """Max min-rotated-rectangle long/short ratio over all parcels."""
+    import math
+
+    worst = 1.0
+    for parcel in generated.layout.mesh.parcels.values():
+        rect = parcel.geom.minimum_rotated_rectangle
+        coords = list(rect.exterior.coords)
+        if len(coords) < 4:
+            continue
+        edge_a = math.dist(coords[0], coords[1])
+        edge_b = math.dist(coords[1], coords[2])
+        short, long_ = sorted((edge_a, edge_b))
+        worst = max(worst, long_ / max(short, 1e-9))
+    return worst
+
+
+@pytest.mark.parametrize("aspect,width,height", [(4, 160.0, 40.0), (8, 320.0, 40.0)])
+def test_paper_mode_elongated_rectangle_does_not_ratchet_slivers(
+    aspect: int, width: float, height: float
+) -> None:
+    """Paper-default elongated rectangles must not degrade into sliver fans.
+
+    Regression for the streamline min-length gate deviation: the old absolute
+    gate (0.18 x bbox diagonal, no basis in Yang Sec. 5 / Chen Sec. 4.1)
+    rejected every short-axis candidate above ~5.5:1 aspect, so each split ran
+    parallel to the long axis and doubled the child aspect — an 8:1 rectangle
+    at parcel_count=16 ratcheted to 128:1 slivers. With the Yang rejection set
+    (self-intersection + boundary-endpoint only) plus orientation-fair
+    candidate selection, Eq. 2 picks the aspect-reducing perpendicular cuts:
+    the 8:1 case settles into an 8x2 grid of 2:1 parcels and the 4:1 case into
+    16 squares. The <4.0 band is loose against field/selection drift.
+    """
+    boundary = BoundarySpec(
+        name=f"rect{aspect}x1",
+        geom=Polygon([(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]),
+    )
+    generated = generate_layout_for_boundary(boundary, parcel_count=16, seed=0)
+    assert generated.metrics["geometry_valid_pass"]
+    assert generated.metrics["paper_invariant_pass"]
+    assert _max_parcel_elongation(generated) < 4.0
+
+
 def test_min_parcel_area_and_parcel_count_are_mutually_exclusive() -> None:
     boundary = boundary_preset("square")
     with pytest.raises(ValueError):
@@ -429,6 +472,15 @@ def _default_path_digest(generated) -> str:
 # change: run the pinned test below and copy the actual digest from the
 # assertion failure (it is _default_path_digest of the square parcel_count=12
 # seed=0 default-kwargs layout), then note the intentional change in the diff.
+#
+# 2026-07 candidate-gate fix (Yang Sec. 5 rejection set + orientation-fair
+# selection + direction-neutral Eq. 2 tiebreak): an INTENTIONAL default-path
+# change, so this digest was re-derived — and verified UNCHANGED. On the
+# symmetric square every candidate already passed the old min-length gate,
+# and the reordered candidates/tiebreak resolve the Eq. 2 ties to the same
+# cuts, so the pinned layout is byte-identical (checked twice for
+# determinism). Elongated boundaries do change; see
+# test_paper_mode_elongated_rectangle_does_not_ratchet_slivers.
 _SQUARE_12_SEED0_GOLDEN_DIGEST = (
     "d04f64111b6ca0cbf029828191152e96904a0b7e6356a4dc9655ba8befb269f7"
 )

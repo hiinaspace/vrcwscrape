@@ -101,6 +101,41 @@ def test_rectangle_streamline_candidates_are_predominantly_axis_aligned() -> Non
     assert axis_aligned_count / len(candidates) >= 0.75
 
 
+def test_elongated_rectangle_candidates_include_both_orientation_families() -> None:
+    """An 8:1 rectangle must yield candidates from BOTH RoSy families.
+
+    Yang 2013 Sec. 5 rejects only streamlines that stop at singularities and
+    self-intersecting streamlines — there is no minimum-length rule (and Chen
+    Fig. 6 shows short transverse candidates). The removed absolute gate
+    (0.18 x bbox diagonal) rejected every short-axis streamline once the
+    parcel aspect exceeded ~5.5:1, leaving an all-parallel candidate set whose
+    accepted splits doubled the aspect each level (the sliver ratchet).
+    """
+    rectangle = Polygon([(0.0, 0.0), (320.0, 0.0), (320.0, 40.0), (0.0, 40.0)])
+
+    candidates = candidate_streamlines(rectangle, target_count=20, seed=0)
+
+    assert candidates
+    assert {candidate.orientation_index for candidate in candidates} == {0, 1}
+    # World-frame families, independent of per-seed orientation indexing: both
+    # long-axis (horizontal) and short-axis (vertical) streamlines survive.
+    angles = [candidate.diagnostics["midpoint_angle"] for candidate in candidates]
+    horizontal = [a for a in angles if min(a, math.pi - a) <= math.radians(6.0)]
+    vertical = [a for a in angles if abs(a - math.pi * 0.5) <= math.radians(6.0)]
+    assert horizontal
+    assert vertical
+    # Short-axis candidates (length ~40) sit far below the old absolute gate
+    # (0.18 x diagonal ~ 58), pinning the gate removal specifically.
+    assert min(candidate.length for candidate in candidates) < 58.0
+    # Orientation-fair selection: the head of the returned set already
+    # interleaves the two families, so a small Eq. 2 candidate budget can
+    # never be exhausted by one family alone.
+    assert {
+        candidates[0].orientation_index,
+        candidates[1].orientation_index,
+    } == {0, 1}
+
+
 def test_yang_d_field_rectangle_recovers_cartesian_grid() -> None:
     rectangle = Polygon([(0.0, 0.0), (160.0, 0.0), (160.0, 80.0), (0.0, 80.0)])
     config = StreamlineConfig(field_mode="yang_d_field")

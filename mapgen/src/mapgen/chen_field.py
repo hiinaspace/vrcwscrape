@@ -39,7 +39,6 @@ class StreamlineConfig:
     max_steps: int = 160
     boundary_blend_radius_fraction: float = 0.42
     max_boundary_weight: float = 0.88
-    min_length_fraction: float = 0.18
     duplicate_distance_fraction: float = 0.045
     duplicate_angle_tolerance: float = math.radians(14.0)
     endpoint_tolerance_fraction: float = 0.018
@@ -64,6 +63,17 @@ class StreamlineConfig:
 
 
 DEFAULT_STREAMLINE_CONFIG = StreamlineConfig()
+
+#: Implementation epsilon, not a paper rule. Yang 2013 Sec. 5 rejects only
+#: streamlines that stop at singularities and self-intersecting streamlines —
+#: no minimum-length filter exists in Yang Sec. 5 / supp1 or Chen Sec. 4.1
+#: (Chen Fig. 6 shows short transverse candidates). A trace spanning fewer
+#: than ~2 integration steps is numerically degenerate (a seed hugging the
+#: boundary exits immediately in both directions), so only those are dropped.
+#: The previous absolute gate (0.18 x bbox diagonal) rejected the entire
+#: short-axis candidate family in parcels above ~5.5:1 aspect, causing a
+#: sliver ratchet under repeated splits.
+_DEGENERATE_TRACE_STEP_FACTOR = 2.0
 
 
 @dataclass(frozen=True, eq=False)
@@ -441,7 +451,7 @@ def candidate_streamlines(
     endpoint_tolerance = max(
         config.endpoint_tolerance_fraction * scale, _trace_step(boundary, config) * 1.5
     )
-    min_length = config.min_length_fraction * scale
+    degenerate_length = _trace_step(boundary, config) * _DEGENERATE_TRACE_STEP_FACTOR
     duplicate_distance = config.duplicate_distance_fraction * scale
     field = _build_cross_field(boundary, config=config, guidance=guidance)
     field_diagnostics = field.diagnostics
@@ -486,7 +496,11 @@ def candidate_streamlines(
             line = _trace_streamline_with_field(
                 boundary, seed_xy, seed_angle, config, field
             )
-            if line.length < min_length or not line.is_simple:
+            # Yang Sec. 5 rejection set: self-intersecting streamlines are
+            # dropped here; interior stalls (the singularity-stop case) are
+            # dropped by the endpoint-reaches-boundary check below. Length is
+            # only filtered by the degeneracy epsilon, never a paper rule.
+            if line.length < degenerate_length or not line.is_simple:
                 continue
 
             endpoint_distance_max = _endpoint_distance_max(boundary, line)
@@ -577,16 +591,8 @@ def candidate_streamlines(
     if score_mode == _STREAMLINE_SCORE_MODE_YANG_DIV_DB_DS_CT:
         candidates = _apply_yang_normalized_scores(candidates)
 
-    candidates.sort(
-        key=lambda candidate: (
-            -candidate.quality,
-            -candidate.length,
-            candidate.orientation_index,
-            round(candidate.seed[0], 9),
-            round(candidate.seed[1], 9),
-        )
-    )
-    returned = tuple(candidates[:target_count])
+    candidates.sort(key=_candidate_sort_key)
+    returned = _orientation_fair_selection(candidates, target_count)
     active_option_remaining_count = sum(
         int(option_active)
         for seed_options in active_options
@@ -622,6 +628,53 @@ def candidate_streamlines(
         _with_call_diagnostics(candidate, trace_diagnostics, return_rank=index)
         for index, candidate in enumerate(returned)
     )
+
+
+def _candidate_sort_key(
+    candidate: StreamlineCandidate,
+) -> tuple[float, float, int, float, float]:
+    return (
+        -candidate.quality,
+        -candidate.length,
+        candidate.orientation_index,
+        round(candidate.seed[0], 9),
+        round(candidate.seed[1], 9),
+    )
+
+
+def _orientation_fair_selection(
+    candidates: list[StreamlineCandidate], target_count: int
+) -> tuple[StreamlineCandidate, ...]:
+    """Round-robin the sorted RoSy orientation families into the budget.
+
+    Chen Sec. 4.1 uses "around 20 streamlines" as the Eq. 2 candidate set; the
+    Yang Sec. 5 machinery it cites keeps both cross-field orientations
+    represented by deactivating similar-orientation seeds near each placed
+    streamline (d_eps = 0.3 x parcel length). LABELED APPROXIMATION: instead of
+    Yang's seed deactivation we bound the set with a fixed budget interleaved
+    across the two orientation families (each pre-sorted by the heuristic
+    quality; the family holding the overall best candidate draws first), plus
+    the existing duplicate-line suppression as the spacing analogue. This
+    guarantees the length-dominated quality ordering can never truncate away an
+    entire orientation family before Eq. 2 ever scores it — the failure mode
+    behind the elongated-parcel sliver ratchet.
+
+    ``candidates`` must already be sorted by ``_candidate_sort_key``.
+    """
+    if not candidates:
+        return ()
+    families: dict[int, list[StreamlineCandidate]] = {0: [], 1: []}
+    for candidate in candidates:
+        families[candidate.orientation_index].append(candidate)
+    lead = candidates[0].orientation_index
+    first, second = families[lead], families[1 - lead]
+    interleaved: list[StreamlineCandidate] = []
+    for index in range(max(len(first), len(second))):
+        if index < len(first):
+            interleaved.append(first[index])
+        if index < len(second):
+            interleaved.append(second[index])
+    return tuple(interleaved[:target_count])
 
 
 def _streamline_score_mode(config: StreamlineConfig) -> str:

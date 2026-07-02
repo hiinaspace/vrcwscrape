@@ -740,7 +740,7 @@ def _try_split_parcel(
 
     street_segments = _street_world_segments(editor, street_mesh_edges)
 
-    best: tuple[tuple[float, ...], LineString] | None = None
+    best: tuple[tuple[float, int], LineString] | None = None
     for index, candidate in enumerate(streamlines):
         scored = _score_candidate(
             parcel_poly,
@@ -753,10 +753,14 @@ def _try_split_parcel(
         if scored is None:
             continue
         score, segment = scored
+        # Direction-neutral tiebreak: Eq. 2 score, then the stable candidate
+        # return rank (earlier = better by the field module's ordering). The
+        # previous key also compared candidate quality and segment length,
+        # which broke exact Eq. 2 ties toward the longer (sliver-parallel)
+        # cut direction — a paper deviation (Chen Sec. 4.1 selects only by
+        # the Eq. 2 metric score).
         key = (
             score,
-            float(candidate.quality),
-            float(segment.length),
             -index,
         )
         if best is None or key > best[0]:

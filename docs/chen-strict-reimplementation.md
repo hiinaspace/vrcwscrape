@@ -45,7 +45,14 @@ optimization.
   `evaluate_layout_invariants`.
 - `chen_field.py` — per-parcel streamline candidates: default grid-smoothed
   4-RoSy; opt-in `yang_d_field` / `yang_b_field` modes (approximations,
-  labeled). Optional `RasterGuidanceField` blend (R1 regional extension, off by
+  labeled). Candidate rejection follows Yang §5: self-intersecting streamlines
+  and traces whose endpoints fail to reach the boundary (the singularity-stall
+  case) are dropped; there is **no minimum-length rule** — only a ~2-trace-step
+  degeneracy epsilon (`_DEGENERATE_TRACE_STEP_FACTOR`, implementation epsilon,
+  not paper). The ~20-candidate budget is interleaved across the two RoSy
+  orientation families (labeled approximation of Yang's d_ε seed deactivation;
+  see ledger) so Eq. 2 always scores both cut directions. Optional
+  `RasterGuidanceField` blend (R1 regional extension, off by
   default, not Chen/Yang paper machinery): adds a weighted 4-RoSy alignment
   constraint to the `grid_smooth` field, attenuated so boundary alignment
   dominates inside the boundary radius; `yang_*`/`boundary_blend` modes ignore
@@ -97,6 +104,7 @@ Scripts: `scripts/run_chen_strict_shapes.py`,
 | --- | --- | --- | --- | --- |
 | Curved-shape parcel polygon types | Gap | Oval at 48-target: 23 quad / 19 pent / 20 hex vs paper ellipse 124/128 quad; visuals look quad-like, so either the 135° corner rule misreads sampled curved sides or splits land off the field | Blocking (next wave) | Audit approximate-polygon corner detection on curved parcels vs paper Fig. 2 semantics, then field quality |
 | Triangle junction angles | Gap | junction_angle_dev 21.7° vs paper 2.94° at 48-target | Blocking (next wave) | Likely same root as above + field fidelity near corners |
+| Candidate-set bounding vs Yang d_ε | Partial | Default (grid-seed) path bounds the ~20-candidate set by orientation-family interleave + duplicate-line suppression instead of Yang §5's d_ε seed deactivation (the opt-in `yang_mesh_vertices` mode has true d_ε). The rejection set itself now matches Yang §5 — the former absolute min-length gate (no paper basis) caused the elongated-parcel sliver ratchet; fixed, pinned by `test_paper_mode_elongated_rectangle_does_not_ratchet_slivers` | Non-blocking | Port d_ε seed deactivation to the grid seed mode if candidate spacing fidelity becomes a goal |
 | Yang D/B field fidelity | Partial | Opt-in modes use clipped SciPy Delaunay/uniform Laplacian approximations, not constrained Delaunay/cotan | Non-blocking until corner/junction debt clears | CDT (`triangle` lib) + cotan Laplacian; exact DIV/DB/DS/CT scoring |
 | Optimizer exactness | Partial | Local LSQR projection with guards, not ShapeOp; paper's optimizer barely perturbs (input already regular) | Non-blocking | Bounded `compas_shapeop` backend ablation behind the existing constraint layer; delete guard layers if regular input makes them unnecessary |
 | Irregularity outliers | Gap | irregularity_max 2.0-4.1 on curved shapes (paper max 0.16); avg fine | Non-blocking | Inspect the outlier parcels (likely shape-corner parcels); may resolve with corner-detection fix |
