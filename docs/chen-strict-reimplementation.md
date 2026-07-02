@@ -1,6 +1,6 @@
 # Chen/Yang Strict Reimplementation Contract
 
-Last updated: 2026-06-09. History lives in git; this doc states only current truth.
+Last updated: 2026-07-01. History lives in git; this doc states only current truth.
 
 ## Mission
 
@@ -51,7 +51,11 @@ optimization.
   degeneracy epsilon (`_DEGENERATE_TRACE_STEP_FACTOR`, implementation epsilon,
   not paper). The ~20-candidate budget is interleaved across the two RoSy
   orientation families (labeled approximation of Yang's d_ε seed deactivation;
-  see ledger) so Eq. 2 always scores both cut directions. Optional
+  see ledger) so Eq. 2 scores both cut directions — reliably where the field is
+  ~axis-aligned; the family label is per-seed and folds at 45°, so on
+  rotated/curved/guided fields the split is only approximate (ledger:
+  "Orientation-family fairness on rotated fields"). The interleave is applied
+  on all seed paths, including the opt-in Yang modes. Optional
   `RasterGuidanceField` blend (R1 regional extension, off by
   default, not Chen/Yang paper machinery): adds a weighted 4-RoSy alignment
   constraint to the `grid_smooth` field, attenuated so boundary alignment
@@ -104,7 +108,8 @@ Scripts: `scripts/run_chen_strict_shapes.py`,
 | --- | --- | --- | --- | --- |
 | Curved-shape parcel polygon types | Gap (narrowed 2026-07-01) | Oval at 48-target: 51/59 quad (0.864) vs paper ellipse 124/128 (0.969), measured at HEAD after the corner-derivation fixpoint (0f052ad); the earlier 23-quad evidence was pre-fixpoint | Blocking (next wave) | Audit approximate-polygon corner detection on curved parcels vs paper Fig. 2 semantics, then field quality |
 | Triangle junction angles | Gap (narrowed 2026-07-01) | junction_angle_dev 16.67° vs paper 2.94° at 48-target at HEAD (pre-fixpoint evidence said 21.7°) | Blocking (next wave) | Likely same root as above + field fidelity near corners |
-| Candidate-set bounding vs Yang d_ε | Partial | Default (grid-seed) path bounds the ~20-candidate set by orientation-family interleave + duplicate-line suppression instead of Yang §5's d_ε seed deactivation (the opt-in `yang_mesh_vertices` mode has true d_ε). The rejection set itself now matches Yang §5 — the former absolute min-length gate (no paper basis) caused the elongated-parcel sliver ratchet; fixed, pinned by `test_paper_mode_elongated_rectangle_does_not_ratchet_slivers` | Non-blocking | Port d_ε seed deactivation to the grid seed mode if candidate spacing fidelity becomes a goal |
+| Candidate-set bounding vs Yang d_ε | Partial | The rejection set now matches Yang §5 — the former absolute min-length gate (no paper basis) caused the elongated-parcel sliver ratchet; fixed, pinned by `test_paper_mode_elongated_rectangle_does_not_ratchet_slivers`. The ~20-candidate budget is bounded by orientation-family interleave + duplicate-line suppression instead of Yang §5's d_ε seed deactivation, and the interleave is applied on ALL seed paths (incl. opt-in Yang modes, which also have their own true d_ε) | Non-blocking | Port d_ε seed deactivation to the grid seed mode (also subsumes the fairness-on-rotated-fields row); until then, gate the interleave off the Yang modes so they keep their prior top-score truncation |
+| Orientation-family fairness on rotated fields | Partial (2026-07-01 review) | `_orientation_fair_selection` keys families on the per-seed RoSy branch (`orientation_index`), which folds at 45°, so on rotated/curved/guided fields (ovals, triangles, density ridges) the two "families" are not globally coherent and the anti-ratchet fairness is only approximate there; exact on axis-aligned parcels (square + the ratchet regression rectangle) | Non-blocking | Classify families by world-frame `midpoint_angle` mod π/2 (already computed), or port grid-mode d_ε; add a rotated-parcel unit test for `_orientation_fair_selection`. Also missing: direct tests for the interleave tail, the degeneracy epsilon under-filter direction, and the `(score, -index)` Eq. 2 tiebreak |
 | Yang D/B field fidelity | Partial | Opt-in modes use clipped SciPy Delaunay/uniform Laplacian approximations, not constrained Delaunay/cotan | Non-blocking until corner/junction debt clears | CDT (`triangle` lib) + cotan Laplacian; exact DIV/DB/DS/CT scoring |
 | Optimizer exactness | Partial | Local LSQR projection with guards, not ShapeOp; paper's optimizer barely perturbs (input already regular) | Non-blocking | Bounded `compas_shapeop` backend ablation behind the existing constraint layer; delete guard layers if regular input makes them unnecessary |
 | Irregularity outliers | Gap | irregularity_max 2.0-4.1 on curved shapes (paper max 0.16); avg fine | Non-blocking | Inspect the outlier parcels (likely shape-corner parcels); may resolve with corner-detection fix |

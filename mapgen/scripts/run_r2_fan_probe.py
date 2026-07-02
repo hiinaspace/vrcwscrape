@@ -17,8 +17,12 @@ on 3 test blocks (2 core-ring downtowns + 1 combed non-core band):
   B. paper split weights (0.30/0.50/0.20) instead of REGIONAL_SPLIT_WEIGHTS
   C. guidance=None
   D. no density-mass mode; ``parcel_count`` set to A's district count
-  E. guidance at half strength (strength 6->3, density_ridge_boost 2->1;
-     the guidance weight raster is linear in both, so this exactly halves it)
+  E. guidance at half strength (strength 6->3, density_ridge_boost 2->1). The
+     weight raster is linear in both, but chen_field caps effective guidance at
+     0.5*field_boundary_weight (=4.0), and control raw weight reaches ~8.0 in
+     the densest summit cells — so in exactly the saturated fan cells E cuts
+     effective guidance by less than half (down to ~0 where the cap binds). The
+     wave's guidance conclusions rest on config C (guidance=None), not E.
   F. B + C combined (paper weights AND no guidance)
 
 Per (block, config): district count, minimum-rotated-rectangle elongation

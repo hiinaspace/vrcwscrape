@@ -654,10 +654,20 @@ def _orientation_fair_selection(
     Yang's seed deactivation we bound the set with a fixed budget interleaved
     across the two orientation families (each pre-sorted by the heuristic
     quality; the family holding the overall best candidate draws first), plus
-    the existing duplicate-line suppression as the spacing analogue. This
-    guarantees the length-dominated quality ordering can never truncate away an
-    entire orientation family before Eq. 2 ever scores it — the failure mode
-    behind the elongated-parcel sliver ratchet.
+    the existing duplicate-line suppression as the spacing analogue. This keeps
+    the length-dominated quality ordering from truncating away an entire
+    orientation family before Eq. 2 ever scores it — the failure mode behind the
+    elongated-parcel sliver ratchet.
+
+    CAVEAT (see ledger "Orientation-family fairness on rotated fields"):
+    ``orientation_index`` is the per-seed RoSy branch relative to the field
+    angle at that seed, and the 4-RoSy representative folds at 45°. So the two
+    families are globally coherent only where the field is ~axis-aligned (the
+    controlled square, and the axis-aligned rectangle the ratchet test pins);
+    on rotated/curved/guided fields (ovals, triangles, density ridges) index 0
+    at one seed may be the world-perpendicular of index 0 at another, so the
+    fairness is approximate there until d_ε seed deactivation is ported to the
+    grid path. Applied on all seed paths, including the opt-in Yang modes.
 
     ``candidates`` must already be sorted by ``_candidate_sort_key``.
     """

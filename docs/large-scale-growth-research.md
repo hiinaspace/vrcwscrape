@@ -328,8 +328,9 @@ artifact at its paper-fidelity root. The hybrid uses a 3-tier semantic node hier
 L0 towns / peak villages) with dense cores folded into ringed "downtown"
 blocks: arterials are CLIPPED to core exteriors (T-junctions on the ring) and
 core rings + clipped arterials are polygonized → 13 cores, 36 macro-blocks →
-697 districts at total-target 1200 (post beta-prune fix; the reviewed 3.5b
-runs were 35/701), 0 Chen failures, ~330–520 s depending on host. Remaining work, in priority
+698 districts at total-target 1200 (post sliver-fan fix; the beta-prune-only
+run was 36/697, the reviewed 3.5b runs 35/701), 0 Chen failures, ~330–520 s
+depending on host. Remaining work, in priority
 order: **(1) arterial↔local T-junction connectivity** for the non-core
 fabric (spec'd wave, plan exists — gates already terminate on block
 boundaries; fuse/export/render + metric); (2) residual guidance-driven fans
