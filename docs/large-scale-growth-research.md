@@ -291,9 +291,11 @@ upheld; two corrections of record.**
    mechanism-specific tests + a pinned default-path golden added;
    `run_r1_island_inputs.py` now writes the `l1_id`/`l1_name` columns the
    hierarchical seeding requires — the committed pipeline was previously not
-   reproducible from scratch). Remaining minors are Non-blocking debt:
-   beta-prune `realized` semantics, untested chen_in_block retry/fallback
-   paths, missing `test_r1_arm_a.py`, zoom-review harness coverage.
+   reproducible from scratch; beta-prune `realized` semantics corrected —
+   see the network-change note above). Remaining minors as Non-blocking debt:
+   untested chen_in_block retry/fallback paths (the code behind the
+   "0 Chen failures" tallies), missing `test_r1_arm_a.py` for the calibration
+   helpers, zoom-review harness coverage.
 
 ## Status
 
