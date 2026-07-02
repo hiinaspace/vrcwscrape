@@ -8,6 +8,7 @@ import shapely.affinity
 from shapely import LineString, Point, Polygon
 
 from mapgen.chen_field import (
+    RasterDensityField,
     RasterGuidanceField,
     StreamlineConfig,
     candidate_streamlines,
@@ -852,3 +853,69 @@ def test_guidance_field_eq_does_not_compare_arrays() -> None:
     )
     assert guidance == guidance  # identity-based, no ValueError
     assert isinstance(guidance.digest(), bytes)
+
+
+# ---------------------------------------------------------------------------
+# R2 regional extension: RasterDensityField.mass (off by default, not paper).
+# ---------------------------------------------------------------------------
+
+
+def test_density_mass_uniform_field_equals_area_times_density() -> None:
+    # Uniform density 2.0 on a unit-cell 10x10 grid (cell centers at 0.5..9.5).
+    field = RasterDensityField(density=np.full((10, 10), 2.0), x0=0.0, y0=0.0, cell=1.0)
+    # A 3x3 square aligned to cell centers covers exactly 9 cells -> 9 * 2 = 18.
+    square = Polygon([(1.0, 1.0), (4.0, 1.0), (4.0, 4.0), (1.0, 4.0)])
+    assert field.mass(square) == pytest.approx(18.0)
+    # The full grid: 100 cells * 2.0 -> 200 (== area * density for uniform).
+    full = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+    assert field.mass(full) == pytest.approx(200.0)
+
+
+def test_density_mass_picks_out_single_hot_cell() -> None:
+    density = np.zeros((10, 10))
+    density[5, 7] = 4.0  # center at (7.5, 5.5)
+    field = RasterDensityField(density=density, x0=0.0, y0=0.0, cell=1.0)
+    hot = Polygon([(7.0, 5.0), (8.0, 5.0), (8.0, 6.0), (7.0, 6.0)])
+    assert field.mass(hot) == pytest.approx(4.0)
+    # A polygon over a cold neighbour integrates to zero.
+    cold = Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+    assert field.mass(cold) == pytest.approx(0.0)
+
+
+def test_density_mass_hot_cell_with_nonzero_origin() -> None:
+    """Same hot-cell integral with a shifted raster origin (x0, y0 != 0).
+
+    The other mass tests all use x0 = y0 = 0, so a sign/offset bug in the
+    row/col bbox-window or cell-center arithmetic would still pass them.
+    """
+    density = np.zeros((10, 10))
+    density[5, 7] = 4.0  # center at (x0 + 7.5, y0 + 5.5) = (10.5, -14.5)
+    field = RasterDensityField(density=density, x0=3.0, y0=-20.0, cell=1.0)
+    hot = Polygon([(10.0, -15.0), (11.0, -15.0), (11.0, -14.0), (10.0, -14.0)])
+    assert field.mass(hot) == pytest.approx(4.0)
+    # The same window one cell up in y (row 6) is cold.
+    cold = Polygon([(10.0, -14.0), (11.0, -14.0), (11.0, -13.0), (10.0, -13.0)])
+    assert field.mass(cold) == pytest.approx(0.0)
+    # Whole-raster integral must be independent of the origin shift.
+    whole = Polygon([(3.0, -20.0), (13.0, -20.0), (13.0, -10.0), (3.0, -10.0)])
+    assert field.mass(whole) == pytest.approx(4.0)
+
+
+def test_density_mass_scales_with_cell_area() -> None:
+    # Same density, cell=2 -> each cell carries 4x the mass of a unit cell.
+    field = RasterDensityField(density=np.full((10, 10), 1.0), x0=0.0, y0=0.0, cell=2.0)
+    # Square covering a single cell center (center at (1,1)).
+    one_cell = Polygon([(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)])
+    assert field.mass(one_cell) == pytest.approx(1.0 * 2.0 * 2.0)
+
+
+def test_density_mass_outside_raster_is_zero() -> None:
+    field = RasterDensityField(density=np.full((4, 4), 5.0), x0=0.0, y0=0.0, cell=1.0)
+    far = Polygon([(100.0, 100.0), (101.0, 100.0), (101.0, 101.0), (100.0, 101.0)])
+    assert field.mass(far) == 0.0
+
+
+def test_density_field_eq_does_not_compare_arrays() -> None:
+    field = RasterDensityField(density=np.ones((3, 3)), x0=0.0, y0=0.0, cell=1.0)
+    assert field == field  # identity-based, no ValueError on array compare
+    assert isinstance(field.digest(), bytes)

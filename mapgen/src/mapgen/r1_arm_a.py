@@ -29,7 +29,7 @@ from shapely import LineString, Point, Polygon
 from shapely.strtree import STRtree
 
 from mapgen.chen_core import ChenSplitWeights
-from mapgen.chen_field import RasterGuidanceField
+from mapgen.chen_field import RasterDensityField, RasterGuidanceField
 
 
 @dataclass(frozen=True)
@@ -114,6 +114,40 @@ def build_terrain_guidance(
         y0=fields.y0,
         cell=fields.cell,
     )
+
+
+def build_density_field(fields: IslandFields) -> RasterDensityField:
+    """Build the R2 ``RasterDensityField`` from the island density raster.
+
+    Reuses the offline ``density`` channel (smoothed world-point density from
+    ``r1_inputs.compute_density``) on its native island-frame affine, so the
+    Chen density-mass split criterion integrates the same population surface the
+    rest of the probe measures.
+    """
+    return RasterDensityField(
+        density=fields.density,
+        x0=fields.x0,
+        y0=fields.y0,
+        cell=fields.cell,
+    )
+
+
+def total_density_mass(field: RasterDensityField) -> float:
+    """Total integrated density mass over the raster (``sum(density) * cell^2``)."""
+    return float(np.asarray(field.density, dtype=float).sum()) * field.cell * field.cell
+
+
+def default_max_parcel_mass(
+    field: RasterDensityField, target_district_count: int
+) -> float:
+    """Per-district mass target = total mass / requested district count.
+
+    A starting calibration for the "max worlds per district" knob; tune the
+    requested count to push the emergent district count and density adaptivity.
+    """
+    if target_district_count < 1:
+        raise ValueError("target_district_count must be at least 1")
+    return total_density_mass(field) / float(target_district_count)
 
 
 # Regional Eq. 2 lambda override: favor size balance + access over regularity.

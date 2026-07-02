@@ -240,10 +240,11 @@ def main(argv: list[str] | None = None) -> None:
         json.dump(boundary_geojson, f, indent=2)
     print(f"Wrote {boundary_path}")
 
-    # 2. island_points.parquet
-    island_points = df_island.select(
-        ["world_id", "l0_id", "l0_name", "visits"]
-    ).with_columns(
+    # 2. island_points.parquet — keep BOTH cluster tiers: the macro layer
+    # (r1_macro.build_macro_nodes_hierarchical) seeds cities from l1 and towns
+    # from l0.
+    point_columns = ["world_id", "l0_id", "l0_name", "l1_id", "l1_name", "visits"]
+    island_points = df_island.select(point_columns).with_columns(
         pl.Series("x", px_f),
         pl.Series("y", py_f),
     )
@@ -301,6 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         "points": {
             "n_worlds": n_worlds,
             "coordinate": "orig_x/orig_y (DR ground truth)",
+            "columns": [*point_columns, "x", "y"],
         },
         "raster": {
             "x0": x0,

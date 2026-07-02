@@ -9,6 +9,7 @@ Layouts compared
 - Arm A / regional
 - Arm A / regional_fine
 - Arm A / regional_strong
+- Arm A / regional_density (R2 density-mass split, if the Arm A run emitted it)
 - Arm B (least-cost arterial baseline)
 - KMeans (l0 clusters from island_points.parquet, vectorized from raster)
 
@@ -28,7 +29,7 @@ Outputs
 - comparison.json
 - comparison.md
 - compare_main.png   (3 panels: Arm A regional_strong | Arm B | KMeans)
-- compare_contact.png (6 panels: all 4 Arm A configs + Arm B + KMeans)
+- compare_contact.png (contact sheet: every Arm A config + Arm B + KMeans)
 """
 
 from __future__ import annotations
@@ -522,6 +523,7 @@ _LAYOUT_COLOURS = {
     "arm_a_regional": "#1a9850",
     "arm_a_regional_fine": "#d73027",
     "arm_a_regional_strong": "#7570b3",
+    "arm_a_regional_density": "#e08214",
     "arm_b": "#8b0000",
     "kmeans": "#4d4d4d",
 }
@@ -878,7 +880,31 @@ def run_compare(
     # ------------------------------------------------------------------
     # Arm A configs
     # ------------------------------------------------------------------
-    arm_a_configs = ["baseline", "regional", "regional_fine", "regional_strong"]
+    arm_a_required = [
+        "baseline",
+        "regional",
+        "regional_fine",
+        "regional_strong",
+    ]
+    # Only the density-mass config is optional; compare it if the Arm A run
+    # emitted it. Missing REQUIRED configs fail fast with a clear error instead
+    # of a KeyError deep in the render step.
+    arm_a_optional = ["regional_density"]
+    missing = [
+        cfg
+        for cfg in arm_a_required
+        if not (arm_a_dir / cfg / "districts.geojson").exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "missing required Arm A config outputs: "
+            + ", ".join(str(arm_a_dir / cfg / "districts.geojson") for cfg in missing)
+        )
+    arm_a_configs = arm_a_required + [
+        cfg
+        for cfg in arm_a_optional
+        if (arm_a_dir / cfg / "districts.geojson").exists()
+    ]
     arm_a_layouts: dict[str, tuple[Districts, Arterials, list[int]]] = {}
 
     for cfg in arm_a_configs:
@@ -1063,10 +1089,10 @@ def run_compare(
         return arm_a_layouts[cfg][0], arm_a_layouts[cfg][1]
 
     contact_layouts: list[tuple[str, Districts, Arterials | None, str]] = [
-        ("Arm A / baseline", *_a("baseline"), "#2166ac"),
-        ("Arm A / regional", *_a("regional"), "#1a9850"),
-        ("Arm A / regional_fine", *_a("regional_fine"), "#d73027"),
-        ("Arm A / regional_strong", *_a("regional_strong"), "#7570b3"),
+        (f"Arm A / {cfg}", *_a(cfg), _LAYOUT_COLOURS.get(f"arm_a_{cfg}", "#2166ac"))
+        for cfg in arm_a_configs
+    ]
+    contact_layouts += [
         ("Arm B (least-cost)", arm_b_districts, arm_b_arterials, "#8b0000"),
         ("KMeans l0", kmeans_districts, None, "#4d4d4d"),
     ]

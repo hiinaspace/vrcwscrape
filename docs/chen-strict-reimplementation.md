@@ -51,7 +51,8 @@ optimization.
   dominates inside the boundary radius; `yang_*`/`boundary_blend` modes ignore
   it with a logged diagnostic. `generate_layout_for_boundary` also exposes
   `split_weights` (Eq. 2 lambda override). Both default to byte-identical
-  behaviour.
+  behaviour. Also defines `RasterDensityField` for the R2 density-mass mode
+  below (off by default, not Chen/Yang paper machinery).
 - `chen_streets.py` — `extend_street_network` per Section 4.2: unreachable
   grouping, strict I-then-L access enumeration (Fig. 9, incl. case-5
   recursion), junction-weighted Dijkstra connection, cul-de-sac avoidance
@@ -59,7 +60,16 @@ optimization.
 - `chen_generate.py` — the hierarchical driver. `min_parcel_area` is the
   paper-faithful input; `parcel_count` is a convenience
   (`min_area = area / (1.5 * count)`, emergent counts ~1.1-1.35x target;
-  squares quantize to powers of two).
+  squares quantize to powers of two). Optional R2 regional extension (off by
+  default, **not** Chen/Yang paper machinery): passing `density_field`
+  (`RasterDensityField`) + `max_parcel_mass` switches the parcel "size" measure
+  from geometric area to integrated density mass — a parcel splits only while
+  its mass exceeds `2·max_parcel_mass` (on top of the unchanged geometric floor)
+  and Eq. 2's size term scores child mass balance, so splits chase the
+  population surface (see `docs/regional-2_5d-research.md`, R2 results). With it
+  `None` the generator is byte-identical to the paper path. v1 leaves streamline
+  candidate spacing geometric; mass is the smoothed-density integral, not the
+  true world count.
 - `chen_optimize.py` — bounded ShapeOp-like projection (Section 5 energies).
   Untouched by the rewrite; see ledger.
 - `chen_metrics.py` — paper Table 1 metrics, verified reference rows,
@@ -111,6 +121,7 @@ uv run ruff check .          # 2 pre-existing errors outside chen_* are known
 uv run ty check              # pre-existing diagnostics outside chen_* are known
 uv run python -m pytest tests/test_chen_*.py -m "not slow"   # quick lane
 uv run python -m pytest tests/test_chen_*.py                 # full, pre-wave-end
+uv run python -m pytest tests/test_r1_*.py -m "not slow"     # regional probe layer
 uv run python scripts/run_chen_strict_shapes.py --out-dir artifacts/chen_strict_shapes
 uv run python scripts/run_chen_strict_scale_suite.py --out-dir artifacts/chen_strict_scale_suite
 ```

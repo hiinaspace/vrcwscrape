@@ -42,7 +42,9 @@ from mapgen.r1_arm_a import (
     IslandFields,
     arterials_feature_collection,
     assign_worlds_to_parcels,
+    build_density_field,
     build_terrain_guidance,
+    default_max_parcel_mass,
     districts_feature_collection,
 )
 
@@ -60,6 +62,13 @@ class RunConfig:
     split_weights: ChenSplitWeights
     avoid_cul_de_sacs: bool
     note: str
+    # R2 density-mass split/termination. When ``use_density_mass`` is set, the
+    # parcel "size" measure switches from geometric area to integrated density
+    # mass, and termination targets ``total_mass / max_mass_districts`` worlds
+    # per district. ``parcel_count`` then only sets the streamline scale +
+    # geometric floor (kept fine so the mass gate governs).
+    use_density_mass: bool = False
+    max_mass_districts: int = 0
 
 
 def build_run_configs() -> list[RunConfig]:
@@ -105,6 +114,22 @@ def build_run_configs() -> list[RunConfig]:
             split_weights=REGIONAL_SPLIT_WEIGHTS,
             avoid_cul_de_sacs=True,
             note="stronger guidance (strength 6 + density-ridge boost)",
+        ),
+        RunConfig(
+            # R2: density-mass split. Geometric floor kept fine (parcel_count=64)
+            # so the mass gate governs; mass target ~24 districts' worth of
+            # worlds. Expectation: dense core subdivides finer, sparse fringe
+            # terminates as a few large districts -> negative density-area rho.
+            name="regional_density",
+            parcel_count=64,
+            use_guidance=True,
+            guidance_strength=6.0,
+            density_ridge_boost=2.0,
+            split_weights=REGIONAL_SPLIT_WEIGHTS,
+            avoid_cul_de_sacs=True,
+            note="R2 density-mass termination (mass target ~24 districts)",
+            use_density_mass=True,
+            max_mass_districts=24,
         ),
     ]
 
@@ -174,6 +199,8 @@ def _emergent_metrics(
         "parcel_quad_fraction": float(metrics.get("parcel_quad_fraction", 0.0)),
         "max_hierarchical_level": int(metrics.get("max_hierarchical_level", 0)),
         "guidance_field_applied": bool(metrics.get("guidance_field_applied", False)),
+        "density_mass_mode": bool(metrics.get("density_mass_mode", False)),
+        "max_parcel_mass": metrics.get("max_parcel_mass"),
         "split_weight_size": float(metrics.get("split_weight_size", 0.0)),
         "split_weight_regularity": float(metrics.get("split_weight_regularity", 0.0)),
         "split_weight_access": float(metrics.get("split_weight_access", 0.0)),
@@ -207,6 +234,7 @@ def run_config(
             "access": cfg.split_weights.access,
         },
         "avoid_cul_de_sacs": cfg.avoid_cul_de_sacs,
+        "use_density_mass": cfg.use_density_mass,
         "seed": seed,
     }
 
@@ -217,6 +245,14 @@ def run_config(
             strength=cfg.guidance_strength,
             density_ridge_boost=cfg.density_ridge_boost,
         )
+
+    density_field = None
+    max_parcel_mass = None
+    if cfg.use_density_mass:
+        density_field = build_density_field(fields)
+        max_parcel_mass = default_max_parcel_mass(density_field, cfg.max_mass_districts)
+        entry["max_mass_districts"] = cfg.max_mass_districts
+        entry["max_parcel_mass"] = round(float(max_parcel_mass), 6)
 
     street_config = StreetConfig(avoid_cul_de_sacs=cfg.avoid_cul_de_sacs)
 
@@ -229,6 +265,8 @@ def run_config(
             seed=seed,
             split_weights=cfg.split_weights,
             guidance=guidance,
+            density_field=density_field,
+            max_parcel_mass=max_parcel_mass,
             street_config=street_config,
         )
     except Exception as exc:  # noqa: BLE001

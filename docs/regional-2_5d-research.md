@@ -169,10 +169,53 @@ default-off, byte-identical default). Secondary: seed level-0 streets from
 Arm B-style least-cost arterials between density peaks, letting Chen recurse
 inside the resulting macro-blocks.
 
+### R2 results (density-mass split, done)
+
+Implemented as `RasterDensityField` + `density_field` / `max_parcel_mass` on
+`generate_layout_for_boundary` (optional, default-off, byte-identical default —
+same contract as guidance). Mass is the smoothed `compute_density` raster
+integrated over each candidate child polygon (midpoint rule, units
+`density·cell²`), deliberately the *smoothed surface* rather than the raw STRtree
+world count, so the generator's objective stays decoupled from the
+`assign_worlds_to_parcels` count the comparator scores on. A parcel is splittable
+only while its mass exceeds `2·max_parcel_mass` (on top of the unchanged
+geometric robustness floor), and Eq. 2's size term scores child *mass* balance.
+Wired into Arm A as config `regional_density` (`max_parcel_mass = total_mass/24`,
+geometric floor kept fine at `parcel_count=64` so the mass gate governs).
+
+Rerun on the 99-vertex island (`run_r1_arm_a_chen.py` → `run_r1_compare.py`):
+
+| layout | n | area_cv | density–area ρ | world_count_cv |
+| --- | --- | --- | --- | --- |
+| arm_a baseline | 26 | 0.246 | +0.009 | 0.518 |
+| arm_a regional | 27 | 0.197 | +0.055 | 0.570 |
+| arm_a regional_strong | 28 | 0.170 | +0.285 | 0.636 |
+| **arm_a regional_density** | **17** | **0.402** | **−0.853** | **0.215** |
+| arm_b (least-cost) | 9 | 1.771 | −0.933 | 1.362 |
+| kmeans l0 | 18 | 0.518 | −0.426 | 0.515 |
+
+`regional_density` flips density–area ρ from ≈0..+0.29 (every other Chen config)
+to **−0.853**, essentially matching Arm B's −0.933 — but **without** Arm B's
+degeneracy: area CV stays bounded at 0.40 (vs Arm B's 1.77; no single district
+dominates), and world-count balance is the **best of any layout** at CV 0.215
+(vs KMeans 0.515, Arm B 1.362). So the dense core subdivides into small
+districts while sparse fringe terminates as a few large ones, and each district
+carries a comparable world load — exactly the dense-core→small-districts
+structure Chen previously fought, achieved while keeping Chen's regular,
+terrain-aligned edges. Arterial terrain alignment (0.774) is unchanged from the
+other regional configs.
+
+Known v1 simplifications: streamline candidate *spacing* stays geometric (only
+the termination gate, Eq. 2 size term, and split selection are mass-aware); mass
+is the smoothed-density integral, not the true count; child validity uses only
+the geometric floor (large sparse fringe children are intentionally allowed).
+The secondary idea (Arm B arterials seeding Chen macro-blocks) is still open.
+
 ## Sequencing
 
 island-preset fix (done) → R1 probe (done, see results above) → R2
-density-mass split criterion + rerun Arm A → spike-parcel/field fidelity wave →
+density-mass split criterion (done, see R2 results above) → spike-parcel/field
+fidelity wave →
 efficiency/profiling wave (thousands of districts; districts are
 embarrassingly parallel) → world→lot assignment + rural ladder → full
 archipelago integration.

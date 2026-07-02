@@ -1,0 +1,513 @@
+#!/usr/bin/env python
+"""R1 stage 1 — macro hierarchy layer driver + render checkpoint.
+
+Generates a tiered arterial road network (highways/majors) and macro-blocks
+from the staged island inputs, by extending Arm B. See
+``docs/large-scale-growth-research.md`` (staged build plan, step 1) and
+``mapgen/src/mapgen/r1_macro.py``.
+
+Outputs to mapgen/artifacts/r1/macro/ (or --out-dir):
+  macro_overview.png   — density backdrop + macro-blocks + tiered arterials +
+                         nodes + (light) world points
+  arterials.geojson    — tiered arterial LineStrings (tier/tau/length props)
+  macro_blocks.geojson — macro-block Polygons
+  macro_nodes.geojson  — city/town nodes
+  macro_manifest.json  — counts + runtime seconds + params
+
+Run from mapgen/::
+    uv run python scripts/run_r1_macro.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.patches as mpatches  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import polars as pl  # noqa: E402
+import shapely.geometry as sg  # noqa: E402
+
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO / "src"))
+
+from mapgen.r1_arm_a import IslandFields  # noqa: E402
+from mapgen.r1_compare import (  # noqa: E402
+    _render_boundary,
+    _render_density_backdrop,
+    _set_extent,
+)
+from mapgen.r1_macro import (  # noqa: E402
+    DEFAULT_BETA_RATIO,
+    DEFAULT_CORE_FRAC,
+    DEFAULT_CORE_MAX_RADIUS_UNITS,
+    DEFAULT_CORE_MIN_AREA_UNITS2,
+    DEFAULT_COST_FLOOR,
+    DEFAULT_MERGE_RADIUS,
+    DEFAULT_MIN_BLOCK_AREA,
+    DEFAULT_N_CITIES,
+    DEFAULT_PEAK_MIN_DISTANCE_UNITS,
+    DEFAULT_PEAK_THRESHOLD_FRAC,
+    DEFAULT_SEED,
+    DEFAULT_SIMPLIFY_TOLERANCE,
+    DEFAULT_VILLAGE_MERGE_RADIUS,
+    DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+    DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
+    DEFAULT_W_DENSITY,
+    MacroEdge,
+    MacroNode,
+    MacroParams,
+    arterials_to_geojson,
+    build_macro_layer,
+    core_rings_to_geojson,
+    load_boundary,
+    macro_blocks_to_geojson,
+    nodes_to_geojson,
+)
+from mapgen.r1_zoom import load_points_with_labels  # noqa: E402
+
+_DEFAULT_IN = _REPO / "artifacts/r1/inputs"
+_DEFAULT_OUT = _REPO / "artifacts/r1/macro"
+
+# Tier styling: highway = thick red, major = medium blue, local = thin teal.
+_TIER_STYLE: dict[int, dict[str, Any]] = {
+    2: {"color": "#b30000", "lw": 3.2, "label": "Highway (city–city)"},
+    1: {"color": "#1f5fb0", "lw": 1.7, "label": "Major (≥ town)"},
+    0: {"color": "#138d75", "lw": 0.9, "label": "Local (incl. village)"},
+}
+
+
+def render_macro_overview(
+    *,
+    density: np.ndarray,
+    height_carved: np.ndarray,
+    boundary: sg.Polygon,
+    nodes: list[MacroNode],
+    arterial_lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    macro_blocks: list[sg.Polygon],
+    core_polys: list[sg.Polygon],
+    points_path: Path,
+    x0: float,
+    y0: float,
+    cell: float,
+    out_path: Path,
+    dpi: int = 220,
+    draw_points: bool = True,
+) -> None:
+    """Render the macro checkpoint overview PNG.
+
+    ``arterial_lines`` / ``edges`` are the CLIPPED arterials (interiors of dense
+    cores removed); ``core_polys`` are the ringed downtown blocks, drawn as
+    dashed dark-orange ring roads.
+    """
+    nrows, ncols = density.shape
+    fig, ax = plt.subplots(figsize=(13, 9))
+
+    _render_density_backdrop(ax, density, height_carved, x0, y0, cell, nrows, ncols)
+    _render_boundary(ax, boundary)
+
+    # World points: small, low-alpha, colored by l0 cluster (optional, light).
+    if draw_points and points_path.exists():
+        lp = load_points_with_labels(str(points_path))
+        unique = sorted({int(v) for v in lp.l0_ids})
+        cmap = plt.get_cmap("tab20")
+        color_lookup = {uid: cmap(i % 20) for i, uid in enumerate(unique)}
+        pt_colors = [color_lookup[int(i)] for i in lp.l0_ids]
+        ax.scatter(
+            lp.xs, lp.ys, s=1.5, c=pt_colors, alpha=0.18, linewidths=0.0, zorder=2
+        )
+
+    # Macro-block polygon edges (thin gray).
+    for poly in macro_blocks:
+        if poly.is_empty:
+            continue
+        rings = [poly.exterior, *list(poly.interiors)]
+        for ring in rings:
+            rx, ry = ring.xy
+            ax.plot(rx, ry, color="#777777", lw=0.7, alpha=0.85, zorder=3)
+
+    # Arterials colored & sized by tier (locals first, highways last / on top).
+    for tier in (0, 1, 2):
+        if tier not in _TIER_STYLE:
+            continue
+        style = _TIER_STYLE[tier]
+        for line, rec in zip(arterial_lines, edges, strict=True):
+            if rec.tier != tier:
+                continue
+            if line.geom_type == "LineString":
+                lx, ly = line.xy
+                ax.plot(
+                    lx,
+                    ly,
+                    color=style["color"],
+                    lw=style["lw"],
+                    zorder=5 + tier,
+                    solid_capstyle="round",
+                )
+
+    # Core ring roads: dashed dark-orange exterior rings (the "downtown" ring).
+    for poly in core_polys:
+        if poly.is_empty:
+            continue
+        rx, ry = poly.exterior.xy
+        ax.plot(
+            rx,
+            ry,
+            color="#d35400",
+            lw=2.2,
+            ls=(0, (5, 2)),
+            alpha=0.95,
+            zorder=8,
+            solid_capstyle="round",
+        )
+
+    # Macro nodes by kind: city = large star, town = medium dot, village = small.
+    village_x = [nd.x for nd in nodes if nd.kind == "village"]
+    village_y = [nd.y for nd in nodes if nd.kind == "village"]
+    town_x = [nd.x for nd in nodes if nd.kind == "town"]
+    town_y = [nd.y for nd in nodes if nd.kind == "town"]
+    city_x = [nd.x for nd in nodes if nd.kind == "city"]
+    city_y = [nd.y for nd in nodes if nd.kind == "city"]
+    if village_x:
+        ax.scatter(
+            village_x,
+            village_y,
+            s=8,
+            marker="o",
+            c="#555555",
+            edgecolors="white",
+            linewidths=0.3,
+            zorder=7,
+        )
+    if town_x:
+        ax.scatter(
+            town_x,
+            town_y,
+            s=40,
+            marker="o",
+            c="#222222",
+            edgecolors="white",
+            linewidths=0.5,
+            zorder=8,
+        )
+    if city_x:
+        ax.scatter(
+            city_x,
+            city_y,
+            s=220,
+            marker="*",
+            c="#ffd000",
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=9,
+        )
+
+    _set_extent(ax, boundary, pad=2.0)
+
+    n_city = len(city_x)
+    n_town = len(town_x)
+    n_village = len(village_x)
+    n_hwy = sum(1 for e in edges if e.tier == 2)
+    n_major = sum(1 for e in edges if e.tier == 1)
+    n_local = sum(1 for e in edges if e.tier == 0)
+    ax.set_title(
+        "R1 macro hierarchy — 3-tier nodes + tiered arterials + core ring-roads\n"
+        f"({n_city} cities, {n_town} towns, {n_village} villages, "
+        f"{n_hwy} highways, {n_major} majors, {n_local} locals, "
+        f"{len(core_polys)} cores, {len(macro_blocks)} macro-blocks)",
+        fontsize=11,
+    )
+
+    legend_handles = [
+        mpatches.Patch(color=_TIER_STYLE[2]["color"], label=_TIER_STYLE[2]["label"]),
+        mpatches.Patch(color=_TIER_STYLE[1]["color"], label=_TIER_STYLE[1]["label"]),
+        mpatches.Patch(color=_TIER_STYLE[0]["color"], label=_TIER_STYLE[0]["label"]),
+        plt.Line2D(
+            [0],
+            [0],
+            color="#d35400",
+            lw=2.2,
+            ls=(0, (5, 2)),
+            label="Core ring road",
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker="*",
+            color="w",
+            markerfacecolor="#ffd000",
+            markeredgecolor="black",
+            markersize=14,
+            label="City (σ=2, L1 centroid)",
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor="#222222",
+            markersize=8,
+            label="Town (σ=1, L0 centroid)",
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor="#555555",
+            markersize=5,
+            label="Village (σ=0, density peak)",
+        ),
+        plt.Line2D([0], [0], color="#777777", lw=0.9, label="Macro-block edge"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=8, framealpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_macro(
+    in_dir: Path,
+    out_dir: Path,
+    *,
+    params: MacroParams | None = None,
+    seed: int = DEFAULT_SEED,
+    draw_points: bool = True,
+) -> dict[str, Any]:
+    """Run the full macro hierarchy pipeline; return manifest dict."""
+    t_start = time.perf_counter()
+    np.random.seed(seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if params is None:
+        params = MacroParams()
+
+    print("Loading inputs…")
+    fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
+    density = fields.density
+    height_carved = fields.height_carved
+    x0, y0, cell = fields.x0, fields.y0, fields.cell
+
+    boundary = load_boundary(in_dir)
+    points = pl.read_parquet(in_dir / "island_points.parquet")
+
+    seeding = (
+        "hierarchical (L1 city / L0 town / peak village)"
+        if params.hierarchical
+        else "legacy graded-L0"
+    )
+    print(f"Building macro layer ({seeding})…")
+    layer = build_macro_layer(fields, boundary, points, params)
+    nodes = layer.nodes
+    edges = layer.raw_edges
+    core_polys = layer.core_polys
+    clipped_lines = layer.arterial_lines
+    clipped_edges = layer.edges
+    macro_blocks = layer.blocks
+
+    n_city = sum(1 for nd in nodes if nd.kind == "city")
+    n_town = sum(1 for nd in nodes if nd.kind == "town")
+    n_village = sum(1 for nd in nodes if nd.kind == "village")
+    print(
+        f"  {n_city} cities, {n_town} towns, {n_village} villages ({len(nodes)} nodes)"
+    )
+    n_hwy = sum(1 for e in edges if e.tier == 2)
+    n_major = sum(1 for e in edges if e.tier == 1)
+    n_local = sum(1 for e in edges if e.tier == 0)
+    print(f"  {len(edges)} edges: {n_hwy} highways, {n_major} majors, {n_local} locals")
+    print(f"  {len(core_polys)} cores, {len(macro_blocks)} macro-blocks")
+
+    print("Writing GeoJSON…")
+    with (out_dir / "macro_nodes.geojson").open("w") as f:
+        json.dump(nodes_to_geojson(nodes), f, indent=2)
+    # arterials.geojson holds the CLIPPED arterials (core interiors removed).
+    with (out_dir / "arterials.geojson").open("w") as f:
+        json.dump(arterials_to_geojson(clipped_lines, clipped_edges), f, indent=2)
+    with (out_dir / "macro_blocks.geojson").open("w") as f:
+        json.dump(macro_blocks_to_geojson(macro_blocks), f, indent=2)
+    with (out_dir / "core_rings.geojson").open("w") as f:
+        json.dump(core_rings_to_geojson(core_polys), f, indent=2)
+
+    print("Rendering macro_overview.png…")
+    render_macro_overview(
+        density=density,
+        height_carved=height_carved,
+        boundary=boundary,
+        nodes=nodes,
+        arterial_lines=clipped_lines,
+        edges=clipped_edges,
+        macro_blocks=macro_blocks,
+        core_polys=core_polys,
+        points_path=in_dir / "island_points.parquet",
+        x0=x0,
+        y0=y0,
+        cell=cell,
+        out_path=out_dir / "macro_overview.png",
+        draw_points=draw_points,
+    )
+
+    runtime_s = round(time.perf_counter() - t_start, 3)
+
+    block_areas = [float(b.area) for b in macro_blocks]
+    manifest: dict[str, Any] = {
+        "stage": "1 (macro hierarchy layer)",
+        "description": "Galin 2011 + Arm B tiered arterials + macro-blocks",
+        "seed": seed,
+        "seeding": seeding,
+        "params": params.to_dict(),
+        "cost_field_note": (
+            "cost = (base + w_slope*norm_slope + w_river*(flow>p99)) "
+            "- w_density*norm_density; clamped to cost_floor inside mask, "
+            "inf outside"
+        ),
+        "counts": {
+            "n_cities": n_city,
+            "n_towns": n_town,
+            "n_villages": n_village,
+            "n_highway_edges": n_hwy,
+            "n_major_edges": n_major,
+            "n_local_edges": n_local,
+            "n_cores": len(core_polys),
+            "n_macro_blocks": len(macro_blocks),
+        },
+        "macro_block_area_stats": (
+            {
+                "min": round(min(block_areas), 3),
+                "max": round(max(block_areas), 3),
+                "mean": round(float(np.mean(block_areas)), 3),
+                "median": round(float(np.median(block_areas)), 3),
+            }
+            if block_areas
+            else {}
+        ),
+        "runtime_seconds": runtime_s,
+        "outputs": [
+            "macro_nodes.geojson",
+            "arterials.geojson",
+            "macro_blocks.geojson",
+            "core_rings.geojson",
+            "macro_overview.png",
+            "macro_manifest.json",
+        ],
+    }
+    with (out_dir / "macro_manifest.json").open("w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Wrote macro_manifest.json (runtime {runtime_s}s)")
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="R1 stage 1: macro hierarchy layer (tiered arterials + blocks)"
+    )
+    parser.add_argument("--in-dir", type=Path, default=_DEFAULT_IN)
+    parser.add_argument("--out-dir", type=Path, default=_DEFAULT_OUT)
+    parser.add_argument(
+        "--legacy-seeding",
+        action="store_true",
+        help="Use legacy graded-L0 seeding instead of the 3-tier semantic "
+        "hierarchy (default: hierarchical)",
+    )
+    parser.add_argument("--n-cities", type=int, default=DEFAULT_N_CITIES)
+    parser.add_argument("--merge-radius", type=float, default=DEFAULT_MERGE_RADIUS)
+    parser.add_argument(
+        "--peak-min-distance", type=float, default=DEFAULT_PEAK_MIN_DISTANCE_UNITS
+    )
+    parser.add_argument(
+        "--peak-threshold-frac", type=float, default=DEFAULT_PEAK_THRESHOLD_FRAC
+    )
+    parser.add_argument("--cost-base", type=float, default=1.0)
+    parser.add_argument("--w-slope", type=float, default=8.0)
+    parser.add_argument("--w-river", type=float, default=6.0)
+    parser.add_argument("--w-density", type=float, default=DEFAULT_W_DENSITY)
+    parser.add_argument("--cost-floor", type=float, default=DEFAULT_COST_FLOOR)
+    parser.add_argument("--beta-ratio", type=float, default=DEFAULT_BETA_RATIO)
+    parser.add_argument(
+        "--simplify-tolerance", type=float, default=DEFAULT_SIMPLIFY_TOLERANCE
+    )
+    parser.add_argument(
+        "--village-merge-radius", type=float, default=DEFAULT_VILLAGE_MERGE_RADIUS
+    )
+    parser.add_argument(
+        "--village-peak-min-distance",
+        type=float,
+        default=DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
+    )
+    parser.add_argument(
+        "--village-peak-threshold-frac",
+        type=float,
+        default=DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
+    )
+    parser.add_argument("--min-block-area", type=float, default=DEFAULT_MIN_BLOCK_AREA)
+    parser.add_argument("--core-frac", type=float, default=DEFAULT_CORE_FRAC)
+    parser.add_argument(
+        "--core-max-radius", type=float, default=DEFAULT_CORE_MAX_RADIUS_UNITS
+    )
+    parser.add_argument(
+        "--core-min-area", type=float, default=DEFAULT_CORE_MIN_AREA_UNITS2
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--no-points",
+        action="store_true",
+        help="Skip drawing world points in the overview render",
+    )
+    args = parser.parse_args(argv)
+
+    params = MacroParams(
+        hierarchical=not args.legacy_seeding,
+        n_cities=args.n_cities,
+        merge_radius=args.merge_radius,
+        peak_min_distance_units=args.peak_min_distance,
+        peak_threshold_frac=args.peak_threshold_frac,
+        village_merge_radius=args.village_merge_radius,
+        village_peak_min_distance_units=args.village_peak_min_distance,
+        village_peak_threshold_frac=args.village_peak_threshold_frac,
+        cost_base=args.cost_base,
+        w_slope=args.w_slope,
+        w_river=args.w_river,
+        w_density=args.w_density,
+        cost_floor=args.cost_floor,
+        beta_ratio=args.beta_ratio,
+        simplify_tolerance=args.simplify_tolerance,
+        min_block_area=args.min_block_area,
+        core_frac=args.core_frac,
+        core_max_radius_units=args.core_max_radius,
+        core_min_area_units2=args.core_min_area,
+    )
+    manifest = run_macro(
+        args.in_dir,
+        args.out_dir,
+        params=params,
+        seed=args.seed,
+        draw_points=not args.no_points,
+    )
+
+    c = manifest["counts"]
+    print("\n--- Macro stage 1 summary ---")
+    print(f"  cities:       {c['n_cities']}")
+    print(f"  towns:        {c['n_towns']}")
+    print(f"  villages:     {c.get('n_villages', 0)}")
+    print(f"  highways:     {c['n_highway_edges']}")
+    print(f"  majors:       {c['n_major_edges']}")
+    print(f"  locals:       {c.get('n_local_edges', 0)}")
+    print(f"  cores:        {c.get('n_cores', 0)}")
+    print(f"  macro-blocks: {c['n_macro_blocks']}")
+    print(f"  runtime:      {manifest['runtime_seconds']}s")
+    print(f"\nOutputs in: {args.out_dir}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
