@@ -32,8 +32,20 @@ Machine split:
   arterials + core rings, unified street graph with T-junctions — but exports
   **only PNGs + `hybrid_junctions.geojson` + manifest**. District/street/
   block/arterial geometry never leaves the process. G0 fixes that.
-- No per-world geometry exists anywhere yet: **world→lot assignment and
-  building footprints are new** in this wave (deliberately naive versions).
+- **Correction (recon 2026-07-02): per-world geometry DOES already exist in an
+  older, non-Chen lineage.** `mapgen/src/mapgen/city_layout.py` (mesh/planar
+  layout engines, ~6.4k lines) generated the `web/public/*-city*` dataset
+  dirs: full-map coverage, Hungarian world→lot assignment, **rotated-rect
+  buildings** (`building_width/depth/angle/height` columns in
+  `app_points.parquet`), `roads{,_mid,_near}.geojson` (LineStrings with
+  `kind ∈ arterial|collector|local|minor|service` + `width`), 6,776 blocks,
+  125k parcels, `landuse.geojson` parks — all in the app/DR coordinate frame,
+  and the deck.gl app already renders them (`isCity` mode, dataset selected by
+  `?data=` URL param; `blocks`/`landuse` are styled in `config.js` but not yet
+  fetched). The r1 hybrid island has no per-world geometry yet; G0 adds naive
+  lots **there**. The city dataset schema is the interchange format track W
+  targets, and `city_layout.py`'s assignment machinery is reference/reuse
+  material for a later non-naive lot wave.
 
 ## Stage G0 — geometry + lots export (natto, Python)
 
@@ -99,6 +111,12 @@ tracer bullet).
   scale and group inventory.
 - Optional `--labels-csv`: `world_id, name, x, y, z_roof` in meters for
   oni-side TextMeshPro signage experiments (no text in the mesh itself).
+- Optional second input mode `--city-dataset DIR`: bake a `web/public/*-city*`
+  dataset dir (rotated-rect buildings from `app_points.parquet`, roads from
+  `roads_near.geojson`) instead of a G0 export. This lets G2 walk the
+  existing **full-map** city-mesh layout as a comparison point alongside the
+  hybrid island, from the same baker. Scale knob is per-run — the DR app
+  frame and the island frame have very different unit sizes.
 
 Size estimate: ~12k prisms ≈ low hundreds of thousands of triangles; OBJ in
 the tens of MB. Commit under `mapgen/artifacts/r1/greybox/` if < ~50 MB,
@@ -140,22 +158,36 @@ Item 4/5 output **reorders the mapgen backlog** (currently:
 interior-fabric gap, residual guidance fans, wedge regularization,
 betweenness road-width promotion). Don't resume fabric waves before this.
 
-## Track W — 2D site citygen view (natto, parallel with G2)
+## Track W — hybrid island as a city dataset dir (natto, parallel with G2)
 
-The existing `web/` deck.gl app renders per-world Voronoi cells from UMAP
-coords for all 218k worlds. The citygen island covers the top 12,311, in a
-frame that maps back via the recorded affine. v1 integration:
+Revised after recon: the deck.gl app **already has a city view** (`isCity`
+mode: rotated-rect buildings, tier-swapped roads, lazy parcels, selection →
+sidebar), driven entirely by which dataset dir the `?data=` URL param picks.
+So v1 needs **zero web code changes**: a new exporter emits the hybrid island
+in the existing city dataset schema.
 
-- New **"city" view mode** (toggle alongside the existing map, not a silent
-  overlay): GeoJsonLayers for island/blocks/districts/streets/arterials from
-  the G0 export (inverse-affine into app coords), lots as polygons at deep
-  zoom, buildings colored by region as today, height available for a later
-  2.5D `PolygonLayer` extrusion (deck.gl supports it cheaply — a nice
-  "google maps" moment).
-- Reuse the existing sidebar/selection: lots carry `world_id`, so clicking a
-  lot drives the same queryWorld path.
-- This doubles as the fast iteration viewer for citygen output — replacing
-  the matplotlib PNG loop for everything except paper-fidelity gates.
+- New `mapgen/scripts/run_r1_app_export.py`: reads the G0 greybox export +
+  the source DR export dir (`full-nolabs-localmap-island-toponymy`), writes
+  `web/public/<name>-island-chen/`:
+  - all geometry inverse-affined from island frame → app/DR frame (the
+    affine is in the G0 manifest);
+  - `app_points.parquet` for the 12,311 island worlds, base columns copied
+    from the source export, plus `building_width/depth/angle` = oriented
+    min bounding rect of each G0 lot footprint, `building_height`, `lot_id`,
+    `block_id`;
+  - `roads{,_mid,_near}.geojson` with tier→kind mapping (highway→arterial,
+    major→collector, local arterial→local, ring→arterial, Chen streets→minor);
+  - `parcels.geojson` from lots (`lot_id, block_id, world_id`),
+    `blocks.geojson` from districts, `landuse.geojson` from park districts;
+  - subset `worlds_meta.parquet` + region geojson from the source export;
+    v3-style `manifest.json`.
+- Payoff: instant **A/B against the old city-mesh layout** by switching the
+  URL param; the app becomes the fast iteration viewer for hybrid output,
+  replacing the matplotlib PNG loop for everything except paper-fidelity
+  gates.
+- Later (not v1): render the already-styled `blocks`/`landuse` layers in
+  `Map.jsx`; 2.5D building extrusion from `building_height`; polygon (not
+  rect) footprints.
 
 ## Sequencing
 
