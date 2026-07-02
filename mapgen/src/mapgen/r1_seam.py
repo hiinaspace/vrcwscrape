@@ -43,6 +43,7 @@ from mapgen.r1_arm_a import (
     build_density_field,
     build_terrain_guidance,
 )
+from mapgen.r1_connect import Gate, extract_block_gates, street_perimeter_flags
 
 # Seeds tried in order by :func:`chen_in_block`. A concave block breaking Chen on
 # seed 7 but working on a later seed IS a finding, surfaced in the returned info.
@@ -255,6 +256,15 @@ class ChenInBlockResult:
         Chen district polygons (empty on failure).
     streets:
         Chen street ``LineString`` s (empty on failure).
+    gates:
+        Block-boundary street "gates" (empty on failure) — the interior
+        street endpoints that touch the block boundary, i.e. candidate
+        junctions to the macro arterial network. See
+        ``mapgen.r1_connect.extract_block_gates``.
+    street_perimeter_flags:
+        One bool per element of ``streets`` (index-aligned), ``True`` when
+        that street coincides with the block-boundary ring rather than
+        being an interior street. See ``mapgen.r1_connect.street_perimeter_flags``.
     info:
         Per-run record: the calibration inputs (``max_parcel_mass``,
         ``min_parcel_area``), the seed that worked (or ``"all_failed"``),
@@ -265,6 +275,8 @@ class ChenInBlockResult:
     generated: GeneratedChenLayout | None
     districts: list[sg.Polygon] = field(default_factory=list)
     streets: list[sg.LineString] = field(default_factory=list)
+    gates: list[Gate] = field(default_factory=list)
+    street_perimeter_flags: list[bool] = field(default_factory=list)
     info: dict[str, Any] = field(default_factory=dict)
 
 
@@ -345,13 +357,20 @@ def chen_in_block(
         info["seed_used"] = seed
         districts = [p.geom for p in generated.layout.mesh.parcels.values()]
         streets = [line for line, _props in _street_lines(generated.layout)]
+        block_gates = extract_block_gates(generated.layout)
+        perimeter_flags = street_perimeter_flags(generated.layout)
         info["district_count"] = len(districts)
         info["geometry_valid_pass"] = bool(generated.metrics.get("geometry_valid_pass"))
         info["paper_invariant_pass"] = bool(
             generated.metrics.get("paper_invariant_pass")
         )
         return ChenInBlockResult(
-            generated=generated, districts=districts, streets=streets, info=info
+            generated=generated,
+            districts=districts,
+            streets=streets,
+            gates=list(block_gates.gates),
+            street_perimeter_flags=perimeter_flags,
+            info=info,
         )
 
     return ChenInBlockResult(generated=None, info=info)

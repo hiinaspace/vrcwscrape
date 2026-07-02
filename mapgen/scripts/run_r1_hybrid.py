@@ -6,10 +6,14 @@ Assembles the whole-island macro+micro hybrid from
 macro arterial hierarchy (highways/majors + macro-blocks) with per-block
 density-calibrated Chen/R2 *local* fabric run inside EVERY macro-block.
 
-Connectivity (arterial<->local T-junctions) is a KNOWN, DELIBERATELY DEFERRED gap
-(see the stage-2 seam findings): this script does NOT stitch junctions. The
-deliverable is a full-island render at scale so the assembled character can be
-judged before investing in seam stitching.
+Connectivity (arterial<->local T-junctions) is now WIRED (stage-3 connectivity
+slices in ``mapgen.r1_connect``): per-block Chen boundary "gates" are snapped
+onto the macro arterial/ring network (``snap_gates_to_macro``), summarized
+(``connectivity_metrics``), and fused with the local street fabric into one
+``networkx`` graph (``build_unified_street_graph`` /
+``graph_connectivity_summary``). Perimeter-flagged local streets (duplicates of
+the arterial/ring/coast geometry they run along) are skipped when rendering;
+realized T-junctions are drawn as markers.
 
 Calibration (LOCKED design decision; see the doc): a SINGLE GLOBAL district mass
 ``M = total_mass / total_target`` is applied as ``max_parcel_mass`` to every
@@ -19,13 +23,19 @@ consistent island-wide), with a global absolute geometric floor
 geometry, governs termination.
 
 Outputs to mapgen/artifacts/r1/hybrid/ (or --out-dir):
-  hybrid_overview.png   — full island: density backdrop + boundary + all Chen
-                          district edges (faint) + Chen streets + macro
-                          arterials (tier-colored, on top) + world points.
-  hybrid_core{1..3}.png — zooms into the top-3 density peaks, same layers but
-                          fabric/arterials thicker so local-meets-arterial reads.
-  hybrid_manifest.json  — totals, calibration, per-block district counts, failure
-                          count, runtime, invariant pass rate.
+  hybrid_overview.png    — full island: density backdrop + boundary + all Chen
+                           district edges (faint) + Chen streets (perimeter
+                           duplicates skipped) + macro arterials (tier-colored,
+                           on top) + T-junction markers + world points.
+  hybrid_core{1..3}.png  — zooms into the top-3 density peaks, same layers but
+                           fabric/arterials thicker so local-meets-arterial reads.
+  hybrid_seam.png        — zoom into the non-core macro-block with the median
+                           T-junction count: the money shot for judging whether
+                           local fabric actually plugs into the arterial grid.
+  hybrid_junctions.geojson — every snapped SeamJunction as a Point feature.
+  hybrid_manifest.json   — totals, calibration, per-block district counts,
+                           failure count, runtime, invariant pass rate,
+                           connectivity metrics + unified-graph summary.
 
 Run from mapgen/::
     uv run python scripts/run_r1_hybrid.py
@@ -62,6 +72,15 @@ from mapgen.r1_compare import (  # noqa: E402
     _render_density_backdrop,
     _set_extent,
 )
+from mapgen.r1_connect import (  # noqa: E402
+    Gate,
+    SeamJunction,
+    build_unified_street_graph,
+    connectivity_metrics,
+    densify_gates,
+    graph_connectivity_summary,
+    snap_gates_to_macro,
+)
 from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
     MacroParams,
@@ -90,7 +109,13 @@ class BlockResult:
 
     A thin record (not a dataclass to keep it local): the districts and streets
     produced inside macro-block ``block_id``, the seed used, whether Chen
-    succeeded (vs the single-district fallback), and the cheap invariant flags.
+    succeeded (vs the single-district fallback), the cheap invariant flags, and
+    (stage-3 connectivity) the boundary "gates" and index-aligned
+    street-perimeter flags used to stitch this block's local streets onto the
+    macro network (``mapgen.r1_connect``). ``n_connectors`` (stage-4,
+    optional) is how many of ``gates``/``streets`` are
+    :func:`mapgen.r1_connect.densify_gates` connectors rather than organic
+    Chen output (``0`` when densification is off).
     """
 
     __slots__ = (
@@ -103,6 +128,9 @@ class BlockResult:
         "geometry_valid_pass",
         "paper_invariant_pass",
         "seconds",
+        "gates",
+        "street_perimeter_flags",
+        "n_connectors",
     )
 
     def __init__(
@@ -117,6 +145,9 @@ class BlockResult:
         geometry_valid_pass: bool | None,
         paper_invariant_pass: bool | None,
         seconds: float,
+        gates: list[Gate],
+        street_perimeter_flags: list[bool],
+        n_connectors: int = 0,
     ) -> None:
         self.block_id = block_id
         self.districts = districts
@@ -127,6 +158,9 @@ class BlockResult:
         self.geometry_valid_pass = geometry_valid_pass
         self.paper_invariant_pass = paper_invariant_pass
         self.seconds = seconds
+        self.gates = gates
+        self.street_perimeter_flags = street_perimeter_flags
+        self.n_connectors = n_connectors
 
 
 def run_all_blocks(
@@ -136,6 +170,7 @@ def run_all_blocks(
     max_parcel_mass: float,
     min_parcel_area: float,
     seeds: tuple[int, ...] = DEFAULT_RETRY_SEEDS,
+    max_gate_spacing: float | None = None,
 ) -> list[BlockResult]:
     """Run Chen/R2 inside every macro-block with the global calibration.
 
@@ -143,6 +178,16 @@ def run_all_blocks(
     block (every seed raised), fall back to leaving that block as a SINGLE
     district (the block polygon itself) and record it as failed, rather than
     aborting the whole run. Prints per-block progress.
+
+    ``max_gate_spacing`` (stage-4, optional; ``None`` is OFF by default) runs
+    :func:`mapgen.r1_connect.densify_gates` on every successful (non-fallback)
+    block right here, while ``res.generated.layout`` is still in scope:
+    connector streets are appended to that block's ``streets`` (so they render
+    as local streets and become unified-graph edges) and connector gates are
+    appended to ``gates`` — both BEFORE the caller's ``snap_gates_to_macro``
+    call, exactly like organically-extracted gates. A fallback block (no Chen
+    layout) is never densified — it has no interior corner graph to route
+    through.
     """
     results: list[BlockResult] = []
     n = len(macro_blocks)
@@ -157,7 +202,9 @@ def run_all_blocks(
         )
         seconds = time.perf_counter() - t0
         if res.generated is None:
-            # Fallback: the block itself is one district; no local streets.
+            # Fallback: the block itself is one district; no local streets, so
+            # no gates either (a single-district block has no interior street
+            # to snap onto the macro network).
             districts: list[sg.Polygon] = [block]
             streets: list[sg.LineString] = []
             failed = True
@@ -165,6 +212,9 @@ def run_all_blocks(
             geom_pass: bool | None = None
             inv_pass: bool | None = None
             seed_used: int | str = "all_failed"
+            gates: list[Gate] = []
+            perimeter_flags: list[bool] = []
+            n_connectors = 0
             print(
                 f"  block {i + 1}/{n}: FAILED Chen (fallback 1 district) "
                 f"{seconds:.1f}s",
@@ -172,15 +222,32 @@ def run_all_blocks(
             )
         else:
             districts = res.districts
-            streets = res.streets
+            streets = list(res.streets)
             failed = False
             district_count = res.info["district_count"]
             geom_pass = res.info.get("geometry_valid_pass")
             inv_pass = res.info.get("paper_invariant_pass")
             seed_used = res.info["seed_used"]
+            gates = list(res.gates)
+            perimeter_flags = list(res.street_perimeter_flags)
+            n_connectors = 0
+            if max_gate_spacing is not None:
+                connectors, connector_gates = densify_gates(
+                    res.generated.layout,
+                    block,
+                    gates,
+                    max_gate_spacing=max_gate_spacing,
+                )
+                streets.extend(connectors)
+                perimeter_flags.extend([False] * len(connectors))
+                gates.extend(connector_gates)
+                n_connectors = len(connectors)
+            suffix = (
+                f", +{n_connectors} connectors" if max_gate_spacing is not None else ""
+            )
             print(
                 f"  block {i + 1}/{n}: {district_count} districts "
-                f"(seed {seed_used}) {seconds:.1f}s",
+                f"(seed {seed_used}) {seconds:.1f}s{suffix}",
                 flush=True,
             )
         results.append(
@@ -194,6 +261,9 @@ def run_all_blocks(
                 geometry_valid_pass=geom_pass,
                 paper_invariant_pass=inv_pass,
                 seconds=round(seconds, 2),
+                gates=gates,
+                street_perimeter_flags=perimeter_flags,
+                n_connectors=n_connectors,
             )
         )
     return results
@@ -218,6 +288,7 @@ def _draw_layers(
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
+    junctions: list[SeamJunction],
     district_lw: float,
     district_alpha: float,
     street_lw: float,
@@ -225,8 +296,9 @@ def _draw_layers(
     ring_lw: float,
     point_size: float,
     point_alpha: float,
+    junction_size: float,
 ) -> None:
-    """Draw the shared hybrid layer stack on ``ax`` (backdrop -> arterials)."""
+    """Draw the shared hybrid layer stack on ``ax`` (backdrop -> junctions)."""
     density = fields.density
     nrows, ncols = density.shape
     x0, y0, cell = fields.x0, fields.y0, fields.cell
@@ -264,9 +336,15 @@ def _draw_layers(
                     zorder=3,
                 )
 
-    # Chen streets: thin black.
+    # Chen streets: thin black. Perimeter-flagged streets are skipped — they
+    # coincide with the block-boundary ring (arterial/ring/coast geometry
+    # already drawn), so drawing them too is a doubled-line artifact (see
+    # mapgen.r1_connect.street_perimeter_flags).
     for res in results:
-        for line in res.streets:
+        flags = res.street_perimeter_flags or [False] * len(res.streets)
+        for line, is_perimeter in zip(res.streets, flags, strict=True):
+            if is_perimeter:
+                continue
             if line.geom_type != "LineString":
                 continue
             lx, ly = line.xy
@@ -307,6 +385,23 @@ def _draw_layers(
             solid_capstyle="round",
         )
 
+    # Realized arterial/ring T-junctions: light dot, dark edge, above
+    # everything else. Coast/unmatched gates are skipped — they aren't a
+    # local-fabric<->macro-network junction (see mapgen.r1_connect.SeamJunction).
+    jx = [j.x for j in junctions if j.kind in ("arterial", "ring")]
+    jy = [j.y for j in junctions if j.kind in ("arterial", "ring")]
+    if jx:
+        ax.scatter(
+            jx,
+            jy,
+            s=junction_size,
+            c="#fdfefe",
+            edgecolors="#1a1a1a",
+            linewidths=0.6,
+            zorder=10,
+            alpha=0.95,
+        )
+
 
 def _legend_handles() -> list[Any]:
     return [
@@ -318,6 +413,17 @@ def _legend_handles() -> list[Any]:
         ),
         plt.Line2D([0], [0], color="#1a1a1a", lw=1.2, label="Chen street (local)"),
         plt.Line2D([0], [0], color="#555555", lw=0.8, label="Chen district edge"),
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markerfacecolor="#fdfefe",
+            markeredgecolor="#1a1a1a",
+            markeredgewidth=0.8,
+            markersize=6,
+            label="arterial↔local T-junction",
+        ),
     ]
 
 
@@ -333,6 +439,7 @@ def render_overview(
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
+    junctions: list[SeamJunction],
     total_districts: int,
     total_streets: int,
     out_path: Path,
@@ -352,6 +459,7 @@ def render_overview(
         lp_ys=lp_ys,
         lp_l0=lp_l0,
         colors=colors,
+        junctions=junctions,
         district_lw=0.25,
         district_alpha=0.35,
         street_lw=0.4,
@@ -359,6 +467,7 @@ def render_overview(
         ring_lw=1.6,
         point_size=1.2,
         point_alpha=0.18,
+        junction_size=5.0,
     )
     _set_extent(ax, boundary, pad=2.0)
     n_hwy = sum(1 for e in edges if e.tier == 2)
@@ -389,6 +498,7 @@ def render_core(
     lp_ys: np.ndarray,
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
+    junctions: list[SeamJunction],
     window: tuple[float, float, float, float],
     rank: int,
     cx: float,
@@ -410,6 +520,7 @@ def render_core(
         lp_ys=lp_ys,
         lp_l0=lp_l0,
         colors=colors,
+        junctions=junctions,
         district_lw=0.6,
         district_alpha=0.7,
         street_lw=1.1,
@@ -417,6 +528,7 @@ def render_core(
         ring_lw=2.8,
         point_size=14.0,
         point_alpha=0.85,
+        junction_size=26.0,
     )
     ax.set_xlim(window[0], window[2])
     ax.set_ylim(window[1], window[3])
@@ -434,6 +546,125 @@ def render_core(
     plt.close(fig)
 
 
+def render_seam(
+    *,
+    fields: IslandFields,
+    boundary: sg.Polygon,
+    results: list[BlockResult],
+    arterial_lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
+    lp_xs: np.ndarray,
+    lp_ys: np.ndarray,
+    lp_l0: np.ndarray,
+    colors: dict[int, tuple[float, float, float, float]],
+    junctions: list[SeamJunction],
+    window: tuple[float, float, float, float],
+    block_id: int,
+    tjunction_count: int,
+    out_path: Path,
+    dpi: int,
+) -> None:
+    """Seam money-shot: the median-T-junction non-core block, thickly styled."""
+    fig, ax = plt.subplots(figsize=(11, 11))
+    _draw_layers(
+        ax,
+        fields=fields,
+        boundary=boundary,
+        results=results,
+        arterial_lines=arterial_lines,
+        edges=edges,
+        core_polys=core_polys,
+        lp_xs=lp_xs,
+        lp_ys=lp_ys,
+        lp_l0=lp_l0,
+        colors=colors,
+        junctions=junctions,
+        district_lw=0.7,
+        district_alpha=0.75,
+        street_lw=1.3,
+        arterial_lw={2: 3.8, 1: 2.4, 0: 1.5},
+        ring_lw=3.0,
+        point_size=16.0,
+        point_alpha=0.85,
+        junction_size=50.0,
+    )
+    ax.set_xlim(window[0], window[2])
+    ax.set_ylim(window[1], window[3])
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(
+        f"hybrid seam — macro-block {block_id} ({tjunction_count} T-junctions, "
+        "median among non-core blocks) — local fabric plugging into arterials",
+        fontsize=12,
+    )
+    ax.legend(handles=_legend_handles(), loc="upper left", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def junctions_to_geojson(junctions: list[SeamJunction]) -> dict[str, Any]:
+    """Serialize every snapped :class:`SeamJunction` as a Point feature."""
+    features = []
+    for j in junctions:
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [j.x, j.y]},
+                "properties": {
+                    "block_id": j.block_id,
+                    "kind": j.kind,
+                    "tier": j.tier,
+                    "macro_index": j.macro_index,
+                    "distance": j.distance,
+                },
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _is_core_block(block: sg.Polygon, core_polys: list[sg.Polygon]) -> bool:
+    """True if ``block``'s representative point lands inside a detected core.
+
+    Core interiors are polygonized as their own macro-block (ring boundary as
+    a block edge), so a representative-point-in-polygon test is exact for the
+    normal case; ``buffer(1e-6)`` absorbs float noise on the shared boundary.
+    """
+    if not core_polys:
+        return False
+    point = block.representative_point()
+    return any(point.within(poly.buffer(1e-6)) for poly in core_polys)
+
+
+def _select_seam_block(
+    macro_blocks: list[sg.Polygon],
+    core_polys: list[sg.Polygon],
+    tjunctions_by_block: dict[int, int],
+) -> tuple[int, int]:
+    """Pick the non-core block with the median T-junction count.
+
+    Ranks (count, block_id) pairs over every non-core block (0 for blocks
+    with no realized junction) and takes the element at ``len // 2`` — for an
+    odd-length ranking that IS the median value; for an even length it is the
+    deterministic upper-middle element (still block_id tie-broken). Falls back
+    to ranking over ALL blocks if every block is core (degenerate small
+    islands), so a seam render always exists.
+
+    Returns ``(block_id, tjunction_count)``.
+    """
+    non_core_ids = [
+        i
+        for i, block in enumerate(macro_blocks)
+        if not _is_core_block(block, core_polys)
+    ]
+    candidate_ids = non_core_ids if non_core_ids else list(range(len(macro_blocks)))
+    ranked = sorted((tjunctions_by_block.get(bid, 0), bid) for bid in candidate_ids)
+    count, block_id = ranked[len(ranked) // 2]
+    return block_id, count
+
+
 def run_hybrid(
     in_dir: Path,
     out_dir: Path,
@@ -441,8 +672,15 @@ def run_hybrid(
     total_target: int,
     n_cores: int = 3,
     dpi: int = 240,
+    max_gate_spacing: float | None = None,
 ) -> dict[str, Any]:
-    """Full hybrid assembly: macro layer -> per-block Chen -> assemble -> render."""
+    """Full hybrid assembly: macro layer -> per-block Chen -> assemble -> render.
+
+    ``max_gate_spacing`` is stage-4 gate densification
+    (``mapgen.r1_connect.densify_gates``, wired in ``run_all_blocks``);
+    ``None`` (the default) leaves it OFF, so the connectivity numbers are
+    byte-identical to the pre-stage-4 hybrid.
+    """
     t_start = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -484,16 +722,59 @@ def run_hybrid(
         fields,
         max_parcel_mass=global_m,
         min_parcel_area=min_parcel_area,
+        max_gate_spacing=max_gate_spacing,
     )
 
     total_districts = sum(r.district_count for r in results)
     total_streets = sum(len(r.streets) for r in results)
     n_failed = sum(1 for r in results if r.failed)
+    n_connectors_added = sum(r.n_connectors for r in results)
     print(
         f"  assembled: {total_districts} districts, {total_streets} Chen streets, "
-        f"{n_failed} blocks failed",
+        f"{n_failed} blocks failed"
+        + (
+            f", {n_connectors_added} gate-densification connectors"
+            if max_gate_spacing is not None
+            else ""
+        ),
         flush=True,
     )
+
+    # Stage-3 connectivity: snap every block's boundary gates onto the macro
+    # network, summarize the seam, and fuse everything into one graph.
+    print("Snapping gates to macro network (arterial/ring/coast)…", flush=True)
+    gates_by_block: dict[int, list[Gate]] = {r.block_id: r.gates for r in results}
+    streets_by_block: dict[int, list[sg.LineString]] = {
+        r.block_id: r.streets for r in results
+    }
+    perimeter_flags_by_block: dict[int, list[bool]] = {
+        r.block_id: r.street_perimeter_flags for r in results
+    }
+    junctions: list[SeamJunction] = snap_gates_to_macro(
+        gates_by_block, arterial_lines, edges, layer.ring_lines, boundary, tol=0.05
+    )
+    conn_metrics = connectivity_metrics(
+        junctions, arterial_lines, edges, layer.ring_lines, macro_blocks
+    )
+    unified_graph = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        layer.ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+    graph_summary = graph_connectivity_summary(unified_graph)
+    print(
+        f"  connectivity: {conn_metrics['n_tjunctions']} T-junctions "
+        f"({conn_metrics['n_arterial']} arterial, {conn_metrics['n_ring']} ring), "
+        f"graph n_components={graph_summary['n_components']}, "
+        f"largest_component_local_length_fraction="
+        f"{graph_summary['largest_component_local_length_fraction']}",
+        flush=True,
+    )
+    with (out_dir / "hybrid_junctions.geojson").open("w") as f:
+        json.dump(junctions_to_geojson(junctions), f, indent=2)
 
     # Points (loaded once, reused across renders).
     lp = load_points_with_labels(str(in_dir / "island_points.parquet"))
@@ -511,6 +792,7 @@ def run_hybrid(
         lp_ys=lp.ys,
         lp_l0=lp.l0_ids,
         colors=colors,
+        junctions=junctions,
         total_districts=total_districts,
         total_streets=total_streets,
         out_path=out_dir / "hybrid_overview.png",
@@ -544,6 +826,7 @@ def run_hybrid(
             lp_ys=lp.ys,
             lp_l0=lp.l0_ids,
             colors=colors,
+            junctions=junctions,
             window=window,
             rank=rank,
             cx=cx,
@@ -552,6 +835,44 @@ def run_hybrid(
             dpi=dpi,
         )
         core_paths.append(str(out_path))
+
+    # Seam money-shot: the non-core block with the median T-junction count.
+    tjunctions_by_block: dict[int, int] = {}
+    for j in junctions:
+        if j.kind in ("arterial", "ring"):
+            tjunctions_by_block[j.block_id] = tjunctions_by_block.get(j.block_id, 0) + 1
+    seam_block_id, seam_tjunction_count = _select_seam_block(
+        macro_blocks, core_polys, tjunctions_by_block
+    )
+    seam_block = macro_blocks[seam_block_id]
+    minx, miny, maxx, maxy = seam_block.bounds
+    pad_x = (maxx - minx) * 0.2
+    pad_y = (maxy - miny) * 0.2
+    seam_window = (minx - pad_x, miny - pad_y, maxx + pad_x, maxy + pad_y)
+    seam_path = out_dir / "hybrid_seam.png"
+    print(
+        f"Rendering {seam_path.name}… (block {seam_block_id}, "
+        f"{seam_tjunction_count} T-junctions)",
+        flush=True,
+    )
+    render_seam(
+        fields=fields,
+        boundary=boundary,
+        results=results,
+        arterial_lines=arterial_lines,
+        edges=edges,
+        core_polys=core_polys,
+        lp_xs=lp.xs,
+        lp_ys=lp.ys,
+        lp_l0=lp.l0_ids,
+        colors=colors,
+        junctions=junctions,
+        window=seam_window,
+        block_id=seam_block_id,
+        tjunction_count=seam_tjunction_count,
+        out_path=seam_path,
+        dpi=dpi,
+    )
 
     runtime_s = round(time.perf_counter() - t_start, 2)
 
@@ -572,11 +893,13 @@ def run_hybrid(
     }
 
     manifest: dict[str, Any] = {
-        "stage": "3 (full hybrid assembly, stage-3.5b core ring-roads)",
+        "stage": "3 (full hybrid assembly, stage-3.5b core ring-roads, "
+        "stage-3 connectivity)",
         "description": (
             "Chen/R2 in every macro-block (global district mass) + macro "
             "arterials clipped to dense-core ring-roads (downtown blocks); "
-            "arterial<->local junctions deliberately deferred"
+            "arterial<->local junctions snapped and fused into one unified "
+            "street graph (mapgen.r1_connect)"
         ),
         "macro_params": params.to_dict(),
         "total_target": total_target,
@@ -597,10 +920,21 @@ def run_hybrid(
         "per_block_seed_used": [r.seed_used for r in results],
         "invariant_pass_rate": pass_rate,
         "retry_seeds": list(DEFAULT_RETRY_SEEDS),
+        "connectivity": {
+            **conn_metrics,
+            "graph": graph_summary,
+            "seam_block_id": seam_block_id,
+            "seam_block_tjunctions": seam_tjunction_count,
+            "densification_enabled": max_gate_spacing is not None,
+            "max_gate_spacing": max_gate_spacing,
+            "n_connectors_added": n_connectors_added,
+        },
         "runtime_seconds": runtime_s,
         "outputs": [
             "hybrid_overview.png",
             *[Path(p).name for p in core_paths],
+            "hybrid_seam.png",
+            "hybrid_junctions.geojson",
             "hybrid_manifest.json",
         ],
     }
@@ -624,6 +958,19 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--n-cores", type=int, default=3)
     parser.add_argument("--dpi", type=int, default=240)
+    parser.add_argument(
+        "--max-gate-spacing",
+        type=float,
+        default=None,
+        help=(
+            "Stage-4 boundary-run densification threshold (island units): a "
+            "boundary run (gap between a block's gate stations) longer than "
+            "this gets a connector street routed to the nearest interior "
+            "local-street node (mapgen.r1_connect.densify_gates). Default "
+            "None leaves densification OFF (byte-identical to the "
+            "pre-stage-4 hybrid)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     manifest = run_hybrid(
@@ -632,6 +979,7 @@ def main(argv: list[str] | None = None) -> None:
         total_target=args.total_target,
         n_cores=args.n_cores,
         dpi=args.dpi,
+        max_gate_spacing=args.max_gate_spacing,
     )
 
     print("\n--- Hybrid stage 3 summary ---")
@@ -641,6 +989,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  blocks failed:   {manifest['n_blocks_failed']}")
     print(f"  total districts: {manifest['total_districts']}")
     print(f"  Chen streets:    {manifest['total_chen_streets']}")
+    conn = manifest["connectivity"]
+    print(f"  T-junctions:     {conn['n_tjunctions']} (graph: {conn['graph']})")
+    print(
+        f"  densification:   enabled={conn['densification_enabled']} "
+        f"max_gate_spacing={conn['max_gate_spacing']} "
+        f"n_connectors_added={conn['n_connectors_added']}"
+    )
     print(f"  runtime:         {manifest['runtime_seconds']}s")
     print(f"\nOutputs in: {args.out_dir}")
     print("Done.")

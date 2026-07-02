@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import shapely.geometry as sg
 
 from mapgen.r1_arm_a import IslandFields
@@ -99,3 +100,26 @@ def test_chen_in_block_splits_square_for_small_mass() -> None:
     # Districts should tile (roughly) the block: union covers most of its area.
     union_area = sum(p.area for p in result.districts)
     assert union_area > 0.8 * block.area
+
+
+@pytest.mark.slow
+def test_chen_in_block_surfaces_gates_and_perimeter_flags() -> None:
+    # R1 connectivity stage 1 (mapgen.r1_connect): chen_in_block should surface
+    # per-street boundary gates and perimeter flags alongside districts/streets,
+    # index-aligned with .streets. A smaller max_parcel_mass than the
+    # `_splits_for_small_mass` case above is needed here: at the coarser masses
+    # every district still touches the boundary ring directly (no interior
+    # street is ever generated, so gates == 0 -- a real, legitimate Chen
+    # outcome, not a bug), so this uses a mass small enough to force at least
+    # one interior street.
+    block = _square(0, 0, 10)
+    fields = _flat_fields(10.0)
+    result = chen_in_block(
+        block,
+        fields,
+        max_parcel_mass=6.0,
+        min_parcel_area=10.0 * 10.0 / (40 * 4),
+    )
+    assert result.generated is not None, result.info
+    assert len(result.street_perimeter_flags) == len(result.streets)
+    assert len(result.gates) >= 1
