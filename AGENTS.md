@@ -21,3 +21,16 @@
   follow-up worker nor explicitly deferred with a reason.
 - For long Chen/Yang work, keep the main thread focused on orchestration and use
   subagents for bounded implementation, source-audit, test, and review slices.
+
+## Orchestration Tooling
+
+- Implementation slices run as `chen-slice-implementer` subagents
+  (`.claude/agents/`): one bounded slice each, with explicit write scope, test
+  target, and the standard report format. Slices are dependent and
+  review-gated — do not batch them into a workflow.
+- Paper-fidelity checks run as `paper-auditor` subagents (read-only).
+- Wave-end review runs the `wave-review` dynamic workflow
+  (`.claude/workflows/wave-review.js`; args `{base, head, notes}`): parallel
+  lens reviewers plus adversarial verification of every finding. Use dynamic
+  workflows for fan-out-shaped review/audit/research work only; the milestone
+  visual eval stays with the main thread and the user.
