@@ -365,8 +365,11 @@ blocks: arterials are CLIPPED to core exteriors (T-junctions on the ring) and
 core rings + clipped arterials are polygonized → 13 cores, 36 macro-blocks →
 698 districts at total-target 1200 (post sliver-fan fix; the beta-prune-only
 run was 36/697, the reviewed 3.5b runs 35/701), 0 Chen failures, ~330–520 s
-depending on host. Remaining work, in priority
-order: **(1) interior-fabric gap** — coarse non-core blocks where Chen emits
+depending on host. **2026-07-02 product pivot: the next wave is the greybox
+tracer bullet ([greybox-plan.md](greybox-plan.md)) — citygen → lots →
+mesh → walkable VRChat greybox + 2D site city view. The fabric backlog below
+is paused until the in-engine eval reorders it.** Remaining fabric work, in
+prior priority order: **(1) interior-fabric gap** — coarse non-core blocks where Chen emits
 no interior streets (blocks the connectivity wave structurally couldn't reach,
 and related to the sliver residual): needs a chen_* interior-street change or
 a densification target that seeds stubs; **(2) residual guidance-driven fans**
