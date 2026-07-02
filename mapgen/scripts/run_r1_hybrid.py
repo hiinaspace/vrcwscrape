@@ -63,25 +63,14 @@ from mapgen.r1_compare import (  # noqa: E402
     _set_extent,
 )
 from mapgen.r1_macro import (  # noqa: E402
-    DEFAULT_BETA_RATIO,
-    DEFAULT_COST_FLOOR,
-    DEFAULT_MIN_BLOCK_AREA,
-    DEFAULT_SIMPLIFY_TOLERANCE,
-    DEFAULT_VILLAGE_MERGE_RADIUS,
-    DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
-    DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
-    DEFAULT_W_DENSITY,
     MacroEdge,
-    build_density_cost_field,
-    build_macro_blocks_with_cores,
-    build_macro_nodes_hierarchical,
-    compute_macro_arterials,
+    MacroParams,
+    build_macro_layer,
+    load_boundary,
 )
 from mapgen.r1_seam import (  # noqa: E402
     DEFAULT_RETRY_SEEDS,
-    boundary_mask,
     chen_in_block,
-    load_boundary,
 )
 from mapgen.r1_zoom import load_points_with_labels, zoom_window  # noqa: E402
 
@@ -94,81 +83,6 @@ _TIER_STYLE: dict[int, dict[str, Any]] = {
     1: {"color": "#1f5fb0", "label": "Major (≥ town)"},
     0: {"color": "#138d75", "label": "Local (incl. village)"},
 }
-
-
-def build_macro_layer(in_dir: Path) -> dict[str, Any]:
-    """Rebuild the stage-1 macro layer with ``run_r1_macro``'s defaults.
-
-    Returns a bundle with the fields, boundary, arterial lines + edge records,
-    and the macro-blocks. Mirrors the macro construction in the seam spike so the
-    macro layer matches the already-reviewed stage-1 output.
-    """
-    fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
-    density = fields.density
-    slope = fields.slope
-    flow_accum = fields.flow_accum
-    x0, y0, cell = fields.x0, fields.y0, fields.cell
-    nrows, ncols = density.shape
-
-    boundary = load_boundary(in_dir)
-    points = pl.read_parquet(in_dir / "island_points.parquet")
-
-    mask = boundary_mask(boundary, x0, y0, cell, nrows, ncols)
-
-    nodes = build_macro_nodes_hierarchical(
-        density,
-        x0,
-        y0,
-        cell,
-        points,
-        merge_radius=DEFAULT_VILLAGE_MERGE_RADIUS,
-        peak_min_distance_units=DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
-        peak_threshold_frac=DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
-    )
-    cost = build_density_cost_field(
-        slope,
-        flow_accum,
-        density,
-        mask,
-        base=1.0,
-        w_slope=8.0,
-        w_river=6.0,
-        w_density=DEFAULT_W_DENSITY,
-        cost_floor=DEFAULT_COST_FLOOR,
-    )
-    arterial_lines, edges = compute_macro_arterials(
-        nodes,
-        cost,
-        x0,
-        y0,
-        cell,
-        beta_ratio=DEFAULT_BETA_RATIO,
-        simplify_tolerance=DEFAULT_SIMPLIFY_TOLERANCE,
-    )
-    # Stage 3.5b: fold dense cores into ringed downtown blocks. The block set is
-    # polygonized over CLIPPED arterials + core rings + boundary, and the drawn
-    # arterials are the clipped ones (no convergence on a core summit).
-    bundle = build_macro_blocks_with_cores(
-        density,
-        nodes,
-        arterial_lines,
-        edges,
-        boundary,
-        x0,
-        y0,
-        cell,
-        min_block_area=DEFAULT_MIN_BLOCK_AREA,
-    )
-
-    return {
-        "fields": fields,
-        "boundary": boundary,
-        "arterial_lines": bundle.clipped_lines,
-        "edges": bundle.clipped_edges,
-        "core_polys": bundle.core_polys,
-        "ring_lines": bundle.ring_lines,
-        "macro_blocks": bundle.blocks,
-    }
 
 
 class BlockResult:
@@ -532,14 +446,19 @@ def run_hybrid(
     t_start = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Building stage-1 macro layer (run_r1_macro defaults)…", flush=True)
-    macro = build_macro_layer(in_dir)
-    fields: IslandFields = macro["fields"]
-    boundary: sg.Polygon = macro["boundary"]
-    arterial_lines: list[sg.LineString] = macro["arterial_lines"]
-    edges: list[MacroEdge] = macro["edges"]
-    core_polys: list[sg.Polygon] = macro["core_polys"]
-    macro_blocks: list[sg.Polygon] = macro["macro_blocks"]
+    print("Building stage-1 macro layer (shared build_macro_layer)…", flush=True)
+    fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
+    boundary = load_boundary(in_dir)
+    points = pl.read_parquet(in_dir / "island_points.parquet")
+    params = MacroParams()
+    # Stage 3.5b: the block set is polygonized over CLIPPED arterials + core
+    # rings + boundary, and the drawn arterials are the clipped ones (no
+    # convergence on a core summit).
+    layer = build_macro_layer(fields, boundary, points, params)
+    arterial_lines: list[sg.LineString] = layer.arterial_lines
+    edges: list[MacroEdge] = layer.edges
+    core_polys: list[sg.Polygon] = layer.core_polys
+    macro_blocks: list[sg.Polygon] = layer.blocks
     n_blocks = len(macro_blocks)
     print(
         f"  {n_blocks} macro-blocks, {len(core_polys)} core rings, "
@@ -659,6 +578,7 @@ def run_hybrid(
             "arterials clipped to dense-core ring-roads (downtown blocks); "
             "arterial<->local junctions deliberately deferred"
         ),
+        "macro_params": params.to_dict(),
         "total_target": total_target,
         "M": round(global_m, 6),
         "min_parcel_area": round(min_parcel_area, 6),

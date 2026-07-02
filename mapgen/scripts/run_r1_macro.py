@@ -35,7 +35,6 @@ import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import polars as pl  # noqa: E402
-import shapely  # noqa: E402
 import shapely.geometry as sg  # noqa: E402
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -67,13 +66,11 @@ from mapgen.r1_macro import (  # noqa: E402
     DEFAULT_W_DENSITY,
     MacroEdge,
     MacroNode,
+    MacroParams,
     arterials_to_geojson,
-    build_density_cost_field,
-    build_macro_blocks_with_cores,
-    build_macro_nodes,
-    build_macro_nodes_hierarchical,
-    compute_macro_arterials,
+    build_macro_layer,
     core_rings_to_geojson,
+    load_boundary,
     macro_blocks_to_geojson,
     nodes_to_geojson,
 )
@@ -88,39 +85,6 @@ _TIER_STYLE: dict[int, dict[str, Any]] = {
     1: {"color": "#1f5fb0", "lw": 1.7, "label": "Major (≥ town)"},
     0: {"color": "#138d75", "lw": 0.9, "label": "Local (incl. village)"},
 }
-
-
-def load_boundary(inputs_dir: Path) -> sg.Polygon:
-    """Load the island boundary Polygon, handling FC/Feature/geometry forms."""
-    raw = json.loads((inputs_dir / "island_boundary.geojson").read_text())
-    if raw.get("type") == "FeatureCollection":
-        geometry = raw["features"][0]["geometry"]
-    elif raw.get("type") == "Feature":
-        geometry = raw["geometry"]
-    else:
-        geometry = raw
-    geom = sg.shape(geometry)
-    if not isinstance(geom, sg.Polygon):
-        raise ValueError(f"island boundary must be a Polygon, got {geom.geom_type}")
-    return geom
-
-
-def _boundary_mask(
-    boundary: sg.Polygon,
-    x0: float,
-    y0: float,
-    cell: float,
-    nrows: int,
-    ncols: int,
-) -> np.ndarray:
-    """Inside-island boolean mask from boundary + cell-centre meshgrid."""
-    cols = np.arange(ncols)
-    rows = np.arange(nrows)
-    xc = x0 + (cols + 0.5) * cell
-    yc = y0 + (rows + 0.5) * cell
-    xx, yy = np.meshgrid(xc, yc)
-    inside = shapely.contains_xy(boundary, xx.ravel(), yy.ravel())
-    return inside.reshape(nrows, ncols)
 
 
 def render_macro_overview(
@@ -318,25 +282,7 @@ def run_macro(
     in_dir: Path,
     out_dir: Path,
     *,
-    hierarchical: bool = True,
-    n_cities: int = DEFAULT_N_CITIES,
-    merge_radius: float = DEFAULT_MERGE_RADIUS,
-    peak_min_distance_units: float = DEFAULT_PEAK_MIN_DISTANCE_UNITS,
-    peak_threshold_frac: float = DEFAULT_PEAK_THRESHOLD_FRAC,
-    village_merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS,
-    village_peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
-    village_peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
-    cost_base: float = 1.0,
-    w_slope: float = 8.0,
-    w_river: float = 6.0,
-    w_density: float = DEFAULT_W_DENSITY,
-    cost_floor: float = DEFAULT_COST_FLOOR,
-    beta_ratio: float = DEFAULT_BETA_RATIO,
-    simplify_tolerance: float = DEFAULT_SIMPLIFY_TOLERANCE,
-    min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
-    core_frac: float = DEFAULT_CORE_FRAC,
-    core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS,
-    core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
+    params: MacroParams | None = None,
     seed: int = DEFAULT_SEED,
     draw_points: bool = True,
 ) -> dict[str, Any]:
@@ -344,101 +290,42 @@ def run_macro(
     t_start = time.perf_counter()
     np.random.seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if params is None:
+        params = MacroParams()
 
     print("Loading inputs…")
     fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
     density = fields.density
     height_carved = fields.height_carved
-    flow_accum = fields.flow_accum
-    slope = fields.slope
     x0, y0, cell = fields.x0, fields.y0, fields.cell
-    nrows, ncols = density.shape
 
     boundary = load_boundary(in_dir)
     points = pl.read_parquet(in_dir / "island_points.parquet")
 
-    print("Building island mask…")
-    mask = _boundary_mask(boundary, x0, y0, cell, nrows, ncols)
+    seeding = (
+        "hierarchical (L1 city / L0 town / peak village)"
+        if params.hierarchical
+        else "legacy graded-L0"
+    )
+    print(f"Building macro layer ({seeding})…")
+    layer = build_macro_layer(fields, boundary, points, params)
+    nodes = layer.nodes
+    edges = layer.raw_edges
+    core_polys = layer.core_polys
+    clipped_lines = layer.arterial_lines
+    clipped_edges = layer.edges
+    macro_blocks = layer.blocks
 
-    if hierarchical:
-        print("Building macro nodes (3-tier semantic: L1 city / L0 town / peak)…")
-        nodes = build_macro_nodes_hierarchical(
-            density,
-            x0,
-            y0,
-            cell,
-            points,
-            merge_radius=village_merge_radius,
-            peak_min_distance_units=village_peak_min_distance_units,
-            peak_threshold_frac=village_peak_threshold_frac,
-        )
-    else:
-        print("Building macro nodes (legacy graded-L0)…")
-        nodes = build_macro_nodes(
-            density,
-            x0,
-            y0,
-            cell,
-            points,
-            n_cities=n_cities,
-            merge_radius=merge_radius,
-            peak_min_distance_units=peak_min_distance_units,
-            peak_threshold_frac=peak_threshold_frac,
-        )
     n_city = sum(1 for nd in nodes if nd.kind == "city")
     n_town = sum(1 for nd in nodes if nd.kind == "town")
     n_village = sum(1 for nd in nodes if nd.kind == "village")
     print(
         f"  {n_city} cities, {n_town} towns, {n_village} villages ({len(nodes)} nodes)"
     )
-
-    print("Building density-attracting cost field…")
-    cost = build_density_cost_field(
-        slope,
-        flow_accum,
-        density,
-        mask,
-        base=cost_base,
-        w_slope=w_slope,
-        w_river=w_river,
-        w_density=w_density,
-        cost_floor=cost_floor,
-    )
-
-    print("Computing tiered arterial network…")
-    arterial_lines, edges = compute_macro_arterials(
-        nodes,
-        cost,
-        x0,
-        y0,
-        cell,
-        beta_ratio=beta_ratio,
-        simplify_tolerance=simplify_tolerance,
-    )
     n_hwy = sum(1 for e in edges if e.tier == 2)
     n_major = sum(1 for e in edges if e.tier == 1)
     n_local = sum(1 for e in edges if e.tier == 0)
     print(f"  {len(edges)} edges: {n_hwy} highways, {n_major} majors, {n_local} locals")
-
-    print("Detecting dense cores + folding into ringed blocks…")
-    bundle = build_macro_blocks_with_cores(
-        density,
-        nodes,
-        arterial_lines,
-        edges,
-        boundary,
-        x0,
-        y0,
-        cell,
-        core_frac=core_frac,
-        core_max_radius_units=core_max_radius_units,
-        core_min_area_units2=core_min_area_units2,
-        min_block_area=min_block_area,
-    )
-    core_polys = bundle.core_polys
-    clipped_lines = bundle.clipped_lines
-    clipped_edges = bundle.clipped_edges
-    macro_blocks = bundle.blocks
     print(f"  {len(core_polys)} cores, {len(macro_blocks)} macro-blocks")
 
     print("Writing GeoJSON…")
@@ -477,30 +364,8 @@ def run_macro(
         "stage": "1 (macro hierarchy layer)",
         "description": "Galin 2011 + Arm B tiered arterials + macro-blocks",
         "seed": seed,
-        "seeding": "hierarchical (L1 city / L0 town / peak village)"
-        if hierarchical
-        else "legacy graded-L0",
-        "params": {
-            "hierarchical": hierarchical,
-            "n_cities": n_cities,
-            "merge_radius": merge_radius,
-            "peak_min_distance_units": peak_min_distance_units,
-            "peak_threshold_frac": peak_threshold_frac,
-            "village_merge_radius": village_merge_radius,
-            "village_peak_min_distance_units": village_peak_min_distance_units,
-            "village_peak_threshold_frac": village_peak_threshold_frac,
-            "cost_base": cost_base,
-            "w_slope": w_slope,
-            "w_river": w_river,
-            "w_density": w_density,
-            "cost_floor": cost_floor,
-            "beta_ratio": beta_ratio,
-            "simplify_tolerance": simplify_tolerance,
-            "min_block_area": min_block_area,
-            "core_frac": core_frac,
-            "core_max_radius_units": core_max_radius_units,
-            "core_min_area_units2": core_min_area_units2,
-        },
+        "seeding": seeding,
+        "params": params.to_dict(),
         "cost_field_note": (
             "cost = (base + w_slope*norm_slope + w_river*(flow>p99)) "
             "- w_density*norm_density; clamped to cost_floor inside mask, "
@@ -600,9 +465,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    manifest = run_macro(
-        args.in_dir,
-        args.out_dir,
+    params = MacroParams(
         hierarchical=not args.legacy_seeding,
         n_cities=args.n_cities,
         merge_radius=args.merge_radius,
@@ -622,6 +485,11 @@ def main(argv: list[str] | None = None) -> None:
         core_frac=args.core_frac,
         core_max_radius_units=args.core_max_radius,
         core_min_area_units2=args.core_min_area,
+    )
+    manifest = run_macro(
+        args.in_dir,
+        args.out_dir,
+        params=params,
         seed=args.seed,
         draw_points=not args.no_points,
     )

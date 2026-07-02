@@ -12,10 +12,8 @@ holds the small, deterministic, testable pieces used by
    chosen block: (a) the max boundary-to-fabric distance (are bounding arterials
    left bare?) and (b) the uncovered-area fraction.
 
-``load_boundary`` and ``_boundary_mask`` mirror the same-named helpers in
-``scripts/run_r1_macro.py`` (copied here, ~10 lines each, because that file is a
-script and not cleanly importable). Keep them in sync with run_r1_macro so the
-macro layer the spike builds matches the one already reviewed.
+Boundary/mask IO lives in ``mapgen.r1_macro`` (``load_boundary`` /
+``boundary_mask``); import it from there.
 
 Coordinate convention: island frame (``x = x0 + (col + 0.5) * cell``), same as
 ``r1_macro`` / ``r1_arm_b``.
@@ -23,15 +21,12 @@ Coordinate convention: island frame (``x = x0 + (col + 0.5) * cell``), same as
 
 from __future__ import annotations
 
-import json
 import time
 import traceback
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-import shapely
 import shapely.geometry as sg
 from shapely.ops import unary_union
 
@@ -52,49 +47,6 @@ from mapgen.r1_arm_a import (
 # Seeds tried in order by :func:`chen_in_block`. A concave block breaking Chen on
 # seed 7 but working on a later seed IS a finding, surfaced in the returned info.
 DEFAULT_RETRY_SEEDS: tuple[int, ...] = (7, 1, 2, 13)
-
-# ---------------------------------------------------------------------------
-# Boundary / mask helpers (mirror scripts/run_r1_macro.py)
-# ---------------------------------------------------------------------------
-
-
-def load_boundary(inputs_dir: Path) -> sg.Polygon:
-    """Load the island boundary Polygon, handling FC/Feature/geometry forms.
-
-    Mirrors ``scripts/run_r1_macro.py::load_boundary`` (kept in sync).
-    """
-    raw = json.loads((inputs_dir / "island_boundary.geojson").read_text())
-    if raw.get("type") == "FeatureCollection":
-        geometry = raw["features"][0]["geometry"]
-    elif raw.get("type") == "Feature":
-        geometry = raw["geometry"]
-    else:
-        geometry = raw
-    geom = sg.shape(geometry)
-    if not isinstance(geom, sg.Polygon):
-        raise ValueError(f"island boundary must be a Polygon, got {geom.geom_type}")
-    return geom
-
-
-def boundary_mask(
-    boundary: sg.Polygon,
-    x0: float,
-    y0: float,
-    cell: float,
-    nrows: int,
-    ncols: int,
-) -> np.ndarray:
-    """Inside-island boolean mask from boundary + cell-centre meshgrid.
-
-    Mirrors ``scripts/run_r1_macro.py::_boundary_mask`` (kept in sync).
-    """
-    cols = np.arange(ncols)
-    rows = np.arange(nrows)
-    xc = x0 + (cols + 0.5) * cell
-    yc = y0 + (rows + 0.5) * cell
-    xx, yy = np.meshgrid(xc, yc)
-    inside = shapely.contains_xy(boundary, xx.ravel(), yy.ravel())
-    return inside.reshape(nrows, ncols)
 
 
 # ---------------------------------------------------------------------------

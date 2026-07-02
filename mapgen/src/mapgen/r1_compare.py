@@ -880,16 +880,30 @@ def run_compare(
     # ------------------------------------------------------------------
     # Arm A configs
     # ------------------------------------------------------------------
-    arm_a_configs = [
+    arm_a_required = [
         "baseline",
         "regional",
         "regional_fine",
         "regional_strong",
-        "regional_density",
     ]
-    # Density-mass config is optional; only compare it if the Arm A run emitted it.
-    arm_a_configs = [
-        cfg for cfg in arm_a_configs if (arm_a_dir / cfg / "districts.geojson").exists()
+    # Only the density-mass config is optional; compare it if the Arm A run
+    # emitted it. Missing REQUIRED configs fail fast with a clear error instead
+    # of a KeyError deep in the render step.
+    arm_a_optional = ["regional_density"]
+    missing = [
+        cfg
+        for cfg in arm_a_required
+        if not (arm_a_dir / cfg / "districts.geojson").exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "missing required Arm A config outputs: "
+            + ", ".join(str(arm_a_dir / cfg / "districts.geojson") for cfg in missing)
+        )
+    arm_a_configs = arm_a_required + [
+        cfg
+        for cfg in arm_a_optional
+        if (arm_a_dir / cfg / "districts.geojson").exists()
     ]
     arm_a_layouts: dict[str, tuple[Districts, Arterials, list[int]]] = {}
 

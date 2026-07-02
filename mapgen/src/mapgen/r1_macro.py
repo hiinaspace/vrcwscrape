@@ -34,21 +34,25 @@ set so any future jitter stays reproducible.
 
 from __future__ import annotations
 
+import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 import polars as pl
 import shapely.geometry as sg
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, QhullError
 from shapely.ops import unary_union
 from skimage.graph import route_through_array
 
+from mapgen.r1_arm_a import IslandFields
 from mapgen.r1_arm_b import (
     _prune_edges,
     _rowcol_to_xy,
     _xy_to_rowcol,
+    boundary_mask,
     build_cost_field,
     find_density_peaks,
     polygonize_districts,
@@ -140,6 +144,31 @@ DEFAULT_CORE_PEAK_WINDOW_UNITS: float = 3.0
 DEFAULT_CORE_SIMPLIFY_TOLERANCE: float = 1.0
 
 NodeKind = Literal["city", "town", "village"]
+
+
+# ---------------------------------------------------------------------------
+# 0. Staged-input IO helpers (single shared implementation)
+# ---------------------------------------------------------------------------
+#
+# ``load_boundary`` below and ``boundary_mask`` (re-exported from ``r1_arm_b``)
+# are THE implementations for every r1 stage script (run_r1_macro,
+# run_r1_seam_spike, run_r1_hybrid, run_r1_zoom_review). Do not copy them into
+# scripts.
+
+
+def load_boundary(inputs_dir: Path) -> sg.Polygon:
+    """Load the island boundary Polygon, handling FC/Feature/geometry forms."""
+    raw = json.loads((inputs_dir / "island_boundary.geojson").read_text())
+    if raw.get("type") == "FeatureCollection":
+        geometry = raw["features"][0]["geometry"]
+    elif raw.get("type") == "Feature":
+        geometry = raw["geometry"]
+    else:
+        geometry = raw
+    geom = sg.shape(geometry)
+    if not isinstance(geom, sg.Polygon):
+        raise ValueError(f"island boundary must be a Polygon, got {geom.geom_type}")
+    return geom
 
 
 # ---------------------------------------------------------------------------
@@ -532,21 +561,64 @@ def tier_for_tau(tau: int) -> int:
     return 2 if tau >= 2 else 1
 
 
+def _pair(a: int, b: int) -> tuple[int, int]:
+    """Canonical (sorted) node-index pair."""
+    return (a, b) if a <= b else (b, a)
+
+
+def _nearest_neighbor_chain(
+    indices: list[int], xs: np.ndarray, ys: np.ndarray
+) -> set[tuple[int, int]]:
+    """Deterministic nearest-neighbour chain over a degenerate node subset.
+
+    Last-resort fallback when even joggled Delaunay fails (e.g. all nodes
+    coincident): starting from the first node of ``indices``, repeatedly
+    connect the current node to its nearest unvisited node (ties broken by
+    position in ``indices``, which is deterministic). Returns a connected chain
+    of ``m - 1`` edges.
+    """
+    m = len(indices)
+    if m < 2:
+        return set()
+    remaining = [int(i) for i in indices[1:]]
+    current = int(indices[0])
+    edges: set[tuple[int, int]] = set()
+    while remaining:
+        rem = np.array(remaining, dtype=int)
+        d2 = (xs[rem] - xs[current]) ** 2 + (ys[rem] - ys[current]) ** 2
+        best = int(rem[int(np.argmin(d2))])  # argmin: first minimum wins
+        edges.add(_pair(current, best))
+        remaining.remove(best)
+        current = best
+    return edges
+
+
 def _delaunay_edges(
     indices: list[int], xs: np.ndarray, ys: np.ndarray
 ) -> set[tuple[int, int]]:
-    """Delaunay edge set (global node-index pairs) over a node subset."""
+    """Delaunay edge set (global node-index pairs) over a node subset.
+
+    Degenerate subsets are handled deterministically: ``m < 2`` -> empty,
+    ``m == 2`` -> the single pair, >=3 collinear nodes (QhullError: "initial
+    simplex is flat") -> retry with joggled input (``QJ``), and if even that
+    fails (e.g. coincident nodes) -> a nearest-neighbour chain. Per-sigma-level
+    subsets are routinely tiny (3-4 nodes), so exact collinearity happens on
+    real islands.
+    """
     m = len(indices)
     if m < 2:
         return set()
 
-    def _pair(a: int, b: int) -> tuple[int, int]:
-        return (a, b) if a <= b else (b, a)
-
     if m == 2:
         return {_pair(int(indices[0]), int(indices[1]))}
     sub = np.column_stack([xs[indices], ys[indices]])
-    tri = Delaunay(sub)
+    try:
+        tri = Delaunay(sub)
+    except QhullError:
+        try:
+            tri = Delaunay(sub, qhull_options="QJ")
+        except QhullError:
+            return _nearest_neighbor_chain(indices, xs, ys)
     edges: set[tuple[int, int]] = set()
     for simplex in tri.simplices:
         for i in range(3):
@@ -572,9 +644,10 @@ def compute_macro_arterials(
     first. For each level ``L`` (descending distinct sigma) a Delaunay is built
     over the nodes with ``sigma >= L``, geodesic least-cost paths are routed
     (Arm B ``route_through_array``), the level is beta-ratio pruned (Arm B
-    ``_prune_edges``) independently, and node-pairs already realized at a higher
-    level are excluded. Edge ``tier`` is its construction level ``L``; ``tau``
-    records ``min(sigma_a, sigma_b)``.
+    ``_prune_edges``) independently, and node-pairs already realized (i.e. kept
+    after pruning) at a higher level are excluded — a pair PRUNED at a higher
+    level stays eligible at lower levels. Edge ``tier`` is its construction
+    level ``L``; ``tau`` records ``min(sigma_a, sigma_b)``.
 
     For semantic sigmas ``{0, 1, 2}`` this yields three tiers:
 
@@ -600,20 +673,18 @@ def compute_macro_arterials(
 
     # One level per distinct sigma, highest first. The Delaunay at level L spans
     # all nodes with sigma >= L; pairs realized at a higher level are excluded.
+    # Only pairs that SURVIVE beta pruning count as realized — a pair pruned at
+    # a higher level stays eligible at lower levels (docstring contract).
     distinct_levels = sorted({int(s) for s in sigmas}, reverse=True)
     realized: set[tuple[int, int]] = set()
-    level_edges: list[tuple[int, list[tuple[int, int]]]] = []
-    for level in distinct_levels:
-        subset = [i for i in range(n) if sigmas[i] >= level]
-        edge_set = _delaunay_edges(subset, xs, ys) - realized
-        realized |= edge_set
-        level_edges.append((level, sorted(edge_set)))
 
     lines: list[sg.LineString] = []
     records: list[MacroEdge] = []
 
     # Build each level independently (highest tier first so it sorts ahead).
-    for tier, edge_list in level_edges:
+    for tier in distinct_levels:
+        subset = [i for i in range(n) if sigmas[i] >= tier]
+        edge_list = sorted(_delaunay_edges(subset, xs, ys) - realized)
         if not edge_list:
             continue
         edge_paths: list[list[tuple[int, int]]] = []
@@ -632,6 +703,7 @@ def compute_macro_arterials(
         for idx, (i_a, i_b) in enumerate(edge_list):
             if not kept[idx]:
                 continue
+            realized.add((i_a, i_b))
             path = edge_paths[idx]
             rows_p = np.array([p[0] for p in path])
             cols_p = np.array([p[1] for p in path])
@@ -1047,6 +1119,182 @@ def build_macro_blocks_with_cores(
         clipped_lines=clipped_lines,
         clipped_edges=clipped_edges,
         blocks=blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. Composed macro-layer assembly (shared by the stage scripts)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MacroParams:
+    """Frozen knob-set for :func:`build_macro_layer` (one macro-layer recipe).
+
+    Captures every parameter the stage scripts (``run_r1_macro``,
+    ``run_r1_seam_spike``, ``run_r1_hybrid``) feed into the nodes ->
+    cost-field -> arterials -> blocks-with-cores pipeline, so all three build
+    the SAME layer and record the exact recipe in their manifests
+    (:meth:`to_dict`).
+    """
+
+    # Node seeding: 3-tier semantic hierarchy (default) vs legacy graded-L0.
+    hierarchical: bool = True
+    # Legacy graded-L0 seeding knobs (used when ``hierarchical=False``).
+    n_cities: int = DEFAULT_N_CITIES
+    merge_radius: float = DEFAULT_MERGE_RADIUS
+    peak_min_distance_units: float = DEFAULT_PEAK_MIN_DISTANCE_UNITS
+    peak_threshold_frac: float = DEFAULT_PEAK_THRESHOLD_FRAC
+    # Hierarchical village-peak knobs (used when ``hierarchical=True``).
+    village_merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS
+    village_peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS
+    village_peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC
+    # Density-attracting cost field.
+    cost_base: float = 1.0
+    w_slope: float = 8.0
+    w_river: float = 6.0
+    w_density: float = DEFAULT_W_DENSITY
+    cost_floor: float = DEFAULT_COST_FLOOR
+    # Importance-typed network.
+    beta_ratio: float = DEFAULT_BETA_RATIO
+    simplify_tolerance: float = DEFAULT_SIMPLIFY_TOLERANCE
+    # Macro-blocks + dense-core ring-roads (stage 3.5b).
+    min_block_area: float = DEFAULT_MIN_BLOCK_AREA
+    core_frac: float = DEFAULT_CORE_FRAC
+    core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS
+    core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain-dict form for JSON manifests."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MacroLayer:
+    """Fully-assembled stage-1 macro layer (result of :func:`build_macro_layer`).
+
+    Attributes
+    ----------
+    params : the exact :class:`MacroParams` recipe used.
+    nodes : macro nodes (cities/towns/villages).
+    cost : the density-attracting routing cost field.
+    raw_arterial_lines / raw_edges : the pre-clip arterial network.
+    core_polys / ring_lines : dense-core downtown polygons and their rings.
+    arterial_lines / edges : the CLIPPED arterials (core interiors removed;
+        identical to the raw ones when no cores are detected). These are what
+        the stage scripts draw and export.
+    blocks : polygonized macro-blocks (clipped arterials + rings + boundary).
+    """
+
+    params: MacroParams
+    nodes: list[MacroNode]
+    cost: np.ndarray
+    raw_arterial_lines: list[sg.LineString]
+    raw_edges: list[MacroEdge]
+    core_polys: list[sg.Polygon]
+    ring_lines: list[sg.LineString]
+    arterial_lines: list[sg.LineString]
+    edges: list[MacroEdge]
+    blocks: list[sg.Polygon]
+
+
+def build_macro_layer(
+    fields: IslandFields,
+    boundary: sg.Polygon,
+    points: pl.DataFrame,
+    params: MacroParams | None = None,
+) -> MacroLayer:
+    """Assemble the full stage-1 macro layer from the staged inputs.
+
+    THE single shared nodes -> cost-field -> arterials -> blocks-with-cores
+    pipeline behind ``run_r1_macro``, ``run_r1_seam_spike`` and
+    ``run_r1_hybrid`` (previously each script hand-assembled its own copy).
+    Deterministic: depends only on the inputs and ``params``.
+
+    With no detectable cores the returned ``blocks`` match the pre-3.5b
+    polygonization (:func:`polygonize_macro_blocks` over the raw arterials) and
+    ``arterial_lines``/``edges`` equal the raw network.
+    """
+    if params is None:
+        params = MacroParams()
+
+    density = fields.density
+    x0, y0, cell = fields.x0, fields.y0, fields.cell
+    nrows, ncols = density.shape
+    mask = boundary_mask(boundary, x0, y0, cell, nrows, ncols)
+
+    if params.hierarchical:
+        nodes = build_macro_nodes_hierarchical(
+            density,
+            x0,
+            y0,
+            cell,
+            points,
+            merge_radius=params.village_merge_radius,
+            peak_min_distance_units=params.village_peak_min_distance_units,
+            peak_threshold_frac=params.village_peak_threshold_frac,
+        )
+    else:
+        nodes = build_macro_nodes(
+            density,
+            x0,
+            y0,
+            cell,
+            points,
+            n_cities=params.n_cities,
+            merge_radius=params.merge_radius,
+            peak_min_distance_units=params.peak_min_distance_units,
+            peak_threshold_frac=params.peak_threshold_frac,
+        )
+
+    cost = build_density_cost_field(
+        fields.slope,
+        fields.flow_accum,
+        density,
+        mask,
+        base=params.cost_base,
+        w_slope=params.w_slope,
+        w_river=params.w_river,
+        w_density=params.w_density,
+        cost_floor=params.cost_floor,
+    )
+
+    raw_lines, raw_edges = compute_macro_arterials(
+        nodes,
+        cost,
+        x0,
+        y0,
+        cell,
+        beta_ratio=params.beta_ratio,
+        simplify_tolerance=params.simplify_tolerance,
+    )
+
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        raw_lines,
+        raw_edges,
+        boundary,
+        x0,
+        y0,
+        cell,
+        core_frac=params.core_frac,
+        core_max_radius_units=params.core_max_radius_units,
+        core_min_area_units2=params.core_min_area_units2,
+        min_block_area=params.min_block_area,
+    )
+
+    return MacroLayer(
+        params=params,
+        nodes=nodes,
+        cost=cost,
+        raw_arterial_lines=raw_lines,
+        raw_edges=raw_edges,
+        core_polys=bundle.core_polys,
+        ring_lines=bundle.ring_lines,
+        arterial_lines=bundle.clipped_lines,
+        edges=bundle.clipped_edges,
+        blocks=bundle.blocks,
     )
 
 

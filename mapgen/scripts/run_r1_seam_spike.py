@@ -3,8 +3,10 @@
 
 A viability probe (not a finished pipeline) for the macro+micro hybrid in
 ``docs/large-scale-growth-research.md`` (staged build plan, step 2). It rebuilds
-the stage-1 macro layer (with ``run_r1_macro``'s defaults), selects one
-mid-complexity macro-block, runs Chen/R2 *inside* that block, and measures /
+the stage-1 macro layer via the shared ``mapgen.r1_macro.build_macro_layer``
+with default ``MacroParams`` (hierarchical 3-tier seeding + dense-core
+ring-roads — the SAME layer as ``run_r1_macro`` / ``run_r1_hybrid``), selects
+one mid-complexity macro-block, runs Chen/R2 *inside* that block, and measures /
 renders the **seam**: how cleanly the local street fabric meets the bounding
 arterials.
 
@@ -61,26 +63,14 @@ from mapgen.r1_compare import (  # noqa: E402
     _set_extent,
 )
 from mapgen.r1_macro import (  # noqa: E402
-    DEFAULT_BETA_RATIO,
-    DEFAULT_COST_FLOOR,
-    DEFAULT_MERGE_RADIUS,
-    DEFAULT_MIN_BLOCK_AREA,
-    DEFAULT_N_CITIES,
-    DEFAULT_PEAK_MIN_DISTANCE_UNITS,
-    DEFAULT_PEAK_THRESHOLD_FRAC,
-    DEFAULT_SIMPLIFY_TOLERANCE,
-    DEFAULT_W_DENSITY,
     MacroEdge,
-    build_density_cost_field,
-    build_macro_nodes,
-    compute_macro_arterials,
-    polygonize_macro_blocks,
+    MacroParams,
+    build_macro_layer,
+    load_boundary,
 )
 from mapgen.r1_seam import (  # noqa: E402
     SeamGap,
-    boundary_mask,
     chen_in_block,
-    load_boundary,
     seam_gap,
     select_block_by_rank,
 )
@@ -97,71 +87,8 @@ _RETRY_SEEDS: tuple[int, ...] = (7, 1, 2, 13)
 _TIER_STYLE: dict[int, dict[str, Any]] = {
     2: {"color": "#b30000", "lw": 1.2, "label": "Highway (city–city)"},
     1: {"color": "#1f5fb0", "lw": 0.7, "label": "Major (city–town / town–town)"},
+    0: {"color": "#138d75", "lw": 0.5, "label": "Local (incl. village)"},
 }
-
-
-def build_macro_layer(
-    in_dir: Path,
-) -> dict[str, Any]:
-    """Rebuild the stage-1 macro layer with run_r1_macro's defaults.
-
-    Returns a dict bundle with the fields, boundary, points, arterial lines +
-    edge records, and the macro-blocks.
-    """
-    fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
-    density = fields.density
-    slope = fields.slope
-    flow_accum = fields.flow_accum
-    x0, y0, cell = fields.x0, fields.y0, fields.cell
-    nrows, ncols = density.shape
-
-    boundary = load_boundary(in_dir)
-    points = pl.read_parquet(in_dir / "island_points.parquet")
-
-    mask = boundary_mask(boundary, x0, y0, cell, nrows, ncols)
-
-    nodes = build_macro_nodes(
-        density,
-        x0,
-        y0,
-        cell,
-        points,
-        n_cities=DEFAULT_N_CITIES,
-        merge_radius=DEFAULT_MERGE_RADIUS,
-        peak_min_distance_units=DEFAULT_PEAK_MIN_DISTANCE_UNITS,
-        peak_threshold_frac=DEFAULT_PEAK_THRESHOLD_FRAC,
-    )
-    cost = build_density_cost_field(
-        slope,
-        flow_accum,
-        density,
-        mask,
-        base=1.0,
-        w_slope=8.0,
-        w_river=6.0,
-        w_density=DEFAULT_W_DENSITY,
-        cost_floor=DEFAULT_COST_FLOOR,
-    )
-    arterial_lines, edges = compute_macro_arterials(
-        nodes,
-        cost,
-        x0,
-        y0,
-        cell,
-        beta_ratio=DEFAULT_BETA_RATIO,
-        simplify_tolerance=DEFAULT_SIMPLIFY_TOLERANCE,
-    )
-    macro_blocks = polygonize_macro_blocks(
-        arterial_lines, boundary, min_block_area=DEFAULT_MIN_BLOCK_AREA
-    )
-
-    return {
-        "fields": fields,
-        "boundary": boundary,
-        "arterial_lines": arterial_lines,
-        "edges": edges,
-        "macro_blocks": macro_blocks,
-    }
 
 
 def run_chen_in_block(
@@ -276,8 +203,8 @@ def render_overview(
     )
     _render_boundary(ax, boundary)
 
-    # All macro arterials, faint, tier-colored.
-    for tier in (1, 2):
+    # All macro arterials, faint, tier-colored (locals first, highways on top).
+    for tier in (0, 1, 2):
         style = _TIER_STYLE[tier]
         for line, rec in zip(arterial_lines, edges, strict=True):
             if rec.tier != tier or line.geom_type != "LineString":
@@ -307,6 +234,7 @@ def render_overview(
     legend_handles = [
         mpatches.Patch(color=_TIER_STYLE[2]["color"], label=_TIER_STYLE[2]["label"]),
         mpatches.Patch(color=_TIER_STYLE[1]["color"], label=_TIER_STYLE[1]["label"]),
+        mpatches.Patch(color=_TIER_STYLE[0]["color"], label=_TIER_STYLE[0]["label"]),
         mpatches.Patch(color="#00c2a8", alpha=0.5, label=f"Chosen block #{block_id}"),
     ]
     ax.legend(handles=legend_handles, loc="upper left", fontsize=8, framealpha=0.9)
@@ -443,13 +371,15 @@ def run_seam(
     t_start = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Building stage-1 macro layer (run_r1_macro defaults)…", flush=True)
-    macro = build_macro_layer(in_dir)
-    fields: IslandFields = macro["fields"]
-    boundary: sg.Polygon = macro["boundary"]
-    arterial_lines: list[sg.LineString] = macro["arterial_lines"]
-    edges: list[MacroEdge] = macro["edges"]
-    macro_blocks: list[sg.Polygon] = macro["macro_blocks"]
+    print("Building stage-1 macro layer (shared build_macro_layer)…", flush=True)
+    fields = IslandFields.from_npz(str(in_dir / "fields.npz"))
+    boundary = load_boundary(in_dir)
+    points = pl.read_parquet(in_dir / "island_points.parquet")
+    params = MacroParams()
+    layer = build_macro_layer(fields, boundary, points, params)
+    arterial_lines: list[sg.LineString] = layer.arterial_lines
+    edges: list[MacroEdge] = layer.edges
+    macro_blocks: list[sg.Polygon] = layer.blocks
     print(f"  {len(macro_blocks)} macro-blocks, {len(edges)} arterials", flush=True)
 
     if block_id is not None:
@@ -462,7 +392,7 @@ def run_seam(
         print(f"  using explicit --block-id {chosen_id}", flush=True)
     else:
         chosen_id, block = select_block_by_rank(
-            macro_blocks, block_frac, min_block_area=DEFAULT_MIN_BLOCK_AREA
+            macro_blocks, block_frac, min_block_area=params.min_block_area
         )
         print(
             f"  selected block #{chosen_id} at frac {block_frac} "
@@ -527,6 +457,7 @@ def run_seam(
     manifest: dict[str, Any] = {
         "stage": "2 (seam spike)",
         "description": "Chen/R2 inside one macro-block; measure local-vs-arterial seam",
+        "macro_params": params.to_dict(),
         "block_id": chosen_id,
         "block_area": round(float(block.area), 3),
         "block_frac": None if block_id is not None else block_frac,

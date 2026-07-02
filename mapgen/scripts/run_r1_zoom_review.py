@@ -29,7 +29,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-import shapely  # noqa: E402
 from shapely import LineString, Polygon  # noqa: E402
 
 from mapgen.chen_artifacts import _street_lines  # noqa: E402
@@ -54,6 +53,7 @@ from mapgen.r1_compare import (  # noqa: E402
     _render_districts,
     _set_extent,
 )
+from mapgen.r1_macro import load_boundary  # noqa: E402
 from mapgen.r1_zoom import (  # noqa: E402
     LabeledPoints,
     dominant_cluster_per_district,
@@ -61,22 +61,10 @@ from mapgen.r1_zoom import (  # noqa: E402
     zoom_window,
 )
 
-DEFAULT_INPUTS = Path("artifacts/r1/inputs")
-DEFAULT_OUT = Path("artifacts/r1/zoom_review")
-
-
-def load_boundary(inputs_dir: Path) -> BoundarySpec:
-    raw = json.loads((inputs_dir / "island_boundary.geojson").read_text())
-    if raw.get("type") == "FeatureCollection":
-        geometry = raw["features"][0]["geometry"]
-    elif raw.get("type") == "Feature":
-        geometry = raw["geometry"]
-    else:
-        geometry = raw
-    geom = shapely.geometry.shape(geometry)
-    if not isinstance(geom, Polygon):
-        raise ValueError(f"island boundary must be a Polygon, got {geom.geom_type}")
-    return BoundarySpec(name="island", geom=geom)
+# Anchor to the repo like the sibling run_r1_* scripts (not the cwd).
+_REPO = Path(__file__).resolve().parents[1]
+DEFAULT_INPUTS = _REPO / "artifacts/r1/inputs"
+DEFAULT_OUT = _REPO / "artifacts/r1/zoom_review"
 
 
 def _district_polys(generated: GeneratedChenLayout) -> list[Polygon]:
@@ -334,7 +322,7 @@ def main() -> None:
     targets = [int(t) for t in args.targets.split(",") if t.strip()]
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    boundary = load_boundary(args.inputs_dir)
+    boundary = BoundarySpec(name="island", geom=load_boundary(args.inputs_dir))
     fields = IslandFields.from_npz(str(args.inputs_dir / "fields.npz"))
     lp = load_points_with_labels(str(args.inputs_dir / "island_points.parquet"))
     colors = _color_lookup(lp.l0_ids)
