@@ -48,6 +48,18 @@ function datasetFromParams(data, layout) {
     };
   }
   if (
+    data === "island-chen" ||
+    data === "nolabs-chen" ||
+    data === "full-nolabs-localmap-island-chen" ||
+    layout === "chen"
+  ) {
+    return {
+      key: "nolabs-localmap-island-chen",
+      dir: "full-nolabs-localmap-island-chen/",
+      label: "Hybrid Island (Chen)",
+    };
+  }
+  if (
     data === "nolabs-city-mesh" ||
     data === "full-nolabs-localmap-island-toponymy-city-mesh" ||
     layout === "city-mesh" ||

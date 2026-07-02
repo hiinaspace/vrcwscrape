@@ -189,6 +189,25 @@ in the existing city dataset schema.
   `Map.jsx`; 2.5D building extrusion from `building_height`; polygon (not
   rect) footprints.
 
+## Status (2026-07-02)
+
+G0, G1, and W are implemented and committed. The production G0 export
+(total-target 1200, `--max-gate-spacing 20`: 118 T-junctions, 0.867
+largest-component share) lives at `mapgen/artifacts/r1/greybox/`
+(regenerable, not committed). The baked mesh — `greybox.obj` (~21 MB, 379k
+tris, 44 groups), `greybox.mtl`, `labels.csv`, manifest — IS committed at
+`mapgen/artifacts/r1/greybox_mesh/` for oni to pull; bounds ≈ 5.0 × 3.15 km
+at the default 25 m/unit. The 2D dataset is generated at
+`web/public/full-nolabs-localmap-island-chen/` (gitignored like all dataset
+dirs; regenerate with `uv run python scripts/run_r1_app_export.py` from
+mapgen/) and viewable at `http://localhost:5173/?data=island-chen` — verified
+end-to-end: parcels/roads/labels render, lot click → sidebar works. Known
+greybox artifacts for the eval: min-rotated-rect buildings can overlap
+neighbors on elongated Voronoi cells; ~2k sliver lots render near-invisible
+(stacked duplicate footprints); offshore region-outline blobs from the
+bbox-filtered source regions. **Next: G2 on oni** (see checklist above), then
+the backlog reorder.
+
 ## Sequencing
 
 1. **G0** — implementation slice (Sonnet `chen-slice-implementer`), review
