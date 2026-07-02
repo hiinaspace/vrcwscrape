@@ -242,6 +242,9 @@ is where prototype effort will concentrate. Worth a small spike before committin
      peak no longer hosts a multi-arterial junction with a parallel-sliver fan).
      Ring roads read as realistic bypasses and clipping yields clean T-junctions
      where arterials meet the rings (helps the deferred connectivity story).
+     *(Correction, 2026-07-01: the "fixed" claim was overstated — see the
+     pre-merge re-review section below; summit sliver fans persist inside the
+     rings of cores #1/#2.)*
      Remaining: a few residual acute-wedge parallel-district fans persist in
      NON-core blocks beside the rings (e.g. just outside core #1/#3) — milder and
      no longer at the summit, but artifact (c)'s wedge problem isn't 100% gone;
@@ -253,23 +256,62 @@ is where prototype effort will concentrate. Worth a small spike before committin
    feed back into cost field; optional switchback styling for steep local roads.
 5. **Point relaxation (optional)** — nudge world points toward generated lots.
 
+## PR #1 pre-merge re-review (2026-07-01)
+
+Full re-review before merging this branch (adversarial multi-lens code review
+via the `wave-review` workflow + a fresh visual pass with stronger vision than
+the session that produced stages 3–3.5b). Outcome: **approach structure
+upheld; two corrections of record.**
+
+1. **The 3.5b "core #1 fixed / no more sliver fan at the summit" claim was
+   overstated.** Re-render (deterministic: identical 35 blocks / 701 districts)
+   shows 10–12-line parallel-sliver fans draped directly over the density
+   summits INSIDE the core rings of cores #1 and #2, plus several large combed
+   bands across the island (core #3's ring interior is genuinely good). What
+   3.5b did fix is the multi-arterial junction at the summit. Also observed:
+   arterials sometimes converge on a single ring vertex as a 5-way junction
+   rather than distributed T-junctions, and one near-coincident doubled major
+   pair near core #1.
+2. **The acute-concave-wedge diagnosis is incomplete.** Fans appear inside
+   convex rings, always on density ridges/peaks. Working diagnosis: the R2
+   mass gate forces many splits exactly where density is high, while the
+   ridge-aligned guidance field makes candidate cuts run along the ridge —
+   repeated parallel slivers. The world-count-balance metric (CV 0.215)
+   actively *rewards* this shape; per the repo rule, metrics must not outrank
+   visual fidelity. **The sliver-fan fabric defect is the next wave**, ahead
+   of the (already spec'd) arterial↔local connectivity wave.
+3. The beta-prune fix below intentionally changes the network (pruned
+   higher-tier pairs become eligible at lower tiers): post-fix rerun gives
+   **36 macro-blocks / 697 districts** (was 35/701), 0 Chen failures,
+   visually near-identical.
+4. Code review: no blocking findings; majors fixed pre-merge (QhullError on
+   collinear per-level node subsets; macro-layer assembly triplicated across
+   the three scripts with realized drift — hoisted into a single
+   `build_macro_layer`; boundary/mask IO helpers de-duplicated; R2
+   mechanism-specific tests + a pinned default-path golden added;
+   `run_r1_island_inputs.py` now writes the `l1_id`/`l1_name` columns the
+   hierarchical seeding requires — the committed pipeline was previously not
+   reproducible from scratch). Remaining minors are Non-blocking debt:
+   beta-prune `realized` semantics, untested chen_in_block retry/fallback
+   paths, missing `test_r1_arm_a.py`, zoom-review harness coverage.
+
 ## Status
 
-Stages 1–3 + stage-3.5a + stage-3.5b done. The hybrid uses a 3-tier semantic
-node hierarchy (L1 cities / L0 towns / peak villages), now with dense cores
-folded into ringed "downtown" blocks: arterials are CLIPPED to core exteriors
-(T-junctions on the ring) and core rings + clipped arterials are polygonized →
-13 cores, 35 macro-blocks (was 30) → 701 districts at total-target 1200, 35/35
-geometry-valid, 34/35 paper-invariant, 518 s. The densest cores now read as
-coherent ringed downtowns (artifact (c) substantially fixed — peaks are block
-interiors, no more parallel-sliver fan AT the summit). Remaining stage-3.5 work,
-in priority order: (a) arterial↔local T-junction connectivity for the non-core
-fabric (still the dominant remaining artifact — arterials run parallel to local
-Chen streets); residual acute-wedge parallel-district fans in a few non-core
-blocks beside the rings (milder than before; regularize/split very concave
-blocks). Footholds: `r1_macro.py` (incl. `cluster_centroids`,
+Stages 1–3 + stage-3.5a + stage-3.5b done and merged after the 2026-07-01
+re-review above. The hybrid uses a 3-tier semantic node hierarchy (L1 cities /
+L0 towns / peak villages) with dense cores folded into ringed "downtown"
+blocks: arterials are CLIPPED to core exteriors (T-junctions on the ring) and
+core rings + clipped arterials are polygonized → 13 cores, 36 macro-blocks →
+697 districts at total-target 1200 (post beta-prune fix; the reviewed 3.5b
+runs were 35/701), 0 Chen failures, ~330–520 s depending on host. Remaining work, in priority
+order (revised by the re-review): **(1) summit sliver-fan fabric defect** (R2
+mass-split × ridge-aligned guidance interaction; dominant visual artifact,
+sits on the density peaks themselves); **(2) arterial↔local T-junction
+connectivity** for the non-core fabric (spec'd wave, plan exists — gates
+already terminate on block boundaries; fuse/export/render + metric);
+(3) concave-wedge block regularization and over-merged-downtown tuning.
+Footholds: `r1_macro.py` (incl. `cluster_centroids`,
 `build_macro_nodes_hierarchical`, N-level `compute_macro_arterials`,
-`detect_core_regions` / `clip_arterials_to_cores` /
-`build_macro_blocks_with_cores`), `r1_seam.py` (incl. `chen_in_block`),
-`run_r1_macro.py`, `run_r1_seam_spike.py`, `run_r1_hybrid.py`, plus the
-zoom-review harness.
+`detect_core_regions` / `clip_arterials_to_cores` / `build_macro_layer`),
+`r1_seam.py` (incl. `chen_in_block`), `run_r1_macro.py`,
+`run_r1_seam_spike.py`, `run_r1_hybrid.py`, plus the zoom-review harness.
