@@ -320,24 +320,62 @@ interplay, not paper machinery. Candidate levers when picked up: per-block
 guidance attenuation (strength or weight cap scaled by block size/mass),
 or bounding guidance weight where density curvature is high.
 
+## Connectivity wave (2026-07-01, done)
+
+Artifact (a): local Chen streets and the tiered arterial network were
+disconnected graphs that only touched geometrically. The junction geometry
+already existed (Chen seeds the block perimeter as its level-0 street, so
+street paths terminate exactly on block boundaries = the arterial/ring/coast).
+Built as `mapgen/src/mapgen/r1_connect.py` (assembly layer, zero chen_*
+change): gate extraction → snap-to-macro (`SeamJunction`, snap distance
+exactly 0.0) → unified networkx graph (NODE_SCALE coordinate fusion so
+gate/arterial-split points become shared degree-≥3 nodes) → connectivity
+metric; plus opt-in `densify_gates` (`--max-gate-spacing`, default OFF =
+byte-identical) routing connector streets over Chen's corner graph from
+under-served boundary stretches to interior street nodes. `run_r1_hybrid`
+drops perimeter-duplicate streets (kills the doubled-line artifact), marks
+T-junctions, writes a `connectivity` manifest section + `hybrid_junctions.geojson`,
+and renders `hybrid_seam.png`.
+
+Milestone (1200 target, `--max-gate-spacing 20`): 118 T-junctions (51
+arterial / 67 ring), graph 34 components, largest component holds 0.87 of
+local street length (0.73 without densification, 0.73 pre-connectivity had it
+as 44 disconnected components). Visual gate: cores plug into their ring roads
+cleanly; mid-island reads meaningfully more connected than the pre-wave
+"two parallel systems".
+
+**Residual (non-blocking, deeper root cause):** 14/26 non-core blocks still
+have zero T-junctions because Chen produced NO interior streets there at all
+(every decomposed street coincides with the block-boundary ring), so there is
+nothing for a connector to plug into — densification structurally can't help.
+Closing this needs a chen_* change (promote interior parcel edges to streets
+in coarse blocks) or a densification target that seeds interior stub streets;
+a later wave. Minor: `hybrid_seam.png` selects the median non-core block,
+which is one of these zero-junction blocks — the money-shot render should pick
+a gated block (cheap render-selection tweak).
+
 ## Status
 
 Stages 1–3 + stage-3.5a + stage-3.5b done and merged after the 2026-07-01
-re-review above. The sliver-fan wave (above) then fixed the dominant fabric
-artifact at its paper-fidelity root. The hybrid uses a 3-tier semantic node hierarchy (L1 cities /
+re-review above. The sliver-fan wave then fixed the dominant fabric artifact
+at its paper-fidelity root; the connectivity wave (above) then made
+arterial↔local T-junctions real. The hybrid uses a 3-tier semantic node hierarchy (L1 cities /
 L0 towns / peak villages) with dense cores folded into ringed "downtown"
 blocks: arterials are CLIPPED to core exteriors (T-junctions on the ring) and
 core rings + clipped arterials are polygonized → 13 cores, 36 macro-blocks →
 698 districts at total-target 1200 (post sliver-fan fix; the beta-prune-only
 run was 36/697, the reviewed 3.5b runs 35/701), 0 Chen failures, ~330–520 s
 depending on host. Remaining work, in priority
-order: **(1) arterial↔local T-junction connectivity** for the non-core
-fabric (spec'd wave, plan exists — gates already terminate on block
-boundaries; fuse/export/render + metric); (2) residual guidance-driven fans
-in small dense blocks (sliver-fan wave residual above); (3) concave-wedge
-block regularization and over-merged-downtown tuning.
-Footholds: `r1_macro.py` (incl. `cluster_centroids`,
-`build_macro_nodes_hierarchical`, N-level `compute_macro_arterials`,
-`detect_core_regions` / `clip_arterials_to_cores` / `build_macro_layer`),
-`r1_seam.py` (incl. `chen_in_block`), `run_r1_macro.py`,
+order: **(1) interior-fabric gap** — coarse non-core blocks where Chen emits
+no interior streets (blocks the connectivity wave structurally couldn't reach,
+and related to the sliver residual): needs a chen_* interior-street change or
+a densification target that seeds stubs; **(2) residual guidance-driven fans**
+in small dense blocks (sliver-fan wave residual above); **(3)** concave-wedge
+block regularization, over-merged-downtown tuning, and the `hybrid_seam.png`
+render-selection tweak (pick a gated block); **(4)** promote high-betweenness
+edges of the unified street graph to wider roads (now cheap — the graph exists).
+Footholds: `r1_connect.py` (gates/snap/unified-graph/densify), `r1_macro.py`
+(incl. `cluster_centroids`, `build_macro_nodes_hierarchical`, N-level
+`compute_macro_arterials`, `detect_core_regions` / `clip_arterials_to_cores` /
+`build_macro_layer`), `r1_seam.py` (incl. `chen_in_block`), `run_r1_macro.py`,
 `run_r1_seam_spike.py`, `run_r1_hybrid.py`, plus the zoom-review harness.

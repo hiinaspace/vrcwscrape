@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import shapely.geometry as sg
 
 from mapgen.r1_arm_a import IslandFields
@@ -102,7 +101,6 @@ def test_chen_in_block_splits_square_for_small_mass() -> None:
     assert union_area > 0.8 * block.area
 
 
-@pytest.mark.slow
 def test_chen_in_block_surfaces_gates_and_perimeter_flags() -> None:
     # R1 connectivity stage 1 (mapgen.r1_connect): chen_in_block should surface
     # per-street boundary gates and perimeter flags alongside districts/streets,
@@ -112,6 +110,12 @@ def test_chen_in_block_surfaces_gates_and_perimeter_flags() -> None:
     # street is ever generated, so gates == 0 -- a real, legitimate Chen
     # outcome, not a bug), so this uses a mass small enough to force at least
     # one interior street.
+    #
+    # Not marked slow: measured ~1-3s (comparable to the mass=12 case above,
+    # not the "real Chen generation is expensive" case slow is meant for) --
+    # and this is the only test exercising the real chen_in_block -> r1_connect
+    # integration (gate content, street/flag alignment), so it belongs in the
+    # quick lane `pytest tests/test_r1_*.py -m "not slow"` runs by default.
     block = _square(0, 0, 10)
     fields = _flat_fields(10.0)
     result = chen_in_block(
@@ -123,3 +127,9 @@ def test_chen_in_block_surfaces_gates_and_perimeter_flags() -> None:
     assert result.generated is not None, result.info
     assert len(result.street_perimeter_flags) == len(result.streets)
     assert len(result.gates) >= 1
+    # Every gate must land exactly on the block boundary (the whole point of
+    # a "gate": a per-block street endpoint on the block-boundary ring that
+    # a later stage snaps onto the macro network).
+    boundary = block.exterior
+    for gate in result.gates:
+        assert boundary.distance(sg.Point(gate.x, gate.y)) < 1e-9

@@ -491,6 +491,15 @@ def build_unified_street_graph(
     same key, so they fuse into one node — this is what turns independently
     generated block street networks and the macro network into a single
     connected graph with real (degree >= 3) T-junctions, not a disjoint union.
+    ``tol`` in :func:`snap_gates_to_macro` means that coordinate identity is
+    not automatic: a gate snapped at a nonzero (but within-``tol``) distance
+    has a raw coordinate that does NOT round to the same :func:`_node_key` as
+    the on-line point the arterial/ring was actually cut at. Before adding a
+    block's local streets, every coordinate matching a snapped ``"arterial"``
+    or ``"ring"`` junction's raw ``(x, y)`` (by ``_node_key``, scoped to that
+    junction's ``block_id``) is replaced with the exact on-line point
+    (``line.interpolate(station)``) so fusion holds across the whole ``tol``
+    band, not just the (typical, ~0-distance) exact-coincidence case.
 
     Every edge also carries a ``length`` attr (planar distance between its
     two endpoints) for later weighting/summary work. Returns a plain
@@ -502,15 +511,29 @@ def build_unified_street_graph(
 
     stations_by_arterial: dict[int, list[float]] = {}
     stations_by_ring: dict[int, list[float]] = {}
-    for junction in junctions:
+    # Raw gate coordinate -> exact on-line point, scoped per block, for the
+    # off-line-but-within-tol snap fusion fix (see docstring above). Junctions
+    # are processed in (block_id, x, y) order regardless of input order so a
+    # (practically impossible) raw-coordinate collision within one block still
+    # resolves deterministically.
+    snap_targets_by_block: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
+    for junction in sorted(junctions, key=lambda j: (j.block_id, j.x, j.y)):
         if junction.kind == "arterial":
             stations_by_arterial.setdefault(junction.macro_index, []).append(
                 junction.station
             )
+            line = arterial_lines[junction.macro_index]
         elif junction.kind == "ring":
             stations_by_ring.setdefault(junction.macro_index, []).append(
                 junction.station
             )
+            line = ring_lines[junction.macro_index]
+        else:
+            continue
+        snapped = line.interpolate(junction.station)
+        snap_targets_by_block.setdefault(junction.block_id, {})[
+            _node_key(junction.x, junction.y)
+        ] = (snapped.x, snapped.y)
 
     g: nx.Graph = nx.Graph()
 
@@ -531,9 +554,17 @@ def build_unified_street_graph(
         flags = perimeter_flags_by_block.get(block_id, [False] * len(streets))
         if len(flags) != len(streets):
             raise ValueError(f"perimeter flags misaligned for block {block_id}")
+        block_snap_targets = snap_targets_by_block.get(block_id, {})
         for line, is_perimeter in zip(streets, flags, strict=True):
             if is_perimeter:
                 continue
+            if block_snap_targets:
+                coords = [
+                    block_snap_targets.get(_node_key(x, y), (x, y))
+                    for x, y in line.coords
+                ]
+                if coords != list(line.coords):
+                    line = LineString(coords)
             _add_polyline_edges(g, line, kind="local", tier=-1, block_id=block_id)
 
     return g

@@ -817,6 +817,165 @@ def test_graph_connectivity_summary_empty_graph_no_division_by_zero() -> None:
 
 
 # ---------------------------------------------------------------------------
+# build_unified_street_graph -- off-line-but-within-tol snap fusion
+# ---------------------------------------------------------------------------
+#
+# snap_gates_to_macro accepts snaps up to tol=0.05 away from the matched
+# arterial/ring line, but node identity (_node_key / chen_core.node_key) is
+# exact-coordinate quantization at 1e-6. A gate snapped at a nonzero distance
+# (e.g. 0.03, well within tol) has a raw (x, y) that does NOT round to the
+# same node key as the on-line point (line.interpolate(station)) the arterial
+# was actually cut at, UNLESS build_unified_street_graph explicitly re-snaps
+# the local street's matching coordinate onto that on-line point first.
+
+
+def test_build_unified_street_graph_fuses_off_line_gate_within_tol() -> None:
+    # Arterial at y=10; the "gate" is 0.03 off the line (within tol=0.05, the
+    # same offset test_snap_gates_to_macro_classifies_kinds_tiers_stations_
+    # distances uses for its within-tol case). The local street's boundary
+    # endpoint carries that same raw, off-line coordinate -- exactly what
+    # extract_block_gates/chen_in_block would hand back for a genuinely (if
+    # atypically) off-line-but-snapped gate.
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions = [
+        SeamJunction(
+            block_id=0,
+            x=5.0,
+            y=10.03,
+            kind="arterial",
+            macro_index=0,
+            tier=2,
+            station=5.0,
+            distance=0.03,
+        ),
+    ]
+    streets_by_block = {0: [LineString([(5.0, 10.03), (5.0, 5.0)])]}
+    flags = {0: [False]}
+
+    g = build_unified_street_graph(
+        arterial_lines, edges, ring_lines, junctions, streets_by_block, flags
+    )
+    summary = graph_connectivity_summary(g)
+
+    # The off-line gate coordinate itself must NOT survive as its own node --
+    # it is re-snapped onto the arterial's exact on-line split point.
+    assert (5_000_000, 10_030_000) not in g
+    node_on_line = (5_000_000, 10_000_000)
+    assert node_on_line in g
+    assert g.degree[node_on_line] == 3
+    assert nx.number_connected_components(g) == 1
+    assert summary["n_tjunctions_realized"] == 1
+
+
+def test_build_unified_street_graph_off_line_gate_beyond_snap_untouched() -> None:
+    # A local street endpoint that does NOT match any junction's raw gate
+    # coordinate (e.g. it belongs to an "unmatched"/never-snapped street, or
+    # simply isn't a gate at all) is left exactly as given -- the re-snap only
+    # ever touches coordinates that equal a snapped arterial/ring junction's
+    # own (x, y), scoped to that junction's block.
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions: list[SeamJunction] = []
+    streets_by_block = {0: [LineString([(5.0, 10.03), (5.0, 5.0)])]}
+    flags = {0: [False]}
+
+    g = build_unified_street_graph(
+        arterial_lines, edges, ring_lines, junctions, streets_by_block, flags
+    )
+    assert (5_000_000, 10_030_000) in g
+    assert (5_000_000, 10_000_000) not in g
+
+
+# ---------------------------------------------------------------------------
+# Consistency cross-check: stage-2 n_tjunctions vs graph n_tjunctions_realized
+# ---------------------------------------------------------------------------
+#
+# The correct relationship (confirmed against a real densified hybrid run,
+# artifacts/r1/hybrid_conn_dense/hybrid_manifest.json: n_tjunctions=118,
+# graph.n_tjunctions_realized=123) is n_tjunctions_realized >= n_tjunctions,
+# NOT equality. n_tjunctions (connectivity_metrics) counts snapped GATES --
+# only the two *endpoints* of a decomposed street/connector ever become a
+# Gate (extract_block_gates / densify_gates). n_tjunctions_realized
+# (graph_connectivity_summary) counts GRAPH NODES with both a macro- and a
+# local-kind incident edge, over the FULL vertex chain of every arterial/ring
+# input line AND every local street, including vertices that were never
+# extracted as a gate. Two arterial (or ring) *edges* sharing an endpoint is
+# exactly such a case: that shared macro-graph node is unconditionally in the
+# graph (both edges' own literal endpoint), regardless of whether any gate
+# ever snapped there. Traced against a real densified hybrid run
+# (artifacts/r1/hybrid_conn_dense), a densify_gates connector -- a
+# multi-vertex shortest path over the parcel corner graph from a boundary
+# point to an interior street node -- concretely produced this shape: its
+# path threaded through an arterial-arterial macro-graph node mid-route (not
+# at either of the connector's own endpoints), realizing a T-junction stage-2
+# never counted. This test reproduces that shape directly with a local street
+# whose middle vertex (not either of its own endpoints) coincides with a
+# shared arterial-arterial macro-graph node.
+
+
+def test_tjunctions_realized_can_exceed_snapped_tjunctions_via_midpath_touch() -> None:
+    # Two arterial edges sharing the macro-graph node (10, 10) -- e.g. an
+    # arterial intersection -- unconditionally present in the graph.
+    arterial_lines = [
+        LineString([(0.0, 10.0), (10.0, 10.0)]),
+        LineString([(10.0, 10.0), (20.0, 10.0)]),
+    ]
+    edges = [
+        MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=10.0),
+        MacroEdge(node_a=1, node_b=2, tau=2, tier=2, path_cost=1.0, length=10.0),
+    ]
+    ring_lines: list[LineString] = []
+    boundary = Polygon([(-5.0, -5.0), (25.0, -5.0), (25.0, 25.0), (-5.0, 25.0)])
+
+    # One genuine, extracted gate (the block's only Gate) snapping cleanly.
+    gates_by_block = {0: [Gate(x=5.0, y=10.0, street_id=1, vertex_id=1)]}
+    junctions = snap_gates_to_macro(
+        gates_by_block, arterial_lines, edges, ring_lines, boundary
+    )
+    assert len(junctions) == 1
+
+    # A second local street (a densify-connector-shaped path) whose middle
+    # vertex -- not either of its own endpoints -- happens to sit exactly on
+    # the shared arterial-arterial node (10, 10). This vertex was never
+    # extracted as a Gate (it is interior to this street's node chain), so it
+    # contributes nothing to stage-2's n_tjunctions, but
+    # build_unified_street_graph fuses it there anyway (pure coordinate
+    # identity, no station/gate machinery involved).
+    connector = LineString([(15.0, 8.0), (10.0, 10.0), (5.0, 5.0)])
+    streets_by_block = {
+        0: [LineString([(5.0, 10.0), (5.0, 5.0)]), connector],
+    }
+    perimeter_flags_by_block = {0: [False, False]}
+
+    conn_metrics = connectivity_metrics(
+        junctions,
+        arterial_lines,
+        edges,
+        ring_lines,
+        [Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])],
+    )
+    g = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+    graph_summary = graph_connectivity_summary(g)
+
+    assert conn_metrics["n_tjunctions"] == 1
+    # The midpath touch at (10, 10) realizes a SECOND T-junction the stage-2
+    # count never saw -- the documented n_tjunctions_realized >= n_tjunctions
+    # relationship, not equality.
+    assert graph_summary["n_tjunctions_realized"] == 2
+    assert graph_summary["n_tjunctions_realized"] > conn_metrics["n_tjunctions"]
+
+
+# ---------------------------------------------------------------------------
 # densify_gates (stage 4 -- assembly-layer boundary-run densification)
 # ---------------------------------------------------------------------------
 #
