@@ -1,5 +1,13 @@
 # Greybox wave: citygen → walkable VRChat world (tracer bullet)
 
+> **Status (2026-07-04): COMPLETE — verdict GO.** G0/G1 landed; the baked OBJ is
+> now a gitignored local/world-project artifact (scrubbed from git history at the
+> user's request). G2 walk + a bonus Udon in-world title-search spike ran on
+> **oni** → feasibility validated. Full results, findings, and the backlog reorder
+> are in [greybox-eval.md](greybox-eval.md). Net: continue toward the 3D world;
+> priority shifts to geometry *aesthetic quality* (roads/terrain/buildings), Track
+> W (2D site) drops to fallback.
+
 Decision record (user, 2026-07-02): before more fabric-quality waves, run the
 cheapest possible **end-to-end chain** from citygen artifacts to a walkable
 VRChat greybox, plus wire the citygen geometry into the existing 2D deck.gl
