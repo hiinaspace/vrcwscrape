@@ -44,6 +44,8 @@ readability (elongated cells, overlapping rotated-rect buildings, ~2k slivers).
 1. Regenerated island-chen dataset → main-thread visual review (2D + 2.5D
    before/after) — interim substitute for the missing G2 defect ranking.
 2. `wave-review` workflow on the wave diff.
-3. Re-bake G1 mesh → commit → **oni structured audit** (G2 checklist items 2/4:
+3. Re-bake G1 mesh locally (`mapgen/artifacts/` is gitignored — the OBJ stays
+   OUT of git per the history scrub; transfer to oni over LAN ssh/rsync, or
+   regenerate there) → **oni structured audit** (G2 checklist items 2/4:
    eye-level hierarchy legibility + ranked street-level defect list) = wave exit
    gate; its ranking orders wave 2.
