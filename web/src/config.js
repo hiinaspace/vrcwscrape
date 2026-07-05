@@ -34,15 +34,14 @@ export const BUILDINGS = {
   strokeMinZoomTier: "near",
 };
 
-// 2.5D extrusion mode (?extrude=1). building_height in app_points.parquet is in raw
-// world/meter units (~4-100+ for the island-chen dataset) while x/y/building_width
-// are in the map's own normalized layout units (~0.02-0.5 wide, spanning ~O(10) for
-// the whole island) — i.e. height lives on a completely different scale than the
-// footprint. elevationScale converts height -> layout units; tuned so a ~50-unit
-// building reads as a handful of footprint-widths tall rather than a skyscraper
-// spike or a paper-thin slab. Iterate here if buildings look too spiky/flat.
+// 2.5D extrusion mode (?extrude=1). building_height in app_points.parquet is in
+// METERS while x/y/building_width are app-frame layout units. For the island-chen
+// dataset 1 app unit = 17.6886 island units × 25 m/unit ≈ 442 m, so the physically
+// correct conversion is 1/442 ≈ 0.00226 — the preview then shows the same massing
+// proportions the Unity bake will. Raise/lower only to deliberately exaggerate or
+// flatten relief.
 export const EXTRUDE = {
-  elevationScale: 0.0025,
+  elevationScale: 0.00226,
   // OrthographicView looks straight down the z axis, so extrusion has no visible
   // relief there; extrude mode swaps in OrbitView (same target/zoom convention,
   // non-geospatial like Orthographic) pitched by rotationX degrees.
