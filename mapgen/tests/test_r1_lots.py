@@ -1,5 +1,7 @@
 """Tests for R1 greybox lot geometry (``mapgen.r1_lots``): world -> district
-assignment and per-district Voronoi lot/footprint tessellation."""
+assignment and per-district street-fronting subdivision + Hungarian
+assignment (falling back to the old per-district Voronoi tessellation on
+subdivision failure)."""
 
 from __future__ import annotations
 
@@ -11,19 +13,27 @@ import pytest
 import shapely.geometry as sg
 from shapely.ops import unary_union
 
+import mapgen.r1_lots as r1_lots
 from mapgen.r1_lots import (
     DEFAULT_H_BASE,
     DEFAULT_H_SCALE,
     Lot,
+    LotConfig,
+    _build_lots_voronoi,
     _footprint,
+    _frontage_direction,
+    _obb_axes,
+    _oriented_footprint,
     assign_worlds_to_districts,
     build_lots,
     count_sliver_reassignments,
+    displacement_stats,
     select_member_points,
+    subdivide_district,
 )
 
 # ---------------------------------------------------------------------------
-# assign_worlds_to_districts
+# assign_worlds_to_districts (UNCHANGED behavior -- not part of this wave)
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +115,7 @@ def test_select_member_points_preserves_order_and_attaches_assigned() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_lots — 5-point square: disjoint, tiles the district, contains generator
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -129,7 +139,88 @@ def _member_points(
     return pl.DataFrame(data)
 
 
-def test_build_lots_five_points_disjoint_and_tiles_district() -> None:
+def _obb_diagonal(poly: sg.Polygon) -> float:
+    """Length of ``poly``'s ``minimum_rotated_rectangle`` diagonal."""
+    _center, _axl, _axs, long_len, short_len = _obb_axes(poly)
+    return math.hypot(long_len, short_len)
+
+
+def _no_overlap(polys: list[sg.Polygon], tol: float = 1e-6) -> bool:
+    for i, a in enumerate(polys):
+        for b in polys[i + 1 :]:
+            if a.intersection(b).area > tol:
+                return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# subdivide_district -- partition invariants, count reconciliation, determinism
+# ---------------------------------------------------------------------------
+
+
+def test_subdivide_district_partitions_a_square() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    lots = subdivide_district(district, 6, seed=1, cfg=LotConfig())
+    assert len(lots) >= 6
+    union = unary_union(lots)
+    assert union.area == pytest.approx(district.area, rel=1e-6)
+    assert sum(p.area for p in lots) == pytest.approx(district.area, rel=1e-6)
+    assert _no_overlap(lots)
+
+
+def test_subdivide_district_partitions_a_concave_l_shape() -> None:
+    # L-shaped (gamma) concave district.
+    district = sg.Polygon([(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)])
+    lots = subdivide_district(district, 5, seed=3, cfg=LotConfig())
+    assert len(lots) >= 5
+    union = unary_union(lots)
+    assert union.area == pytest.approx(district.area, rel=1e-6)
+    assert _no_overlap(lots)
+
+
+def test_subdivide_district_no_lot_overlap_across_seeds() -> None:
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    for seed in range(5):
+        lots = subdivide_district(district, 10, seed=seed, cfg=LotConfig())
+        assert _no_overlap(lots), f"overlap at seed={seed}"
+        union = unary_union(lots)
+        assert union.area == pytest.approx(district.area, rel=1e-6)
+
+
+def test_subdivide_district_n_le_1_returns_whole_district() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    assert subdivide_district(district, 1, seed=0, cfg=LotConfig())[0].equals(district)
+    assert subdivide_district(district, 0, seed=0, cfg=LotConfig())[0].equals(district)
+
+
+def test_subdivide_district_is_deterministic() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    cfg = LotConfig()
+    first = subdivide_district(district, 7, seed=42, cfg=cfg)
+    second = subdivide_district(district, 7, seed=42, cfg=cfg)
+    assert [p.wkb for p in first] == [p.wkb for p in second]
+
+
+def test_subdivide_district_deficit_path_forces_resplit() -> None:
+    # An astronomically high stop_area_factor means the MAIN recursion never
+    # splits at all (the whole district is already "below threshold") -- the
+    # entire lot count has to come from the largest-first deficit-fill retry
+    # path (_fill_deficit), exercising it directly.
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    cfg = LotConfig(stop_area_factor=1e9)
+    lots = subdivide_district(district, 5, seed=0, cfg=cfg)
+    assert len(lots) >= 5
+    union = unary_union(lots)
+    assert union.area == pytest.approx(district.area, rel=1e-6)
+    assert _no_overlap(lots)
+
+
+# ---------------------------------------------------------------------------
+# build_lots -- count reconciliation, bijection, displacement bound
+# ---------------------------------------------------------------------------
+
+
+def test_build_lots_count_reconciliation_and_bijection() -> None:
     district = sg.box(0.0, 0.0, 10.0, 10.0)
     member = _member_points(
         ["a", "b", "c", "d", "e"],
@@ -138,30 +229,33 @@ def test_build_lots_five_points_disjoint_and_tiles_district() -> None:
         [0, 10, 100, 1000, 100_000_000],
     )
     lots = build_lots(district, 0, member)
-    assert len(lots) == 5
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    greenspace = [lot for lot in lots if lot.kind == "greenspace"]
+    assert len(occupied) == 5
+    assert len(lots) == len(occupied) + len(greenspace)
+    assert {lot.world_id for lot in occupied} == {"a", "b", "c", "d", "e"}
+    for lot in greenspace:
+        assert lot.world_id == ""
+        assert lot.footprint.is_empty
 
-    # Union of lots equals the district area (tiles it); pairwise interiors
-    # are disjoint (sum of areas == union area, i.e. no double-counted area).
-    union = unary_union([lot.lot for lot in lots])
-    assert union.area == pytest.approx(district.area, abs=1e-6)
-    assert sum(lot.lot.area for lot in lots) == pytest.approx(district.area, abs=1e-6)
+    # Bijection: every occupied lot maps to a distinct lot polygon.
+    lot_wkbs = [lot.lot.wkb for lot in occupied]
+    assert len(set(lot_wkbs)) == len(lot_wkbs)
 
-    for i, lot in enumerate(lots):
-        for j, other in enumerate(lots):
-            if i == j:
-                continue
-            assert lot.lot.intersection(other.lot).area == pytest.approx(0.0, abs=1e-9)
+    # Partition invariant over ALL returned lots (occupied + greenspace).
+    all_polys = [lot.lot for lot in lots]
+    union = unary_union(all_polys)
+    assert union.area == pytest.approx(district.area, rel=1e-6)
+    assert _no_overlap(all_polys)
 
-    # Every lot contains (or at least touches, at the boundary) its own
-    # generator point.
-    for lot in lots:
-        gen = sg.Point(lot.x, lot.y)
-        assert lot.lot.intersects(gen)
-
-    # Footprints are strictly inside their lot (inset by the default margin).
-    for lot in lots:
-        assert lot.footprint.area < lot.lot.area
-        assert lot.lot.contains(lot.footprint) or lot.lot.covers(lot.footprint)
+    # Displacement bound: every occupied lot's assigned anchor is within the
+    # district's own OBB diagonal of the world's original coordinate.
+    diag = _obb_diagonal(district)
+    for lot in occupied:
+        assert lot.displacement <= diag + 1e-6
+        assert lot.displacement == pytest.approx(
+            math.hypot(lot.x - lot.lot_x, lot.y - lot.lot_y)
+        )
 
 
 def test_build_lots_preserves_world_metadata() -> None:
@@ -175,7 +269,7 @@ def test_build_lots_preserves_world_metadata() -> None:
         names=["World A", None],
     )
     lots = build_lots(district, 7, member)
-    by_id = {lot.world_id: lot for lot in lots}
+    by_id = {lot.world_id: lot for lot in lots if lot.kind == "lot"}
     assert by_id["a"].name == "World A"
     assert by_id["b"].name is None
     assert by_id["a"].assigned == "direct"
@@ -196,40 +290,80 @@ def test_build_lots_single_point_district_is_whole_district() -> None:
     lots = build_lots(district, 0, member)
     assert len(lots) == 1
     assert lots[0].lot.equals(district)
+    assert lots[0].kind == "lot"
+    assert lots[0].displacement == 0.0
     assert lots[0].footprint.area > 0.0
     assert district.contains(lots[0].footprint) or district.covers(lots[0].footprint)
 
 
-def test_build_lots_duplicate_coordinates_still_yields_two_disjoint_lots() -> None:
+def test_build_lots_duplicate_coordinates_still_yields_disjoint_lots() -> None:
     district = sg.box(0.0, 0.0, 10.0, 10.0)
     member = _member_points(["a", "b"], [5.0, 5.0], [5.0, 5.0], [1, 2])
     lots = build_lots(district, 0, member)
-    assert len(lots) == 2
-    # Original (pre-jitter) coordinates are preserved on the Lot.
-    assert (lots[0].x, lots[0].y) == (5.0, 5.0)
-    assert (lots[1].x, lots[1].y) == (5.0, 5.0)
-    # But the two lots are still two distinct, essentially-disjoint polygons.
-    assert lots[0].lot.area > 0.0
-    assert lots[1].lot.area > 0.0
-    assert lots[0].lot.intersection(lots[1].lot).area == pytest.approx(0.0, abs=1e-6)
-    union = unary_union([lot.lot for lot in lots])
-    assert union.area == pytest.approx(district.area, abs=1e-6)
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    assert len(occupied) == 2
+    # Original coordinates are preserved on the Lot (both worlds sat at the
+    # same point) even though their assigned lots (and therefore lot_x/lot_y)
+    # differ.
+    assert (occupied[0].x, occupied[0].y) == (5.0, 5.0)
+    assert (occupied[1].x, occupied[1].y) == (5.0, 5.0)
+    assert occupied[0].lot.area > 0.0
+    assert occupied[1].lot.area > 0.0
+    assert occupied[0].lot.intersection(occupied[1].lot).area == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_build_lots_zero_points_returns_empty_list() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    empty_member = pl.DataFrame(
+        {"world_id": [], "x": [], "y": [], "visits": [], "assigned": []}
+    )
+    assert build_lots(district, 0, empty_member) == []
+
+
+def test_build_lots_fallback_path_triggers_on_subdivision_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force EVERY split attempt to fail so subdivide_district can never reach
+    # the requested lot count -- deterministically exercising build_lots's
+    # exception-driven fallback to _build_lots_voronoi, without depending on
+    # incidental geometric luck.
+    monkeypatch.setattr(r1_lots, "_best_split", lambda *args, **kwargs: None)
+
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member = _member_points(
+        ["a", "b", "c"],
+        [2.0, 8.0, 5.0],
+        [2.0, 2.0, 8.0],
+        [1, 1, 1],
+    )
+    stats: dict[str, Any] = {}
+    lots = build_lots(district, 0, member, fallback_stats=stats)
+
+    assert stats["n_fallback"] == 1
+    assert stats["fallback_districts"][0]["district_id"] == 0
+    assert len(lots) == 3
+    # The Voronoi fallback never produces greenspace and never displaces a
+    # world off its own generator point.
+    assert all(lot.kind == "lot" for lot in lots)
+    assert all(lot.displacement == 0.0 for lot in lots)
+    assert all(lot.lot_x == lot.x and lot.lot_y == lot.y for lot in lots)
 
 
 def test_build_lots_sliver_reassignment_duplicates_survivor_geometry() -> None:
+    # Exercises the Voronoi-specific sliver reassignment directly (this
+    # behavior is _build_lots_voronoi's, not the default subdivision path's).
     district = sg.box(0.0, 0.0, 10.0, 10.0)
-    # Three well-separated "big" generators plus a near-duplicate "tiny" one
-    # right next to big3, which should be squeezed into a sliver cell.
     member = _member_points(
         ["big1", "big2", "big3", "tiny"],
         [1.0, 9.0, 5.0, 5.0001],
         [1.0, 9.0, 9.0, 9.0001],
         [1, 1, 1, 1],
     )
-    lots = build_lots(district, 2, member, min_lot_area_frac=0.2)
+    lots = _build_lots_voronoi(district, 2, member, min_lot_area_frac=0.2)
     by_id = {lot.world_id: lot for lot in lots}
     assert len(lots) == 4
-    # The tiny world's lot/footprint duplicate big3's exactly.
     assert by_id["tiny"].lot.equals(by_id["big3"].lot)
     assert by_id["tiny"].footprint.equals(by_id["big3"].footprint)
     assert count_sliver_reassignments(lots) == 1
@@ -243,7 +377,7 @@ def test_build_lots_no_sliver_reassignment_when_floor_is_low() -> None:
         [1.0, 9.0, 9.0, 9.0001],
         [1, 1, 1, 1],
     )
-    lots = build_lots(district, 2, member, min_lot_area_frac=1e-9)
+    lots = _build_lots_voronoi(district, 2, member, min_lot_area_frac=1e-9)
     assert count_sliver_reassignments(lots) == 0
 
 
@@ -263,12 +397,80 @@ def test_footprint_empty_lot_falls_back_to_nonempty_circle() -> None:
     assert footprint.area == pytest.approx(math.pi * 0.05**2, rel=1e-2)
 
 
-def test_build_lots_zero_points_returns_empty_list() -> None:
+# ---------------------------------------------------------------------------
+# Building footprint: fully inside its lot, frontage-oriented
+# ---------------------------------------------------------------------------
+
+
+def test_oriented_footprint_fully_inside_lot() -> None:
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    for lot_poly in subdivide_district(district, 6, seed=5, cfg=LotConfig()):
+        footprint = _oriented_footprint(lot_poly, district.exterior, LotConfig())
+        assert not footprint.is_empty
+        assert lot_poly.contains(footprint) or lot_poly.covers(footprint)
+
+
+def test_frontage_direction_matches_long_edge_of_rectangular_district() -> None:
+    # A wide, short rectangle: the long edges run horizontally (dx, 0).
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    direction = _frontage_direction(district, district.exterior, min_frontage=0.0)
+    assert direction is not None
+    angle = abs(math.atan2(direction[1], direction[0]))
+    # Horizontal, mod pi (direction sign is not fixed).
+    angle_mod_pi = min(angle, abs(math.pi - angle))
+    assert angle_mod_pi == pytest.approx(0.0, abs=1e-6)
+
+
+def test_oriented_footprint_angle_matches_long_district_edge() -> None:
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    footprint = _oriented_footprint(district, district.exterior, LotConfig())
+    _center, axis_long, _axis_short, _long_len, _short_len = _obb_axes(footprint)
+    angle = abs(math.atan2(axis_long[1], axis_long[0]))
+    angle_mod_pi = min(angle, abs(math.pi - angle))
+    assert angle_mod_pi == pytest.approx(0.0, abs=0.05)
+
+
+# ---------------------------------------------------------------------------
+# displacement_stats
+# ---------------------------------------------------------------------------
+
+
+def test_displacement_stats_empty() -> None:
+    assert displacement_stats([]) == {"n": 0, "median": 0.0, "p95": 0.0, "max": 0.0}
+
+
+def test_displacement_stats_ignores_greenspace_and_computes_percentiles() -> None:
     district = sg.box(0.0, 0.0, 10.0, 10.0)
-    empty_member = pl.DataFrame(
-        {"world_id": [], "x": [], "y": [], "visits": [], "assigned": []}
-    )
-    assert build_lots(district, 0, empty_member) == []
+
+    def _lot(disp: float, kind: str) -> Lot:
+        return Lot(
+            world_id="w" if kind == "lot" else "",
+            district_id=0,
+            footprint=district,
+            lot=district,
+            height=4.0,
+            name=None,
+            visits=0,
+            x=0.0,
+            y=0.0,
+            assigned="direct" if kind == "lot" else "",
+            lot_x=disp,
+            lot_y=0.0,
+            kind=kind,
+            displacement=disp,
+        )
+
+    lots = [
+        _lot(1.0, "lot"),
+        _lot(2.0, "lot"),
+        _lot(3.0, "lot"),
+        _lot(100.0, "greenspace"),
+    ]
+    stats = displacement_stats(lots)
+    assert stats["n"] == 3
+    assert stats["median"] == pytest.approx(2.0)
+    assert stats["max"] == pytest.approx(3.0)
+    assert stats["p95"] <= 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +491,7 @@ def test_height_formula_monotone_in_visits() -> None:
         ["a", "b", "c"], [2.0, 5.0, 8.0], [2.0, 5.0, 8.0], [0, 1_000, 100_000_000]
     )
     lots = build_lots(district, 0, member)
-    heights = {lot.world_id: lot.height for lot in lots}
+    heights = {lot.world_id: lot.height for lot in lots if lot.kind == "lot"}
     assert heights["a"] < heights["b"] < heights["c"]
     # Spot value at the top-visits end of the doc's stated range (~105m).
     expected_top = DEFAULT_H_BASE + DEFAULT_H_SCALE * math.log10(1.0 + 100_000_000)
@@ -314,12 +516,16 @@ def test_build_lots_is_deterministic() -> None:
     second = build_lots(district, 0, member)
 
     assert [lot.world_id for lot in first] == [lot.world_id for lot in second]
+    assert [lot.kind for lot in first] == [lot.kind for lot in second]
     for a, b in zip(first, second, strict=True):
         assert a == b or (
             a.world_id == b.world_id
             and a.lot.equals(b.lot)
             and a.footprint.equals(b.footprint)
             and a.height == b.height
+            and a.lot_x == b.lot_x
+            and a.lot_y == b.lot_y
+            and a.displacement == b.displacement
         )
 
 
@@ -336,6 +542,10 @@ def test_lot_is_frozen() -> None:
         x=5.0,
         y=5.0,
         assigned="direct",
+        lot_x=5.0,
+        lot_y=5.0,
+        kind="lot",
+        displacement=0.0,
     )
     with pytest.raises(AttributeError):
         lot.height = 10.0  # ty: ignore[invalid-assignment]
