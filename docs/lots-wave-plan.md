@@ -1,8 +1,15 @@
 # Lots/buildings wave (post-greybox wave 1)
 
 Status: IN PROGRESS (started 2026-07-04). Follows the greybox GO verdict
-([greybox-eval.md](greybox-eval.md)); full decision context in the session plan
-(`~/.claude/plans/in-the-mapgen-part-fizzy-dahl.md`).
+([greybox-eval.md](greybox-eval.md)).
+
+The greybox tracer bullet's per-world Voronoi lots read as noise, not parcels
+(elongated cells, overlapping rotated-rect buildings, ~2k slivers) -- the G0
+mechanism was deliberately naive and never meant to be the shipped lot
+geometry. This wave replaces it with street-fronting subdivision + exact
+assignment so parcels/buildings actually read as a city block, while keeping
+district membership decided from each world's true DR coordinate (not the
+lot geometry) so the map's spatial meaning doesn't silently shift.
 
 ## Goal
 
@@ -14,11 +21,23 @@ readability (elongated cells, overlapping rotated-rect buildings, ~2k slivers).
 ## Decisions (user, 2026-07-04)
 
 - **Bounded displacement**: worlds move onto assigned lots within their district
-  (membership still decided by the true DR coordinate → displacement bounded by
-  district diameter, ~150 m at 25 m/unit). Orig coords + displacement stats kept.
-  Rationale: sub-district DR distances carry little meaning; Voronoi cells can
-  never read as parcels. (Open research thread, not this wave: "citygen-aware
-  DR" / map-like spatialization as an upstream alternative.)
+  (membership still decided by the true DR coordinate). For DIRECTLY-assigned
+  worlds (81% of worlds in the production run -- point-in-polygon membership),
+  displacement is bounded by the district's own diameter (~150 m at 25 m/unit),
+  since the true coordinate already lay inside the district. Worlds SNAPPED into
+  a district from outside (the remaining 19% -- no district contained their true
+  coordinate, so `assign_worlds_to_districts` snapped them to the nearest one)
+  additionally carry their snap distance on top of that district-scale term, and
+  are NOT bounded by district size -- observed max 433 m in the production run.
+  `mapgen.r1_lots.displacement_stats` reports both the combined stats and a
+  `direct`/`snapped` split so this distinction stays visible. Orig coords +
+  displacement stats kept. Rationale: sub-district DR distances carry little
+  meaning; Voronoi cells can never read as parcels. **User re-confirmed the
+  corrected figures (2026-07-04): 433 m max for snapped worlds is acceptable —
+  at the local level it's already hard to tell what the DR is clustering. The
+  standing revisit trigger: if local structure starts feeling less coherent in
+  practice, that motivates the "citygen-aware DR" / map-like spatialization
+  direction upstream (open research thread, not this wave).**
 - Chen ledger's two Blocking paper-fidelity items → Deferred (see ledger).
 - Roads+terrain are wave 2; a parallel research-only spike seeds its design
   (deliverable: `docs/terrain-roads-research.md`).

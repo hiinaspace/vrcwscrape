@@ -15,7 +15,7 @@ Outputs to mapgen/artifacts/r1/greybox_mesh/ (or --out-dir):
   greybox.mtl               — flat per-material diffuse colors
   greybox.obj.gz             — gzip of the OBJ, ONLY written if the raw OBJ
                                exceeds 50 MB (Unity side unpacks; no git-lfs)
-  labels.csv                — world_id, name, x_m, z_m, roof_y_m
+  labels.csv                — world_id, name, x_m, z_m, roof_y_m, lot_id
   greybox_mesh_manifest.json — scale, group/material inventory, bounds, stats
 
 Run from mapgen/::
@@ -137,7 +137,7 @@ def _read_districts(in_dir: Path) -> tuple[dict[int, int], list[sg.Polygon]]:
 
 def _read_lots(
     in_dir: Path, district_to_block: dict[int, int]
-) -> tuple[list[LotRecord], int]:
+) -> tuple[list[LotRecord], dict[str, int], int]:
     """Decode ``lots.parquet`` into :class:`LotRecord`\\ s.
 
     ``kind="greenspace"`` rows (docs/lots-wave-plan.md slice L2: surplus
@@ -153,10 +153,16 @@ def _read_lots(
     A lot whose ``district_id`` has no known block (should not happen given
     ``run_r1_hybrid.py``'s greybox export invariants, but this is the IO
     boundary reading someone else's export file) is skipped and counted
-    rather than raising. Returns ``(lots, n_unmapped_district)``.
+    rather than raising. Returns ``(lots, lot_id_by_world, n_unmapped_district)``:
+    ``lot_id_by_world`` maps ``world_id -> lots.parquet``'s ``lot_id`` (see
+    ``run_r1_hybrid.py``'s ``export_greybox``) for every INCLUDED lot, so
+    ``bake_greybox_mesh`` can carry it through to ``labels.csv`` -- threaded
+    alongside :class:`LotRecord` rather than added as a field on it, since
+    ``mapgen.r1_mesh`` itself is outside this wave's write scope.
     """
     df = pl.read_parquet(in_dir / "lots.parquet")
     lots: list[LotRecord] = []
+    lot_id_by_world: dict[str, int] = {}
     n_unmapped = 0
     for row in df.iter_rows(named=True):
         if row["kind"] == "greenspace":
@@ -167,9 +173,11 @@ def _read_lots(
             n_unmapped += 1
             continue
         footprint = shapely_wkb.loads(bytes(row["footprint_wkb"]))
+        world_id = str(row["world_id"])
+        lot_id_by_world[world_id] = int(row["lot_id"])
         lots.append(
             LotRecord(
-                world_id=str(row["world_id"]),
+                world_id=world_id,
                 block_id=block_id,
                 footprint=footprint,
                 height=float(row["height"]),
@@ -178,7 +186,7 @@ def _read_lots(
                 y=float(row["lot_y"]),
             )
         )
-    return lots, n_unmapped
+    return lots, lot_id_by_world, n_unmapped
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +218,7 @@ def bake_greybox_mesh(
     island = _read_island(in_dir)
     roads = _read_arterials(in_dir) + _read_streets(in_dir)
     district_to_block, parks = _read_districts(in_dir)
-    lots, n_unmapped_lots = _read_lots(in_dir, district_to_block)
+    lots, lot_id_by_world, n_unmapped_lots = _read_lots(in_dir, district_to_block)
 
     mesh, stats = assemble_mesh(
         island=island,
@@ -246,10 +254,11 @@ def bake_greybox_mesh(
     label_rows = build_label_rows(lots, meters_per_unit)
     with (out_dir / _LABELS_NAME).open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["world_id", "name", "x_m", "z_m", "roof_y_m"])
+        writer.writerow(["world_id", "name", "x_m", "z_m", "roof_y_m", "lot_id"])
         for world_id, name, x_m, z_m, roof_y_m in label_rows:
+            lot_id = lot_id_by_world.get(world_id, "")
             writer.writerow(
-                [world_id, name, f"{x_m:.4f}", f"{z_m:.4f}", f"{roof_y_m:.4f}"]
+                [world_id, name, f"{x_m:.4f}", f"{z_m:.4f}", f"{roof_y_m:.4f}", lot_id]
             )
 
     minx, miny, maxx, maxy = island.bounds

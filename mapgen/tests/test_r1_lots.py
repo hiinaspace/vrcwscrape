@@ -5,6 +5,7 @@ subdivision failure)."""
 
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any
 
@@ -24,6 +25,7 @@ from mapgen.r1_lots import (
     _frontage_direction,
     _obb_axes,
     _oriented_footprint,
+    _touches_ext_ring,
     assign_worlds_to_districts,
     build_lots,
     count_sliver_reassignments,
@@ -215,6 +217,56 @@ def test_subdivide_district_deficit_path_forces_resplit() -> None:
     assert _no_overlap(lots)
 
 
+def test_subdivide_district_degenerate_zero_area_raises_when_n_gt_1() -> None:
+    # A collapsed/duplicate-vertex "polygon" (zero area) -- n_lots > 1 can
+    # never honor the M >= N contract for it, so subdivide_district must
+    # raise rather than silently returning a single-lot [district] (which
+    # would violate build_lots's downstream count-reconciliation contract).
+    degenerate = sg.Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (0.0, 0.0)])
+    with pytest.raises(r1_lots._SubdivisionFailure):
+        subdivide_district(degenerate, 2, seed=0, cfg=LotConfig())
+
+
+def test_subdivide_district_prefers_frontage_touching_splits() -> None:
+    # A square district subdivided deep enough (n_lots=20) that some interior
+    # pieces can only keep frontage if the scoring actively prefers it -- a
+    # naive mid-split with no frontage preference would landlock several
+    # interior lots with no contact on the district's own exterior ring.
+    #
+    # Empirically verified (per the fix-4 instructions, not left in this
+    # diff): temporarily inverting the sense of `frontage_bad` in
+    # `_best_split` (`not all(...)` -> `all(...)`) drops the touching
+    # fraction on this exact fixture from 1.0 to 0.65 -- well below the
+    # threshold below, which the current (correct) scoring clears easily.
+    district = sg.box(0.0, 0.0, 20.0, 20.0)
+    lots = subdivide_district(district, 20, seed=7, cfg=LotConfig())
+    ext_ring = district.exterior
+    touching = sum(1 for p in lots if _touches_ext_ring(p, ext_ring, 0.0))
+    frac = touching / len(lots)
+    assert frac >= 0.95
+
+
+# ---------------------------------------------------------------------------
+# _assert_partition -- defensive negative checks
+# ---------------------------------------------------------------------------
+
+
+def test_assert_partition_overlapping_lots_raises() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    a = sg.box(0.0, 0.0, 6.0, 10.0)
+    b = sg.box(4.0, 0.0, 10.0, 10.0)  # overlaps a on [4, 6] x [0, 10]
+    with pytest.raises(r1_lots._SubdivisionFailure):
+        r1_lots._assert_partition(district, [a, b])
+
+
+def test_assert_partition_area_mismatch_raises() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)  # area 100
+    a = sg.box(0.0, 0.0, 5.0, 10.0)
+    b = sg.box(5.0, 0.0, 9.0, 10.0)  # union area 90 != district area 100
+    with pytest.raises(r1_lots._SubdivisionFailure):
+        r1_lots._assert_partition(district, [a, b])
+
+
 # ---------------------------------------------------------------------------
 # build_lots -- count reconciliation, bijection, displacement bound
 # ---------------------------------------------------------------------------
@@ -256,6 +308,47 @@ def test_build_lots_count_reconciliation_and_bijection() -> None:
         assert lot.displacement == pytest.approx(
             math.hypot(lot.x - lot.lot_x, lot.y - lot.lot_y)
         )
+
+
+def test_build_lots_hungarian_assignment_is_globally_optimal() -> None:
+    # Two tight world clusters in opposite corners of a wide rectangular
+    # district, subdivided into exactly n lots (stop_area_factor=1e9 forces
+    # the ENTIRE lot count through _fill_deficit's one-leaf-becomes-two-per-
+    # split path, so len(lot_polys) == n exactly -- see
+    # test_subdivide_district_deficit_path_forces_resplit). n <= 6 makes an
+    # exact brute-force check over itertools.permutations cheap.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    cfg = LotConfig(stop_area_factor=1e9)
+    n = 5
+    world_ids = [f"w{i}" for i in range(n)]
+    xs = [0.3, 0.6, 0.9, 19.1, 19.4]
+    ys = [0.3, 0.6, 0.9, 7.7, 7.4]
+    member = _member_points(world_ids, xs, ys, [1] * n)
+
+    lots = build_lots(district, 0, member, cfg=cfg)
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    assert len(occupied) == n
+
+    # Independently reproduce the exact lot anchors build_lots assigned
+    # against (same district/n/seed=district_id/cfg -> deterministic).
+    lot_polys = subdivide_district(district, n, seed=0, cfg=cfg)
+    assert len(lot_polys) == n
+    anchors = []
+    for poly in lot_polys:
+        centroid = poly.centroid
+        anchor = centroid if poly.contains(centroid) else poly.representative_point()
+        anchors.append((anchor.x, anchor.y))
+
+    cost = [
+        [(xs[i] - ax) ** 2 + (ys[i] - ay) ** 2 for (ax, ay) in anchors]
+        for i in range(n)
+    ]
+    best = min(
+        sum(cost[i][perm[i]] for i in range(n))
+        for perm in itertools.permutations(range(n))
+    )
+    actual = sum(lot.displacement**2 for lot in occupied)
+    assert actual == pytest.approx(best, rel=1e-6, abs=1e-9)
 
 
 def test_build_lots_preserves_world_metadata() -> None:
@@ -351,6 +444,26 @@ def test_build_lots_fallback_path_triggers_on_subdivision_failure(
     assert all(lot.lot_x == lot.x and lot.lot_y == lot.y for lot in lots)
 
 
+def test_build_lots_degenerate_district_falls_back_instead_of_crashing() -> None:
+    # A collapsed/duplicate-vertex "polygon" (zero area) with n_lots > 1:
+    # subdivide_district now raises _SubdivisionFailure for this (see
+    # test_subdivide_district_degenerate_zero_area_raises_when_n_gt_1) rather
+    # than returning a single [district] lot that violates build_lots's own
+    # M >= N contract for its Hungarian assignment step. build_lots must
+    # catch that and fall back to the Voronoi mechanism, not crash.
+    degenerate = sg.Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (0.0, 0.0)])
+    member = _member_points(["a", "b"], [0.0, 1.0], [0.0, 0.0], [1, 1])
+    stats: dict[str, Any] = {}
+
+    lots = build_lots(degenerate, 3, member, fallback_stats=stats)
+
+    assert stats["n_fallback"] == 1
+    assert stats["fallback_districts"][0]["district_id"] == 3
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    assert len(occupied) == 2
+    assert {lot.world_id for lot in occupied} == {"a", "b"}
+
+
 def test_build_lots_sliver_reassignment_duplicates_survivor_geometry() -> None:
     # Exercises the Voronoi-specific sliver reassignment directly (this
     # behavior is _build_lots_voronoi's, not the default subdivision path's).
@@ -435,8 +548,18 @@ def test_oriented_footprint_angle_matches_long_district_edge() -> None:
 # ---------------------------------------------------------------------------
 
 
+_ZERO_STATS = {"n": 0, "median": 0.0, "p95": 0.0, "max": 0.0}
+
+
 def test_displacement_stats_empty() -> None:
-    assert displacement_stats([]) == {"n": 0, "median": 0.0, "p95": 0.0, "max": 0.0}
+    stats = displacement_stats([])
+    assert stats["n"] == 0
+    assert stats["median"] == 0.0
+    assert stats["p95"] == 0.0
+    assert stats["max"] == 0.0
+    # Per-kind splits are present (and zero) even with no lots at all.
+    assert stats["direct"] == _ZERO_STATS
+    assert stats["snapped"] == _ZERO_STATS
 
 
 def test_displacement_stats_ignores_greenspace_and_computes_percentiles() -> None:
@@ -471,6 +594,72 @@ def test_displacement_stats_ignores_greenspace_and_computes_percentiles() -> Non
     assert stats["median"] == pytest.approx(2.0)
     assert stats["max"] == pytest.approx(3.0)
     assert stats["p95"] <= 3.0
+    # All three occupied lots are "direct" here -- the split mirrors combined.
+    assert stats["direct"]["n"] == 3
+    assert stats["snapped"] == _ZERO_STATS
+
+
+def test_displacement_stats_p95_matches_ceil_index_formula() -> None:
+    # 20 values 1..20: p95_idx = min(19, ceil(0.95*20) - 1) = min(19, 18) = 18
+    # (0-indexed) -> sorted values[18] == 19.0, distinct from max == 20.0 --
+    # independently derived expected values, not copied from the implementation.
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+
+    def _lot(disp: float) -> Lot:
+        return Lot(
+            world_id="w",
+            district_id=0,
+            footprint=district,
+            lot=district,
+            height=4.0,
+            name=None,
+            visits=0,
+            x=0.0,
+            y=0.0,
+            assigned="direct",
+            lot_x=disp,
+            lot_y=0.0,
+            kind="lot",
+            displacement=disp,
+        )
+
+    lots = [_lot(float(v)) for v in range(1, 21)]
+    stats = displacement_stats(lots)
+    assert stats["n"] == 20
+    assert stats["p95"] == pytest.approx(19.0)
+    assert stats["max"] == pytest.approx(20.0)
+
+
+def test_displacement_stats_splits_direct_and_snapped() -> None:
+    # A snapped world's true coordinate sits far outside the district (the
+    # module docstring's bounded-displacement decision only applies to
+    # "direct" worlds) -- the combined stats would hide this outlier inside
+    # an otherwise-tight direct-only distribution; the split must not.
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member = _member_points(
+        ["a", "b", "snapped_far"],
+        [2.0, 8.0, 1000.0],
+        [2.0, 8.0, 1000.0],
+        [1, 1, 1],
+        assigned=["direct", "direct", "snapped"],
+    )
+    lots = build_lots(district, 0, member)
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    diag = _obb_diagonal(district)
+
+    direct_lots = [lot for lot in occupied if lot.assigned == "direct"]
+    snapped_lots = [lot for lot in occupied if lot.assigned == "snapped"]
+    assert len(direct_lots) == 2
+    assert len(snapped_lots) == 1
+    for lot in direct_lots:
+        assert lot.displacement <= diag + 1e-6
+    assert snapped_lots[0].displacement > diag
+
+    stats = displacement_stats(lots)
+    assert stats["direct"]["n"] == 2
+    assert stats["snapped"]["n"] == 1
+    assert stats["direct"]["max"] <= diag + 1e-6
+    assert stats["snapped"]["max"] > diag
 
 
 # ---------------------------------------------------------------------------

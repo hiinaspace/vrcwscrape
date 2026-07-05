@@ -3,7 +3,7 @@ import DeckGL from "@deck.gl/react";
 import { OrbitView, OrthographicView } from "@deck.gl/core";
 import { GeoJsonLayer, PolygonLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import { Delaunay } from "d3-delaunay";
-import { DATA_DIR, EXTRUDE_MODE, getLevels, loadPoints } from "./duckdb.js";
+import { DATA_DIR, EXTRUDE_MODE, getLevels, getManifest, loadPoints } from "./duckdb.js";
 import { hexToRgb, labelPoint } from "./util.js";
 import {
   BLOCKS,
@@ -249,7 +249,15 @@ function parcelPolygon(point) {
 }
 
 function buildingPolygon(point) {
-  const [x, y] = point.position;
+  // The building rect is centered at its OWN footprint center (building_cx/cy,
+  // exported separately from the lot anchor) when the dataset provides it -- a
+  // clipped footprint or a Voronoi-fallback district's footprint can have its
+  // true center offset from point.position (the lot anchor / map-click/label
+  // position), and centering there instead would draw the building off its own
+  // footprint. Falls back to point.position for datasets without it.
+  const [px, py] = point.position;
+  const x = point.buildingCx ?? px;
+  const y = point.buildingCy ?? py;
   const width = Math.max(point.buildingWidth ?? 0, 1e-9);
   const depth = Math.max(point.buildingDepth ?? 0, 1e-9);
   const a = point.buildingAngle ?? 0;
@@ -277,6 +285,10 @@ export default function WorldMap({
   // "top" = coarsest hierarchy level (continents), "sub" = next (sub-regions).
   // Their numeric level varies by dataset (20k: 3/2; 218k: 5/4), discovered at load.
   const [lvl, setLvl] = useState(null); // { top, sub, levels }
+  // 2.5D extrude elevationScale = EXTRUDE.exaggeration / meters_per_app_unit, derived
+  // from the loaded manifest.json; EXTRUDE.elevationScale is the fallback for a
+  // dataset whose manifest has no meters_per_app_unit (see config.js EXTRUDE comment).
+  const [elevationScale, setElevationScale] = useState(EXTRUDE.elevationScale);
   const [land, setLand] = useState(null);
   const [regionsTop, setRegionsTop] = useState(null);
   const [regionsSub, setRegionsSub] = useState(null);
@@ -348,6 +360,12 @@ export default function WorldMap({
         fetch(base + "landuse.geojson")
           .then((r) => (r.ok ? r.json() : null))
           .then(setLanduse, () => setLanduse(null));
+        getManifest().then((manifest) => {
+          const mpau = manifest?.meters_per_app_unit;
+          setElevationScale(
+            mpau ? EXTRUDE.exaggeration / mpau : EXTRUDE.elevationScale,
+          );
+        });
         return loadPoints();
       })
       .then((d) => {
@@ -391,6 +409,14 @@ export default function WorldMap({
     return () => ro.disconnect();
   }, []);
 
+  // Hoisted above the viewState-init effect below (which needs it to gate the
+  // extrude-only rotationX/rotationOrbit fields) -- city datasets provide
+  // explicit building footprints, older road/legacy datasets don't.
+  const isCity = useMemo(
+    () => points.some((p) => p.buildingWidth != null && p.buildingDepth != null),
+    [points],
+  );
+
   useEffect(() => {
     if (viewState || size.width < 2) return;
     const bounds = geojsonBounds(land) ?? (points.length ? dataBounds(points) : null);
@@ -406,12 +432,13 @@ export default function WorldMap({
       maxZoomX: v.zoom + 13,
       maxZoomY: v.zoom + 13,
       // Extra fields consumed only by OrbitView (extrude mode's pitched view); the
-      // default OrthographicView ignores them.
-      ...(EXTRUDE_MODE
+      // default OrthographicView ignores them. Gated on isCity too -- extrude mode
+      // only actually applies to city (building) datasets, same as extrudeMode below.
+      ...(EXTRUDE_MODE && isCity
         ? { rotationX: EXTRUDE.rotationX, rotationOrbit: EXTRUDE.rotationOrbit }
         : {}),
     });
-  }, [land, points, viewState, size]);
+  }, [land, points, viewState, size, isCity]);
 
   useEffect(() => {
     if (import.meta.env.DEV) {
@@ -432,11 +459,6 @@ export default function WorldMap({
     return (rid) =>
       hexToRgb(REGION_PALETTE[(idx.get(rid) ?? 0) % REGION_PALETTE.length]);
   }, [points, regionsTop, regionsSub]);
-
-  const isCity = useMemo(
-    () => points.some((p) => p.buildingWidth != null && p.buildingDepth != null),
-    [points],
-  );
 
   // The map body. City datasets provide explicit building footprints; older road
   // datasets provide parcel squares; legacy datasets fall back to bounded Voronoi.
@@ -928,13 +950,14 @@ export default function WorldMap({
       onClick: (info) => info.object && onSelect(info.object.point.world_id),
       // 2.5D mode (?extrude=1, city datasets only): extrude each building footprint
       // by building_height, scaled down to the layout's normalized units (see the
-      // EXTRUDE.elevationScale comment in config.js — height and footprint size live
-      // on very different scales in this dataset).
+      // EXTRUDE comment in config.js — height and footprint size live on very
+      // different scales in this dataset; elevationScale here is derived per-dataset
+      // from manifest.json's meters_per_app_unit, see the state hook above).
       extruded: extrudeMode,
       wireframe: EXTRUDE.wireframe,
       material: extrudeMode ? EXTRUDE.material : null,
       getElevation: extrudeMode
-        ? (d) => (d.point.buildingHeight ?? 0) * EXTRUDE.elevationScale
+        ? (d) => (d.point.buildingHeight ?? 0) * elevationScale
         : 0,
       updateTriggers: {
         getFillColor: selected,
@@ -1049,7 +1072,7 @@ export default function WorldMap({
     <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
       <DeckGL
         views={
-          EXTRUDE_MODE
+          extrudeMode
             ? new OrbitView({ orthographic: true, controller: true })
             : new OrthographicView({ flipY: false })
         }

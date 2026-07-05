@@ -29,7 +29,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import polars as pl
 import shapely
 import shapely.geometry
@@ -50,12 +49,14 @@ from mapgen.r1_app_export import (
     landuse_feature_collection,
     max_affine_roundtrip_error,
     oriented_rect,
+    parcel_feature,
     parcels_feature_collection,
     road_feature,
     road_kind,
     road_width_island_units,
     roads_feature_collection,
 )
+from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT as _FALLBACK_METERS_PER_UNIT
 
 _REPO = Path(__file__).resolve().parents[2]
 _DEFAULT_GREYBOX_DIR = Path(__file__).resolve().parents[1] / "artifacts/r1/greybox"
@@ -117,24 +118,46 @@ def main(argv: list[str] | None = None) -> None:
         f"scale={affine.scale:.4f}"
     )
 
+    # meters_per_app_unit = island_frame.scale (island units per app unit) *
+    # meters-per-island-unit. greybox_manifest.json (this is the G0 export,
+    # written by run_r1_hybrid.py's export_greybox) doesn't itself record a
+    # meters-per-unit -- that's a G1 mesh-bake concept (run_r1_greybox_mesh.py,
+    # a separate later step that can run with a --meters-per-unit override),
+    # so use its RECORDED value if this greybox_manifest ever grows one, else
+    # fall back to r1_mesh's own default (the value run_r1_greybox_mesh.py
+    # itself uses unless overridden).
+    meters_per_unit = float(
+        greybox_manifest.get("meters_per_unit", _FALLBACK_METERS_PER_UNIT)
+    )
+    meters_per_app_unit = affine.scale * meters_per_unit
+    print(
+        f"meters_per_unit={meters_per_unit:g} (island->meters), "
+        f"meters_per_app_unit={meters_per_app_unit:.4f}"
+    )
+
     # -----------------------------------------------------------------
     # Lots + source app_points join.
     #
     # ``lots.parquet`` (docs/lots-wave-plan.md slice L2) now includes
     # ``kind="greenspace"`` rows (surplus subdivision pieces, ``world_id=""``,
-    # no world/building) alongside the occupied ``kind="lot"`` rows. A single
-    # global ``lot_id`` is assigned here, over ALL rows (occupied +
-    # greenspace) sorted by ``(world_id, district_id, lot_x, lot_y)`` --
-    # ``world_id`` alone no longer disambiguates rows since every greenspace
-    # row shares ``world_id=""``, so the anchor point breaks the tie
-    # deterministically. ``lot_id`` is the one identifier parcels.geojson and
-    # app_points.parquet (occupied rows only) share.
+    # no world/building) alongside the occupied ``kind="lot"`` rows.
+    # ``lot_id`` is read straight from ``lots.parquet`` -- ``run_r1_hybrid.py``
+    # ``export_greybox`` now mints it upstream (its own deterministic
+    # district-walk BUILD order, assigned before that script's world_id sort)
+    # -- rather than re-minted here via a different sort, so the identifier is
+    # stable across a re-export even if this script's own row order changes.
+    # It's the one identifier parcels.geojson and app_points.parquet (occupied
+    # rows only) share.
     # -----------------------------------------------------------------
-    lots = pl.read_parquet(greybox_dir / "lots.parquet").sort(
-        ["world_id", "district_id", "lot_x", "lot_y"]
-    )
+    lots = pl.read_parquet(greybox_dir / "lots.parquet")
     n_lots = lots.height
-    lots = lots.with_columns(pl.Series("lot_id", np.arange(n_lots, dtype=np.int64)))
+    n_unique_lot_ids = lots["lot_id"].n_unique()
+    if n_unique_lot_ids != n_lots:
+        raise SystemExit(
+            f"lots.parquet's lot_id column has {n_unique_lot_ids} unique values "
+            f"over {n_lots} rows -- expected every row to have a distinct "
+            "lot_id (run_r1_hybrid.py's export_greybox invariant)."
+        )
     occupied = lots.filter(pl.col("kind") == "lot")
     n_greenspace = n_lots - occupied.height
     print(
@@ -191,17 +214,27 @@ def main(argv: list[str] | None = None) -> None:
     # min-rotated-rectangle of each occupied footprint, inverse-affined into
     # the app frame -- a faithful representation of the new frontage-aligned,
     # possibly lot-guard-clipped footprints).
+    #
+    # building_cx/building_cy (the oriented rect's OWN center) are exported
+    # separately from x/y (the lot anchor): a clipped footprint (lot-guard
+    # intersection) or a Voronoi-fallback district's footprint can have its
+    # true center offset from the lot anchor, and the viewer draws the
+    # building rect centered at building_cx/cy (falling back to x/y when
+    # absent) so buildings actually sit on their own footprints -- x/y stays
+    # the world's map/click/label position, unchanged.
     # -----------------------------------------------------------------
     xs, ys = invert_xy(joined["lot_x"].to_numpy(), joined["lot_y"].to_numpy(), affine)
 
     footprints_island = shapely.from_wkb(joined["footprint_wkb"].to_numpy())
-    widths, depths, angles = [], [], []
+    widths, depths, angles, cxs, cys = [], [], [], [], []
     for footprint in footprints_island:
         footprint_app = invert_geom(footprint, affine)
         rect = oriented_rect(footprint_app)
         widths.append(rect.width)
         depths.append(rect.depth)
         angles.append(rect.angle)
+        cxs.append(rect.cx)
+        cys.append(rect.cy)
 
     # All lots' polygons (occupied + greenspace), inverse-affined -- used by
     # parcels.geojson (every lot) and landuse.geojson (greenspace lots only).
@@ -238,6 +271,8 @@ def main(argv: list[str] | None = None) -> None:
             pl.Series("building_width", widths, dtype=pl.Float64),
             pl.Series("building_depth", depths, dtype=pl.Float64),
             pl.Series("building_angle", angles, dtype=pl.Float64),
+            pl.Series("building_cx", cxs, dtype=pl.Float64),
+            pl.Series("building_cy", cys, dtype=pl.Float64),
         )
         .rename({"height": "building_height", "district_id": "block_id"})
     )
@@ -254,6 +289,8 @@ def main(argv: list[str] | None = None) -> None:
             "building_width",
             "building_depth",
             "building_height",
+            "building_cx",
+            "building_cy",
             "lot_id",
             "block_id",
         ]
@@ -355,16 +392,7 @@ def main(argv: list[str] | None = None) -> None:
     district_ids = lots["district_id"].to_list()
     kinds = lots["kind"].to_list()
     parcel_features = [
-        {
-            "type": "Feature",
-            "geometry": shapely.geometry.mapping(geom),
-            "properties": {
-                "lot_id": lot_id,
-                "block_id": block_id,
-                "world_id": world_id,
-                "kind": kind,
-            },
-        }
+        parcel_feature(lot_id, block_id, world_id, kind, geom)
         for lot_id, world_id, block_id, kind, geom in zip(
             lot_ids, world_ids, district_ids, kinds, lot_polys_app, strict=True
         )
@@ -445,6 +473,11 @@ def main(argv: list[str] | None = None) -> None:
         },
         "layout": "city-chen-v1",
         "building_height_units": "meters",
+        # web/src/Map.jsx derives its 2.5D extrude elevationScale as
+        # EXTRUDE.exaggeration / meters_per_app_unit (building_height is
+        # meters; x/y/building_width are app-frame layout units) -- see
+        # web/src/config.js's EXTRUDE comment.
+        "meters_per_app_unit": meters_per_app_unit,
         "source": {
             "stage": "G0 (docs/greybox-plan.md Track W)",
             "greybox_dir": _rel_to_repo(greybox_dir),

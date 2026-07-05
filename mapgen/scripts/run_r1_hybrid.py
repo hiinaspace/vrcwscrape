@@ -810,7 +810,11 @@ def export_greybox(
     (perimeter-duplicate paths excluded, reusing the connectivity wave's
     ``street_perimeter_flags``), ``lots.parquet`` (now with ``lot_x``/
     ``lot_y``/``kind``/``displacement`` -- see ``mapgen.r1_lots.Lot``,
-    ``kind="greenspace"`` rows carry ``world_id=""``), and
+    ``kind="greenspace"`` rows carry ``world_id=""`` -- plus a ``lot_id``
+    column: the row's index in this function's own deterministic
+    district-walk BUILD order, assigned before the world_id sort below so
+    downstream readers (``run_r1_app_export.py``) can use it directly as a
+    stable identifier instead of re-minting one via a different sort), and
     ``greybox_manifest.json`` (``displacement_stats``/``fallback_districts``
     keys and ``counts.n_greenspace``/``counts.n_fallback``, one shared
     ``fallback_stats`` dict threaded across every district's ``build_lots``
@@ -858,6 +862,25 @@ def export_greybox(
     n_sliver = count_sliver_reassignments(all_lots)
     n_greenspace = sum(1 for lot in all_lots if lot.kind == "greenspace")
 
+    # Fallback-rate acceptance check (docs/lots-wave-plan.md): the street-
+    # fronting subdivision path is meant to be the norm, with the Voronoi
+    # fallback (:func:`build_lots`) absorbing rare geometry pathologies --
+    # not a large fraction of all districts. Mirrors the affine-roundtrip
+    # acceptance check in ``scripts/run_r1_app_export.py`` (a loud but
+    # non-fatal signal; does not raise/exit nonzero).
+    n_districts = len(district_entries)
+    n_fallback = fallback_stats.get("n_fallback", 0)
+    fallback_threshold = max(2, 0.02 * n_districts)
+    fallback_ok = n_fallback <= fallback_threshold
+    if not fallback_ok:
+        print(
+            f"!!! WARNING: {n_fallback}/{n_districts} districts fell back to "
+            f"Voronoi tessellation (threshold {fallback_threshold:.1f}) -- "
+            "street-fronting subdivision is failing far more often than "
+            "expected; see greybox_manifest.json's fallback_districts for "
+            "reasons. !!!"
+        )
+
     with (out_dir / "island.geojson").open("w") as f:
         json.dump(_greybox_island_geojson(boundary), f, indent=2, sort_keys=True)
     with (out_dir / "arterials.geojson").open("w") as f:
@@ -878,9 +901,19 @@ def export_greybox(
     with (out_dir / "streets.geojson").open("w") as f:
         json.dump(_greybox_streets_geojson(results), f, indent=2, sort_keys=True)
 
+    # lot_id: row index in the district-walk BUILD order (all_lots' append
+    # order from the district loop above -- itself deterministic given fixed
+    # inputs/seeds, see this function's docstring), assigned BEFORE the
+    # world_id sort below so it stays stable across reruns rather than being
+    # re-derived from a different sort key downstream. Paired with each Lot
+    # via enumerate() before sorting so it travels along with its lot.
+    all_lots_with_id = list(enumerate(all_lots))
     # lots.parquet — sorted by world_id so the table is deterministic
-    # independent of district/build_lots internal ordering.
-    all_lots.sort(key=lambda lot: lot.world_id)
+    # independent of district/build_lots internal ordering (lot_id, above,
+    # is what preserves the build-order identity through this sort).
+    all_lots_with_id.sort(key=lambda pair: pair[1].world_id)
+    lot_ids = [pair[0] for pair in all_lots_with_id]
+    all_lots = [pair[1] for pair in all_lots_with_id]
     lots_df = pl.DataFrame(
         {
             "world_id": [lot.world_id for lot in all_lots],
@@ -902,6 +935,7 @@ def export_greybox(
             "lot_y": [lot.lot_y for lot in all_lots],
             "kind": [lot.kind for lot in all_lots],
             "displacement": [lot.displacement for lot in all_lots],
+            "lot_id": lot_ids,
         }
     )
     lots_df.write_parquet(out_dir / "lots.parquet")
@@ -953,6 +987,7 @@ def export_greybox(
         },
         "displacement_stats": displacement_stats(all_lots),
         "fallback_districts": fallback_stats.get("fallback_districts", []),
+        "acceptance": {"fallback_ok": fallback_ok},
         "island_frame": island_frame,
         "coordinate_note": (
             "Planar geometry in every greybox export file (island/arterials/"

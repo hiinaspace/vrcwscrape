@@ -262,8 +262,13 @@ def roads_feature_collection(features: Sequence[Mapping[str, Any]]) -> dict[str,
 
 
 def parcel_feature(
-    lot_id: int, block_id: int, world_id: str, geom: Any
+    lot_id: int, block_id: int, world_id: str, kind: str, geom: Any
 ) -> dict[str, Any]:
+    """One ``parcels.geojson`` feature -- ``kind`` is ``"lot"`` (a world sits
+    here) or ``"greenspace"`` (surplus subdivision piece, no world/building --
+    docs/lots-wave-plan.md slice L2). Superseded the pre-L2 ``contains_building``
+    boolean property, which assumed every parcel had a building; ``kind``
+    covers that (and more) directly."""
     return {
         "type": "Feature",
         "geometry": sg.mapping(geom),
@@ -271,7 +276,7 @@ def parcel_feature(
             "lot_id": lot_id,
             "block_id": block_id,
             "world_id": world_id,
-            "contains_building": True,
+            "kind": kind,
         },
     }
 

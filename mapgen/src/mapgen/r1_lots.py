@@ -12,12 +12,19 @@ count).
 Design decision (user-approved, ``docs/lots-wave-plan.md``): worlds are
 allowed BOUNDED displacement -- district membership is decided from a world's
 TRUE (DR) coordinate (:func:`assign_worlds_to_districts`, unchanged), but each
-world is then moved onto its assigned lot's anchor point. Displacement is
-bounded by the district's own OBB diagonal, since membership was already
-locked in from the true coordinate before any lot geometry exists. The
-original coordinate is preserved on ``Lot.x``/``Lot.y``; ``Lot.lot_x``/
-``Lot.lot_y`` carry the assigned anchor and ``Lot.displacement`` the distance
-between them.
+world is then moved onto its assigned lot's anchor point. For an
+``assigned="direct"`` world (point-in-polygon membership), displacement IS
+bounded by the district's own OBB diagonal, since its true coordinate already
+lay inside the district before any lot geometry existed. For an
+``assigned="snapped"`` world (no district contained its true coordinate, so
+:func:`assign_worlds_to_districts` snapped it to the NEAREST district), the
+true coordinate can sit arbitrarily far OUTSIDE that district -- its
+displacement is the snap distance PLUS a district-scale term and is NOT
+bounded by the district's own size. :func:`displacement_stats` reports both
+the combined (manifest-compat) stats and a per-``assigned``-kind split so this
+distinction stays visible rather than getting averaged away. The original
+coordinate is preserved on ``Lot.x``/``Lot.y``; ``Lot.lot_x``/``Lot.lot_y``
+carry the assigned anchor and ``Lot.displacement`` the distance between them.
 
 Pure module: no IO, no plotting. ``scripts/run_r1_hybrid.py`` (``--greybox-out``)
 is the only caller that touches disk.
@@ -135,8 +142,12 @@ class Lot:
     ``x``/``y`` are the world's ORIGINAL (true DR) coordinates -- these never
     move. ``lot_x``/``lot_y`` are the assigned lot's anchor point (the point
     the world's building actually sits at); ``displacement`` is the Euclidean
-    distance between them, bounded by the district's own OBB diagonal (see
-    the module docstring's bounded-displacement design decision).
+    distance between them. For ``assigned="direct"`` worlds this IS bounded by
+    the district's own OBB diagonal (see the module docstring's bounded-
+    displacement design decision); for ``assigned="snapped"`` worlds it is
+    NOT -- it additionally carries the snap distance from the world's true
+    coordinate to the district it got snapped into, which can be arbitrarily
+    large.
 
     ``kind`` is ``"lot"`` (occupied: a world assigned to it) or
     ``"greenspace"`` (surplus subdivision piece with no world -- ``world_id``
@@ -367,19 +378,35 @@ def _lot_aspect_ratio(poly: sg.Polygon) -> float:
     return float(max(lens.max(), short) / short)
 
 
-def _frontage_length(piece: sg.Polygon, ext_ring: sg.LinearRing) -> float:
-    """Total boundary length of ``piece`` lying on ``ext_ring`` (small buffer tol)."""
+def _frontage_length(
+    piece: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    ext_buffer: sg.base.BaseGeometry | None = None,
+) -> float:
+    """Total boundary length of ``piece`` lying on ``ext_ring`` (small buffer tol).
+
+    ``ext_buffer``, if given, must be ``ext_ring.buffer(_FRONTAGE_TOUCH_TOL)``
+    precomputed by the caller -- :func:`subdivide_district`/:func:`build_lots`
+    thread it through so that buffer (which doesn't depend on ``piece``) is
+    computed ONCE per call rather than once per query across an entire
+    recursion. Recomputed on the fly when omitted, so direct test callers
+    keep working unmodified."""
     if piece.is_empty:
         return 0.0
-    buffered = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
+    buffered = (
+        ext_ring.buffer(_FRONTAGE_TOUCH_TOL) if ext_buffer is None else ext_buffer
+    )
     shared = piece.boundary.intersection(buffered)
     return float(shared.length) if hasattr(shared, "length") else 0.0
 
 
 def _touches_ext_ring(
-    piece: sg.Polygon, ext_ring: sg.LinearRing, min_frontage: float
+    piece: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    min_frontage: float,
+    ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> bool:
-    return _frontage_length(piece, ext_ring) > max(min_frontage, 1e-9)
+    return _frontage_length(piece, ext_ring, ext_buffer) > max(min_frontage, 1e-9)
 
 
 def _split_candidates(
@@ -410,12 +437,20 @@ def _best_split(
     ext_ring: sg.LinearRing,
     cfg: LotConfig,
     rng: np.random.Generator,
+    ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> list[sg.Polygon] | None:
     """Try the candidate cut lines from :func:`_split_candidates`, score valid
     binary splits (area balance + child rectangularity/aspect), and return the
     best pair -- preferring candidates where BOTH children still touch the
     district exterior ring. ``None`` if no candidate produces a clean 2-piece
-    split (the caller treats ``poly`` as an (oversized or unsplittable) leaf)."""
+    split (the caller treats ``poly`` as an (oversized or unsplittable) leaf).
+
+    ``ext_buffer``, if given, is ``ext_ring``'s precomputed frontage-touch
+    buffer (see :func:`_frontage_length`) -- threaded through by
+    :func:`subdivide_district`/:func:`_fill_deficit` so it's computed once per
+    top-level call rather than once per candidate split."""
+    if ext_buffer is None:
+        ext_buffer = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
     lines = _split_candidates(poly, cfg, rng)
     min_area = 1e-9 * max(poly.area, 1e-12)
     scored: list[tuple[bool, float, int, list[sg.Polygon]]] = []
@@ -438,7 +473,7 @@ def _best_split(
                 aspect_pen += ar - cfg.aspect_clamp
         score = balance * 0.5 + irregularity + aspect_pen
         frontage_bad = not all(
-            _touches_ext_ring(p, ext_ring, cfg.min_frontage) for p in parts
+            _touches_ext_ring(p, ext_ring, cfg.min_frontage, ext_buffer) for p in parts
         )
         children = sorted(parts, key=_poly_sort_key)
         scored.append((frontage_bad, score, order_idx, children))
@@ -454,12 +489,18 @@ def _fill_deficit(
     ext_ring: sg.LinearRing,
     cfg: LotConfig,
     rng: np.random.Generator,
+    ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> list[sg.Polygon] | None:
     """Re-split the largest still-splittable leaf until ``len(leaves) >=
     n_needed``. Returns ``None`` (subdivision failure) if every remaining
     leaf refuses to split further while a deficit remains -- this always
     terminates: each iteration either grows the leaf count or permanently
-    moves one leaf to ``unsplittable``, so the loop cannot spin forever."""
+    moves one leaf to ``unsplittable``, so the loop cannot spin forever.
+
+    ``ext_buffer`` is threaded through to :func:`_best_split` (see
+    :func:`_frontage_length`)."""
+    if ext_buffer is None:
+        ext_buffer = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
     splittable = list(leaves)
     unsplittable: list[sg.Polygon] = []
     while len(splittable) + len(unsplittable) < n_needed:
@@ -470,7 +511,7 @@ def _fill_deficit(
             key=lambda i: (splittable[i].area, _poly_sort_key(splittable[i])),
         )
         target = splittable.pop(idx)
-        children = _best_split(target, ext_ring, cfg, rng)
+        children = _best_split(target, ext_ring, cfg, rng, ext_buffer)
         if children is None:
             unsplittable.append(target)
             continue
@@ -519,10 +560,25 @@ def subdivide_district(
     """
     if cfg is None:
         cfg = LotConfig()
-    if n_lots <= 1 or district.is_empty or district.area <= 0.0:
+    if n_lots <= 1:
         return [district]
+    if district.is_empty or district.area <= 0.0:
+        # M >= N is a hard contract once n_lots > 1: a degenerate district
+        # (empty/zero-area geometry, e.g. a collapsed/duplicate-vertex
+        # polygon slipping through upstream) can never honor it -- raise so
+        # build_lots falls back to _build_lots_voronoi instead of silently
+        # returning a single lot for a district that needs >= 2.
+        raise _SubdivisionFailure(
+            f"district is empty or has zero area but n_lots={n_lots} > 1"
+        )
 
     ext_ring = district.exterior
+    # Computed ONCE per subdivide_district call and threaded through every
+    # frontage query below (_best_split -> _touches_ext_ring -> _frontage_length)
+    # instead of re-buffering ext_ring on every single candidate-split check
+    # (docs/lots-wave-plan.md perf fix) -- the buffer doesn't depend on the
+    # piece being tested, only on the district's own exterior ring.
+    ext_buffer = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
     rng = np.random.default_rng(seed)
     target_area = district.area / float(n_lots)
 
@@ -535,7 +591,7 @@ def subdivide_district(
         ):
             leaves.append(poly)
             return
-        children = _best_split(poly, ext_ring, cfg, rng)
+        children = _best_split(poly, ext_ring, cfg, rng, ext_buffer)
         if children is None:
             leaves.append(poly)
             return
@@ -545,7 +601,7 @@ def subdivide_district(
     _recurse(district, 0)
 
     if len(leaves) < n_lots:
-        filled = _fill_deficit(leaves, n_lots, ext_ring, cfg, rng)
+        filled = _fill_deficit(leaves, n_lots, ext_ring, cfg, rng, ext_buffer)
         if filled is None:
             raise _SubdivisionFailure(
                 f"could not reach {n_lots} lots from district (got {len(leaves)})"
@@ -579,14 +635,20 @@ def _assert_partition(
 
 
 def _frontage_direction(
-    lot_poly: sg.Polygon, ext_ring: sg.LinearRing, min_frontage: float
+    lot_poly: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    min_frontage: float,
+    ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> np.ndarray | None:
     """Unit direction of the LONGEST boundary edge of ``lot_poly`` that lies
     on ``ext_ring`` (the district's street frontage), or ``None`` if no edge
     qualifies (``>= min_frontage`` long and fully covered by a small buffer
     around ``ext_ring``) -- the caller falls back to the lot's own OBB long
-    axis in that case."""
-    buffered = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
+    axis in that case. ``ext_buffer``, if given, is ``ext_ring``'s precomputed
+    frontage-touch buffer (see :func:`_frontage_length`)."""
+    buffered = (
+        ext_ring.buffer(_FRONTAGE_TOUCH_TOL) if ext_buffer is None else ext_buffer
+    )
     coords = list(lot_poly.exterior.coords)
     best_len = max(min_frontage, 1e-9)
     best_dir: np.ndarray | None = None
@@ -604,19 +666,25 @@ def _frontage_direction(
 
 
 def _oriented_footprint(
-    lot_poly: sg.Polygon, ext_ring: sg.LinearRing, cfg: LotConfig
+    lot_poly: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    cfg: LotConfig,
+    ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> sg.Polygon:
     """Building footprint oriented to ``lot_poly``'s frontage edge (fallback:
     its own OBB long axis), sized from its OBB fill ratio clamped into
     ``cfg.building_width_frac`` / ``cfg.building_depth_frac``, inset by
     ``cfg.inset`` and guaranteed fully inside the lot (intersected with an
     inward-buffered guard copy of it, same collapse-to-nonempty fallback as
-    :func:`_footprint`)."""
+    :func:`_footprint`). ``ext_buffer``, if given, is ``ext_ring``'s
+    precomputed frontage-touch buffer (see :func:`_frontage_length`) --
+    :func:`build_lots` threads it through so it's computed once per district
+    rather than once per lot."""
     if lot_poly.is_empty or lot_poly.area <= 0.0:
         return _footprint(lot_poly, cfg.inset)
 
     center, axis_long, axis_short, long_len, short_len = _obb_axes(lot_poly)
-    frontage_dir = _frontage_direction(lot_poly, ext_ring, cfg.min_frontage)
+    frontage_dir = _frontage_direction(lot_poly, ext_ring, cfg.min_frontage, ext_buffer)
     if frontage_dir is not None:
         along = frontage_dir
         perp = np.array([-along[1], along[0]])
@@ -665,12 +733,13 @@ def _oriented_footprint(
     return footprint
 
 
-def displacement_stats(lots: list[Lot]) -> dict[str, float | int]:
-    """Median/p95/max ``Lot.displacement`` over OCCUPIED (``kind == "lot"``)
-    lots. Greenspace lots carry no world so their (always-0.0) displacement
-    isn't meaningful and is excluded. Returns zeros (never NaN/None) when
-    there are no occupied lots, so callers can always index the dict."""
-    values = sorted(lot.displacement for lot in lots if lot.kind == "lot")
+def _percentile_stats(values: list[float]) -> dict[str, float | int]:
+    """Shared n/median/p95/max computation for :func:`displacement_stats`'s
+    combined stats and its per-``assigned``-kind splits. ``p95`` indexes the
+    sorted values at ``ceil(0.95 * n) - 1`` (clamped to the last index), so it
+    equals ``max`` for small ``n`` but diverges once ``n`` is large enough for
+    the ceiling to land short of the final element."""
+    values = sorted(values)
     n = len(values)
     if n == 0:
         return {"n": 0, "median": 0.0, "p95": 0.0, "max": 0.0}
@@ -681,6 +750,33 @@ def displacement_stats(lots: list[Lot]) -> dict[str, float | int]:
         "p95": float(values[p95_idx]),
         "max": float(values[-1]),
     }
+
+
+def displacement_stats(lots: list[Lot]) -> dict[str, Any]:
+    """Median/p95/max ``Lot.displacement`` over OCCUPIED (``kind == "lot"``)
+    lots. Greenspace lots carry no world so their (always-0.0) displacement
+    isn't meaningful and is excluded. Returns zeros (never NaN/None) when
+    there are no occupied lots, so callers can always index the dict.
+
+    The top-level ``n``/``median``/``p95``/``max`` keys are the COMBINED
+    stats over every occupied lot regardless of ``assigned`` kind (kept for
+    manifest/back-compat). ``"direct"`` and ``"snapped"`` are the SAME four
+    keys computed separately per :class:`Lot`'s ``assigned`` field -- see the
+    module docstring's bounded-displacement design decision: only the
+    ``"direct"`` split is bounded by district size, so collapsing the two
+    together (the combined stats alone) can hide a snapped-world outlier
+    inside an otherwise-tight distribution."""
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    combined: dict[str, Any] = dict(
+        _percentile_stats([lot.displacement for lot in occupied])
+    )
+    combined["direct"] = _percentile_stats(
+        [lot.displacement for lot in occupied if lot.assigned == "direct"]
+    )
+    combined["snapped"] = _percentile_stats(
+        [lot.displacement for lot in occupied if lot.assigned == "snapped"]
+    )
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1086,10 @@ def build_lots(
         seed = district_id
 
     ext_ring = district.exterior
+    # Computed ONCE per build_lots call and threaded through every
+    # _oriented_footprint call below, instead of re-buffering ext_ring per
+    # lot (docs/lots-wave-plan.md perf fix).
+    ext_buffer = ext_ring.buffer(_FRONTAGE_TOUCH_TOL)
 
     if n == 1:
         lot_poly = district
@@ -997,7 +1097,7 @@ def build_lots(
             Lot(
                 world_id=world_ids[0],
                 district_id=district_id,
-                footprint=_oriented_footprint(lot_poly, ext_ring, cfg),
+                footprint=_oriented_footprint(lot_poly, ext_ring, cfg, ext_buffer),
                 lot=lot_poly,
                 height=heights[0],
                 name=names[0],
@@ -1019,6 +1119,17 @@ def build_lots(
     # enumerate in advance).
     try:
         lot_polys = subdivide_district(district, n, seed, cfg)
+        if len(lot_polys) < n:
+            # Belt-and-braces: subdivide_district's own contract is M >= N,
+            # but this is the IO/logic boundary where a future change to that
+            # function (or a pathological case it doesn't itself detect)
+            # could silently under-deliver. Treat it exactly like any other
+            # subdivision failure rather than letting a short lot_polys list
+            # reach the Hungarian assignment below (which would raise or
+            # silently mismatch instead of falling back cleanly).
+            raise _SubdivisionFailure(
+                f"subdivide_district returned {len(lot_polys)} lots < {n} requested"
+            )
         _assert_partition(district, lot_polys)
     except Exception as exc:
         if fallback_stats is not None:
@@ -1061,7 +1172,7 @@ def build_lots(
             Lot(
                 world_id=world_ids[i],
                 district_id=district_id,
-                footprint=_oriented_footprint(lot_poly, ext_ring, cfg),
+                footprint=_oriented_footprint(lot_poly, ext_ring, cfg, ext_buffer),
                 lot=lot_poly,
                 height=heights[i],
                 name=names[i],

@@ -193,7 +193,10 @@ function searchTerms(query) {
 }
 
 let _manifestPromise;
-async function getManifest() {
+// Exported (narrow addition, see the lots-wave fix report) so Map.jsx can read
+// manifest fields the rest of this module doesn't otherwise expose, e.g.
+// meters_per_app_unit (2.5D extrude elevationScale derivation).
+export async function getManifest() {
   if (_manifestPromise) return _manifestPromise;
   _manifestPromise = (async () => {
     try {
@@ -300,6 +303,8 @@ export async function loadPoints() {
     "building_width",
     "building_depth",
     "building_height",
+    "building_cx",
+    "building_cy",
     "lot_id",
     "block_id",
     "road_id",
@@ -332,6 +337,8 @@ export async function loadPoints() {
       buildingWidth: r.building_width == null ? null : Number(r.building_width),
       buildingDepth: r.building_depth == null ? null : Number(r.building_depth),
       buildingHeight: r.building_height == null ? null : Number(r.building_height),
+      buildingCx: r.building_cx == null ? null : Number(r.building_cx),
+      buildingCy: r.building_cy == null ? null : Number(r.building_cy),
       lotId: r.lot_id == null ? null : Number(r.lot_id),
       blockId: r.block_id == null ? null : Number(r.block_id),
       roadId: r.road_id == null ? null : Number(r.road_id),

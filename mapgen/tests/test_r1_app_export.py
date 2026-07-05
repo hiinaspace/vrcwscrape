@@ -270,8 +270,8 @@ def test_roads_feature_collection_sorted_by_road_id() -> None:
 def test_parcels_feature_collection_props_and_no_road_id_key() -> None:
     poly = sg.box(0, 0, 1, 1)
     feats = [
-        parcel_feature(1, 7, "wrld_b", poly),
-        parcel_feature(0, 7, "wrld_a", poly),
+        parcel_feature(1, 7, "wrld_b", "lot", poly),
+        parcel_feature(0, 7, "wrld_a", "lot", poly),
     ]
     fc = parcels_feature_collection(feats)
     ids = [f["properties"]["lot_id"] for f in fc["features"]]
@@ -281,9 +281,20 @@ def test_parcels_feature_collection_props_and_no_road_id_key() -> None:
         "lot_id": 0,
         "block_id": 7,
         "world_id": "wrld_a",
-        "contains_building": True,
+        "kind": "lot",
     }
     assert "road_id" not in props
+
+
+def test_parcel_feature_greenspace_kind() -> None:
+    poly = sg.box(0, 0, 1, 1)
+    feat = parcel_feature(2, 3, "", "greenspace", poly)
+    assert feat["properties"] == {
+        "lot_id": 2,
+        "block_id": 3,
+        "world_id": "",
+        "kind": "greenspace",
+    }
 
 
 def test_blocks_feature_collection_sorted_by_block_id() -> None:

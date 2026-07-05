@@ -69,11 +69,14 @@ the brief are already answered by existing code.
   Comparable to a modest Unity terrain heightmap (384×~240), fine for macro
   relief, too coarse for literal per-road hairpin geometry without upsampling
   or a local detail layer.
-- Mesh tri budget breakdown (`mapgen/artifacts/r1/greybox_mesh/greybox_mesh_manifest.json`,
-  the committed G1 artifact): **379,093 tris total — buildings 356,706
-  (94.1%), roads 22,562 (6.0%), ground+water+parks 415 (0.1%)**. Ground is
-  currently a two-triangle flat slab. This number anchors the RQ4 budget
-  discussion below.
+- Mesh tri budget breakdown (`mapgen/artifacts/r1/greybox_mesh/greybox_mesh_manifest.json`
+  -- `mapgen/artifacts/` is gitignored local state, not committed to git;
+  regenerate from `mapgen/` with
+  `uv run python scripts/run_r1_hybrid.py --total-target 1200 --max-gate-spacing 20 --greybox-out artifacts/r1/greybox`
+  then `uv run python scripts/run_r1_greybox_mesh.py`): **379,093 tris total —
+  buildings 356,706 (94.1%), roads 22,562 (6.0%), ground+water+parks 415
+  (0.1%)**. Ground is currently a two-triangle flat slab. This number anchors
+  the RQ4 budget discussion below.
 
 ### A documented-vs-shipped contradiction (flag per the brief's instructions)
 
@@ -305,7 +308,8 @@ above four.
   **~50k triangles for a Quest-compatible world**, plus a **100MB
   post-compression size cap on Quest**
   ([creators.vrchat.com/platforms/android/quest-content-optimization](https://creators.vrchat.com/platforms/android/quest-content-optimization/)).
-  The current committed greybox is already **379k tris**, above the PC
+  The current greybox (regenerated locally per §0's commands above -- the
+  artifact itself is gitignored, never committed) is already **379k tris**, above the PC
   advisory figure, yet G2's in-headset eval called performance "trivial on
   modern GPUs" with "ample headroom." Read this as: either the 250k figure is
   conservative/dated for modern PC VR hardware, or this world is implicitly
@@ -314,7 +318,7 @@ above four.
   the total available budget by ~5-7×, and terrain is exactly the kind of
   addition (100% new geometry) that would need to respect whichever ceiling
   applies.
-- Given the committed budget breakdown (§0: buildings 94.1%, roads 6.0%,
+- Given the budget breakdown above (§0: buildings 94.1%, roads 6.0%,
   ground+water 0.1% of 379k), **terrain has enormous headroom under the
   PC-only reading** — even a terrain layer 10-50× the current ground tri
   count (i.e. 4k-20k tris) would only add 1-5% to the total. Under a

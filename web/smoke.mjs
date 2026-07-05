@@ -82,4 +82,44 @@ const vsAfter = await page.evaluate(() => window.__vs);
 console.log("SIDEBAR TITLE AFTER CLICK:", JSON.stringify(sidebarTitle));
 console.log("SIDEBAR:", JSON.stringify(sidebar));
 console.log("VS BEFORE:", JSON.stringify(vsBefore), "AFTER:", JSON.stringify(vsAfter));
+
+// ---------------------------------------------------------------------------
+// Second pass: 2.5D extrude mode (?data=island-chen&extrude=1) smoke check.
+// A fresh page + its own console/pageerror listeners, so this pass's
+// assertions never mix with the default pass above. Only asserts canvas
+// presence + zero console errors (a real visual review is a main-thread /
+// Fable-vision task, not this script's job) + one screenshot for the record.
+// ---------------------------------------------------------------------------
+const extrudeErrors = [];
+const extrudePage = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+extrudePage.on("console", (m) => {
+  console.log(`[extrude console.${m.type()}]`, m.text());
+  if (m.type() === "error") extrudeErrors.push(m.text());
+});
+extrudePage.on("pageerror", (e) => {
+  console.log("[extrude pageerror]", e.message);
+  extrudeErrors.push(e.message);
+});
+
+const extrudeUrl = `${URL}?data=island-chen&extrude=1`;
+await extrudePage.goto(extrudeUrl, { waitUntil: "networkidle" });
+await extrudePage.waitForTimeout(8000);
+const extrudeHasCanvas = (await extrudePage.$("canvas")) != null;
+console.log(
+  "EXTRUDE HAS CANVAS:",
+  extrudeHasCanvas,
+  "| console errors:",
+  extrudeErrors.length,
+);
+await extrudePage.screenshot({ path: "/tmp/map-extrude.png" });
+if (!extrudeHasCanvas) {
+  console.log("EXTRUDE SMOKE FAILED: no canvas");
+  process.exitCode = 1;
+}
+if (extrudeErrors.length > 0) {
+  console.log("EXTRUDE SMOKE FAILED: console errors present:", extrudeErrors);
+  process.exitCode = 1;
+}
+await extrudePage.close();
+
 await browser.close();

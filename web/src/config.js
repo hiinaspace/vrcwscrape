@@ -35,12 +35,20 @@ export const BUILDINGS = {
 };
 
 // 2.5D extrusion mode (?extrude=1). building_height in app_points.parquet is in
-// METERS while x/y/building_width are app-frame layout units. For the island-chen
-// dataset 1 app unit = 17.6886 island units × 25 m/unit ≈ 442 m, so the physically
-// correct conversion is 1/442 ≈ 0.00226 — the preview then shows the same massing
-// proportions the Unity bake will. Raise/lower only to deliberately exaggerate or
+// METERS while x/y/building_width are app-frame layout units, so Map.jsx derives
+// the ACTUAL elevationScale per-dataset as exaggeration / meters_per_app_unit,
+// where meters_per_app_unit comes from the loaded manifest.json (written by
+// run_r1_app_export.py: island_frame.scale * meters-per-island-unit, e.g. for the
+// island-chen dataset 17.6886 island units/app-unit × 25 m/unit ≈ 442 m/app-unit).
+// exaggeration: 1.0 is physically correct (the preview then shows the same massing
+// proportions the Unity bake will); raise/lower only to deliberately exaggerate or
 // flatten relief.
 export const EXTRUDE = {
+  exaggeration: 1.0,
+  // Fallback elevationScale (island-chen's own 1/442 ≈ 0.00226) used ONLY for a
+  // dataset whose manifest.json has no meters_per_app_unit (older/non-mapgen
+  // exports) -- current mapgen exports always carry the field, so this path is
+  // legacy-dataset insurance, not the normal case.
   elevationScale: 0.00226,
   // OrthographicView looks straight down the z axis, so extrusion has no visible
   // relief there; extrude mode swaps in OrbitView (same target/zoom convention,
