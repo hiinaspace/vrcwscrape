@@ -15,6 +15,12 @@ const _params = new URLSearchParams(location.search);
 const _data = (_params.get("data") || "").toLowerCase();
 const _layout = (_params.get("layout") || "").toLowerCase();
 
+// 2.5D building extrusion toggle (city datasets only; see EXTRUDE in config.js and
+// its use in Map.jsx). `?extrude=1` (or any truthy-looking value) enables it.
+export const EXTRUDE_MODE = ["1", "true", "yes"].includes(
+  (_params.get("extrude") || "").toLowerCase(),
+);
+
 function datasetFromParams(data, layout) {
   if (data === "20k") return { key: "20k", dir: "", label: "20k UMAP" };
   if (

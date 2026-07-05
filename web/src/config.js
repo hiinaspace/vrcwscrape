@@ -34,6 +34,29 @@ export const BUILDINGS = {
   strokeMinZoomTier: "near",
 };
 
+// 2.5D extrusion mode (?extrude=1). building_height in app_points.parquet is in raw
+// world/meter units (~4-100+ for the island-chen dataset) while x/y/building_width
+// are in the map's own normalized layout units (~0.02-0.5 wide, spanning ~O(10) for
+// the whole island) — i.e. height lives on a completely different scale than the
+// footprint. elevationScale converts height -> layout units; tuned so a ~50-unit
+// building reads as a handful of footprint-widths tall rather than a skyscraper
+// spike or a paper-thin slab. Iterate here if buildings look too spiky/flat.
+export const EXTRUDE = {
+  elevationScale: 0.0025,
+  // OrthographicView looks straight down the z axis, so extrusion has no visible
+  // relief there; extrude mode swaps in OrbitView (same target/zoom convention,
+  // non-geospatial like Orthographic) pitched by rotationX degrees.
+  rotationX: 50,
+  rotationOrbit: 0,
+  material: {
+    ambient: 0.55,
+    diffuse: 0.65,
+    shininess: 24,
+    specularColor: [255, 255, 255],
+  },
+  wireframe: false,
+};
+
 // "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). The land is
 // a precomputed alpha-shape polygon over the world coordinates, so it stays solid at
 // any zoom without drawing every world as an overlapping scatter point.
@@ -43,8 +66,18 @@ export const LAND = {
 };
 
 export const LANDUSE = {
+  visibleFromTier: "mid", // "far" | "mid" | "near"
   parkColor: [196, 218, 184, 210],
   developedColor: [232, 231, 224, 70],
+};
+
+// Block outlines (the road-network cells that group lots) — a faint structural line
+// under the parcels/buildings, visible a bit before individual parcels are.
+export const BLOCKS = {
+  visibleFromTier: "mid", // "far" | "mid" | "near"
+  fillColor: [0, 0, 0, 0], // unfilled by default; set alpha > 0 to tint blocks
+  lineColor: [130, 128, 120, 110],
+  lineWidth: 0.9,
 };
 
 export const PARCELS = {

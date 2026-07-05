@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeckGL from "@deck.gl/react";
-import { OrthographicView } from "@deck.gl/core";
+import { OrbitView, OrthographicView } from "@deck.gl/core";
 import { GeoJsonLayer, PolygonLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import { Delaunay } from "d3-delaunay";
-import { DATA_DIR, getLevels, loadPoints } from "./duckdb.js";
+import { DATA_DIR, EXTRUDE_MODE, getLevels, loadPoints } from "./duckdb.js";
 import { hexToRgb, labelPoint } from "./util.js";
 import {
+  BLOCKS,
   BUILDINGS,
   CAPITOL_DOT,
   CAPITOLS_PER_REGION,
   CELLS,
+  EXTRUDE,
   LABEL_STYLE,
   LABELS,
   LAND,
+  LANDUSE,
   OCEAN,
   PARCELS,
   REGION_BG,
@@ -281,6 +284,8 @@ export default function WorldMap({
   const [roadsMid, setRoadsMid] = useState(null);
   const [roadsNear, setRoadsNear] = useState(null);
   const [parcels, setParcels] = useState(null);
+  const [landuse, setLanduse] = useState(null);
+  const [blocks, setBlocks] = useState(null);
   const [viewState, setViewState] = useState(null);
   const [size, setSize] = useState({ width: 1, height: 1 });
   // Hold label rendering until Inter is loaded, so deck builds the SDF atlas from the
@@ -290,6 +295,7 @@ export default function WorldMap({
   const wrapRef = useRef(null);
   const focusAnimation = useRef(null);
   const parcelsRequested = useRef(false);
+  const blocksRequested = useRef(false);
 
   const cancelFocusAnimation = () => {
     if (focusAnimation.current != null) cancelAnimationFrame(focusAnimation.current);
@@ -337,6 +343,11 @@ export default function WorldMap({
         fetch(base + "roads_near.geojson")
           .then((r) => (r.ok ? r.json() : null))
           .then(setRoadsNear, () => setRoadsNear(null));
+        // landuse.geojson is small (park/developed patches) — fetch eagerly like
+        // roads; datasets without it (non-city) just resolve null, no console spam.
+        fetch(base + "landuse.geojson")
+          .then((r) => (r.ok ? r.json() : null))
+          .then(setLanduse, () => setLanduse(null));
         return loadPoints();
       })
       .then((d) => {
@@ -394,6 +405,11 @@ export default function WorldMap({
       minZoomY: v.zoom - 2,
       maxZoomX: v.zoom + 13,
       maxZoomY: v.zoom + 13,
+      // Extra fields consumed only by OrbitView (extrude mode's pitched view); the
+      // default OrthographicView ignores them.
+      ...(EXTRUDE_MODE
+        ? { rotationX: EXTRUDE.rotationX, rotationOrbit: EXTRUDE.rotationOrbit }
+        : {}),
     });
   }, [land, points, viewState, size]);
 
@@ -737,6 +753,19 @@ export default function WorldMap({
       .then(setParcels, () => setParcels(null));
   }, [isCity, parcels, tier]);
 
+  // blocks.geojson can be large (thousands of features covering the whole city), so
+  // it's lazily fetched once the zoom tier reaches BLOCKS.visibleFromTier — same
+  // lazy/gate convention as parcels above. Datasets without the file resolve null.
+  useEffect(() => {
+    if (!isCity || blocks || blocksRequested.current) return;
+    if (TIER_RANK[tier] < TIER_RANK[BLOCKS.visibleFromTier]) return;
+    blocksRequested.current = true;
+    const base = import.meta.env.BASE_URL + DATA_DIR;
+    fetch(base + "blocks.geojson")
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setBlocks, () => setBlocks(null));
+  }, [isCity, blocks, tier]);
+
   if (!viewState) {
     return (
       <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
@@ -751,6 +780,13 @@ export default function WorldMap({
   const roadsVisible = roads && TIER_RANK[tier] >= TIER_RANK[ROADS.visibleFromTier];
   const parcelsVisible =
     isCity && parcels && TIER_RANK[tier] >= TIER_RANK[PARCELS.visibleFromTier];
+  const landuseVisible =
+    isCity && landuse && TIER_RANK[tier] >= TIER_RANK[LANDUSE.visibleFromTier];
+  const blocksVisible =
+    isCity && blocks && TIER_RANK[tier] >= TIER_RANK[BLOCKS.visibleFromTier];
+  const landuseFillColor = (f) =>
+    f.properties.kind === "park" ? LANDUSE.parkColor : LANDUSE.developedColor;
+  const extrudeMode = EXTRUDE_MODE && isCity;
   const roadWidth = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
@@ -845,6 +881,30 @@ export default function WorldMap({
         getFillColor: (f) => [...regionRGB(f.properties.region), REGION_BG.l2Alpha],
         pickable: false,
       }),
+    // landuse (park/developed patches) — a filled backdrop under blocks/buildings.
+    landuseVisible &&
+      new GeoJsonLayer({
+        id: "landuse",
+        data: landuse,
+        filled: true,
+        stroked: false,
+        getFillColor: landuseFillColor,
+        pickable: false,
+      }),
+    // block outlines — the road-network cells that group lots, faint structure
+    // beneath parcels/buildings.
+    blocksVisible &&
+      new GeoJsonLayer({
+        id: "blocks",
+        data: blocks,
+        filled: BLOCKS.fillColor[3] > 0,
+        stroked: true,
+        getFillColor: BLOCKS.fillColor,
+        getLineColor: BLOCKS.lineColor,
+        lineWidthUnits: "pixels",
+        getLineWidth: BLOCKS.lineWidth,
+        pickable: false,
+      }),
     new PolygonLayer({
       id: isCity ? "buildings" : "cells",
       data: visibleCells,
@@ -866,6 +926,16 @@ export default function WorldMap({
       filled: true,
       pickable: true,
       onClick: (info) => info.object && onSelect(info.object.point.world_id),
+      // 2.5D mode (?extrude=1, city datasets only): extrude each building footprint
+      // by building_height, scaled down to the layout's normalized units (see the
+      // EXTRUDE.elevationScale comment in config.js — height and footprint size live
+      // on very different scales in this dataset).
+      extruded: extrudeMode,
+      wireframe: EXTRUDE.wireframe,
+      material: extrudeMode ? EXTRUDE.material : null,
+      getElevation: extrudeMode
+        ? (d) => (d.point.buildingHeight ?? 0) * EXTRUDE.elevationScale
+        : 0,
       updateTriggers: {
         getFillColor: selected,
         getLineColor: selected,
@@ -978,7 +1048,11 @@ export default function WorldMap({
   return (
     <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
       <DeckGL
-        views={new OrthographicView({ flipY: false })}
+        views={
+          EXTRUDE_MODE
+            ? new OrbitView({ orthographic: true, controller: true })
+            : new OrthographicView({ flipY: false })
+        }
         viewState={viewState}
         controller={true}
         pickingRadius={6}
