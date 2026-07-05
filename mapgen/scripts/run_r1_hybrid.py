@@ -90,6 +90,7 @@ from mapgen.r1_lots import (  # noqa: E402
     assign_worlds_to_districts,
     build_lots,
     count_sliver_reassignments,
+    displacement_stats,
     select_member_points,
 )
 from mapgen.r1_macro import (  # noqa: E402
@@ -807,8 +808,13 @@ def export_greybox(
     Writes ``island.geojson``, ``arterials.geojson`` (clipped arterials +
     core rings), ``blocks.geojson``, ``districts.geojson``, ``streets.geojson``
     (perimeter-duplicate paths excluded, reusing the connectivity wave's
-    ``street_perimeter_flags``), ``lots.parquet``, and
-    ``greybox_manifest.json``. Returns the manifest dict.
+    ``street_perimeter_flags``), ``lots.parquet`` (now with ``lot_x``/
+    ``lot_y``/``kind``/``displacement`` -- see ``mapgen.r1_lots.Lot``,
+    ``kind="greenspace"`` rows carry ``world_id=""``), and
+    ``greybox_manifest.json`` (``displacement_stats``/``fallback_districts``
+    keys and ``counts.n_greenspace``/``counts.n_fallback``, one shared
+    ``fallback_stats`` dict threaded across every district's ``build_lots``
+    call). Returns the manifest dict.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -825,6 +831,10 @@ def export_greybox(
     all_lots: list[Lot] = []
     district_records: list[tuple[int, int, sg.Polygon, int]] = []
     n_park = 0
+    # Shared across every district's build_lots call (docs/lots-wave-plan.md
+    # slice L2) so the manifest reports ONE island-wide fallback tally rather
+    # than only the last district's.
+    fallback_stats: dict[str, Any] = {}
     for district_id, (block_id, poly) in enumerate(district_entries):
         row_indices = assignment.get(district_id, [])
         world_count = len(row_indices)
@@ -842,9 +852,11 @@ def export_greybox(
                 min_lot_area_frac=min_lot_area_frac,
                 h_base=h_base,
                 h_scale=h_scale,
+                fallback_stats=fallback_stats,
             )
         )
     n_sliver = count_sliver_reassignments(all_lots)
+    n_greenspace = sum(1 for lot in all_lots if lot.kind == "greenspace")
 
     with (out_dir / "island.geojson").open("w") as f:
         json.dump(_greybox_island_geojson(boundary), f, indent=2, sort_keys=True)
@@ -886,6 +898,10 @@ def export_greybox(
             "x": [lot.x for lot in all_lots],
             "y": [lot.y for lot in all_lots],
             "assigned": [lot.assigned for lot in all_lots],
+            "lot_x": [lot.lot_x for lot in all_lots],
+            "lot_y": [lot.lot_y for lot in all_lots],
+            "kind": [lot.kind for lot in all_lots],
+            "displacement": [lot.displacement for lot in all_lots],
         }
     )
     lots_df.write_parquet(out_dir / "lots.parquet")
@@ -906,10 +922,12 @@ def export_greybox(
     manifest: dict[str, Any] = {
         "stage": "G0 (greybox geometry + lots export)",
         "description": (
-            "Island/arterial/block/district/street geometry + per-world "
-            "Voronoi lot tessellation and building footprints, exported from "
-            "the hybrid pipeline for the G1 mesh bake / track-W 2D site view "
-            "(docs/greybox-plan.md)"
+            "Island/arterial/block/district/street geometry + per-district "
+            "street-fronting lot subdivision (falling back to per-world "
+            "Voronoi tessellation on subdivision failure, see 'n_fallback') "
+            "and building footprints, exported from the hybrid pipeline for "
+            "the G1 mesh bake / track-W 2D site view (docs/greybox-plan.md, "
+            "docs/lots-wave-plan.md)"
         ),
         "counts": {
             "n_worlds": points.height,
@@ -924,6 +942,8 @@ def export_greybox(
             "n_fabric_districts": len(district_entries) - n_park,
             "n_lots": len(all_lots),
             "n_sliver_reassignments": n_sliver,
+            "n_greenspace": n_greenspace,
+            "n_fallback": fallback_stats.get("n_fallback", 0),
         },
         "lot_config": {
             "inset": inset,
@@ -931,16 +951,23 @@ def export_greybox(
             "h_base": h_base,
             "h_scale": h_scale,
         },
+        "displacement_stats": displacement_stats(all_lots),
+        "fallback_districts": fallback_stats.get("fallback_districts", []),
         "island_frame": island_frame,
         "coordinate_note": (
             "Planar geometry in every greybox export file (island/arterials/"
-            "blocks/districts/streets, and lots.parquet's x/y/footprint_wkb/"
-            "lot_wkb) is in ISLAND UNITS -- the same frame as "
-            "island_points.parquet / hybrid_manifest.json -- NOT meters. "
-            "lots.parquet's 'height' column IS already in meters (h_base/"
-            "h_scale are meter constants, docs/greybox-plan.md Stage G0); "
-            "G1's mesh bake applies --meters-per-unit to the planar geometry "
-            "only, not to height."
+            "blocks/districts/streets, and lots.parquet's x/y/lot_x/lot_y/"
+            "displacement/footprint_wkb/lot_wkb) is in ISLAND UNITS -- the "
+            "same frame as island_points.parquet / hybrid_manifest.json -- "
+            "NOT meters. 'displacement' is an island-unit DISTANCE (Euclidean, "
+            "same units as x/y), so 'displacement_stats' below is also island "
+            "units; multiply by the island_frame scale's reciprocal (or see "
+            "run_r1_app_export.py's affine) to get app units, or by the G1 "
+            "mesh bake's --meters-per-unit for meters. lots.parquet's "
+            "'height' column IS already in meters (h_base/h_scale are meter "
+            "constants, docs/greybox-plan.md Stage G0); G1's mesh bake "
+            "applies --meters-per-unit to the planar geometry only, not to "
+            "height."
         ),
         "outputs": [
             "island.geojson",

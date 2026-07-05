@@ -140,6 +140,16 @@ def _read_lots(
 ) -> tuple[list[LotRecord], int]:
     """Decode ``lots.parquet`` into :class:`LotRecord`\\ s.
 
+    ``kind="greenspace"`` rows (docs/lots-wave-plan.md slice L2: surplus
+    subdivision pieces, ``world_id=""``, no world/building) are skipped
+    entirely -- their empty ``footprint`` would be dropped by
+    :func:`~mapgen.r1_mesh.build_building_groups` anyway (no building), but
+    excluding them here also keeps them out of ``labels.csv`` (no
+    roof label belongs on a lot with no building). ``LotRecord.x``/``y`` are
+    populated from ``lot_x``/``lot_y`` -- the world's ASSIGNED lot anchor,
+    not its original (possibly displaced-away-from) coordinate -- so
+    ``labels.csv`` roof-label positions sit over the actual baked building.
+
     A lot whose ``district_id`` has no known block (should not happen given
     ``run_r1_hybrid.py``'s greybox export invariants, but this is the IO
     boundary reading someone else's export file) is skipped and counted
@@ -149,6 +159,8 @@ def _read_lots(
     lots: list[LotRecord] = []
     n_unmapped = 0
     for row in df.iter_rows(named=True):
+        if row["kind"] == "greenspace":
+            continue
         district_id = int(row["district_id"])
         block_id = district_to_block.get(district_id)
         if block_id is None:
@@ -162,8 +174,8 @@ def _read_lots(
                 footprint=footprint,
                 height=float(row["height"]),
                 name=row["name"],
-                x=float(row["x"]),
-                y=float(row["y"]),
+                x=float(row["lot_x"]),
+                y=float(row["lot_y"]),
             )
         )
     return lots, n_unmapped

@@ -43,13 +43,13 @@ from mapgen.r1_app_export import (
     derive_levels,
     filter_regions_by_bbox,
     invert_geom,
+    invert_xy,
     island_length_to_app,
     land_feature_collection,
     landuse_feature,
     landuse_feature_collection,
     max_affine_roundtrip_error,
     oriented_rect,
-    parcel_feature,
     parcels_feature_collection,
     road_feature,
     road_kind,
@@ -118,18 +118,45 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # -----------------------------------------------------------------
-    # Lots + source app_points join, sorted by world_id (lot_id = row index)
+    # Lots + source app_points join.
+    #
+    # ``lots.parquet`` (docs/lots-wave-plan.md slice L2) now includes
+    # ``kind="greenspace"`` rows (surplus subdivision pieces, ``world_id=""``,
+    # no world/building) alongside the occupied ``kind="lot"`` rows. A single
+    # global ``lot_id`` is assigned here, over ALL rows (occupied +
+    # greenspace) sorted by ``(world_id, district_id, lot_x, lot_y)`` --
+    # ``world_id`` alone no longer disambiguates rows since every greenspace
+    # row shares ``world_id=""``, so the anchor point breaks the tie
+    # deterministically. ``lot_id`` is the one identifier parcels.geojson and
+    # app_points.parquet (occupied rows only) share.
     # -----------------------------------------------------------------
-    lots = pl.read_parquet(greybox_dir / "lots.parquet").sort("world_id")
+    lots = pl.read_parquet(greybox_dir / "lots.parquet").sort(
+        ["world_id", "district_id", "lot_x", "lot_y"]
+    )
     n_lots = lots.height
-    print(f"Loaded {n_lots} lots")
+    lots = lots.with_columns(pl.Series("lot_id", np.arange(n_lots, dtype=np.int64)))
+    occupied = lots.filter(pl.col("kind") == "lot")
+    n_greenspace = n_lots - occupied.height
+    print(
+        f"Loaded {n_lots} lots ({occupied.height} occupied, {n_greenspace} greenspace)"
+    )
 
     source_points = pl.read_parquet(source_dir / "app_points.parquet").rename(
         {"x": "orig_x", "y": "orig_y"}
     )
-    joined = lots.select(["world_id", "district_id", "height", "x", "y"]).join(
-        source_points, on="world_id", how="left"
-    )
+    joined = occupied.select(
+        [
+            "world_id",
+            "district_id",
+            "height",
+            "x",
+            "y",
+            "lot_x",
+            "lot_y",
+            "lot_id",
+            "footprint_wkb",
+        ]
+    ).join(source_points, on="world_id", how="left")
     missing = joined.filter(pl.col("orig_x").is_null())
     if missing.height:
         raise SystemExit(
@@ -138,8 +165,10 @@ def main(argv: list[str] | None = None) -> None:
             f"mismatch. First few: {missing['world_id'].to_list()[:5]}"
         )
 
-    # Acceptance check: inverse-affine(lots.x, lots.y) must reproduce the
-    # source's original DR coordinates (docs/greybox-plan.md Track W).
+    # Acceptance check: inverse-affine(lots.x, lots.y) -- the world's
+    # ORIGINAL (unmoved) DR coordinate, never the assigned lot_x/lot_y --
+    # must reproduce the source's original DR coordinates
+    # (docs/greybox-plan.md Track W).
     err = max_affine_roundtrip_error(
         joined["x"].to_numpy(),
         joined["y"].to_numpy(),
@@ -157,23 +186,29 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     # -----------------------------------------------------------------
-    # Building rects (oriented min-rotated-rectangle of each footprint,
-    # inverse-affined into the app frame)
+    # Assigned position (lot_x/lot_y, inverse-affined -- the world's
+    # DISPLACED position, docs/lots-wave-plan.md) + building rects (oriented
+    # min-rotated-rectangle of each occupied footprint, inverse-affined into
+    # the app frame -- a faithful representation of the new frontage-aligned,
+    # possibly lot-guard-clipped footprints).
     # -----------------------------------------------------------------
-    footprints_island = shapely.from_wkb(lots["footprint_wkb"].to_numpy())
-    lot_polys_island = shapely.from_wkb(lots["lot_wkb"].to_numpy())
+    xs, ys = invert_xy(joined["lot_x"].to_numpy(), joined["lot_y"].to_numpy(), affine)
 
-    xs, ys, widths, depths, angles = [], [], [], [], []
-    lot_polys_app = []
-    for footprint, lot_poly in zip(footprints_island, lot_polys_island, strict=True):
+    footprints_island = shapely.from_wkb(joined["footprint_wkb"].to_numpy())
+    widths, depths, angles = [], [], []
+    for footprint in footprints_island:
         footprint_app = invert_geom(footprint, affine)
-        lot_polys_app.append(invert_geom(lot_poly, affine))
         rect = oriented_rect(footprint_app)
-        xs.append(rect.cx)
-        ys.append(rect.cy)
         widths.append(rect.width)
         depths.append(rect.depth)
         angles.append(rect.angle)
+
+    # All lots' polygons (occupied + greenspace), inverse-affined -- used by
+    # parcels.geojson (every lot) and landuse.geojson (greenspace lots only).
+    lot_polys_app = [
+        invert_geom(poly, affine)
+        for poly in shapely.from_wkb(lots["lot_wkb"].to_numpy())
+    ]
 
     # -----------------------------------------------------------------
     # app_points.parquet
@@ -192,6 +227,7 @@ def main(argv: list[str] | None = None) -> None:
                 "orig_y",
                 "district_id",
                 "height",
+                "lot_id",
                 *level_cols,
                 *base_cols,
             ]
@@ -202,7 +238,6 @@ def main(argv: list[str] | None = None) -> None:
             pl.Series("building_width", widths, dtype=pl.Float64),
             pl.Series("building_depth", depths, dtype=pl.Float64),
             pl.Series("building_angle", angles, dtype=pl.Float64),
-            pl.Series("lot_id", np.arange(n_lots, dtype=np.int64)),
         )
         .rename({"height": "building_height", "district_id": "block_id"})
     )
@@ -230,7 +265,7 @@ def main(argv: list[str] | None = None) -> None:
     # worlds_meta.parquet (subset to island worlds)
     # -----------------------------------------------------------------
     worlds_meta = pl.read_parquet(source_dir / "worlds_meta.parquet")
-    island_world_ids = set(lots["world_id"].to_list())
+    island_world_ids = set(occupied["world_id"].to_list())
     worlds_meta_out = worlds_meta.filter(
         pl.col("world_id").is_in(island_world_ids)
     ).sort("world_id")
@@ -310,14 +345,28 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Wrote roads_mid.geojson / roads_near.geojson ({n_mid} features)")
 
     # -----------------------------------------------------------------
-    # parcels.geojson (one polygon per lot, app frame)
+    # parcels.geojson (one polygon per lot -- occupied AND greenspace -- app
+    # frame; ``kind`` distinguishes "lot" (a world sits here) from
+    # "greenspace" (surplus subdivision piece, no world/building) --
+    # docs/lots-wave-plan.md slice L2.
     # -----------------------------------------------------------------
+    lot_ids = lots["lot_id"].to_list()
     world_ids = lots["world_id"].to_list()
     district_ids = lots["district_id"].to_list()
+    kinds = lots["kind"].to_list()
     parcel_features = [
-        parcel_feature(lot_id, block_id, world_id, geom)
-        for lot_id, (world_id, block_id, geom) in enumerate(
-            zip(world_ids, district_ids, lot_polys_app, strict=True)
+        {
+            "type": "Feature",
+            "geometry": shapely.geometry.mapping(geom),
+            "properties": {
+                "lot_id": lot_id,
+                "block_id": block_id,
+                "world_id": world_id,
+                "kind": kind,
+            },
+        }
+        for lot_id, world_id, block_id, kind, geom in zip(
+            lot_ids, world_ids, district_ids, kinds, lot_polys_app, strict=True
         )
     ]
     parcels_fc = parcels_feature_collection(parcel_features)
@@ -326,7 +375,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # -----------------------------------------------------------------
     # blocks.geojson (G0 districts play the "block" role at this
-    # granularity) + landuse.geojson (park districts)
+    # granularity) + landuse.geojson (park districts + greenspace lots)
     # -----------------------------------------------------------------
     districts_fc = _load_geojson(greybox_dir / "districts.geojson")
     block_features = []
@@ -346,13 +395,32 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Wrote blocks.geojson ({len(blocks_fc['features'])} features)")
 
     park_polys_app.sort(key=lambda pair: pair[0])
+    # Greenspace lots (docs/lots-wave-plan.md slice L2: surplus subdivision
+    # pieces inside otherwise-"fabric" districts) additionally style as
+    # "park" landuse -- ``web/src/config.js`` LANDUSE only distinguishes
+    # ``kind === "park"`` from everything else (developedColor), and these
+    # pocket-park patches are exactly the leftover-subdivision-becomes-
+    # greenspace outcome the lots wave intends to make visible.
+    greenspace_polys_app = [
+        (lot_id, poly)
+        for lot_id, kind, poly in zip(lot_ids, kinds, lot_polys_app, strict=True)
+        if kind == "greenspace"
+    ]
+    greenspace_polys_app.sort(key=lambda pair: pair[0])
     landuse_features = [
         landuse_feature(landuse_id, geom)
         for landuse_id, (_district_id, geom) in enumerate(park_polys_app)
+    ] + [
+        landuse_feature(len(park_polys_app) + i, geom)
+        for i, (_lot_id, geom) in enumerate(greenspace_polys_app)
     ]
     landuse_fc = landuse_feature_collection(landuse_features)
     _dump_geojson(landuse_fc, out_dir / "landuse.geojson")
-    print(f"Wrote landuse.geojson ({len(landuse_fc['features'])} features)")
+    print(
+        f"Wrote landuse.geojson ({len(landuse_fc['features'])} features: "
+        f"{len(park_polys_app)} park districts + {len(greenspace_polys_app)} "
+        "greenspace lots)"
+    )
 
     # -----------------------------------------------------------------
     # manifest.json (v3-style, city-schema assets)
@@ -383,6 +451,7 @@ def main(argv: list[str] | None = None) -> None:
             "source_dir": _rel_to_repo(source_dir),
             "island_frame": island_frame,
             "affine_roundtrip_max_error_app_units": err,
+            "n_greenspace_lots": n_greenspace,
         },
     }
     with (out_dir / "manifest.json").open("w") as f:
