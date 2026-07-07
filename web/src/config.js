@@ -85,9 +85,14 @@ export const STREETVIEW = {
   fastMultiplier: 3, // hold Shift to move at moveSpeedMps * this (a jog/vehicle peek)
   turnSpeedDegPerSec: 90, // Q/E keyboard turn rate (mouse-drag also turns, via deck's
   // FirstPersonController default drag-to-rotate behavior)
-  lookPitchMin: -60, // degrees; clamps mouse-drag look up/down
-  lookPitchMax: 60,
-  initialPitch: -6, // slight downward tilt so the near street is in frame on entry
+  lookPitchMin: -80, // degrees; clamps mouse-drag look up/down
+  lookPitchMax: 80,
+  // Entry drops you at a navigable low-aerial vantage ABOVE the fabric (suburban
+  // buildings are ~4.5-10 m; 18 m clears them without hiding behind landmark
+  // towers), tilted down to survey the massing. F descends to eyeHeightMeters for
+  // the street-level drive-through read, R rises back up.
+  entryHeightMeters: 18,
+  entryPitch: -22,
   initialBearing: 0,
   fovy: 75, // vertical field of view, degrees
   nearMeters: 0.5, // clip-plane distances (see unit-conversion note above)

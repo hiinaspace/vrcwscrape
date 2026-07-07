@@ -46,6 +46,8 @@ const STREET_MOVE_KEYS = new Set([
   "KeyD",
   "KeyQ",
   "KeyE",
+  "KeyR",
+  "KeyF",
   "ArrowUp",
   "ArrowDown",
   "ArrowLeft",
@@ -491,10 +493,13 @@ export default function WorldMap({
       position: [
         source.target[0],
         source.target[1],
-        STREETVIEW.eyeHeightMeters * elevationScaleRef.current,
+        // Enter ABOVE the fabric (not at eye height on the target point, which is
+        // usually inside a building footprint) -- a navigable low-aerial survey you
+        // can F down from to street level. See entryHeightMeters in config.
+        STREETVIEW.entryHeightMeters * elevationScaleRef.current,
       ],
       bearing: STREETVIEW.initialBearing,
-      pitch: STREETVIEW.initialPitch,
+      pitch: STREETVIEW.entryPitch,
       minPitch: STREETVIEW.lookPitchMin,
       maxPitch: STREETVIEW.lookPitchMax,
     });
@@ -566,6 +571,12 @@ export default function WorldMap({
           }
           if (keys.has("KeyE")) bearing += turn;
           if (keys.has("KeyQ")) bearing -= turn;
+          // R / F = free-fly up / down, so you can enter above the fabric (no
+          // spawn-in-a-building) and descend to eye level to judge the drive-through
+          // read. Clamp to the ground floor so you never drop under the terrain.
+          if (keys.has("KeyR")) z += speed;
+          if (keys.has("KeyF")) z -= speed;
+          z = Math.max(STREETVIEW.eyeHeightMeters * elevationScaleRef.current, z);
           return { ...vs, position: [x, y, z], bearing };
         });
       }
@@ -1306,7 +1317,7 @@ export default function WorldMap({
             pointerEvents: "none",
           }}
         >
-          WASD / arrows: move · drag or Q/E: turn · Shift: run
+          WASD / arrows: move · R / F: up / down · drag or Q/E: turn · Shift: run
         </div>
       )}
     </div>
