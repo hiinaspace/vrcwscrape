@@ -48,6 +48,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -82,16 +83,17 @@ from mapgen.r1_connect import (  # noqa: E402
     snap_gates_to_macro,
 )
 from mapgen.r1_lots import (  # noqa: E402
-    DEFAULT_H_BASE,
-    DEFAULT_H_SCALE,
     DEFAULT_INSET,
     DEFAULT_MIN_LOT_AREA_FRAC,
     Lot,
+    MassingConfig,
     assign_worlds_to_districts,
     build_lots,
+    classify_typology,
     count_sliver_reassignments,
     displacement_stats,
     select_member_points,
+    top_landmark_ids,
 )
 from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
@@ -100,6 +102,7 @@ from mapgen.r1_macro import (  # noqa: E402
     build_macro_layer,
     load_boundary,
 )
+from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT  # noqa: E402
 from mapgen.r1_seam import (  # noqa: E402
     DEFAULT_RETRY_SEEDS,
     chen_in_block,
@@ -743,10 +746,38 @@ def _greybox_blocks_geojson(macro_blocks: list[sg.Polygon]) -> dict[str, Any]:
     )
 
 
+def _district_typology_tier(
+    poly: sg.Polygon,
+    world_count: int,
+    massing: MassingConfig,
+    meters_per_unit: float,
+) -> str:
+    """Area-only typology tier for a WHOLE district (``"detached"``/``"row"``,
+    ``"park"`` for a zero-world district) -- ignores ``landmark_ids`` (a
+    per-WORLD override, see :func:`mapgen.r1_lots.classify_typology`), so this
+    is the base tier every occupied lot in the district shares before any
+    landmark override. Used only for ``districts.geojson``'s audit-facing
+    ``typology`` property; ``lots.parquet``'s per-lot ``typology`` column
+    (``Lot.typology``) is the authoritative per-world value."""
+    if world_count <= 0:
+        return "park"
+    return classify_typology(
+        poly.area, world_count, "", frozenset(), massing, meters_per_unit
+    )
+
+
 def _greybox_districts_geojson(
     district_records: list[tuple[int, int, sg.Polygon, int]],
+    massing: MassingConfig,
+    meters_per_unit: float,
 ) -> dict[str, Any]:
-    """``district_records``: ``(district_id, block_id, polygon, world_count)``."""
+    """``district_records``: ``(district_id, block_id, polygon, world_count)``.
+
+    ``typology`` is the district's AREA-ONLY tier (:func:`_district_typology_tier`)
+    -- the classification map viewers/audit see at a glance; a district's
+    individual lots can still classify ``"landmark"`` per world (see
+    ``lots.parquet``'s own ``typology`` column).
+    """
     records: list[tuple[int, Any, dict[str, Any]]] = []
     for district_id, block_id, poly, world_count in district_records:
         kind = "fabric" if world_count > 0 else "park"
@@ -759,6 +790,9 @@ def _greybox_districts_geojson(
                     "district_id": district_id,
                     "kind": kind,
                     "world_count": world_count,
+                    "typology": _district_typology_tier(
+                        poly, world_count, massing, meters_per_unit
+                    ),
                 },
             )
         )
@@ -789,8 +823,8 @@ def export_greybox(
     points: pl.DataFrame,
     inset: float = DEFAULT_INSET,
     min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
-    h_base: float = DEFAULT_H_BASE,
-    h_scale: float = DEFAULT_H_SCALE,
+    massing: MassingConfig | None = None,
+    meters_per_unit: float = DEFAULT_METERS_PER_UNIT,
 ) -> dict[str, Any]:
     """Write the Stage-G0 greybox export (geometry + lots) to ``out_dir``.
 
@@ -805,22 +839,32 @@ def export_greybox(
     (``mapgen.r1_lots.build_lots``); a district with zero worlds is exported
     as ``kind="park"`` with no lots, per ``docs/greybox-plan.md`` Stage G0.
 
+    ``massing`` (default ``MassingConfig()``) + ``meters_per_unit`` drive the
+    wave-2 typology/height/footprint model (``docs/wave2-plan.md``);
+    ``landmark_ids`` (the top ``massing.landmark_count`` worlds by visits,
+    island-wide -- :func:`mapgen.r1_lots.top_landmark_ids`) is computed once
+    here from ``points`` and threaded into every district's ``build_lots``
+    call.
+
     Writes ``island.geojson``, ``arterials.geojson`` (clipped arterials +
-    core rings), ``blocks.geojson``, ``districts.geojson``, ``streets.geojson``
-    (perimeter-duplicate paths excluded, reusing the connectivity wave's
-    ``street_perimeter_flags``), ``lots.parquet`` (now with ``lot_x``/
-    ``lot_y``/``kind``/``displacement`` -- see ``mapgen.r1_lots.Lot``,
-    ``kind="greenspace"`` rows carry ``world_id=""`` -- plus a ``lot_id``
-    column: the row's index in this function's own deterministic
-    district-walk BUILD order, assigned before the world_id sort below so
-    downstream readers (``run_r1_app_export.py``) can use it directly as a
-    stable identifier instead of re-minting one via a different sort), and
-    ``greybox_manifest.json`` (``displacement_stats``/``fallback_districts``
-    keys and ``counts.n_greenspace``/``counts.n_fallback``, one shared
-    ``fallback_stats`` dict threaded across every district's ``build_lots``
-    call). Returns the manifest dict.
+    core rings), ``blocks.geojson``, ``districts.geojson`` (now with a
+    ``typology`` property per district -- the AREA-ONLY tier, see
+    :func:`_district_typology_tier`), ``streets.geojson`` (perimeter-duplicate
+    paths excluded, reusing the connectivity wave's ``street_perimeter_flags``),
+    ``lots.parquet`` (now with ``lot_x``/``lot_y``/``kind``/``displacement``/
+    ``typology`` -- see ``mapgen.r1_lots.Lot``, ``kind="greenspace"`` rows
+    carry ``world_id=""`` -- plus a ``lot_id`` column: the row's index in this
+    function's own deterministic district-walk BUILD order, assigned before
+    the world_id sort below so downstream readers (``run_r1_app_export.py``)
+    can use it directly as a stable identifier instead of re-minting one via
+    a different sort), and ``greybox_manifest.json`` (``displacement_stats``/
+    ``fallback_districts`` keys and ``counts.n_greenspace``/
+    ``counts.n_fallback``, one shared ``fallback_stats`` dict threaded across
+    every district's ``build_lots`` call). Returns the manifest dict.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    if massing is None:
+        massing = MassingConfig()
 
     district_entries: list[tuple[int, sg.Polygon]] = []  # (block_id, polygon)
     for res in results:
@@ -831,6 +875,8 @@ def export_greybox(
     assignment, assigned_kind = assign_worlds_to_districts(points, district_polys)
     n_direct = sum(1 for kind in assigned_kind if kind == "direct")
     n_snapped = sum(1 for kind in assigned_kind if kind == "snapped")
+
+    landmark_ids = top_landmark_ids(points, massing.landmark_count)
 
     all_lots: list[Lot] = []
     district_records: list[tuple[int, int, sg.Polygon, int]] = []
@@ -854,8 +900,9 @@ def export_greybox(
                 member,
                 inset=inset,
                 min_lot_area_frac=min_lot_area_frac,
-                h_base=h_base,
-                h_scale=h_scale,
+                massing=massing,
+                meters_per_unit=meters_per_unit,
+                landmark_ids=landmark_ids,
                 fallback_stats=fallback_stats,
             )
         )
@@ -896,7 +943,10 @@ def export_greybox(
         json.dump(_greybox_blocks_geojson(layer.blocks), f, indent=2, sort_keys=True)
     with (out_dir / "districts.geojson").open("w") as f:
         json.dump(
-            _greybox_districts_geojson(district_records), f, indent=2, sort_keys=True
+            _greybox_districts_geojson(district_records, massing, meters_per_unit),
+            f,
+            indent=2,
+            sort_keys=True,
         )
     with (out_dir / "streets.geojson").open("w") as f:
         json.dump(_greybox_streets_geojson(results), f, indent=2, sort_keys=True)
@@ -935,6 +985,7 @@ def export_greybox(
             "lot_y": [lot.lot_y for lot in all_lots],
             "kind": [lot.kind for lot in all_lots],
             "displacement": [lot.displacement for lot in all_lots],
+            "typology": [lot.typology for lot in all_lots],
             "lot_id": lot_ids,
         }
     )
@@ -978,12 +1029,19 @@ def export_greybox(
             "n_sliver_reassignments": n_sliver,
             "n_greenspace": n_greenspace,
             "n_fallback": fallback_stats.get("n_fallback", 0),
+            "typology_counts": {
+                typ: sum(
+                    1 for lot in all_lots if lot.kind == "lot" and lot.typology == typ
+                )
+                for typ in ("detached", "row", "landmark")
+            },
         },
         "lot_config": {
             "inset": inset,
             "min_lot_area_frac": min_lot_area_frac,
-            "h_base": h_base,
-            "h_scale": h_scale,
+            "meters_per_unit": meters_per_unit,
+            "massing": asdict(massing),
+            "n_landmark_ids": len(landmark_ids),
         },
         "displacement_stats": displacement_stats(all_lots),
         "fallback_districts": fallback_stats.get("fallback_districts", []),
@@ -999,10 +1057,14 @@ def export_greybox(
             "units; multiply by the island_frame scale's reciprocal (or see "
             "run_r1_app_export.py's affine) to get app units, or by the G1 "
             "mesh bake's --meters-per-unit for meters. lots.parquet's "
-            "'height' column IS already in meters (h_base/h_scale are meter "
-            "constants, docs/greybox-plan.md Stage G0); G1's mesh bake "
-            "applies --meters-per-unit to the planar geometry only, not to "
-            "height."
+            "'height' column IS already in meters (MassingConfig constants "
+            "are meter constants, docs/wave2-plan.md 'The massing model'); "
+            "G1's mesh bake applies --meters-per-unit to the planar geometry "
+            "only, not to height. This export's own 'meters_per_unit' "
+            "(lot_config below) is the SAME value G1 must be run with -- the "
+            "massing model's setbacks are meter-denominated and convert to "
+            "island units using it, so a mismatched G1 --meters-per-unit "
+            "would silently mis-scale the footprint/setback geometry."
         ),
         "outputs": [
             "island.geojson",
@@ -1030,8 +1092,8 @@ def run_hybrid(
     greybox_out: Path | None = None,
     greybox_inset: float = DEFAULT_INSET,
     greybox_min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
-    greybox_h_base: float = DEFAULT_H_BASE,
-    greybox_h_scale: float = DEFAULT_H_SCALE,
+    greybox_massing: MassingConfig | None = None,
+    greybox_meters_per_unit: float = DEFAULT_METERS_PER_UNIT,
 ) -> dict[str, Any]:
     """Full hybrid assembly: macro layer -> per-block Chen -> assemble -> render.
 
@@ -1319,8 +1381,8 @@ def run_hybrid(
             points=points,
             inset=greybox_inset,
             min_lot_area_frac=greybox_min_lot_area_frac,
-            h_base=greybox_h_base,
-            h_scale=greybox_h_scale,
+            massing=greybox_massing,
+            meters_per_unit=greybox_meters_per_unit,
         )
         counts = greybox_manifest["counts"]
         print(
@@ -1388,16 +1450,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Sliver-lot floor as a fraction of the median cell area (stage G0).",
     )
     parser.add_argument(
-        "--greybox-h-base",
+        "--meters-per-unit",
         type=float,
-        default=DEFAULT_H_BASE,
-        help="Building height base, meters: h_base + h_scale*log10(1+visits).",
-    )
-    parser.add_argument(
-        "--greybox-h-scale",
-        type=float,
-        default=DEFAULT_H_SCALE,
-        help="Building height scale, meters: h_base + h_scale*log10(1+visits).",
+        default=DEFAULT_METERS_PER_UNIT,
+        help=(
+            "Island-units-to-meters scale (stage G0): must match the G1 mesh "
+            "bake's --meters-per-unit -- the wave-2 massing model's setbacks "
+            "(docs/wave2-plan.md) are meter-denominated and convert to island "
+            "units using this value. Default matches "
+            "mapgen.r1_mesh.DEFAULT_METERS_PER_UNIT."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1411,8 +1473,7 @@ def main(argv: list[str] | None = None) -> None:
         greybox_out=args.greybox_out,
         greybox_inset=args.greybox_inset,
         greybox_min_lot_area_frac=args.greybox_min_lot_area_frac,
-        greybox_h_base=args.greybox_h_base,
-        greybox_h_scale=args.greybox_h_scale,
+        greybox_meters_per_unit=args.meters_per_unit,
     )
 
     print("\n--- Hybrid stage 3 summary ---")

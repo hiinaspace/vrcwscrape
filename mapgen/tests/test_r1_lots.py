@@ -16,22 +16,25 @@ from shapely.ops import unary_union
 
 import mapgen.r1_lots as r1_lots
 from mapgen.r1_lots import (
-    DEFAULT_H_BASE,
-    DEFAULT_H_SCALE,
+    DEFAULT_METERS_PER_UNIT,
     Lot,
     LotConfig,
+    MassingConfig,
     _build_lots_voronoi,
     _footprint,
     _frontage_direction,
+    _massing_height,
     _obb_axes,
     _oriented_footprint,
     _touches_ext_ring,
     assign_worlds_to_districts,
     build_lots,
+    classify_typology,
     count_sliver_reassignments,
     displacement_stats,
     select_member_points,
     subdivide_district,
+    top_landmark_ids,
 )
 
 # ---------------------------------------------------------------------------
@@ -517,8 +520,16 @@ def test_footprint_empty_lot_falls_back_to_nonempty_circle() -> None:
 
 def test_oriented_footprint_fully_inside_lot() -> None:
     district = sg.box(0.0, 0.0, 20.0, 8.0)
+    massing = MassingConfig()
     for lot_poly in subdivide_district(district, 6, seed=5, cfg=LotConfig()):
-        footprint = _oriented_footprint(lot_poly, district.exterior, LotConfig())
+        footprint = _oriented_footprint(
+            lot_poly,
+            district.exterior,
+            "detached",
+            massing,
+            DEFAULT_METERS_PER_UNIT,
+            LotConfig(),
+        )
         assert not footprint.is_empty
         assert lot_poly.contains(footprint) or lot_poly.covers(footprint)
 
@@ -536,7 +547,14 @@ def test_frontage_direction_matches_long_edge_of_rectangular_district() -> None:
 
 def test_oriented_footprint_angle_matches_long_district_edge() -> None:
     district = sg.box(0.0, 0.0, 20.0, 8.0)
-    footprint = _oriented_footprint(district, district.exterior, LotConfig())
+    footprint = _oriented_footprint(
+        district,
+        district.exterior,
+        "detached",
+        MassingConfig(),
+        DEFAULT_METERS_PER_UNIT,
+        LotConfig(),
+    )
     _center, axis_long, _axis_short, _long_len, _short_len = _obb_axes(footprint)
     angle = abs(math.atan2(axis_long[1], axis_long[0]))
     angle_mod_pi = min(angle, abs(math.pi - angle))
@@ -581,6 +599,7 @@ def test_displacement_stats_ignores_greenspace_and_computes_percentiles() -> Non
             lot_y=0.0,
             kind=kind,
             displacement=disp,
+            typology="detached" if kind == "lot" else "",
         )
 
     lots = [
@@ -621,6 +640,7 @@ def test_displacement_stats_p95_matches_ceil_index_formula() -> None:
             lot_y=0.0,
             kind="lot",
             displacement=disp,
+            typology="detached",
         )
 
     lots = [_lot(float(v)) for v in range(1, 21)]
@@ -663,29 +683,181 @@ def test_displacement_stats_splits_direct_and_snapped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Height formula
+# Massing model: typology classification, height, footprint setbacks
+# (docs/wave2-plan.md "The massing model (2a core)")
 # ---------------------------------------------------------------------------
 
 
-def test_height_formula_zero_visits_is_h_base() -> None:
-    district = sg.box(0.0, 0.0, 10.0, 10.0)
-    member = _member_points(["a"], [5.0], [5.0], [0])
-    lots = build_lots(district, 0, member)
-    assert lots[0].height == pytest.approx(DEFAULT_H_BASE)
-
-
-def test_height_formula_monotone_in_visits() -> None:
-    district = sg.box(0.0, 0.0, 10.0, 10.0)
-    member = _member_points(
-        ["a", "b", "c"], [2.0, 5.0, 8.0], [2.0, 5.0, 8.0], [0, 1_000, 100_000_000]
+def test_classify_typology_area_threshold() -> None:
+    cfg = MassingConfig()
+    mpu = DEFAULT_METERS_PER_UNIT
+    # area-per-world = district_area_units * mpu**2 / n_worlds.
+    # Pick a district area comfortably above/below cfg.a_detached_m2.
+    big_area_units = (cfg.a_detached_m2 * 2.0) / (mpu**2)  # a = 2*threshold for n=1
+    small_area_units = (cfg.a_detached_m2 * 0.5) / (mpu**2)  # a = 0.5*threshold for n=1
+    assert (
+        classify_typology(big_area_units, 1, "w", frozenset(), cfg, mpu) == "detached"
     )
+    assert classify_typology(small_area_units, 1, "w", frozenset(), cfg, mpu) == "row"
+
+
+def test_classify_typology_landmark_overrides_area() -> None:
+    cfg = MassingConfig()
+    mpu = DEFAULT_METERS_PER_UNIT
+    # A huge area-per-world would classify "detached" -- landmark membership
+    # must win regardless.
+    huge_area_units = (cfg.a_detached_m2 * 100.0) / (mpu**2)
+    assert (
+        classify_typology(huge_area_units, 1, "w", frozenset({"w"}), cfg, mpu)
+        == "landmark"
+    )
+    # A non-member at the same area still classifies normally.
+    assert (
+        classify_typology(huge_area_units, 1, "other", frozenset({"w"}), cfg, mpu)
+        == "detached"
+    )
+
+
+def test_classify_typology_is_deterministic() -> None:
+    cfg = MassingConfig()
+    mpu = DEFAULT_METERS_PER_UNIT
+    args = (12.0, 3, "world_42", frozenset({"landmark_1"}), cfg, mpu)
+    assert classify_typology(*args) == classify_typology(*args)
+
+
+def test_top_landmark_ids_picks_highest_visits_with_deterministic_ties() -> None:
+    points = pl.DataFrame(
+        {
+            "world_id": ["a", "b", "c", "d"],
+            "visits": [10, 100, 100, 1],
+        }
+    )
+    # Top 2 by visits: b and c tie at 100 -- both picked since count=2 exactly
+    # covers the tie; ascending world_id breaks any ordering ambiguity.
+    top = top_landmark_ids(points, 2)
+    assert top == frozenset({"b", "c"})
+    assert top_landmark_ids(points, 0) == frozenset()
+    assert top_landmark_ids(points, -1) == frozenset()
+    empty = pl.DataFrame({"world_id": [], "visits": []})
+    assert top_landmark_ids(empty, 5) == frozenset()
+
+
+def test_massing_height_within_typology_band_and_deterministic() -> None:
+    cfg = MassingConfig()
+    for typology, (lo, hi) in (
+        ("detached", cfg.detached_stories),
+        ("row", cfg.row_stories),
+        ("landmark", cfg.landmark_stories),
+    ):
+        for world_id in ("world_a", "world_b", "world_c", "another_world"):
+            h = _massing_height(world_id, typology, cfg)
+            lo_bound = lo * cfg.story_height_m - cfg.height_jitter_m
+            hi_bound = hi * cfg.story_height_m + cfg.height_jitter_m
+            assert lo_bound - 1e-9 <= h <= hi_bound + 1e-9
+            # Pure function of its inputs: identical across calls.
+            assert _massing_height(world_id, typology, cfg) == pytest.approx(h)
+
+
+def test_massing_height_visits_do_not_affect_height() -> None:
+    # Wave 2 retires the visits-driven height formula entirely -- visits only
+    # ever feeds typology via top_landmark_ids, never the height itself.
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member_low = _member_points(["a"], [5.0], [5.0], [0])
+    member_high = _member_points(["a"], [5.0], [5.0], [100_000_000])
+    lots_low = build_lots(district, 0, member_low)
+    lots_high = build_lots(district, 0, member_high)
+    assert lots_low[0].height == pytest.approx(lots_high[0].height)
+
+
+def test_build_lots_uses_massing_typology_and_landmark_ids() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member = _member_points(["a", "b"], [3.0, 7.0], [3.0, 7.0], [1, 1])
+    massing = MassingConfig()
+    lots = build_lots(
+        district, 0, member, massing=massing, landmark_ids=frozenset({"a"})
+    )
+    by_id = {lot.world_id: lot for lot in lots if lot.kind == "lot"}
+    assert by_id["a"].typology == "landmark"
+    assert by_id["b"].typology in ("detached", "row")
+    assert by_id["a"].height == pytest.approx(_massing_height("a", "landmark", massing))
+
+
+# ---------------------------------------------------------------------------
+# Footprint invariants (docs/wave2-plan.md's correction-2/3 regression tests)
+# ---------------------------------------------------------------------------
+
+
+def test_build_lots_footprint_inside_lot_for_every_lot() -> None:
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    world_ids = [f"w{i}" for i in range(8)]
+    xs = [1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 19.0]
+    ys = [1.0, 6.0, 2.0, 5.0, 3.0, 4.0, 6.5, 1.5]
+    member = _member_points(world_ids, xs, ys, [10] * 8)
     lots = build_lots(district, 0, member)
-    heights = {lot.world_id: lot.height for lot in lots if lot.kind == "lot"}
-    assert heights["a"] < heights["b"] < heights["c"]
-    # Spot value at the top-visits end of the doc's stated range (~105m).
-    expected_top = DEFAULT_H_BASE + DEFAULT_H_SCALE * math.log10(1.0 + 100_000_000)
-    assert heights["c"] == pytest.approx(expected_top)
-    assert 100.0 < heights["c"] < 110.0
+    for lot in lots:
+        if lot.footprint.is_empty:
+            continue
+        eps = lot.lot.buffer(1e-6)
+        assert lot.lot.contains(lot.footprint) or eps.covers(lot.footprint)
+
+
+def test_build_lots_footprint_never_intersects_fronting_street_ribbon() -> None:
+    # THE key regression (docs/wave2-plan.md correction 2/3): the OLD
+    # fill-ratio footprint model inset only ~1.25m from the lot line while
+    # the Chen street ribbon reached ~1.9m past it -- buildings intersected
+    # the road. The new setback model's front_setback is denominated from
+    # the FRONTAGE LOT LINE and is >= the street half-width by construction
+    # (road_clear_m = half-width + sidewalk), so no footprint should ever
+    # reach into the fronting street's ribbon.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    mpu = DEFAULT_METERS_PER_UNIT
+    massing = MassingConfig()
+
+    # single full-district lot (n=1 build_lots path) -- frontage = bottom edge
+    # (y=0), first-encountered/longest edge on the district's own exterior.
+    member = _member_points(["solo"], [10.0], [1.0], [10])
+    lots = build_lots(district, 0, member, massing=massing, meters_per_unit=mpu)
+    footprint = lots[0].footprint
+    assert not footprint.is_empty
+
+    # Chen "street" ribbon half-width, island units (mapgen.r1_mesh
+    # DEFAULT_STREET_WIDTHS["street"]=0.25 island units, buffer_ribbon halves
+    # it): independently derived here rather than importing r1_mesh, to keep
+    # this module's tests decoupled from that one.
+    street_half_width_units = (0.25 * mpu / 2.0) / mpu
+    frontage_edge = sg.LineString([(0.0, 0.0), (20.0, 0.0)])
+    ribbon = frontage_edge.buffer(street_half_width_units)
+
+    assert footprint.intersection(ribbon).area == pytest.approx(0.0, abs=1e-9)
+
+
+def test_row_typology_footprints_share_wall_with_zero_gap() -> None:
+    # Row typology uses side_setback = 0 (shared wall, continuous terrace) --
+    # adjacent lots' footprints must abut exactly (no gap, no overlap).
+    # The enclosing district is DELIBERATELY wider/taller than the row so
+    # each lot's own left/right edges are interior cuts, not additional
+    # frontage on the district's own exterior ring (only the shared bottom
+    # edge is real frontage here).
+    district = sg.Polygon([(-5.0, 0.0), (20.0, 0.0), (20.0, 8.0), (-5.0, 8.0)])
+    lot1 = sg.Polygon([(0.0, 0.0), (5.0, 0.0), (5.0, 8.0), (0.0, 8.0)])
+    lot2 = sg.Polygon([(5.0, 0.0), (10.0, 0.0), (10.0, 8.0), (5.0, 8.0)])
+    lot3 = sg.Polygon([(10.0, 0.0), (15.0, 0.0), (15.0, 8.0), (10.0, 8.0)])
+    massing = MassingConfig()
+    mpu = DEFAULT_METERS_PER_UNIT
+    cfg = LotConfig()
+
+    footprints = [
+        _oriented_footprint(lot, district.exterior, "row", massing, mpu, cfg)
+        for lot in (lot1, lot2, lot3)
+    ]
+    for fp in footprints:
+        assert not fp.is_empty
+
+    for a, b in ((footprints[0], footprints[1]), (footprints[1], footprints[2])):
+        assert a.intersection(b).area == pytest.approx(0.0, abs=1e-9)
+        assert a.distance(b) == pytest.approx(0.0, abs=1e-9)
+        shared = a.boundary.intersection(b.boundary)
+        assert shared.length > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +907,7 @@ def test_lot_is_frozen() -> None:
         lot_y=5.0,
         kind="lot",
         displacement=0.0,
+        typology="detached",
     )
     with pytest.raises(AttributeError):
         lot.height = 10.0  # ty: ignore[invalid-assignment]

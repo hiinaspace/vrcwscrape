@@ -30,14 +30,25 @@ Pure module: no IO, no plotting. ``scripts/run_r1_hybrid.py`` (``--greybox-out``
 is the only caller that touches disk.
 
 Coordinate convention: island frame (same units as ``r1_macro``/``r1_arm_b`` --
-NOT meters). ``Lot.height``, however, IS meters already (``h_base``/``h_scale``
-are meter constants from ``docs/greybox-plan.md``) even though ``x``/``y``/
-``footprint``/``lot`` stay in island units -- G1's mesh bake applies
-``--meters-per-unit`` to the planar geometry only, not to height.
+NOT meters). ``Lot.height``, however, IS meters already (:class:`MassingConfig`
+constants are meter constants) even though ``x``/``y``/``footprint``/``lot``
+stay in island units -- G1's mesh bake applies ``--meters-per-unit`` to the
+planar geometry only, not to height.
+
+Wave 2 sub-wave 2a (``docs/wave2-plan.md``, "The massing model") replaces the
+old visits-driven height / fill-ratio footprint sizing with a suburb-default
+typology model: :func:`classify_typology` picks ``"detached"``/``"row"``/
+``"landmark"`` per world from area-per-world + a popularity top-N
+(:func:`top_landmark_ids`); :func:`_massing_height` and :func:`_oriented_footprint`
+size the building from real METER setbacks (:class:`MassingConfig`) converted
+to island units via ``meters_per_unit``, denominated from the FRONTAGE LOT
+LINE (not the lot's own OBB) -- this is what keeps buildings off the road
+ribbon (docs/wave2-plan.md root cause 3), unlike the old inset-only footprint.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import statistics
 from dataclasses import dataclass
@@ -57,17 +68,49 @@ from shapely.strtree import STRtree
 
 DEFAULT_INSET: float = 0.05
 DEFAULT_MIN_LOT_AREA_FRAC: float = 0.01
-DEFAULT_H_BASE: float = 4.0
-DEFAULT_H_SCALE: float = 12.0
 
 # Subdivision defaults (LotConfig).
 DEFAULT_STOP_AREA_FACTOR: float = 1.5
 DEFAULT_SPLIT_JITTER: float = 0.15
 DEFAULT_ASPECT_CLAMP: float = 4.0
 DEFAULT_MIN_FRONTAGE: float = 0.0
-DEFAULT_BUILDING_WIDTH_FRAC: tuple[float, float] = (0.55, 0.85)
-DEFAULT_BUILDING_DEPTH_FRAC: tuple[float, float] = (0.55, 0.85)
 DEFAULT_MAX_SPLIT_DEPTH: int = 24
+
+# Massing/typology defaults (docs/wave2-plan.md "The massing model (2a core)").
+# All setback/height constants are METERS; MassingConfig / the footprint and
+# height helpers convert to island units via meters_per_unit themselves.
+# 150 m2/world -> ~72% detached / ~28% row on the production 698-district bake
+# (median area-per-world ~274 m2): "suburb by default, densest areas -> row",
+# tuned against the real distribution + in-viewer massing review (2026-07-06).
+DEFAULT_A_DETACHED_M2: float = 150.0
+DEFAULT_LANDMARK_COUNT: int = 100
+DEFAULT_STORY_HEIGHT_M: float = 3.1
+DEFAULT_HEIGHT_JITTER_M: float = 0.4
+DEFAULT_DETACHED_STORIES: tuple[int, int] = (1, 2)
+DEFAULT_ROW_STORIES: tuple[int, int] = (2, 3)
+DEFAULT_LANDMARK_STORIES: tuple[int, int] = (4, 6)
+# Representative front clearance from the frontage LOT LINE: Chen street
+# half-width (0.25 island-unit "street" ribbon * DEFAULT_METERS_PER_UNIT 25 /
+# 2 = 3.125m, see mapgen.r1_mesh.DEFAULT_STREET_WIDTHS/buffer_ribbon) +
+# sidewalk (1.5m). TODO(wave2 2a slice 2): replace with a per-segment value
+# once street width is computed once at G0 export (density x betweenness) --
+# this flat constant cannot vary by street tier/segment the way the real
+# road network does.
+DEFAULT_ROAD_CLEAR_M: float = 4.6
+DEFAULT_DETACHED_YARD_FRONT_M: float = 3.0
+DEFAULT_DETACHED_SIDE_M: float = 2.0
+DEFAULT_DETACHED_DEPTH_MAX_M: float = 12.0
+DEFAULT_ROW_YARD_FRONT_M: float = 1.0
+DEFAULT_ROW_SIDE_M: float = 0.0  # shared wall -- continuous terrace, v1
+DEFAULT_ROW_DEPTH_MAX_M: float = 10.0
+DEFAULT_LANDMARK_YARD_FRONT_M: float = 3.0
+DEFAULT_LANDMARK_SIDE_M: float = 2.0
+DEFAULT_LANDMARK_DEPTH_MAX_M: float = 20.0
+DEFAULT_REAR_MIN_M: float = 3.0
+# Matches mapgen.r1_mesh.DEFAULT_METERS_PER_UNIT -- duplicated here (rather
+# than importing r1_mesh) so this pure module keeps its own zero-dependency
+# default; run_r1_hybrid.py wires the SAME value through --meters-per-unit.
+DEFAULT_METERS_PER_UNIT: float = 25.0
 
 # Deterministic duplicate-coordinate jitter radius (island units), well below
 # any realistic min_lot_area_frac floor so it never visibly perturbs a lot.
@@ -103,15 +146,15 @@ class LotConfig:
     - ``min_frontage``: minimum contact length (island units) with the
       district exterior ring for a boundary edge/piece to count as real
       frontage; ``0.0`` means any nonzero contact counts.
-    - ``building_width_frac`` / ``building_depth_frac``: (min, max) clamp on
-      the fraction of the lot's frontage-aligned OBB width/depth used to size
-      the building footprint (the raw fraction is the lot's own OBB fill
-      ratio, sqrt'd so it scales like a length rather than an area).
     - ``max_split_depth``: recursion guard (subdivision naturally halts via
       ``stop_area_factor`` long before this in any non-pathological case).
     - ``inset``: building footprint inward buffer -- same meaning as the
-      module-level ``DEFAULT_INSET`` kwarg on :func:`build_lots`.
-    - ``h_base`` / ``h_scale``: unchanged height formula constants.
+      module-level ``DEFAULT_INSET`` kwarg on :func:`build_lots`. Only used
+      by :func:`_footprint`'s degenerate-collapse fallback and the Voronoi
+      path now -- the primary :func:`_oriented_footprint` model sizes the
+      footprint from real :class:`MassingConfig` setbacks instead (wave 2,
+      ``docs/wave2-plan.md``; retired the old fill-ratio ``building_*_frac``
+      sizing entirely).
     - ``voronoi_min_lot_area_frac``: sliver floor used ONLY by the Voronoi
       FALLBACK path (:func:`_build_lots_voronoi`), same meaning as the
       existing ``min_lot_area_frac`` kwarg.
@@ -121,13 +164,60 @@ class LotConfig:
     split_jitter: float = DEFAULT_SPLIT_JITTER
     aspect_clamp: float = DEFAULT_ASPECT_CLAMP
     min_frontage: float = DEFAULT_MIN_FRONTAGE
-    building_width_frac: tuple[float, float] = DEFAULT_BUILDING_WIDTH_FRAC
-    building_depth_frac: tuple[float, float] = DEFAULT_BUILDING_DEPTH_FRAC
     max_split_depth: int = DEFAULT_MAX_SPLIT_DEPTH
     inset: float = DEFAULT_INSET
-    h_base: float = DEFAULT_H_BASE
-    h_scale: float = DEFAULT_H_SCALE
     voronoi_min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC
+
+
+@dataclass(frozen=True)
+class MassingConfig:
+    """Suburb/row/landmark massing model tunables (``docs/wave2-plan.md``
+    "The massing model (2a core)"). ALL setback/height/depth constants below
+    are METERS -- :func:`_oriented_footprint`/:func:`_massing_height` convert
+    to island units via a ``meters_per_unit`` argument threaded separately
+    (this dataclass itself carries no unit-conversion state).
+
+    - ``a_detached_m2`` / ``landmark_count``: typology thresholds (see
+      :func:`classify_typology`) -- area-per-world >= ``a_detached_m2`` is
+      ``"detached"``, else ``"row"``; the top ``landmark_count`` worlds by
+      visits (island-wide, :func:`top_landmark_ids`) are ``"landmark"``
+      regardless of area.
+    - ``story_height_m`` / ``height_jitter_m`` / ``*_stories``: height model
+      (:func:`_massing_height`) -- ``stories`` (drawn from the typology's
+      inclusive ``(lo, hi)`` band, deterministic per ``world_id``) times
+      ``story_height_m``, plus jitter uniform in ``+-height_jitter_m``.
+    - ``road_clear_m``: representative front clearance from the FRONTAGE LOT
+      LINE (not the lot's own OBB) -- see the module-level constant's TODO:
+      slice 2 replaces this flat value with a per-segment one.
+    - ``*_yard_front_m`` / ``*_side_m`` / ``*_depth_max_m``: per-typology
+      footprint setbacks (:func:`_oriented_footprint`) -- ``front_setback =
+      road_clear_m + yard_front_m``; ``side_m`` erodes the footprint on each
+      along-frontage end (``0`` for ``"row"``: shared walls, continuous
+      terrace); ``depth_max_m`` caps how far back the footprint runs from the
+      frontage line.
+    - ``rear_min_m``: guard so a shallow lot always keeps at least this much
+      UNBUILT depth behind the footprint, capping ``depth_max_m`` down when
+      the lot itself is too shallow to fit the full setback + depth_max.
+    """
+
+    a_detached_m2: float = DEFAULT_A_DETACHED_M2
+    landmark_count: int = DEFAULT_LANDMARK_COUNT
+    story_height_m: float = DEFAULT_STORY_HEIGHT_M
+    height_jitter_m: float = DEFAULT_HEIGHT_JITTER_M
+    detached_stories: tuple[int, int] = DEFAULT_DETACHED_STORIES
+    row_stories: tuple[int, int] = DEFAULT_ROW_STORIES
+    landmark_stories: tuple[int, int] = DEFAULT_LANDMARK_STORIES
+    road_clear_m: float = DEFAULT_ROAD_CLEAR_M
+    detached_yard_front_m: float = DEFAULT_DETACHED_YARD_FRONT_M
+    detached_side_m: float = DEFAULT_DETACHED_SIDE_M
+    detached_depth_max_m: float = DEFAULT_DETACHED_DEPTH_MAX_M
+    row_yard_front_m: float = DEFAULT_ROW_YARD_FRONT_M
+    row_side_m: float = DEFAULT_ROW_SIDE_M
+    row_depth_max_m: float = DEFAULT_ROW_DEPTH_MAX_M
+    landmark_yard_front_m: float = DEFAULT_LANDMARK_YARD_FRONT_M
+    landmark_side_m: float = DEFAULT_LANDMARK_SIDE_M
+    landmark_depth_max_m: float = DEFAULT_LANDMARK_DEPTH_MAX_M
+    rear_min_m: float = DEFAULT_REAR_MIN_M
 
 
 @dataclass(frozen=True)
@@ -155,6 +245,12 @@ class Lot:
     is ``0.0``, ``name`` is ``None``, ``visits`` is ``0``, and ``x``/``y``/
     ``lot_x``/``lot_y`` all equal the piece's own anchor point since there is
     no original world coordinate to preserve).
+
+    ``typology`` is ``"detached"``/``"row"``/``"landmark"`` (see
+    :func:`classify_typology`) for an occupied lot, or ``""`` for
+    ``kind="greenspace"`` (no world, no massing decision to make). The
+    Voronoi fallback path (:func:`_build_lots_voronoi`) always classifies
+    ``"detached"`` -- see that function's docstring.
     """
 
     world_id: str
@@ -171,6 +267,7 @@ class Lot:
     lot_y: float
     kind: str  # "lot" | "greenspace"
     displacement: float
+    typology: str  # "detached" | "row" | "landmark" | "" (greenspace)
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +360,96 @@ def select_member_points(
 # ---------------------------------------------------------------------------
 
 
-def _height_from_visits(visits: int, h_base: float, h_scale: float) -> float:
-    """``h_base + h_scale * log10(1 + visits)`` (meters); ``visits < 0`` clamps to 0."""
-    return h_base + h_scale * math.log10(1.0 + float(max(visits, 0)))
+def top_landmark_ids(points: pl.DataFrame, landmark_count: int) -> frozenset[str]:
+    """The ``landmark_count`` ``world_id``s with the highest ``visits``,
+    ISLAND-WIDE (not per-district) -- ties broken by ascending ``world_id``
+    for determinism regardless of ``points``' row order. ``landmark_count <=
+    0`` or an empty ``points`` returns an empty set. Feeds
+    :func:`classify_typology` via :func:`build_lots`'s ``landmark_ids`` kwarg
+    (docs/wave2-plan.md "The massing model")."""
+    if landmark_count <= 0 or points.height == 0:
+        return frozenset()
+    ordered = points.select(["world_id", "visits"]).sort(
+        ["visits", "world_id"], descending=[True, False]
+    )
+    top = ordered.head(landmark_count)
+    return frozenset(str(v) for v in top["world_id"].to_list())
+
+
+def classify_typology(
+    district_area_units: float,
+    n_worlds: int,
+    world_id: str,
+    landmark_ids: frozenset[str],
+    cfg: MassingConfig,
+    meters_per_unit: float,
+) -> str:
+    """One of ``"landmark"``/``"detached"``/``"row"`` (docs/wave2-plan.md
+    "The massing model"): ``"landmark"`` if ``world_id in landmark_ids``
+    (independent of area -- popularity always wins); else area-per-world
+    ``district_area_units * meters_per_unit**2 / n_worlds`` thresholded
+    against ``cfg.a_detached_m2`` (``>=`` is ``"detached"``, else ``"row"``).
+
+    Pure function of its inputs (no RNG, no iteration-order dependence) --
+    the SAME ``(district_area_units, n_worlds, world_id, landmark_ids)``
+    always yields the SAME typology. ``n_worlds <= 0`` is a degenerate guard
+    (:func:`build_lots` never calls this with zero worlds -- see its own
+    0-point early return) classifying as ``"detached"`` rather than dividing
+    by zero.
+    """
+    if world_id in landmark_ids:
+        return "landmark"
+    if n_worlds <= 0:
+        return "detached"
+    a = district_area_units * meters_per_unit**2 / float(n_worlds)
+    return "detached" if a >= cfg.a_detached_m2 else "row"
+
+
+def _setbacks_for_typology(
+    typology: str, cfg: MassingConfig
+) -> tuple[float, float, float]:
+    """``(yard_front_m, side_m, depth_max_m)`` for ``typology`` -- unknown
+    typologies fall back to the detached clearances (same convention as
+    :func:`_stories_for_typology`)."""
+    if typology == "row":
+        return cfg.row_yard_front_m, cfg.row_side_m, cfg.row_depth_max_m
+    if typology == "landmark":
+        return cfg.landmark_yard_front_m, cfg.landmark_side_m, cfg.landmark_depth_max_m
+    return cfg.detached_yard_front_m, cfg.detached_side_m, cfg.detached_depth_max_m
+
+
+def _stories_for_typology(typology: str, cfg: MassingConfig) -> tuple[int, int]:
+    """Inclusive ``(lo, hi)`` story band for ``typology`` -- unknown
+    typologies (should not occur -- :func:`classify_typology` only ever
+    returns the three known values) fall back to the detached band."""
+    if typology == "row":
+        return cfg.row_stories
+    if typology == "landmark":
+        return cfg.landmark_stories
+    return cfg.detached_stories
+
+
+def _massing_height(world_id: str, typology: str, cfg: MassingConfig) -> float:
+    """``stories * cfg.story_height_m + jitter`` (meters). ``stories`` is
+    picked within the typology's inclusive ``(lo, hi)`` band and ``jitter``
+    is drawn uniformly from ``[-height_jitter_m, height_jitter_m]`` -- BOTH
+    keyed off a deterministic hash of ``world_id`` (``hashlib.sha256``,
+    stable across processes/``PYTHONHASHSEED`` -- unlike the builtin
+    ``hash()``, which is salted per-process by default) rather than any RNG
+    draw or dict/set iteration order, per the module's determinism contract
+    (same discipline as :func:`_jitter_duplicates`). Two independent hashes
+    (distinct salt strings) so story selection and jitter don't correlate.
+    Per-lot variation within a row run is intentionally KEPT (real terraces
+    vary story-to-story) -- only the visits-driven height formula is retired.
+    """
+    lo, hi = _stories_for_typology(typology, cfg)
+    n_options = max(hi - lo + 1, 1)
+    story_digest = hashlib.sha256(f"massing_stories:{world_id}".encode()).digest()
+    stories = lo + (int.from_bytes(story_digest[:8], "big") % n_options)
+    jitter_digest = hashlib.sha256(f"massing_jitter:{world_id}".encode()).digest()
+    unit = (int.from_bytes(jitter_digest[:8], "big") % 1_000_003) / 1_000_003.0
+    jitter = (unit * 2.0 - 1.0) * cfg.height_jitter_m
+    return stories * cfg.story_height_m + jitter
 
 
 def _largest_polygon_part(geom: sg.base.BaseGeometry) -> sg.Polygon:
@@ -634,6 +818,41 @@ def _assert_partition(
                 raise _SubdivisionFailure("subdivision lots overlap")
 
 
+def _frontage_edge(
+    lot_poly: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    min_frontage: float,
+    ext_buffer: sg.base.BaseGeometry | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """``(anchor_point, unit_direction)`` of the LONGEST boundary edge of
+    ``lot_poly`` that lies on ``ext_ring`` (the district's street frontage),
+    or ``None`` if no edge qualifies (``>= min_frontage`` long and fully
+    covered by a small buffer around ``ext_ring``) -- the caller falls back
+    to the lot's own OBB axes in that case. ``anchor_point`` is one endpoint
+    of that edge, used by :func:`_oriented_footprint` as the origin of its
+    along/depth coordinate frame (depth 0 sits ON the frontage line).
+    ``ext_buffer``, if given, is ``ext_ring``'s precomputed frontage-touch
+    buffer (see :func:`_frontage_length`)."""
+    buffered = (
+        ext_ring.buffer(_FRONTAGE_TOUCH_TOL) if ext_buffer is None else ext_buffer
+    )
+    coords = list(lot_poly.exterior.coords)
+    best_len = max(min_frontage, 1e-9)
+    best: tuple[np.ndarray, np.ndarray] | None = None
+    for i in range(len(coords) - 1):
+        p0, p1 = coords[i], coords[i + 1]
+        seg = sg.LineString([p0, p1])
+        length = seg.length
+        if length <= best_len:
+            continue
+        if buffered.covers(seg):
+            best_len = length
+            d = np.array([p1[0] - p0[0], p1[1] - p0[1]])
+            direction = d / max(float(np.linalg.norm(d)), 1e-12)
+            best = (np.array([p0[0], p0[1]]), direction)
+    return best
+
+
 def _frontage_direction(
     lot_poly: sg.Polygon,
     ext_ring: sg.LinearRing,
@@ -645,91 +864,183 @@ def _frontage_direction(
     qualifies (``>= min_frontage`` long and fully covered by a small buffer
     around ``ext_ring``) -- the caller falls back to the lot's own OBB long
     axis in that case. ``ext_buffer``, if given, is ``ext_ring``'s precomputed
-    frontage-touch buffer (see :func:`_frontage_length`)."""
-    buffered = (
-        ext_ring.buffer(_FRONTAGE_TOUCH_TOL) if ext_buffer is None else ext_buffer
-    )
-    coords = list(lot_poly.exterior.coords)
-    best_len = max(min_frontage, 1e-9)
-    best_dir: np.ndarray | None = None
-    for i in range(len(coords) - 1):
-        p0, p1 = coords[i], coords[i + 1]
-        seg = sg.LineString([p0, p1])
-        length = seg.length
-        if length <= best_len:
-            continue
-        if buffered.covers(seg):
-            best_len = length
-            d = np.array([p1[0] - p0[0], p1[1] - p0[1]])
-            best_dir = d / max(float(np.linalg.norm(d)), 1e-12)
-    return best_dir
+    frontage-touch buffer (see :func:`_frontage_length`). Thin wrapper around
+    :func:`_frontage_edge` (kept as its own function: callers that only need
+    the direction, e.g. this module's tests, don't need the anchor point)."""
+    edge = _frontage_edge(lot_poly, ext_ring, min_frontage, ext_buffer)
+    return None if edge is None else edge[1]
+
+
+def _strip_polygon(
+    anchor: np.ndarray,
+    along: np.ndarray,
+    perp: np.ndarray,
+    s_lo: float,
+    s_hi: float,
+    d_lo: float,
+    d_hi: float,
+) -> sg.Polygon:
+    """Rectangle in the ``(along, perp)`` frame anchored at ``anchor``: spans
+    ``s in [s_lo, s_hi]`` along ``along`` and ``d in [d_lo, d_hi]`` along
+    ``perp``. :func:`_oriented_footprint` carves the setback slab and its
+    side erosion out of a lot polygon via plain ``Polygon.intersection``
+    against rectangles built by this helper."""
+    corners = [
+        anchor + s * along + d * perp
+        for s, d in ((s_lo, d_lo), (s_hi, d_lo), (s_hi, d_hi), (s_lo, d_hi))
+    ]
+    return sg.Polygon([tuple(c) for c in corners])
+
+
+def _footprint_clamped(lot_poly: sg.Polygon, inset: float) -> sg.Polygon:
+    """:func:`_footprint`'s fallback, additionally clamped to stay INSIDE
+    ``lot_poly``.
+
+    :func:`_footprint`'s own degenerate case -- a ``representative_point()``
+    circle of radius ``inset`` when the lot is too thin for the inward
+    buffer to survive -- is deliberately UNCLAMPED there (see that function's
+    own tests: a lot smaller than the circle gets the full circle, not a
+    sliver) since ``_footprint``'s only contract is "every world gets SOME
+    footprint." :func:`_oriented_footprint` needs a STRICTER guarantee
+    (footprint subset of lot, this module's own invariant tests) for every
+    lot the massing model produces, so its fallback calls go through this
+    wrapper instead: intersect the circle with ``lot_poly`` (never empty --
+    ``representative_point()`` sits inside ``lot_poly`` by contract, so the
+    circle always overlaps it at least at that point) and fall back to the
+    unclamped circle only for a genuinely empty/degenerate ``lot_poly``
+    (``_footprint`` itself already special-cases that)."""
+    fp = _footprint(lot_poly, inset)
+    if lot_poly.is_empty or lot_poly.area <= 0.0:
+        return fp
+    clipped = _largest_polygon_part(fp.intersection(lot_poly))
+    if clipped.is_empty or clipped.area <= 0.0:
+        return fp
+    return clipped
 
 
 def _oriented_footprint(
     lot_poly: sg.Polygon,
     ext_ring: sg.LinearRing,
+    typology: str,
+    massing: MassingConfig,
+    meters_per_unit: float,
     cfg: LotConfig,
     ext_buffer: sg.base.BaseGeometry | None = None,
 ) -> sg.Polygon:
-    """Building footprint oriented to ``lot_poly``'s frontage edge (fallback:
-    its own OBB long axis), sized from its OBB fill ratio clamped into
-    ``cfg.building_width_frac`` / ``cfg.building_depth_frac``, inset by
-    ``cfg.inset`` and guaranteed fully inside the lot (intersected with an
-    inward-buffered guard copy of it, same collapse-to-nonempty fallback as
-    :func:`_footprint`). ``ext_buffer``, if given, is ``ext_ring``'s
-    precomputed frontage-touch buffer (see :func:`_frontage_length`) --
-    :func:`build_lots` threads it through so it's computed once per district
-    rather than once per lot."""
-    if lot_poly.is_empty or lot_poly.area <= 0.0:
-        return _footprint(lot_poly, cfg.inset)
+    """Building footprint from REAL metric setbacks (``docs/wave2-plan.md``
+    "The massing model"), replacing the old OBB-fill-ratio sizing.
 
-    center, axis_long, axis_short, long_len, short_len = _obb_axes(lot_poly)
-    frontage_dir = _frontage_direction(lot_poly, ext_ring, cfg.min_frontage, ext_buffer)
-    if frontage_dir is not None:
-        along = frontage_dir
-        perp = np.array([-along[1], along[0]])
+    In the lot's frontage frame (anchored at the longest boundary edge on
+    ``ext_ring``, :func:`_frontage_edge`): ``footprint = lot_poly ∩
+    depth_slab``, where ``depth_slab`` runs from ``front_setback`` to
+    ``front_setback + depth_max`` (meters, converted to island units via
+    ``meters_per_unit``) measured PERPENDICULAR to the frontage edge and INTO
+    the lot -- then further intersected with a side strip eroded by
+    ``side_setback`` on each along-frontage end (``0`` for ``"row"``: shared
+    walls, so adjacent row lots' footprints abut and the run reads as one
+    continuous terrace; a real end-of-run inset is deferred, see
+    ``docs/wave2-plan.md``'s row footprint note).
+
+    ``front_setback = massing.road_clear_m + <typology>.yard_front_m`` --
+    ``road_clear_m`` is denominated from the FRONTAGE LOT LINE (not the
+    lot's own OBB), which is what keeps buildings off the road ribbon
+    (docs/wave2-plan.md root cause 3: the old fill-ratio footprint inset only
+    ~1.25m from the lot line while the street itself reached ~1.9m past it).
+    A rear guard caps the slab's far edge (``front_setback + depth_max``
+    vs. ``total_lot_depth - rear_min_m``) so a shallow lot always keeps some
+    unbuilt depth behind the footprint rather than eating the whole lot.
+
+    Falls back to :func:`_footprint_clamped` (:func:`_footprint`'s inward-
+    buffer / representative-point circle, clamped to stay inside the lot)
+    whenever the slab construction degenerates (lot too shallow for any
+    setback+depth+rear-guard combination, a strip intersection collapses to
+    empty, or ``lot_poly`` itself is degenerate) -- every world still gets
+    SOME footprint, same guarantee as the pre-2a footprint model, but never
+    one that pokes outside its own lot.
+
+    No frontage edge (interior/landlocked lot -- accepted for the 2a bake
+    per ``docs/wave2-plan.md``'s "Deferred" list, implied alleys): centers a
+    rectangle on the lot's own OBB long/short axes using the DETACHED
+    typology's clearances SYMMETRICALLY on both ends of each axis, since
+    there is no candidate street edge to set back from directionally --
+    a narrower reading of "the current OBB-long-axis behavor with the
+    detached clearances" than a one-directional front setback (design
+    decision; see this slice's report).
+    """
+    if lot_poly.is_empty or lot_poly.area <= 0.0:
+        return _footprint_clamped(lot_poly, cfg.inset)
+
+    yard_front_m, side_m, depth_max_m = _setbacks_for_typology(typology, massing)
+    edge = _frontage_edge(lot_poly, ext_ring, cfg.min_frontage, ext_buffer)
+
+    if edge is not None:
+        anchor, along = edge
+        perp_candidate = np.array([-along[1], along[0]])
+        centroid = lot_poly.centroid
+        rel_c = np.array([centroid.x, centroid.y]) - anchor
+        perp = (
+            perp_candidate if float(rel_c @ perp_candidate) >= 0.0 else -perp_candidate
+        )
+
         coords = np.asarray(lot_poly.exterior.coords[:-1], dtype=np.float64)
-        rel = coords - center
+        rel = coords - anchor
         proj_along = rel @ along
         proj_perp = rel @ perp
-        width_dim = float(proj_along.max() - proj_along.min())
-        depth_dim = float(proj_perp.max() - proj_perp.min())
-        axis_w, axis_d = along, perp
-    else:
-        width_dim, depth_dim = long_len, short_len
-        axis_w, axis_d = axis_long, axis_short
+        total_depth = float(proj_perp.max())
 
-    obb_area = max(width_dim * depth_dim, 1e-12)
-    fill_ratio = max(0.0, min(1.0, lot_poly.area / obb_area))
-    size_frac = math.sqrt(fill_ratio)
-    w_frac = min(max(size_frac, cfg.building_width_frac[0]), cfg.building_width_frac[1])
-    d_frac = min(max(size_frac, cfg.building_depth_frac[0]), cfg.building_depth_frac[1])
-    w = width_dim * w_frac
-    d = depth_dim * d_frac
+        front_setback = (massing.road_clear_m + yard_front_m) / meters_per_unit
+        depth_max = depth_max_m / meters_per_unit
+        rear_min = massing.rear_min_m / meters_per_unit
+        d_lo = front_setback
+        d_hi = min(front_setback + depth_max, total_depth - rear_min)
+        if d_hi <= d_lo:
+            return _footprint_clamped(lot_poly, cfg.inset)
 
-    centroid = lot_poly.centroid
-    anchor = (
-        centroid if lot_poly.contains(centroid) else lot_poly.representative_point()
-    )
-    cx, cy = anchor.x, anchor.y
-    half_w, half_d = w / 2.0, d / 2.0
-    corners = [
-        (
-            cx + s1 * half_w * axis_w[0] + s2 * half_d * axis_d[0],
-            cy + s1 * half_w * axis_w[1] + s2 * half_d * axis_d[1],
+        s_min, s_max = float(proj_along.min()), float(proj_along.max())
+        pad = max(s_max - s_min, total_depth, 1.0) * 2.0 + 1.0
+        depth_strip = _strip_polygon(
+            anchor, along, perp, s_min - pad, s_max + pad, d_lo, d_hi
         )
-        for s1, s2 in ((-1, -1), (1, -1), (1, 1), (-1, 1))
-    ]
-    rect = sg.Polygon(corners)
+        candidate = _largest_polygon_part(lot_poly.intersection(depth_strip))
+        if candidate.is_empty or candidate.area <= 0.0:
+            return _footprint_clamped(lot_poly, cfg.inset)
 
-    guard = lot_poly.buffer(-cfg.inset)
-    guard = _largest_polygon_part(guard) if not guard.is_empty else guard
-    if guard.is_empty or guard.geom_type != "Polygon":
-        return _footprint(lot_poly, cfg.inset)
+        side_setback = side_m / meters_per_unit
+        cand_coords = np.asarray(candidate.exterior.coords[:-1], dtype=np.float64)
+        cand_along = (cand_coords - anchor) @ along
+        cs_min, cs_max = float(cand_along.min()), float(cand_along.max())
+        s_lo = cs_min + side_setback
+        s_hi = cs_max - side_setback
+        if s_hi <= s_lo:
+            return _footprint_clamped(lot_poly, cfg.inset)
+        side_strip = _strip_polygon(
+            anchor, along, perp, s_lo, s_hi, d_lo - pad, d_hi + pad
+        )
+        footprint = _largest_polygon_part(candidate.intersection(side_strip))
+    else:
+        center, axis_long, axis_short, long_len, short_len = _obb_axes(lot_poly)
+        d_yard_m, d_side_m, d_depth_max_m = _setbacks_for_typology("detached", massing)
+        half_w = max(0.0, long_len / 2.0 - d_side_m / meters_per_unit)
+        half_d = max(
+            0.0,
+            min(
+                short_len / 2.0 - d_yard_m / meters_per_unit,
+                d_depth_max_m / (2.0 * meters_per_unit),
+            ),
+        )
+        if half_w <= 0.0 or half_d <= 0.0:
+            return _footprint_clamped(lot_poly, cfg.inset)
+        corners = [
+            (
+                center[0] + s1 * half_w * axis_long[0] + s2 * half_d * axis_short[0],
+                center[1] + s1 * half_w * axis_long[1] + s2 * half_d * axis_short[1],
+            )
+            for s1, s2 in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+        ]
+        footprint = _largest_polygon_part(sg.Polygon(corners).intersection(lot_poly))
 
-    footprint = _largest_polygon_part(rect.intersection(guard))
     if footprint.is_empty or footprint.area <= 0.0:
-        return _footprint(lot_poly, cfg.inset)
+        return _footprint_clamped(lot_poly, cfg.inset)
     return footprint
 
 
@@ -841,8 +1152,7 @@ def _build_lots_voronoi(
     *,
     inset: float = DEFAULT_INSET,
     min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
-    h_base: float = DEFAULT_H_BASE,
-    h_scale: float = DEFAULT_H_SCALE,
+    massing: MassingConfig | None = None,
 ) -> list[Lot]:
     """The pre-L1 naive per-district Voronoi tessellation, kept verbatim as
     :func:`build_lots`'s fallback for districts where street-fronting
@@ -850,6 +1160,14 @@ def _build_lots_voronoi(
     generating world's own lot, so ``lot_x``/``lot_y`` == ``x``/``y`` and
     ``displacement`` is always ``0.0`` and every lot's ``kind`` is ``"lot"``
     (this path never produces greenspace).
+
+    Height uses :func:`_massing_height` with typology fixed to ``"detached"``
+    for every lot (this rare-fallback path predates the wave-2 massing model
+    and doesn't attempt area-per-world typology classification against
+    Hungarian-displaced Chen-district geometry it never touches -- see
+    ``docs/wave2-plan.md``'s massing model, which targets the NORMAL
+    subdivision path). Footprint is unchanged from pre-2a: the plain inset
+    (:func:`_footprint`), not the frontage-setback model.
 
     ``member_points`` needs ``world_id, x, y, visits, assigned`` columns
     (``name`` optional, else every ``Lot.name`` is ``None``) -- see
@@ -879,6 +1197,8 @@ def _build_lots_voronoi(
     ``district`` afterward), then matched back to their generating point
     (:func:`_match_generator_to_cell`).
     """
+    if massing is None:
+        massing = MassingConfig()
     n = member_points.height
     if n == 0:
         return []
@@ -895,7 +1215,7 @@ def _build_lots_voronoi(
     else:
         names = [None] * n
 
-    heights = [_height_from_visits(v, h_base, h_scale) for v in visits]
+    heights = [_massing_height(wid, "detached", massing) for wid in world_ids]
 
     if n == 1:
         lot_poly = district
@@ -915,6 +1235,7 @@ def _build_lots_voronoi(
                 lot_y=ys[0],
                 kind="lot",
                 displacement=0.0,
+                typology="detached",
             )
         ]
 
@@ -942,6 +1263,7 @@ def _build_lots_voronoi(
                 lot_y=ys[i],
                 kind="lot",
                 displacement=0.0,
+                typology="detached",
             )
             for i in range(n)
         ]
@@ -993,6 +1315,7 @@ def _build_lots_voronoi(
                 lot_y=ys[i],
                 kind="lot",
                 displacement=0.0,
+                typology="detached",
             )
         )
     return lots
@@ -1011,29 +1334,42 @@ def build_lots(
     *,
     inset: float = DEFAULT_INSET,
     min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
-    h_base: float = DEFAULT_H_BASE,
-    h_scale: float = DEFAULT_H_SCALE,
     seed: int | None = None,
     cfg: LotConfig | None = None,
+    massing: MassingConfig | None = None,
+    meters_per_unit: float = DEFAULT_METERS_PER_UNIT,
+    landmark_ids: frozenset[str] = frozenset(),
     fallback_stats: dict[str, Any] | None = None,
 ) -> list[Lot]:
-    """Tessellate ``district`` into street-fronting lots and assign its
-    member worlds onto them (Hungarian, exact) + inset building footprints.
+    """Tessellate ``district`` into street-fronting lots, assign its member
+    worlds onto them (Hungarian, exact), and give each a massing-model
+    typology + setback footprint + height (``docs/wave2-plan.md``).
 
     ``member_points`` needs ``world_id, x, y, visits, assigned`` columns
     (``name`` optional, else every ``Lot.name`` is ``None``) -- see
     :func:`select_member_points`.
 
-    ``inset``/``min_lot_area_frac``/``h_base``/``h_scale`` are the pre-L1
-    kwargs (still accepted directly so existing callers -- e.g.
-    ``scripts/run_r1_hybrid.py``'s ``export_greybox`` -- keep working
-    unmodified); passing an explicit ``cfg`` overrides all four at once.
-    ``seed`` defaults to ``district_id`` (deterministic given a fixed
-    district walk order, decorrelated across districts sharing a shape).
-    ``fallback_stats``, if given a dict, gets ``"n_fallback"`` incremented
-    and a ``"fallback_districts"`` list entry appended (``{"district_id",
+    ``inset``/``min_lot_area_frac`` are the pre-L1 kwargs (still accepted
+    directly so existing callers -- e.g. ``scripts/run_r1_hybrid.py``'s
+    ``export_greybox`` -- keep working unmodified); passing an explicit
+    ``cfg`` overrides both at once. ``massing``/``meters_per_unit``/
+    ``landmark_ids`` drive :func:`classify_typology`/:func:`_massing_height`/
+    :func:`_oriented_footprint` for every world in ``member_points`` --
+    ``massing`` defaults to ``MassingConfig()`` and ``landmark_ids`` defaults
+    to an empty set (no world classifies ``"landmark"``) so existing callers
+    that don't yet pass them keep the suburb-default behavior. ``seed``
+    defaults to ``district_id`` (deterministic given a fixed district walk
+    order, decorrelated across districts sharing a shape). ``fallback_stats``,
+    if given a dict, gets ``"n_fallback"`` incremented and a
+    ``"fallback_districts"`` list entry appended (``{"district_id",
     "reason"}``) whenever THIS district falls back to
     :func:`_build_lots_voronoi`.
+
+    Typology/height are computed PER WORLD from the district-level
+    ``(district.area, len(member_points))`` pair (:func:`classify_typology`)
+    -- every world in the SAME district shares the same area-per-world ratio,
+    so only ``landmark_ids`` membership can make two worlds in one district
+    classify differently.
 
     Degenerate cases:
 
@@ -1073,17 +1409,21 @@ def build_lots(
     else:
         names = [None] * n
 
-    heights = [_height_from_visits(v, h_base, h_scale) for v in visits]
-
     if cfg is None:
-        cfg = LotConfig(
-            inset=inset,
-            h_base=h_base,
-            h_scale=h_scale,
-            voronoi_min_lot_area_frac=min_lot_area_frac,
-        )
+        cfg = LotConfig(inset=inset, voronoi_min_lot_area_frac=min_lot_area_frac)
+    if massing is None:
+        massing = MassingConfig()
     if seed is None:
         seed = district_id
+
+    typologies = [
+        classify_typology(district.area, n, wid, landmark_ids, massing, meters_per_unit)
+        for wid in world_ids
+    ]
+    heights = [
+        _massing_height(wid, typ, massing)
+        for wid, typ in zip(world_ids, typologies, strict=True)
+    ]
 
     ext_ring = district.exterior
     # Computed ONCE per build_lots call and threaded through every
@@ -1097,7 +1437,15 @@ def build_lots(
             Lot(
                 world_id=world_ids[0],
                 district_id=district_id,
-                footprint=_oriented_footprint(lot_poly, ext_ring, cfg, ext_buffer),
+                footprint=_oriented_footprint(
+                    lot_poly,
+                    ext_ring,
+                    typologies[0],
+                    massing,
+                    meters_per_unit,
+                    cfg,
+                    ext_buffer,
+                ),
                 lot=lot_poly,
                 height=heights[0],
                 name=names[0],
@@ -1109,6 +1457,7 @@ def build_lots(
                 lot_y=ys[0],
                 kind="lot",
                 displacement=0.0,
+                typology=typologies[0],
             )
         ]
 
@@ -1143,8 +1492,7 @@ def build_lots(
             member_points,
             inset=cfg.inset,
             min_lot_area_frac=cfg.voronoi_min_lot_area_frac,
-            h_base=cfg.h_base,
-            h_scale=cfg.h_scale,
+            massing=massing,
         )
 
     anchors: list[tuple[float, float]] = []
@@ -1172,7 +1520,15 @@ def build_lots(
             Lot(
                 world_id=world_ids[i],
                 district_id=district_id,
-                footprint=_oriented_footprint(lot_poly, ext_ring, cfg, ext_buffer),
+                footprint=_oriented_footprint(
+                    lot_poly,
+                    ext_ring,
+                    typologies[i],
+                    massing,
+                    meters_per_unit,
+                    cfg,
+                    ext_buffer,
+                ),
                 lot=lot_poly,
                 height=heights[i],
                 name=names[i],
@@ -1184,6 +1540,7 @@ def build_lots(
                 lot_y=ay,
                 kind="lot",
                 displacement=math.hypot(xs[i] - ax, ys[i] - ay),
+                typology=typologies[i],
             )
         )
 
@@ -1207,6 +1564,7 @@ def build_lots(
                 lot_y=ay,
                 kind="greenspace",
                 displacement=0.0,
+                typology="",
             )
         )
 
