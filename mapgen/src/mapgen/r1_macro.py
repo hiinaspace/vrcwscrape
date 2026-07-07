@@ -247,6 +247,33 @@ DEFAULT_CORE_SMOOTH_ITERATIONS: int = 2
 # resolves to one raster cell width at call time ("w ~= 1 cell").
 DEFAULT_CORE_CLOSE_WIDTH_UNITS: float | None = None
 
+# --- Ring regularization (slice R) ---
+#
+# `_cells_to_polygon`'s close+Chaikin round the pixel-blob stair-step but
+# never remove a genuinely concave feature the cell-region growth can leave
+# -- a narrow "keyhole" neck feeding a bulge still reads as an organic blob,
+# not a road-like ring, and every core shares the identical close+Chaikin
+# motif ("stamped wheel"). Rank isn't known until `build_nucleus_specs`
+# (mass integration needs the exact core polygon as its domain), so this is
+# applied as a SECOND PASS on already-`_cells_to_polygon`'d core polygons
+# (see `_regularize_ring_polygons`), rank-scaled: MAJOR nuclei (top-K by
+# mass) get a real morphological OPENING that severs necks/lobes; minor/
+# village cores get ``width=0`` (skip -- today's cheap contour), which also
+# de-stamps the motif. See docs/macro-roads-nuclei-plan.md, slice R.
+DEFAULT_RING_OPEN_WIDTH_MAJOR_UNITS: float = 1.75
+DEFAULT_RING_OPEN_WIDTH_MINOR_UNITS: float = 0.0
+
+# Optional low-pass elliptic-Fourier / periodic-spline refit of a MAJOR ring
+# boundary, applied AFTER the opening above. Off by default
+# (``MacroParams.ring_fourier_refit=False``) -- opening alone is expected to
+# suffice; the mini visual gate decides whether to turn it on.
+DEFAULT_RING_FOURIER_HARMONICS: int = 8
+# Uniform arc-length resample count feeding the periodic FFT fit.
+DEFAULT_RING_FOURIER_RESAMPLE_N: int = 128
+# Reject the refit (fall back to the pre-refit ring) if the repaired
+# polygon's area differs from the input's by more than this fraction.
+DEFAULT_RING_FOURIER_MAX_AREA_CHANGE: float = 0.2
+
 NodeKind = Literal["city", "town", "village"]
 
 
@@ -1515,6 +1542,170 @@ def _cells_to_polygon(
     if poly.is_empty or poly.geom_type != "Polygon":
         return None
     return poly
+
+
+def _open_ring_polygon(poly: sg.Polygon, width: float) -> sg.Polygon:
+    """Morphological OPENING (erode then dilate) to shed thin necks/lobes.
+
+    ``buffer(-width).buffer(+width)`` severs any neck narrower than
+    ``2 * width`` from the bulge it feeds -- the mechanism that turns a
+    keyhole-shaped core (narrow neck + bulge) into just the main lobe. If the
+    erosion splits the polygon into several pieces, only the LARGEST (by
+    area) survives the dilation: a ring boundary must stay a single closed
+    loop for :func:`core_ring_boundaries` / :func:`clip_arterials_to_cores` /
+    :func:`snap_endpoints_to_rings` to treat it as one ring. ``width <= 0`` is
+    an identity pass (villages/minor cores; see
+    :func:`_regularize_ring_polygons`). Falls back to ``poly`` unchanged if
+    the opened result is empty or degenerates to a non-polygon (e.g. the
+    whole shape erodes away for a core slimmer than ``2 * width``).
+    """
+    if width <= 0.0:
+        return poly
+    opened = poly.buffer(-width, quad_segs=2).buffer(width, quad_segs=2)
+    if opened.is_empty:
+        return poly
+    if opened.geom_type == "MultiPolygon":
+        if not opened.geoms:
+            return poly
+        opened = max(opened.geoms, key=lambda p: p.area)
+    if opened.geom_type != "Polygon" or opened.is_empty:
+        return poly
+    return opened
+
+
+def _fourier_low_pass_refit(
+    poly: sg.Polygon,
+    *,
+    n_harmonics: int = DEFAULT_RING_FOURIER_HARMONICS,
+    n_samples: int = DEFAULT_RING_FOURIER_RESAMPLE_N,
+    max_area_change: float = DEFAULT_RING_FOURIER_MAX_AREA_CHANGE,
+) -> sg.Polygon:
+    """Low-pass elliptic-Fourier refit of a ring polygon's boundary (slice R).
+
+    Resamples the exterior ring at ``n_samples`` uniform ARC-LENGTH stations,
+    then truncates the closed contour's Fourier series (``np.fft.rfft`` on
+    the resampled ``x``/``y`` sequences) to ``n_harmonics`` and reconstructs
+    -- a periodic low-pass spline that smooths the ring into simple arcs
+    instead of the morphological-open+close+Chaikin's still-somewhat-faceted
+    loop.
+
+    Two guards, either of which falls back to the INPUT ``poly`` unchanged
+    (the refit is cosmetic, never load-bearing):
+
+    1. ``buffer(0)`` validity: the reconstructed contour can self-intersect
+       (Fourier truncation is not shape-preserving) -- ``buffer(0)`` repairs
+       it; if that yields anything other than a single ``Polygon`` (split
+       into a ``MultiPolygon`` or emptied), the refit is rejected.
+    2. Area-change guard: if the repaired polygon's area differs from the
+       input's by more than ``max_area_change`` (a fraction), the refit is
+       rejected -- it must smooth the ring, not resize it.
+
+    Off by default (``MacroParams.ring_fourier_refit=False`` /
+    :func:`_regularize_ring_polygons`'s ``fourier_refit``); the rank-scaled
+    opening alone is expected to suffice, per the mini visual gate.
+    """
+    if n_harmonics <= 0 or poly.is_empty:
+        return poly
+    coords = np.asarray(poly.exterior.coords[:-1], dtype=np.float64)
+    if len(coords) < 3:
+        return poly
+
+    seg = np.diff(coords, axis=0, append=coords[:1])
+    seg_len = np.hypot(seg[:, 0], seg[:, 1])
+    perimeter = float(seg_len.sum())
+    if perimeter <= 0.0:
+        return poly
+    arc = np.concatenate([[0.0], np.cumsum(seg_len)])[:-1]
+
+    samples = np.linspace(0.0, perimeter, n_samples, endpoint=False)
+    xs = np.interp(samples, arc, coords[:, 0], period=perimeter)
+    ys = np.interp(samples, arc, coords[:, 1], period=perimeter)
+
+    fx = np.fft.rfft(xs)
+    fy = np.fft.rfft(ys)
+    keep = min(n_harmonics + 1, len(fx))
+    fx[keep:] = 0.0
+    fy[keep:] = 0.0
+    rx = np.fft.irfft(fx, n=n_samples)
+    ry = np.fft.irfft(fy, n=n_samples)
+
+    refit_coords = list(zip(rx.tolist(), ry.tolist(), strict=True))
+    refit_coords.append(refit_coords[0])
+    if len(refit_coords) < 4:
+        return poly
+    candidate = sg.Polygon(refit_coords)
+    if not candidate.is_valid:
+        candidate = candidate.buffer(0)
+    if candidate.geom_type != "Polygon" or candidate.is_empty:
+        return poly
+    orig_area = poly.area
+    if orig_area <= 0.0:
+        return poly
+    if abs(candidate.area - orig_area) / orig_area > max_area_change:
+        return poly
+    return candidate
+
+
+def _regularize_ring_polygons(
+    core_polys: list[sg.Polygon],
+    density: np.ndarray,
+    nodes: list[MacroNode],
+    points: pl.DataFrame,
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    n_major_nuclei: int,
+    open_width_major: float = DEFAULT_RING_OPEN_WIDTH_MAJOR_UNITS,
+    open_width_minor: float = DEFAULT_RING_OPEN_WIDTH_MINOR_UNITS,
+    fourier_refit: bool = False,
+    fourier_harmonics: int = DEFAULT_RING_FOURIER_HARMONICS,
+) -> list[sg.Polygon]:
+    """Rank-scaled ring regularization: morphological opening (+ optional
+    Fourier low-pass refit), applied to ``detect_core_regions``'s output
+    BEFORE clip/snap/station derivation (slice R).
+
+    Rank is not known at ``_cells_to_polygon`` time -- mass integration needs
+    the exact core polygon as its domain, so ranking has to happen on cores
+    that already exist -- so this runs a lightweight PRELIMINARY
+    :func:`build_nucleus_specs` pass purely to read off ``is_major``
+    (matched back to ``core_polys`` by polygon object identity, since
+    ``build_nucleus_specs`` reuses the input polygon objects unchanged),
+    then opens major cores at ``open_width_major`` and minor cores at
+    ``open_width_minor`` (``0`` = skip, today's cheap contour) -- de-blobbing
+    the biggest downtowns while leaving villages cheap, which also de-stamps
+    the identical "wheel" ring motif every core shared before.
+
+    MUST run before :func:`clip_arterials_to_cores` /
+    :func:`snap_endpoints_to_rings` / :func:`build_nucleus_specs`: the core
+    polygon is simultaneously the arterial clip boundary, the block-
+    protection region, the nucleus mass/rank integration domain, and the
+    spoke-station source, so everything has to re-derive from the SAME
+    regularized polygon rather than desyncing.
+
+    Identity pass if ``core_polys`` is empty or every knob is a no-op
+    (``open_width_major <= 0``, ``open_width_minor <= 0``, no Fourier
+    refit).
+    """
+    if not core_polys:
+        return core_polys
+    if open_width_major <= 0.0 and open_width_minor <= 0.0 and not fourier_refit:
+        return core_polys
+
+    prelim_nuclei = build_nucleus_specs(
+        density, core_polys, nodes, points, x0, y0, cell, n_major=n_major_nuclei
+    )
+    major_ids = {id(n.polygon) for n in prelim_nuclei if n.is_major}
+
+    out: list[sg.Polygon] = []
+    for poly in core_polys:
+        is_major = id(poly) in major_ids
+        width = open_width_major if is_major else open_width_minor
+        opened = _open_ring_polygon(poly, width)
+        if fourier_refit and is_major:
+            opened = _fourier_low_pass_refit(opened, n_harmonics=fourier_harmonics)
+        out.append(opened)
+    return out
 
 
 def detect_core_regions(
@@ -2889,7 +3080,9 @@ class MacroBlockBundle:
 
     Attributes
     ----------
-    core_polys : detected dense-core "downtown" polygons (ringed blocks).
+    core_polys : detected dense-core "downtown" polygons (ringed blocks),
+        AFTER slice R's rank-scaled ring regularization
+        (:func:`_regularize_ring_polygons`).
     ring_lines : each core's exterior ring as a LineString (drawn as ring
         roads), PLUS one plaza ring per major nucleus that got avenues (S3)
         -- both are "ring"-kind macro features downstream (gate snapping,
@@ -2955,6 +3148,10 @@ def build_macro_blocks_with_cores(
     core_simplify_tolerance: float = DEFAULT_CORE_SIMPLIFY_TOLERANCE,
     core_close_width: float | None = DEFAULT_CORE_CLOSE_WIDTH_UNITS,
     core_smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
+    ring_open_width_major: float = DEFAULT_RING_OPEN_WIDTH_MAJOR_UNITS,
+    ring_open_width_minor: float = DEFAULT_RING_OPEN_WIDTH_MINOR_UNITS,
+    ring_fourier_refit: bool = False,
+    ring_fourier_harmonics: int = DEFAULT_RING_FOURIER_HARMONICS,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI,
     r_plaza_major_min: float = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
@@ -2971,6 +3168,13 @@ def build_macro_blocks_with_cores(
 
     1. Detect dense core regions around CITY/TOWN nodes
        (:func:`detect_core_regions`).
+    1b. Rank-scaled ring regularization (:func:`_regularize_ring_polygons`,
+       slice R): a morphological OPENING severs keyhole necks/lobes on MAJOR
+       cores (minor cores keep the cheap ``_cells_to_polygon`` contour),
+       optionally followed by a low-pass Fourier refit (off by default).
+       Runs BEFORE clip/snap so the clip boundary, block-protection region,
+       nucleus mass/rank domain and spoke-station source all re-derive from
+       the SAME regularized polygon.
     2. Clip arterials to the cores' exterior (:func:`clip_arterials_to_cores`)
        so density-attracting arterials terminate ON the ring (T-junctions)
        rather than converging on the summit.
@@ -3017,6 +3221,20 @@ def build_macro_blocks_with_cores(
         simplify_tolerance=core_simplify_tolerance,
         close_width=core_close_width,
         smooth_iterations=core_smooth_iterations,
+    )
+    core_polys = _regularize_ring_polygons(
+        core_polys,
+        density,
+        nodes,
+        points,
+        x0,
+        y0,
+        cell,
+        n_major_nuclei=n_major_nuclei,
+        open_width_major=ring_open_width_major,
+        open_width_minor=ring_open_width_minor,
+        fourier_refit=ring_fourier_refit,
+        fourier_harmonics=ring_fourier_harmonics,
     )
     clipped_lines, clipped_edges = clip_arterials_to_cores(
         arterial_lines, edges, core_polys
@@ -3147,6 +3365,13 @@ class MacroParams:
     core_frac: float = DEFAULT_CORE_FRAC
     core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS
     core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2
+    # Ring regularization (slice R): rank-scaled morphological opening
+    # (majors only; minors default to ``0`` = today's cheap contour) +
+    # optional low-pass Fourier refit (off by default).
+    ring_open_width_major: float = DEFAULT_RING_OPEN_WIDTH_MAJOR_UNITS
+    ring_open_width_minor: float = DEFAULT_RING_OPEN_WIDTH_MINOR_UNITS
+    ring_fourier_refit: bool = False
+    ring_fourier_harmonics: int = DEFAULT_RING_FOURIER_HARMONICS
     # Ranked settlement nuclei (S2): top-K by mass flagged is_major.
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI
     # Intra-nucleus avenues (S3): spokes + a plaza ring, MAJOR nuclei only.
@@ -3352,6 +3577,10 @@ def build_macro_layer(
         core_frac=params.core_frac,
         core_max_radius_units=params.core_max_radius_units,
         core_min_area_units2=params.core_min_area_units2,
+        ring_open_width_major=params.ring_open_width_major,
+        ring_open_width_minor=params.ring_open_width_minor,
+        ring_fourier_refit=params.ring_fourier_refit,
+        ring_fourier_harmonics=params.ring_fourier_harmonics,
         min_block_area=params.min_block_area,
         n_major_nuclei=params.n_major_nuclei,
         r_plaza_major_min=params.r_plaza_major_min,

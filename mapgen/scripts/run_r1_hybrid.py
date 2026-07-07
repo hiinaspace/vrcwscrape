@@ -318,6 +318,8 @@ def _draw_layers(
     point_alpha: float,
     junction_size: float,
     plaza_polys: list[sg.Polygon] | None = None,
+    ring_arc_lines: list[sg.LineString] | None = None,
+    ring_arc_edges: list[MacroEdge] | None = None,
 ) -> None:
     """Draw the shared hybrid layer stack on ``ax`` (backdrop -> junctions)."""
     density = fields.density
@@ -429,6 +431,30 @@ def _draw_layers(
             solid_capstyle="round",
         )
 
+    # Promoted ring arcs (slice B tiers; slice R renders them): a ring arc
+    # that carries highway/major through-traffic is drawn SOLID, tier-colored,
+    # ABOVE the dashed ring stroke -- so the red/blue skeleton stays visually
+    # continuous across a ring traversal instead of breaking into an
+    # undifferentiated "ring". Local-tier arcs are left to the dashed ring
+    # underneath (no override drawn).
+    for tier in (1, 2):
+        if tier not in _TIER_STYLE or tier not in arterial_lw:
+            continue
+        style = _TIER_STYLE[tier]
+        for line, rec in zip(ring_arc_lines or [], ring_arc_edges or [], strict=True):
+            if rec.tier != tier or line.geom_type != "LineString":
+                continue
+            lx, ly = line.xy
+            ax.plot(
+                lx,
+                ly,
+                color=style["color"],
+                lw=arterial_lw[tier],
+                alpha=0.95,
+                zorder=9.5,
+                solid_capstyle="round",
+            )
+
     # Realized arterial/ring T-junctions: light dot, dark edge, above
     # everything else. Coast/unmatched gates are skipped — they aren't a
     # local-fabric<->macro-network junction (see mapgen.r1_connect.SeamJunction).
@@ -486,6 +512,8 @@ def render_overview(
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
     plaza_polys: list[sg.Polygon] | None = None,
+    ring_arc_lines: list[sg.LineString] | None = None,
+    ring_arc_edges: list[MacroEdge] | None = None,
     total_districts: int,
     total_streets: int,
     out_path: Path,
@@ -507,6 +535,8 @@ def render_overview(
         colors=colors,
         junctions=junctions,
         plaza_polys=plaza_polys,
+        ring_arc_lines=ring_arc_lines,
+        ring_arc_edges=ring_arc_edges,
         district_lw=0.25,
         district_alpha=0.35,
         street_lw=0.4,
@@ -547,6 +577,8 @@ def render_core(
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
     plaza_polys: list[sg.Polygon] | None = None,
+    ring_arc_lines: list[sg.LineString] | None = None,
+    ring_arc_edges: list[MacroEdge] | None = None,
     window: tuple[float, float, float, float],
     rank: int,
     cx: float,
@@ -570,6 +602,8 @@ def render_core(
         colors=colors,
         junctions=junctions,
         plaza_polys=plaza_polys,
+        ring_arc_lines=ring_arc_lines,
+        ring_arc_edges=ring_arc_edges,
         district_lw=0.6,
         district_alpha=0.7,
         street_lw=1.1,
@@ -609,6 +643,8 @@ def render_seam(
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
     plaza_polys: list[sg.Polygon] | None = None,
+    ring_arc_lines: list[sg.LineString] | None = None,
+    ring_arc_edges: list[MacroEdge] | None = None,
     window: tuple[float, float, float, float],
     block_id: int,
     tjunction_count: int,
@@ -631,6 +667,8 @@ def render_seam(
         colors=colors,
         junctions=junctions,
         plaza_polys=plaza_polys,
+        ring_arc_lines=ring_arc_lines,
+        ring_arc_edges=ring_arc_edges,
         district_lw=0.7,
         district_alpha=0.75,
         street_lw=1.3,
@@ -760,8 +798,20 @@ def _greybox_arterials_geojson(
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
     ring_lines: list[sg.LineString],
+    ring_arc_lines: list[sg.LineString] | None = None,
+    ring_arc_edges: list[MacroEdge] | None = None,
 ) -> dict[str, Any]:
-    """Clipped arterials (``tier``: highway/major/local) + core rings (``ring``)."""
+    """Clipped arterials (``tier``: highway/major/local) + core rings (``ring``).
+
+    ``ring_arc_lines``/``ring_arc_edges`` (slice B/R) are junction-to-junction
+    ring arcs carrying a promoted functional tier (e.g. a ring segment on a
+    city-city highway path). They are emitted as ADDITIONAL records layered
+    on top of the whole-ring ones -- ``"tier"`` stays ``"ring"`` (so existing
+    consumers filtering by kind are unaffected) and a new ``"ring_tier"``
+    property carries the promoted tier name; whole-ring records are
+    untouched (no ``"ring_tier"`` key) and remain the only "draw a ring"
+    signal a consumer that ignores the new field needs.
+    """
     records: list[tuple[int, Any, dict[str, Any]]] = []
     feature_id = 0
     for line, rec in zip(arterial_lines, edges, strict=True):
@@ -770,6 +820,12 @@ def _greybox_arterials_geojson(
         feature_id += 1
     for line in ring_lines:
         records.append((feature_id, line, {"tier": "ring"}))
+        feature_id += 1
+    for line, rec in zip(ring_arc_lines or [], ring_arc_edges or [], strict=True):
+        ring_tier_name = _GREYBOX_TIER_NAME.get(rec.tier, str(rec.tier))
+        records.append(
+            (feature_id, line, {"tier": "ring", "ring_tier": ring_tier_name})
+        )
         feature_id += 1
     return _feature_collection(records)
 
@@ -1085,7 +1141,11 @@ def export_greybox(
     with (out_dir / "arterials.geojson").open("w") as f:
         json.dump(
             _greybox_arterials_geojson(
-                layer.arterial_lines, layer.edges, layer.ring_lines
+                layer.arterial_lines,
+                layer.edges,
+                layer.ring_lines,
+                layer.ring_arc_lines,
+                layer.ring_arc_edges,
             ),
             f,
             indent=2,
@@ -1430,6 +1490,8 @@ def run_hybrid(
         colors=colors,
         junctions=junctions,
         plaza_polys=layer.plaza_polys,
+        ring_arc_lines=layer.ring_arc_lines,
+        ring_arc_edges=layer.ring_arc_edges,
         total_districts=total_districts,
         total_streets=total_streets,
         out_path=out_dir / "hybrid_overview.png",
@@ -1465,6 +1527,8 @@ def run_hybrid(
             colors=colors,
             junctions=junctions,
             plaza_polys=layer.plaza_polys,
+            ring_arc_lines=layer.ring_arc_lines,
+            ring_arc_edges=layer.ring_arc_edges,
             window=window,
             rank=rank,
             cx=cx,
@@ -1506,6 +1570,8 @@ def run_hybrid(
         colors=colors,
         junctions=junctions,
         plaza_polys=layer.plaza_polys,
+        ring_arc_lines=layer.ring_arc_lines,
+        ring_arc_edges=layer.ring_arc_edges,
         window=seam_window,
         block_id=seam_block_id,
         tjunction_count=seam_tjunction_count,

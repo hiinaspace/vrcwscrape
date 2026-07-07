@@ -15,6 +15,8 @@ from mapgen.r1_macro import (
     DEFAULT_CORE_SIMPLIFY_TOLERANCE,
     DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
+    DEFAULT_RING_FOURIER_HARMONICS,
+    DEFAULT_RING_FOURIER_MAX_AREA_CHANGE,
     DEFAULT_SPOKE_MIN_ANGLE_DEG,
     RING_ARC_NODE_SENTINEL,
     RING_SNAP_TOL,
@@ -30,8 +32,11 @@ from mapgen.r1_macro import (
     _chaikin_pass_open,
     _dedupe_stations_by_angle,
     _delaunay_edges,
+    _fourier_low_pass_refit,
     _nearest_neighbor_chain,
+    _open_ring_polygon,
     _polygonize_macro_blocks_protecting_nuclei,
+    _regularize_ring_polygons,
     _ring_junction_stations,
     add_intra_nucleus_avenues,
     assign_functional_tiers,
@@ -703,6 +708,293 @@ def test_cells_to_polygon_ring_is_smoother_than_raw_pixel_blob() -> None:
     assert len(smoothed.exterior.coords) < len(raw_poly.exterior.coords)
     sym_diff_area = smoothed.symmetric_difference(raw_union).area
     assert sym_diff_area < 0.35 * raw_union.area
+
+
+# ---------------------------------------------------------------------------
+# Ring regularization: morphological opening + Fourier low-pass (slice R)
+# ---------------------------------------------------------------------------
+
+
+def _keyhole_polygon() -> tuple[sg.Polygon, sg.Polygon, sg.Polygon]:
+    """Main lobe + a 1-unit-wide neck feeding a small satellite lobe.
+
+    The neck (1 unit wide) is narrower than ``2 * width`` for any opening
+    width ``>= 0.5`` -- exactly the "keyhole" pathology the bug report
+    describes (worst case: core6's north ring). Returns
+    ``(keyhole, main_lobe, satellite)`` so tests can check against the
+    isolated pieces.
+    """
+    main_lobe = sg.box(0.0, 0.0, 10.0, 10.0)
+    neck = sg.box(10.0, 4.5, 14.0, 5.5)
+    satellite = sg.box(14.0, 3.0, 18.0, 7.0)
+    keyhole = unary_union([main_lobe, neck, satellite])
+    assert keyhole.geom_type == "Polygon"
+    return keyhole, main_lobe, satellite
+
+
+def test_open_ring_polygon_severs_keyhole_neck_keeps_main_lobe() -> None:
+    """A neck narrower than ``2w`` is severed; only the main lobe remains."""
+    keyhole, main_lobe, satellite = _keyhole_polygon()
+    opened = _open_ring_polygon(keyhole, width=1.0)  # 2w=2.0 > 1.0 neck width
+    assert opened.geom_type == "Polygon"
+    assert opened.contains(sg.Point(5.0, 5.0))  # inside the main lobe
+    assert not opened.contains(satellite.centroid)  # satellite dropped
+    # The main lobe survives close to its original footprint (corner
+    # rounding from the erode/dilate round-trip, not a big resize).
+    assert opened.area == pytest.approx(main_lobe.area, rel=0.15)
+
+
+def test_open_ring_polygon_largest_component_selection() -> None:
+    """If the erosion splits the polygon, only the LARGEST piece survives."""
+    lobe_a = sg.box(0.0, 0.0, 10.0, 10.0)  # 100 unit^2 -- larger.
+    lobe_b = sg.box(14.0, 2.0, 20.0, 8.0)  # 36 unit^2 -- smaller.
+    neck = sg.box(10.0, 4.5, 14.0, 5.5)
+    dumbbell = unary_union([lobe_a, neck, lobe_b])
+    assert dumbbell.geom_type == "Polygon"
+
+    opened = _open_ring_polygon(dumbbell, width=1.0)
+    assert opened.geom_type == "Polygon"
+    assert opened.contains(lobe_a.centroid)
+    assert not opened.contains(lobe_b.centroid)
+    assert opened.area == pytest.approx(lobe_a.area, rel=0.15)
+
+
+def test_open_ring_polygon_zero_width_is_identity() -> None:
+    """``width <= 0`` (village/minor cores) is a no-op, same object back."""
+    poly = sg.box(0.0, 0.0, 10.0, 6.0)
+    assert _open_ring_polygon(poly, width=0.0) is poly
+    assert _open_ring_polygon(poly, width=-1.0) is poly
+
+
+def test_regularize_ring_polygons_rank_scaled_major_only() -> None:
+    """Only the MAJOR core (top-K by mass) is opened; minors stay identity."""
+    density = np.ones((60, 60), dtype=float)
+    nodes: list[MacroNode] = []
+    points = pl.DataFrame(
+        {"x": pl.Series([], dtype=pl.Float64), "y": pl.Series([], dtype=pl.Float64)}
+    )
+    keyhole, _main_lobe, satellite = _keyhole_polygon()
+    minor = sg.box(30.0, 30.0, 33.0, 33.0)  # 9 unit^2 -- far smaller mass.
+
+    out = _regularize_ring_polygons(
+        [keyhole, minor],
+        density,
+        nodes,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        n_major_nuclei=1,
+        open_width_major=1.0,
+        open_width_minor=0.0,
+    )
+    assert len(out) == 2
+    # Major (keyhole, far larger area/mass): opened -- satellite severed.
+    assert not out[0].contains(satellite.centroid)
+    # Minor: width=0 is an identity pass, exact same geometry back.
+    assert out[1].equals_exact(minor, 1e-9)
+
+
+def test_regularize_ring_polygons_all_widths_zero_is_identity() -> None:
+    """No knob enabled (opening off, Fourier off) returns the input list."""
+    density = np.ones((20, 20), dtype=float)
+    nodes: list[MacroNode] = []
+    points = pl.DataFrame(
+        {"x": pl.Series([], dtype=pl.Float64), "y": pl.Series([], dtype=pl.Float64)}
+    )
+    core = sg.box(0.0, 0.0, 5.0, 5.0)
+    core_polys = [core]
+    out = _regularize_ring_polygons(
+        core_polys,
+        density,
+        nodes,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        n_major_nuclei=1,
+        open_width_major=0.0,
+        open_width_minor=0.0,
+        fourier_refit=False,
+    )
+    assert out is core_polys  # identity pass: the same input list object back.
+    assert out[0] is core
+
+
+def test_regularize_ring_polygons_is_deterministic() -> None:
+    """Same inputs -> byte-identical coordinates, called twice."""
+    density = np.ones((60, 60), dtype=float)
+    nodes: list[MacroNode] = []
+    points = pl.DataFrame(
+        {"x": pl.Series([], dtype=pl.Float64), "y": pl.Series([], dtype=pl.Float64)}
+    )
+    keyhole, _main_lobe, _satellite = _keyhole_polygon()
+    minor = sg.box(30.0, 30.0, 33.0, 33.0)
+
+    def _run() -> list[sg.Polygon]:
+        return _regularize_ring_polygons(
+            [keyhole, minor],
+            density,
+            nodes,
+            points,
+            x0=0.0,
+            y0=0.0,
+            cell=1.0,
+            n_major_nuclei=1,
+            open_width_major=1.0,
+            open_width_minor=0.0,
+        )
+
+    out_a = _run()
+    out_b = _run()
+    for pa, pb in zip(out_a, out_b, strict=True):
+        assert list(pa.exterior.coords) == list(pb.exterior.coords)
+
+
+def _wavy_ring(n: int = 40, radius: float = 5.0, amp: float = 0.3) -> sg.Polygon:
+    """A jagged-but-simple near-circular ring (stand-in for a core boundary)."""
+    angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radii = radius + amp * np.sin(7.0 * angles)
+    coords = [
+        (r * np.cos(a), r * np.sin(a)) for a, r in zip(angles, radii, strict=True)
+    ]
+    return sg.Polygon(coords)
+
+
+def _star_polygon(n_points: int) -> sg.Polygon:
+    """An ``n_points``-pointed star, alternating long/short radius."""
+    angles = np.linspace(0.0, 2.0 * np.pi, n_points, endpoint=False)
+    radii = np.array([10.0 if i % 2 == 0 else 1.0 for i in range(n_points)])
+    coords = [
+        (r * np.cos(a), r * np.sin(a)) for a, r in zip(angles, radii, strict=True)
+    ]
+    return sg.Polygon(coords)
+
+
+def test_fourier_low_pass_refit_smooths_valid_ring() -> None:
+    """A simple jagged ring refits into a low-harmonic curve, area preserved."""
+    ring = _wavy_ring()
+    refit = _fourier_low_pass_refit(ring, n_harmonics=DEFAULT_RING_FOURIER_HARMONICS)
+    assert refit.geom_type == "Polygon"
+    assert refit.is_valid
+    assert refit.area == pytest.approx(ring.area, rel=0.05)
+    # Not a no-op: the refit actually replaced the vertex list.
+    assert list(refit.exterior.coords) != list(ring.exterior.coords)
+
+
+def test_fourier_low_pass_refit_rejects_self_intersecting_result() -> None:
+    """Validity guard: a self-intersecting reconstruction falls back to input.
+
+    A 16-point star truncated to 8 harmonics reconstructs into a
+    self-intersecting contour (verified empirically) -- ``buffer(0)`` repairs
+    it into a ``MultiPolygon``, which the guard rejects, falling back to the
+    UNCHANGED input polygon.
+    """
+    star = _star_polygon(16)
+    refit = _fourier_low_pass_refit(star, n_harmonics=8)
+    assert refit is star
+
+
+def test_fourier_low_pass_refit_rejects_large_area_change() -> None:
+    """Area-change guard: a valid-but-resized reconstruction falls back too.
+
+    A 12-point star truncated to 4 harmonics reconstructs into a VALID
+    single polygon, but roughly 3x the input's area (verified empirically)
+    -- well past the default 20% guard -- so the refit is rejected.
+    """
+    star = _star_polygon(12)
+    refit = _fourier_low_pass_refit(
+        star, n_harmonics=4, max_area_change=DEFAULT_RING_FOURIER_MAX_AREA_CHANGE
+    )
+    assert refit is star
+
+
+def test_fourier_low_pass_refit_disabled_is_identity() -> None:
+    """``n_harmonics <= 0`` is a no-op, same object back."""
+    ring = _wavy_ring()
+    assert _fourier_low_pass_refit(ring, n_harmonics=0) is ring
+
+
+def test_station_exactness_preserved_after_opening() -> None:
+    """Slice R invariant: ring T-junction stations stay EXACT after opening.
+
+    Opening runs BEFORE clip in ``build_macro_blocks_with_cores``, so
+    ``clip_arterials_to_cores`` cuts against the ALREADY-opened ring and
+    ``_ring_junction_stations``'s exact-on-ring (tol=1e-6) matching -- the
+    spoke/T-geo-snap interface -- holds exactly as it did pre-slice-R.
+    """
+    density, nodes, lines, edges, boundary, points = _downtown_fixture()
+    baseline = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        lines,
+        edges,
+        boundary,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+        n_major_nuclei=1,
+        functional_tiers=False,
+        ring_open_width_major=0.0,
+        r_plaza_major_min=0.85,
+        r_plaza_major_max=0.85,
+    )
+    opened = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        lines,
+        edges,
+        boundary,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+        n_major_nuclei=1,
+        functional_tiers=False,
+        ring_open_width_major=0.5,
+        r_plaza_major_min=0.85,
+        r_plaza_major_max=0.85,
+    )
+    # Opening actually changed the ring geometry vs the no-opening baseline.
+    assert not baseline.core_polys[0].equals_exact(opened.core_polys[0], 1e-9)
+
+    core = opened.core_polys[0]
+    stations = _ring_junction_stations(opened.clipped_lines, core, tol=1e-6)
+    assert len(stations) == 6  # one per spoke arterial, per _downtown_fixture
+    for pt in stations:
+        assert core.exterior.distance(sg.Point(pt)) < 1e-9
+
+
+def test_plaza_survives_ring_opening_on_major_core() -> None:
+    """Slice R invariant: opening must not break the S3 plaza/spoke wiring."""
+    density, nodes, lines, edges, boundary, points = _downtown_fixture()
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        lines,
+        edges,
+        boundary,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+        n_major_nuclei=1,
+        ring_open_width_major=0.5,
+        r_plaza_major_min=0.85,
+        r_plaza_major_max=0.85,
+    )
+    assert len(bundle.core_polys) == 1
+    assert len(bundle.nuclei) == 1
+    assert bundle.nuclei[0].is_major
+    assert len(bundle.plaza_polys) == 1
+    assert bundle.plaza_polys[0].area > 0.0
 
 
 def test_smoothing_preserves_shared_junction_coincidence_across_lines() -> None:
