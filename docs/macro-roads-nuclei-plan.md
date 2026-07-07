@@ -97,13 +97,14 @@ adds no feasibility risk; endpoints preserved keep macro-node junctions fused.
   if the gate still shows near-coincident parallel trunks after peak-snap + smooth.
 - **Per-segment width (S7)** is also the arterial-tier fix promised in
   `wave2-plan.md` (slice-1 uses a flat Chen-width `road_clear_m` placeholder).
-- **⚠ Pre-existing `_assert_partition` blind spot (found during F1, 2026-07-07).**
-  On some triangular/wedge districts + seeds, `subdivide_district` emits lots whose
-  `unary_union(lots).area` is short of `district.area` (a real overlap) while
-  `sum(area)` matches exactly — so the pairwise-STRtree `_assert_partition` (and the
-  pairwise `.intersection().area` checks) miss an overlap that `unary_union` catches.
-  Confirmed on UNMODIFIED code via `git stash`; not introduced by F1. **This matters
-  for S3:** intra-nucleus avenues generate exactly this wedge geometry, so the
-  checker could pass bad downtown lots. **Action:** an audit slice on
-  `_best_split`/`shapely_split` robustness for acute/triangular geometry + tighten
-  `_assert_partition` to a `unary_union`-area check — do this BEFORE or WITH S3.
+- **✅ RESOLVED (subdivision-robustness slice, 2026-07-07).** Two things fixed
+  before S3: (1) **F1 Voronoi-fallback regression** — F1's hard shape-floor sent
+  62/756 (8.2%) of dense districts to the ugly Voronoi path; a per-district floor
+  RELAXATION ladder (`_relaxed_lot_configs`) drops that to **0/756**, `fallback_ok`
+  true. (2) The "wedge overlap" the partition checker was flagged as missing turned
+  out NOT to be a real overlap — leaves are valid, pairwise intersections exactly 0,
+  `sum(area)` exact; GEOS's cascaded `unary_union` just computes a wrong (short) area
+  because repeated `shapely_split` misaligns shared edges by a few ULPs. Fixed with a
+  1e-9 precision-grid snap at the split site + defensively in `_assert_partition`
+  (which already had the union-area check). So acute/wedge subdivision (which S3
+  generates) is now robust.
