@@ -68,3 +68,38 @@ readability (elongated cells, overlapping rotated-rect buildings, ~2k slivers).
    regenerate there) → **oni structured audit** (G2 checklist items 2/4:
    eye-level hierarchy legibility + ranked street-level defect list) = wave exit
    gate; its ranking orders wave 2.
+
+## Exit-gate audit result (oni, 2026-07-06)
+
+Walked the lots-wave bake in-headset. **Verdict: positive — the wave met its
+goal.** Street/parcel readability is clearly better than the G0 Voronoi fabric;
+lots read as street-aligned parcels, not noise. Wave 1 is **closed**.
+
+Redirect for wave 2 (design inputs, not wave-1 defects):
+
+1. **Buildings are lot-sized "skyscraper" towers with thin alleys between them.**
+   Two causes, both confirmed in code:
+   - Height `= h_base + h_scale·log10(1+visits)` (`r1_lots.py`, `h_base=4.0`,
+     `h_scale=12.0` m) → ~28 m floor at 100 visits, ~52 m at 10k, ~76 m at 1M:
+     a 9–25-story band even at baseline, and it's **visits-driven vertical
+     stacking**.
+   - Footprint fills 55–85 % of the lot OBB (`building_{width,depth}_frac`,
+     inset 0.05 u ≈ 1.25 m) and lots **partition the whole district** — so
+     blocks are near-wall-to-wall tall buildings.
+2. **Roads are occluded** by those chunky towers → road hierarchy couldn't be
+   evaluated at eye level (compounded by the 14/26 non-core blocks with no Chen
+   interior streets). Massing must come down before roads/terrain can be judged.
+3. **Intended direction:** suburb/house scale by default (more pleasant to
+   "drive through" than urban canyons), with the **densest areas collapsing to
+   row-housing-style lots** (shared-wall strips) rather than vertical stacking.
+   Explicitly **no vertical stacking at first** — it would thin out the 2D map's
+   footprint density, which the map view depends on. (Google-Maps-style
+   Tokyo-density vertical handling is noted as out-of-scope until there's
+   visceral need — user is US-based, no first-hand dense-vertical map UX.)
+4. **Locomotion:** still the personal-vehicle + transit direction from G2;
+   owned VRChat-side, not a mapgen wave.
+
+Wave-2 scope therefore grows to **massing/typology + roads + terrain** (the
+research doc `terrain-roads-research.md` covers roads/terrain only; massing is
+the new, undesigned axis). Both are going through senior-review before design
+lands.

@@ -401,6 +401,54 @@ current island's macro shape/legibility proves to be a real limiter after
 wave-2 terrain lands, prefer a narrow, presentation-only post-hoc
 declutter/grid-snap pass (Hagrid/DGrid-style) over replacing the DR stage.
 
+### Addendum — senior-review outcome + revisit ladder (2026-07-06)
+
+A senior (Fable) design review + Opus synthesis re-examined this. Outcome:
+**confirm "no action," confidence raised medium → high**, plus three findings
+that close the thread:
+
+- **Genuine research gap, not a gap in our knowledge.** The map-native
+  literature splits into (A) cluster-graph metaphorical maps (GMap → MapSets →
+  GD-2025 stiffness layouts) — input is a *cluster graph*, so "adjacency =
+  relatedness," a different product; (B) hierarchy-native city layouts
+  (Voronoi treemaps, GosperMap, **EvoStreets** — streets encode a *tree*, no
+  pairwise distance; VR-evaluated, the closest thing to "citygen-native data
+  spatialization"); (C) **information landscapes** (ThemeScape/IN-SPIRE,
+  Skupin, Pampalk's *Islands of Music*) — all DR-then-render with a density
+  bridge. This pipeline (LocalMAP + KDE density + toponymy + citygen) IS a
+  modernized information landscape with a walkable layer — the "branch I was
+  less aware of" converged decades ago on the architecture we independently
+  picked. No end-to-end "embedding → legible polygonal geometry" method exists.
+- **The 433 m displacement tail is a `regions.py` artifact, not a DR defect.**
+  HDBSCAN noise (19% of worlds) is assigned to the nearest centroid in
+  *embedding/cosine* space, while region polygons are buffer-unions of core
+  points — so a noise world can be pulled to a far-away 2D region. Fixable
+  downstream (widen polygons, or assign noise by 2D proximity) with no basis change.
+- **The revisit trigger was field-tested in the oni audit (2026-07-06) and did
+  NOT fire** — local structure held up; the defects were massing, not spatial
+  incoherence.
+
+**Decisions (user, 2026-07-06):** map density stays **aesthetic, not semantic**
+(density-as-artifact accepted permanently → density-artifact trigger T3 struck).
+Hierarchy-native (EvoStreets) direction **parked as the last-rung fallback**, not
+closed.
+
+**Revisit ladder (decision rule; stop at the first rung that addresses the firing
+trigger):**
+1. **General fidelity / density complaint → densMAP A/B.** `reduce.py` has no
+   densMAP option yet (~3-line add, `densmap=True`); run through `dr_sweep.py`'s
+   artifact-first comparison + a visual gate before paying the downstream-invalidate
+   cost. Within-paradigm.
+2. **Coverage/displacement regression (snap fraction > ~25% or p95 grows) →
+   downstream fix, no basis change:** widen `regions.py` polygons / assign noise by
+   2D proximity; if region *shape/fragmentation* is the complaint, a **MapSets**-style
+   contiguity pass over the FIXED existing coords.
+3. **Persistent macro/meso semantic misplacement (≥~5 logged instances of
+   expected-together worlds landing non-adjacent, or labels not matching contents;
+   NOT parcel-scale distance) after rungs 1–2 → paradigm swap, eyes open:**
+   hierarchy-native basis (EvoStreets over the toponymy tree). A v2 ground-truth
+   rebuild, only if the product's meaning should become hierarchy-adjacency.
+
 ## Sources
 
 - Parish & Müller 2001, *Procedural Modeling of Cities* —
