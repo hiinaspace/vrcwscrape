@@ -97,3 +97,13 @@ adds no feasibility risk; endpoints preserved keep macro-node junctions fused.
   if the gate still shows near-coincident parallel trunks after peak-snap + smooth.
 - **Per-segment width (S7)** is also the arterial-tier fix promised in
   `wave2-plan.md` (slice-1 uses a flat Chen-width `road_clear_m` placeholder).
+- **⚠ Pre-existing `_assert_partition` blind spot (found during F1, 2026-07-07).**
+  On some triangular/wedge districts + seeds, `subdivide_district` emits lots whose
+  `unary_union(lots).area` is short of `district.area` (a real overlap) while
+  `sum(area)` matches exactly — so the pairwise-STRtree `_assert_partition` (and the
+  pairwise `.intersection().area` checks) miss an overlap that `unary_union` catches.
+  Confirmed on UNMODIFIED code via `git stash`; not introduced by F1. **This matters
+  for S3:** intra-nucleus avenues generate exactly this wedge geometry, so the
+  checker could pass bad downtown lots. **Action:** an audit slice on
+  `_best_split`/`shapely_split` robustness for acute/triangular geometry + tighten
+  `_assert_partition` to a `unary_union`-area check — do this BEFORE or WITH S3.

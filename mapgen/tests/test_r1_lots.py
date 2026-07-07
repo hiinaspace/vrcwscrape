@@ -230,6 +230,100 @@ def test_subdivide_district_degenerate_zero_area_raises_when_n_gt_1() -> None:
         subdivide_district(degenerate, 2, seed=0, cfg=LotConfig())
 
 
+def test_subdivide_district_impossible_shape_floor_raises() -> None:
+    # An impossibly strict width floor means NO candidate split can ever
+    # pass -- _best_split must reject every one of them outright (not fall
+    # back to picking the "least bad" candidate the way the soft
+    # aspect_clamp scoring does), so subdivision can never progress past a
+    # single leaf and must raise rather than ever emit a sub-floor sliver.
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    cfg = LotConfig(min_lot_width=100.0)
+    with pytest.raises(r1_lots._SubdivisionFailure):
+        subdivide_district(district, 5, seed=0, cfg=cfg)
+
+
+def test_subdivide_district_wedge_yields_no_sub_floor_lots() -> None:
+    # A converging wedge (apex at the origin, base 6 units wide at x=20)
+    # simulating a macro-arterial-converged block
+    # (docs/macro-roads-nuclei-plan.md F1 row): pre-fix, splitting deep
+    # enough toward the apex would eventually carve out a thin sliver there
+    # -- the old aspect_clamp only SCORES that down, never rejects it. With
+    # the hard shape-floor active (LotConfig defaults), every split that
+    # would produce such a child is rejected outright (leaving the
+    # apex-side piece whole/unsplit) or, if one still slips through some
+    # other path, the merge pass absorbs it -- either way, no final lot may
+    # violate the floor.
+    # NOTE: a single fixed seed (matching this module's other single-seed
+    # subdivide_district tests, e.g. test_subdivide_district_partitions_a_square)
+    # rather than a seed loop -- a few OTHER seeds on this exact raw-triangle
+    # fixture trip a PRE-EXISTING partition/union-area mismatch in
+    # shapely_split unrelated to the shape floor (confirmed present on
+    # unmodified subdivide_district via `git stash`, reported upward rather
+    # than fixed here -- out of this slice's scope).
+    district = sg.Polygon([(0.0, 0.0), (20.0, 3.0), (20.0, -3.0)])
+    cfg = LotConfig()
+    lots = subdivide_district(district, 8, seed=0, cfg=cfg)
+    assert len(lots) >= 8
+    union = unary_union(lots)
+    assert union.area == pytest.approx(district.area, rel=1e-6)
+    assert _no_overlap(lots)
+    for p in lots:
+        assert r1_lots._meets_shape_floor(p, cfg), f"sub-floor sliver: {p.wkb}"
+
+
+def test_merge_slivers_absorbs_subfloor_leaf_into_widest_shared_neighbor() -> None:
+    # Four axis-aligned pieces partitioning the same 10x10 square: a normal
+    # 6-wide block, a deliberately sub-floor 0.2-wide sliver (below the
+    # default min_lot_width=0.3), and two normal blocks to its right split
+    # top/bottom -- so the sliver shares a FULL-height (10) boundary with
+    # the left block but only PARTIAL-height (6 and 4) boundaries with the
+    # two right blocks. The merge must pick the left block (longest shared
+    # boundary), not just the first candidate encountered.
+    a = sg.box(0.0, 0.0, 6.0, 10.0)
+    sliver = sg.box(6.0, 0.0, 6.2, 10.0)
+    b = sg.box(6.2, 0.0, 10.0, 6.0)
+    c = sg.box(6.2, 6.0, 10.0, 10.0)
+    leaves = [a, sliver, b, c]
+    cfg = LotConfig()
+    total_area_before = sum(p.area for p in leaves)
+
+    merged = r1_lots._merge_slivers(leaves, cfg)
+
+    assert len(merged) == 3
+    assert sum(p.area for p in merged) == pytest.approx(total_area_before)
+    assert _no_overlap(merged)
+    for p in merged:
+        assert r1_lots._meets_shape_floor(p, cfg)
+    # The sliver merged into `a` (the longest shared boundary), yielding a
+    # single 6.2x10 rectangle -- not into `b` or `c`.
+    expected = sg.box(0.0, 0.0, 6.2, 10.0)
+    assert any(p.equals(expected) for p in merged)
+
+
+def test_merge_slivers_noop_when_all_leaves_pass_floor() -> None:
+    leaves = [
+        sg.box(0.0, 0.0, 5.0, 10.0),
+        sg.box(5.0, 0.0, 10.0, 10.0),
+    ]
+    cfg = LotConfig()
+    merged = r1_lots._merge_slivers(leaves, cfg)
+    assert len(merged) == 2
+    assert {p.wkb for p in merged} == {p.wkb for p in leaves}
+
+
+def test_meets_shape_floor_width_and_aspect() -> None:
+    cfg = LotConfig(min_lot_width=1.0, max_aspect_reject=3.0)
+    assert r1_lots._meets_shape_floor(sg.box(0.0, 0.0, 3.0, 3.0), cfg)
+    # Width 0.5 < min_lot_width=1.0 -- fails on width alone.
+    assert not r1_lots._meets_shape_floor(sg.box(0.0, 0.0, 10.0, 0.5), cfg)
+    # Width 2.0 >= 1.0, but aspect 8.0/2.0=4.0 > max_aspect_reject=3.0.
+    assert not r1_lots._meets_shape_floor(sg.box(0.0, 0.0, 8.0, 2.0), cfg)
+    assert not r1_lots._meets_shape_floor(sg.Polygon(), cfg)
+    # Both checks disabled (<= 0) -- always passes for a nonempty polygon.
+    disabled = LotConfig(min_lot_width=0.0, max_aspect_reject=0.0)
+    assert r1_lots._meets_shape_floor(sg.box(0.0, 0.0, 100.0, 0.01), disabled)
+
+
 def test_subdivide_district_prefers_frontage_touching_splits() -> None:
     # A square district subdivided deep enough (n_lots=20) that some interior
     # pieces can only keep frontage if the scoring actively prefers it -- a

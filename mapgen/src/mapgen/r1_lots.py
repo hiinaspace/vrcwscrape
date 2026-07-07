@@ -76,6 +76,21 @@ DEFAULT_ASPECT_CLAMP: float = 4.0
 DEFAULT_MIN_FRONTAGE: float = 0.0
 DEFAULT_MAX_SPLIT_DEPTH: int = 24
 
+# Hard shape-floor (docs/macro-roads-nuclei-plan.md F1 "sliver shape-floor"):
+# unlike aspect_clamp above (a soft score-down), these REJECT a candidate
+# split outright once either child would violate them -- see
+# _meets_shape_floor. Defaults are ON (not 0/disabled like min_frontage)
+# since this IS the fix for the reported sliver defect: 0.3 island units
+# (~7.5m at DEFAULT_METERS_PER_UNIT) sits comfortably below production's
+# typical ~0.66-unit lot width (area-per-world ~274 m2 -> sqrt(274/25**2),
+# docs/lots-wave-plan.md) while still catching genuine near-zero-width wedge
+# slivers; 8.0 is 2x the soft aspect_clamp, catching only genuinely extreme
+# (needle-thin) aspects while leaving moderately-elongated, already-score-
+# penalized splits alone. Either can be set to 0 to disable that half of the
+# floor.
+DEFAULT_MIN_LOT_WIDTH: float = 0.3
+DEFAULT_MAX_ASPECT_REJECT: float = 8.0
+
 # Massing/typology defaults (docs/wave2-plan.md "The massing model (2a core)").
 # All setback/height constants are METERS; MassingConfig / the footprint and
 # height helpers convert to island units via meters_per_unit themselves.
@@ -146,6 +161,17 @@ class LotConfig:
     - ``min_frontage``: minimum contact length (island units) with the
       district exterior ring for a boundary edge/piece to count as real
       frontage; ``0.0`` means any nonzero contact counts.
+    - ``min_lot_width``: HARD shape-floor (docs/macro-roads-nuclei-plan.md
+      F1) -- a candidate split is REJECTED outright (not merely scored down)
+      if either child's OBB short side falls below this (island units); ``<=
+      0`` disables the width half of the floor. See :func:`_meets_shape_floor`.
+    - ``max_aspect_reject``: the hard-reject counterpart to ``aspect_clamp``
+      -- a candidate split is REJECTED outright if either child's OBB
+      aspect ratio exceeds this (rather than merely scored down, as
+      ``aspect_clamp`` does); ``<= 0`` disables the aspect half of the floor.
+      Distinct from ``aspect_clamp`` and normally set higher than it, so
+      moderately elongated splits are still allowed (just penalized) while
+      only genuinely extreme (needle-thin) ones are refused entirely.
     - ``max_split_depth``: recursion guard (subdivision naturally halts via
       ``stop_area_factor`` long before this in any non-pathological case).
     - ``inset``: building footprint inward buffer -- same meaning as the
@@ -164,6 +190,8 @@ class LotConfig:
     split_jitter: float = DEFAULT_SPLIT_JITTER
     aspect_clamp: float = DEFAULT_ASPECT_CLAMP
     min_frontage: float = DEFAULT_MIN_FRONTAGE
+    min_lot_width: float = DEFAULT_MIN_LOT_WIDTH
+    max_aspect_reject: float = DEFAULT_MAX_ASPECT_REJECT
     max_split_depth: int = DEFAULT_MAX_SPLIT_DEPTH
     inset: float = DEFAULT_INSET
     voronoi_min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC
@@ -562,6 +590,26 @@ def _lot_aspect_ratio(poly: sg.Polygon) -> float:
     return float(max(lens.max(), short) / short)
 
 
+def _meets_shape_floor(poly: sg.Polygon, cfg: LotConfig) -> bool:
+    """Hard shape-floor test (docs/macro-roads-nuclei-plan.md F1): ``False``
+    if ``poly``'s OBB short side falls below ``cfg.min_lot_width`` or its OBB
+    aspect ratio exceeds ``cfg.max_aspect_reject`` (each half independently
+    disabled by setting the corresponding ``cfg`` field ``<= 0``) -- or if
+    ``poly`` itself is empty/zero-area. Used by :func:`_best_split` to REJECT
+    a candidate split outright (rather than merely score it down, as
+    ``cfg.aspect_clamp`` does) and by :func:`_merge_slivers` to find leaves
+    that need absorbing into a neighbor."""
+    if poly.is_empty or poly.area <= 1e-12:
+        return False
+    if cfg.min_lot_width > 0.0:
+        _center, _axis_long, _axis_short, _long_len, short_len = _obb_axes(poly)
+        if short_len < cfg.min_lot_width:
+            return False
+    return not (
+        cfg.max_aspect_reject > 0.0 and _lot_aspect_ratio(poly) > cfg.max_aspect_reject
+    )
+
+
 def _frontage_length(
     piece: sg.Polygon,
     ext_ring: sg.LinearRing,
@@ -627,7 +675,12 @@ def _best_split(
     binary splits (area balance + child rectangularity/aspect), and return the
     best pair -- preferring candidates where BOTH children still touch the
     district exterior ring. ``None`` if no candidate produces a clean 2-piece
-    split (the caller treats ``poly`` as an (oversized or unsplittable) leaf).
+    split (the caller treats ``poly`` as an (oversized or unsplittable) leaf)
+    -- this INCLUDES the case where every candidate's children would violate
+    ``cfg``'s hard shape-floor (:func:`_meets_shape_floor`): such candidates
+    are rejected outright, not merely scored down, so a piece that cannot be
+    cleanly split without producing a sub-floor child simply stays whole
+    (docs/macro-roads-nuclei-plan.md F1) rather than emitting a sliver.
 
     ``ext_buffer``, if given, is ``ext_ring``'s precomputed frontage-touch
     buffer (see :func:`_frontage_length`) -- threaded through by
@@ -647,6 +700,8 @@ def _best_split(
         if len(parts) != 2:
             continue
         if parts[0].area <= min_area or parts[1].area <= min_area:
+            continue
+        if any(not _meets_shape_floor(p, cfg) for p in parts):
             continue
         balance = abs(parts[0].area - parts[1].area) / max(poly.area, 1e-12)
         irregularity = _lot_irregularity(parts[0]) + _lot_irregularity(parts[1])
@@ -703,6 +758,66 @@ def _fill_deficit(
     return splittable + unsplittable
 
 
+def _merge_slivers(leaves: list[sg.Polygon], cfg: LotConfig) -> list[sg.Polygon]:
+    """Absorb any leaf failing :func:`_meets_shape_floor` into whichever OTHER
+    leaf it shares the LONGEST boundary with, rather than emitting it as its
+    own lot (docs/macro-roads-nuclei-plan.md F1).
+
+    :func:`_best_split`'s per-candidate reject keeps every leaf it PRODUCES
+    on-floor, but a leaf that was never split at all can still start out
+    below the floor -- e.g. an already-thin wedge district piece that hits
+    ``cfg.stop_area_factor`` (or has every further split rejected) before it
+    ever reaches an acceptable shape. This is the fallback for that
+    unavoidable case.
+
+    Each merge replaces the two pieces with their union (``unary_union``,
+    reduced to its largest polygonal part -- two partition-adjacent pieces
+    share only a zero-area boundary, so the union is a single clean
+    polygon), which preserves total coverage EXACTLY: no area is gained,
+    lost, or re-clipped, only two adjacent pieces of the same partition
+    become one. Repeats (bounded to ``len(leaves)`` passes -- each merge
+    strictly reduces the leaf count by one, so this always terminates)
+    since resolving one sliver can reveal the merged piece -- or another
+    leaf -- as still/newly below floor. A sliver with no boundary-sharing
+    neighbor (can only happen once ``len(current) <= 1``) is left alone --
+    there is nothing to merge it into.
+
+    Note this can drop the leaf count below the caller's ``n_lots`` target;
+    :func:`subdivide_district` re-runs :func:`_fill_deficit` afterward to
+    compensate if so.
+    """
+    current = list(leaves)
+    for _ in range(len(leaves)):
+        if len(current) <= 1:
+            break
+        sliver_idx = next(
+            (i for i, p in enumerate(current) if not _meets_shape_floor(p, cfg)),
+            None,
+        )
+        if sliver_idx is None:
+            break
+        sliver = current[sliver_idx]
+        best_j: int | None = None
+        best_len = 0.0
+        for j, other in enumerate(current):
+            if j == sliver_idx:
+                continue
+            shared = sliver.boundary.intersection(other.boundary)
+            length = float(shared.length) if hasattr(shared, "length") else 0.0
+            if length > best_len:
+                best_len = length
+                best_j = j
+        if best_j is None:
+            # No adjacent neighbor at all (shouldn't happen for a proper
+            # partition with > 1 piece) -- leave it rather than looping.
+            break
+        merged = _largest_polygon_part(unary_union([sliver, current[best_j]]))
+        current = [
+            p for k, p in enumerate(current) if k not in (sliver_idx, best_j)
+        ] + [merged]
+    return current
+
+
 def subdivide_district(
     district: sg.Polygon,
     n_lots: int,
@@ -736,6 +851,19 @@ def subdivide_district(
     if that deficit cannot be filled (pathological concavity / a shape no
     candidate line can ever cleanly bisect) -- :func:`build_lots` catches
     this and falls back to :func:`_build_lots_voronoi`.
+
+    Every split :func:`_best_split` performs REJECTS (not merely scores down)
+    a candidate whose child would violate ``cfg``'s hard shape-floor
+    (``min_lot_width``/``max_aspect_reject``, see :func:`_meets_shape_floor`)
+    -- a piece with no floor-respecting split just stays whole. That alone
+    cannot rule out an "unavoidable" sub-floor leaf that was never split at
+    all (e.g. an already-thin wedge district piece), so a final
+    :func:`_merge_slivers` pass absorbs any leaf still below the floor into
+    its most-shared-boundary neighbor; if that drops the leaf count back
+    below ``n_lots``, :func:`_fill_deficit` runs once more (splitting
+    elsewhere to compensate, itself still floor-respecting) followed by one
+    more merge pass -- raising :class:`_SubdivisionFailure` if that still
+    cannot reach ``n_lots``.
 
     Deterministic: identical ``(district, n_lots, seed, cfg)`` always yields
     identical output (same WKBs, same order) -- the RNG is only ever advanced
@@ -791,6 +919,23 @@ def subdivide_district(
                 f"could not reach {n_lots} lots from district (got {len(leaves)})"
             )
         leaves = filled
+
+    leaves = _merge_slivers(leaves, cfg)
+    if len(leaves) < n_lots:
+        # A merge can drop the count below n_lots -- re-split elsewhere
+        # (still floor-respecting) to compensate, then merge once more in
+        # case that re-split's own leftovers exposed a new sub-floor leaf.
+        filled = _fill_deficit(leaves, n_lots, ext_ring, cfg, rng, ext_buffer)
+        if filled is None:
+            raise _SubdivisionFailure(
+                f"could not reach {n_lots} lots after sliver-merge (got {len(leaves)})"
+            )
+        leaves = _merge_slivers(filled, cfg)
+        if len(leaves) < n_lots:
+            raise _SubdivisionFailure(
+                f"sliver-merge dropped below {n_lots} lots and could not "
+                f"recover (got {len(leaves)})"
+            )
 
     leaves.sort(key=_poly_sort_key)
     return leaves
