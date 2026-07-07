@@ -29,6 +29,14 @@ Pipeline
    rounds them, right after routing and before core-clipping/polygonization,
    so every downstream consumer (blocks, per-block Chen, gates, lots, both
    exports) inherits the same smoothed network. See ``smooth_polyline``.
+3.6. **Same-corridor geometry cleanup** (slice T-geo) — tiers are routed
+   independently, so near-coincident routes braid through shared corridors:
+   ``dedup_corridor_lines`` collapses them PRE-clip (one corridor = one
+   chain, merged tier = max of contributors); post-clip,
+   ``snap_endpoints_to_rings`` turns near-ring trunk endpoints into exact
+   ring T-junctions and ``prune_short_dangles`` removes short degree-1
+   fragments (switchback hooks). Every stage re-emits a fresh index-aligned
+   ``arterial_lines``/``edges`` pair.
 4. **Macro-blocks** — polygonize (union of kept arterials + boundary exterior)
    and merge slivers, reusing Arm B ``polygonize_districts``.
 5. **Ranked settlement nuclei** (S2) — the hierarchical city/town centroids are
@@ -66,7 +74,8 @@ import polars as pl
 import shapely
 import shapely.geometry as sg
 from scipy.spatial import Delaunay, QhullError
-from shapely.ops import polygonize, unary_union
+from shapely.ops import polygonize, substring, unary_union
+from shapely.strtree import STRtree
 from skimage.graph import route_through_array
 
 from mapgen.chen_field import RasterDensityField
@@ -161,6 +170,42 @@ DEFAULT_SMOOTH_ITERATIONS: int = 2
 # Light post-Chaikin simplify (island units) to bound the vertex count back
 # down (Chaikin roughly doubles vertices per pass).
 DEFAULT_SMOOTH_POST_TOL: float = 0.15
+
+# --- Same-corridor geometry cleanup (slice T-geo) ---
+#
+# Three passes: corridor dedup (stage 3.6, PRE-clip), endpoint snap-to-ring
+# and degree-1 dangle prune (both POST-clip, stage 2b of
+# ``build_macro_blocks_with_cores``).
+#
+# Tiers are routed INDEPENDENTLY over one shared cost grid, so two routes can
+# run near-coincident through the same corridor (braiding). Dedup collapses
+# those; the tolerance is just under one buildable lot depth at the production
+# 25 m/unit, so twins that survive are far enough apart to hold a lot row
+# between them (legitimate frontage roads -- no frontage detection needed).
+CORRIDOR_DEDUP_TOL: float = 1.2
+# A near-coincident run shorter than this (arc length along the candidate,
+# island units) is NOT absorbed: a transversal crossing dips inside the
+# corridor buffer for ~2*tol/sin(angle) and must survive as a crossing; only
+# sustained side-by-side runs are braids.
+CORRIDOR_MIN_ABSORB_LEN: float = 5.0
+# Two absorbed runs separated by a shorter far-gap than this merge into one
+# (the candidate wobbling across the buffer edge is still one corridor).
+CORRIDOR_GAP_MERGE_LEN: float = 2.4
+# Arc-length sampling step (island units) for the near/far distance profile.
+CORRIDOR_SAMPLE_STEP: float = 0.25
+
+# Endpoint snap-to-ring (post-clip): a clipped arterial endpoint within this
+# distance (island units) of a core ring -- but not already ON it -- is
+# snapped onto the ring, forming a real T-junction station instead of a stub
+# hovering next to the ring.
+RING_SNAP_TOL: float = 1.5
+
+# Degree-1 dangle prune (post-clip): clipped fragments shorter than this
+# (island units; ~200 m at 25 m/unit) whose free end has degree 1 in the
+# macro graph are removed (the "tiny red switchback hooks" of the visual
+# gate). Fragments terminating on a core ring are always spared -- they carry
+# the ring T-junction stations the S3 spokes are derived from.
+DANGLE_PRUNE_LEN: float = 8.0
 
 # Macro-block sliver-merge floor (island units²). Larger than Arm B's district
 # floor because macro-blocks are coarse by construction.
@@ -1025,6 +1070,273 @@ def smooth_arterial_lines(
 
 
 # ---------------------------------------------------------------------------
+# 3.6. Same-corridor geometry dedup (slice T-geo, PRE-clip)
+# ---------------------------------------------------------------------------
+#
+# Each tier's Delaunay edges are least-cost routed INDEPENDENTLY over the same
+# cost grid, sharing only a node-pair exclusion set -- never geometry. Two
+# routes through the same corridor therefore come out as near-coincident (but
+# not identical) polylines that braid around each other. This pass collapses
+# them so one corridor = one polyline chain: lines are visited in descending
+# (tier, length) priority; each candidate's sustained near-runs (within
+# ``CORRIDOR_DEDUP_TOL`` of an already-kept line for at least
+# ``CORRIDOR_MIN_ABSORB_LEN`` of arc length) are ABSORBED into the kept
+# corridor, whose tier is bumped to the max of its contributors; the
+# candidate's surviving pieces are stitched onto the corridor at their cut
+# ends (the stitch point is inserted as an exact shared VERTEX of the kept
+# line, so downstream ``polygonize``/union noding fuses there -- the same
+# ULP-exactness lesson as `_plaza_ring_polygon`). Lines with no sustained
+# near-coincident partner are re-emitted as the ORIGINAL objects,
+# bit-identical. Runs pre-clip so `clip_arterials_to_cores` /
+# `_ring_junction_stations` exact-on-ring matching is untouched.
+
+
+def _insert_vertex_at_station(
+    coords: list[tuple[float, float]],
+    station: float,
+    *,
+    eps: float = 1e-9,
+) -> tuple[list[tuple[float, float]], tuple[float, float]]:
+    """Insert (or reuse) a vertex at arc-length ``station`` along ``coords``.
+
+    Returns ``(new_coords, q)`` where ``q`` is the exact vertex coordinate at
+    ``station``. When ``station`` falls within ``eps`` of an existing vertex
+    that vertex is REUSED (no near-duplicate inserted) and ``coords`` is
+    returned unchanged; otherwise the interpolated point is inserted into the
+    owning segment so it is an exact vertex of the returned chain.
+    """
+    cum = 0.0
+    for j in range(len(coords) - 1):
+        (x1, y1), (x2, y2) = coords[j], coords[j + 1]
+        seg = float(np.hypot(x2 - x1, y2 - y1))
+        if station <= cum + eps:
+            return coords, coords[j]
+        if station < cum + seg - eps:
+            t = (station - cum) / seg
+            q = (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+            return [*coords[: j + 1], q, *coords[j + 1 :]], q
+        cum += seg
+    return coords, coords[-1]
+
+
+def _absorbed_intervals(
+    stations: np.ndarray,
+    near: np.ndarray,
+    *,
+    min_absorb_len: float,
+    gap_merge_len: float,
+) -> list[tuple[float, float]]:
+    """Station intervals of sustained near-runs along a sampled candidate.
+
+    ``stations`` are ascending arc-length sample positions, ``near`` the
+    parallel within-tolerance flags. Contiguous near-runs become candidate
+    intervals; runs separated by a far-gap shorter than ``gap_merge_len``
+    merge (one corridor, wobbling across the buffer edge); merged intervals
+    shorter than ``min_absorb_len`` are discarded (transversal crossings).
+    """
+    idx = np.nonzero(near)[0]
+    if idx.size == 0:
+        return []
+    runs: list[tuple[float, float]] = []
+    start = prev = int(idx[0])
+    for i in idx[1:].tolist():
+        if i == prev + 1:
+            prev = i
+            continue
+        runs.append((float(stations[start]), float(stations[prev])))
+        start = prev = i
+    runs.append((float(stations[start]), float(stations[prev])))
+
+    merged: list[tuple[float, float]] = [runs[0]]
+    for a, b in runs[1:]:
+        if a - merged[-1][1] < gap_merge_len:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return [(a, b) for a, b in merged if b - a >= min_absorb_len]
+
+
+@dataclass
+class _CorridorEntry:
+    """Mutable bookkeeping for one kept line during corridor dedup."""
+
+    coords: list[tuple[float, float]]
+    geom: sg.LineString
+    rec: MacroEdge
+    tier: int
+    src: int  # original input index (output ordering)
+    start: float  # interval start along the source line (output sub-order)
+    orig_line: sg.LineString | None  # non-None => still bit-identical
+
+
+def dedup_corridor_lines(
+    lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    *,
+    tol: float = CORRIDOR_DEDUP_TOL,
+    min_absorb_len: float = CORRIDOR_MIN_ABSORB_LEN,
+    gap_merge_len: float = CORRIDOR_GAP_MERGE_LEN,
+    sample_step: float = CORRIDOR_SAMPLE_STEP,
+) -> tuple[list[sg.LineString], list[MacroEdge], int]:
+    """Collapse near-coincident same-corridor arterials (slice T-geo, pre-clip).
+
+    Lines are processed in descending ``(tier, length)`` priority (index
+    tie-break -- deterministic). For each candidate, an arc-length distance
+    profile against the already-kept lines (sampled every ``sample_step``)
+    finds its sustained near-runs (see :func:`_absorbed_intervals`); those
+    runs are absorbed -- each kept line they hug has its tier bumped to the
+    max of its contributors -- and the candidate's surviving pieces
+    (``shapely.ops.substring`` of the ORIGINAL geometry, so untouched interior
+    vertices are preserved exactly) are stitched onto the nearest kept line at
+    each cut end via an exact shared vertex. A candidate with no sustained
+    near-run is kept as the ORIGINAL object, bit-identical; twins farther
+    apart than ``tol`` everywhere always survive.
+
+    Returns ``(lines, edges, n_merged)``: a FRESH index-aligned pair in
+    input-source order (surviving pieces of one line stay adjacent, ordered
+    by their interval start), plus the number of input lines that had at
+    least one run absorbed (fully or partially). ``tol <= 0`` disables the
+    pass entirely (identity on fresh lists).
+
+    Edge records: absorbers keep their ``MacroEdge`` (tier possibly bumped,
+    length re-rounded when a stitch vertex was inserted); surviving pieces
+    copy their source record with ``length`` updated -- ``node_a``/
+    ``node_b``/``path_cost`` stay informational, exactly like the fragments
+    :func:`clip_arterials_to_cores` emits.
+    """
+    if tol <= 0.0 or len(lines) < 2:
+        return list(lines), list(edges), 0
+
+    order = sorted(
+        range(len(lines)),
+        key=lambda i: (-edges[i].tier, -lines[i].length, i),
+    )
+
+    kept: list[_CorridorEntry] = []
+    n_merged = 0
+    for i in order:
+        line = lines[i]
+        rec = edges[i]
+        if not kept:
+            kept.append(
+                _CorridorEntry(
+                    coords=list(line.coords),
+                    geom=line,
+                    rec=rec,
+                    tier=rec.tier,
+                    src=i,
+                    start=0.0,
+                    orig_line=line,
+                )
+            )
+            continue
+
+        total = float(line.length)
+        n_samples = max(int(np.ceil(total / sample_step)) + 1, 2)
+        stations = np.linspace(0.0, total, n_samples)
+        pts = shapely.line_interpolate_point(line, stations)
+        tree = STRtree([e.geom for e in kept])
+        q_idx, q_dist = tree.query_nearest(pts, return_distance=True, all_matches=False)
+        nearest = np.full(n_samples, -1, dtype=int)
+        dist = np.full(n_samples, np.inf, dtype=float)
+        nearest[q_idx[0]] = q_idx[1]
+        dist[q_idx[0]] = q_dist
+
+        absorbed = _absorbed_intervals(
+            stations,
+            dist <= tol,
+            min_absorb_len=min_absorb_len,
+            gap_merge_len=gap_merge_len,
+        )
+        if not absorbed:
+            kept.append(
+                _CorridorEntry(
+                    coords=list(line.coords),
+                    geom=line,
+                    rec=rec,
+                    tier=rec.tier,
+                    src=i,
+                    start=0.0,
+                    orig_line=line,
+                )
+            )
+            continue
+
+        n_merged += 1
+        # Bump every absorbing kept line's tier to the max of its contributors.
+        for a, b in absorbed:
+            in_run = (stations >= a - 1e-12) & (stations <= b + 1e-12) & (dist <= tol)
+            for k in sorted({int(k) for k in nearest[in_run] if k >= 0}):
+                kept[k].tier = max(kept[k].tier, rec.tier)
+
+        # Surviving intervals: the complement, CLOSED at the near boundary
+        # samples (so a cut end sits within tol of its absorber -- a short
+        # stitch, not a gap).
+        surviving: list[tuple[float, float]] = []
+        prev_end = 0.0
+        for a, b in absorbed:
+            if a - prev_end > 1e-9:
+                surviving.append((prev_end, a))
+            prev_end = b
+        if total - prev_end > 1e-9:
+            surviving.append((prev_end, total))
+
+        for a, b in surviving:
+            piece = substring(line, a, b)
+            coords = list(piece.coords)
+            if len(coords) < 2:
+                continue
+            for at_start, is_cut in ((True, a > 1e-9), (False, b < total - 1e-9)):
+                if not is_cut:
+                    continue
+                cut_pt = sg.Point(coords[0] if at_start else coords[-1])
+                k = min(
+                    range(len(kept)),
+                    key=lambda k: (kept[k].geom.distance(cut_pt), k),
+                )
+                entry = kept[k]
+                station = float(entry.geom.project(cut_pt))
+                new_coords, q = _insert_vertex_at_station(entry.coords, station)
+                if new_coords is not entry.coords:
+                    entry.coords = new_coords
+                    entry.geom = sg.LineString(new_coords)
+                    entry.orig_line = None
+                if at_start and q != coords[0]:
+                    coords.insert(0, q)
+                elif not at_start and q != coords[-1]:
+                    coords.append(q)
+            piece_line = sg.LineString(coords)
+            kept.append(
+                _CorridorEntry(
+                    coords=coords,
+                    geom=piece_line,
+                    rec=rec,
+                    tier=rec.tier,
+                    src=i,
+                    start=a,
+                    orig_line=None,
+                )
+            )
+
+    out_lines: list[sg.LineString] = []
+    out_edges: list[MacroEdge] = []
+    for entry in sorted(kept, key=lambda e: (e.src, e.start)):
+        if entry.orig_line is not None and entry.tier == entry.rec.tier:
+            out_lines.append(entry.orig_line)
+            out_edges.append(entry.rec)
+        else:
+            out_lines.append(entry.geom)
+            out_edges.append(
+                replace(
+                    entry.rec,
+                    tier=entry.tier,
+                    length=round(float(entry.geom.length), 3),
+                )
+            )
+    return out_lines, out_edges, n_merged
+
+
+# ---------------------------------------------------------------------------
 # 4. Macro-blocks
 # ---------------------------------------------------------------------------
 
@@ -1368,6 +1680,176 @@ def clip_arterials_to_cores(
                 )
             )
     return out_lines, out_edges
+
+
+def snap_endpoints_to_rings(
+    lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    core_polys: list[sg.Polygon],
+    *,
+    tol: float = RING_SNAP_TOL,
+    on_tol: float = 1e-9,
+) -> tuple[list[sg.LineString], list[MacroEdge], list[sg.Polygon], int]:
+    """Snap near-but-not-on-ring arterial endpoints ONTO the ring (T-geo).
+
+    A trunk whose macro node sits just OUTSIDE a core polygon is not cut by
+    :func:`clip_arterials_to_cores`, so its endpoint hovers next to the ring
+    instead of forming a T-junction on it. Every unique endpoint whose
+    distance to the nearest core ring is in ``(on_tol, tol]`` is replaced by
+    its projection onto that ring, and the projected point is also inserted
+    as an exact VERTEX of the core polygon's exterior -- exact coordinate
+    identity is what makes downstream ``polygonize`` noding fuse there AND
+    what keeps ``_ring_junction_stations``'s exact-on-ring matching
+    (tol=1e-6) finding it as a spoke station. Endpoints already ON a ring
+    (within ``on_tol`` -- every clip-produced cut) are left strictly alone,
+    as are endpoints farther than ``tol`` (legitimate termini near a core).
+
+    The snap map is keyed by the unique endpoint COORDINATE, so all lines
+    sharing a macro-node junction move together and stay fused. A line whose
+    two endpoints collapse to the same point is dropped (degenerate).
+
+    Returns ``(lines, edges, core_polys, n_snapped)``: fresh index-aligned
+    line/edge lists (untouched lines re-emitted as the original objects),
+    the core polygons WITH the inserted station vertices (geometrically
+    identical -- only collinear vertices are added), and the number of
+    unique endpoints snapped. ``tol <= 0`` or no cores is an identity pass.
+    """
+    if tol <= 0.0 or not core_polys or not lines:
+        return list(lines), list(edges), list(core_polys), 0
+
+    exteriors = [sg.LineString(list(p.exterior.coords)) for p in core_polys]
+
+    # Unique endpoints, first-seen order (deterministic given `lines` order).
+    endpoints: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+    for line in lines:
+        coords = list(line.coords)
+        for pt in (coords[0], coords[-1]):
+            if pt not in seen:
+                seen.add(pt)
+                endpoints.append(pt)
+
+    # Ring index -> [(station, endpoint)] to snap onto that ring.
+    per_ring: dict[int, list[tuple[float, float, tuple[float, float]]]] = {}
+    for pt in endpoints:
+        p = sg.Point(pt)
+        dists = [ext.distance(p) for ext in exteriors]
+        k = min(range(len(exteriors)), key=lambda j: (dists[j], j))
+        if on_tol < dists[k] <= tol:
+            per_ring.setdefault(k, []).append(
+                (float(exteriors[k].project(p)), dists[k], pt)
+            )
+
+    snap_map: dict[tuple[float, float], tuple[float, float]] = {}
+    out_polys = list(core_polys)
+    n_snapped = 0
+    for k in sorted(per_ring):
+        coords = list(core_polys[k].exterior.coords)
+        for station, _dist, pt in sorted(per_ring[k]):
+            coords, q = _insert_vertex_at_station(coords, station)
+            snap_map[pt] = q
+            n_snapped += 1
+        out_polys[k] = sg.Polygon(coords)
+
+    if not snap_map:
+        return list(lines), list(edges), list(core_polys), 0
+
+    out_lines: list[sg.LineString] = []
+    out_edges: list[MacroEdge] = []
+    for line, rec in zip(lines, edges, strict=True):
+        coords = list(line.coords)
+        new_first = snap_map.get(coords[0])
+        new_last = snap_map.get(coords[-1])
+        if new_first is None and new_last is None:
+            out_lines.append(line)
+            out_edges.append(rec)
+            continue
+        if new_first is not None:
+            coords[0] = new_first
+        if new_last is not None:
+            coords[-1] = new_last
+        if len({(x, y) for x, y in coords}) < 2:
+            continue  # degenerate: both ends collapsed to one station.
+        snapped = sg.LineString(coords)
+        if snapped.length <= 0.0:
+            continue
+        out_lines.append(snapped)
+        out_edges.append(replace(rec, length=round(float(snapped.length), 3)))
+    return out_lines, out_edges, out_polys, n_snapped
+
+
+def prune_short_dangles(
+    lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    ring_lines: list[sg.LineString],
+    *,
+    max_len: float = DANGLE_PRUNE_LEN,
+    protected_points: list[tuple[float, float]] | None = None,
+    protect_tol: float = 0.0,
+    junction_tol: float = 1e-6,
+) -> tuple[list[sg.LineString], list[MacroEdge], int]:
+    """Remove short degree-1 dangling fragments from the clipped network (T-geo).
+
+    A fragment is pruned when its length is below ``max_len`` AND at least
+    one of its endpoints is FREE -- i.e. has degree 1 in the macro graph:
+    farther than ``junction_tol`` from every OTHER surviving line (endpoint
+    coincidences AND mid-line touches both count as junctions, so dedup
+    stitch points keep their piece), farther than ``junction_tol`` from
+    every ring, and farther than ``protect_tol`` from every protected point
+    (the macro NODE positions -- a legitimate short leaf arterial ending at
+    a village node is not clip confetti and must survive). Fragments with
+    ANY endpoint on a ring are never pruned, whatever their other end does:
+    they carry the ring T-junction stations the S3 spokes derive from.
+
+    Iterates to a fixpoint (pruning one stub can free its neighbour's end),
+    which is order-independent within each sweep and therefore
+    deterministic. Returns ``(lines, edges, n_pruned)`` -- a fresh aligned
+    pair of the SURVIVING original objects (never modified, only dropped).
+    ``max_len <= 0`` disables the pass.
+    """
+    if max_len <= 0.0 or not lines:
+        return list(lines), list(edges), 0
+
+    protected = [sg.Point(p) for p in (protected_points or [])]
+    keep = [True] * len(lines)
+    ends = [(sg.Point(line.coords[0]), sg.Point(line.coords[-1])) for line in lines]
+
+    def _on_ring(p: sg.Point) -> bool:
+        return any(ring.distance(p) <= junction_tol for ring in ring_lines)
+
+    def _is_free(i: int, p: sg.Point) -> bool:
+        if _on_ring(p):
+            return False
+        if protect_tol > 0.0 and any(q.distance(p) <= protect_tol for q in protected):
+            return False
+        return all(
+            not keep[j] or j == i or lines[j].distance(p) > junction_tol
+            for j in range(len(lines))
+        )
+
+    n_pruned = 0
+    changed = True
+    while changed:
+        changed = False
+        # Decide the whole sweep against the sweep-entry `keep` state so the
+        # result does not depend on iteration order within the sweep.
+        to_prune = [
+            i
+            for i in range(len(lines))
+            if keep[i]
+            and float(lines[i].length) < max_len
+            and not _on_ring(ends[i][0])
+            and not _on_ring(ends[i][1])
+            and (_is_free(i, ends[i][0]) or _is_free(i, ends[i][1]))
+        ]
+        for i in to_prune:
+            keep[i] = False
+            n_pruned += 1
+            changed = True
+
+    out_lines = [line for line, k in zip(lines, keep, strict=True) if k]
+    out_edges = [rec for rec, k in zip(edges, keep, strict=True) if k]
+    return out_lines, out_edges, n_pruned
 
 
 # ---------------------------------------------------------------------------
@@ -1997,6 +2479,10 @@ class MacroBlockBundle:
     blocks: list[sg.Polygon]
     nuclei: list[NucleusSpec]
     plaza_polys: list[sg.Polygon]
+    # T-geo observability counters (informational; see snap_endpoints_to_rings
+    # and prune_short_dangles).
+    n_endpoints_snapped: int = 0
+    n_dangles_pruned: int = 0
 
 
 def build_macro_blocks_with_cores(
@@ -2023,6 +2509,8 @@ def build_macro_blocks_with_cores(
     r_plaza_major_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
     plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
+    ring_snap_tol: float = RING_SNAP_TOL,
+    dangle_prune_len: float = DANGLE_PRUNE_LEN,
 ) -> MacroBlockBundle:
     """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
 
@@ -2033,6 +2521,12 @@ def build_macro_blocks_with_cores(
     2. Clip arterials to the cores' exterior (:func:`clip_arterials_to_cores`)
        so density-attracting arterials terminate ON the ring (T-junctions)
        rather than converging on the summit.
+    2b. Snap near-ring endpoints onto the ring
+       (:func:`snap_endpoints_to_rings`) and prune short degree-1 dangling
+       fragments (:func:`prune_short_dangles`) -- slice T-geo. Both re-emit
+       fresh aligned line/edge pairs; macro-node endpoints are protected
+       from the prune (within one raster cell -- routed endpoints sit at the
+       node's CELL CENTER, not the exact node xy).
     3. Wrap each surviving core into a ranked :class:`NucleusSpec`
        (:func:`build_nucleus_specs`, S2).
     4. Fan intra-nucleus avenues (spokes + a plaza ring) for every MAJOR
@@ -2064,9 +2558,25 @@ def build_macro_blocks_with_cores(
         close_width=core_close_width,
         smooth_iterations=core_smooth_iterations,
     )
-    ring_lines = core_ring_boundaries(core_polys)
     clipped_lines, clipped_edges = clip_arterials_to_cores(
         arterial_lines, edges, core_polys
+    )
+    # T-geo 2b: snap near-ring endpoints onto the ring (also inserts each
+    # snapped station as an exact ring VERTEX -- core_polys is updated), then
+    # prune short degree-1 dangles. Ring lines derive from the UPDATED polys.
+    clipped_lines, clipped_edges, core_polys, n_endpoints_snapped = (
+        snap_endpoints_to_rings(
+            clipped_lines, clipped_edges, core_polys, tol=ring_snap_tol
+        )
+    )
+    ring_lines = core_ring_boundaries(core_polys)
+    clipped_lines, clipped_edges, n_dangles_pruned = prune_short_dangles(
+        clipped_lines,
+        clipped_edges,
+        ring_lines,
+        max_len=dangle_prune_len,
+        protected_points=[(nd.x, nd.y) for nd in nodes],
+        protect_tol=cell,
     )
     nuclei = build_nucleus_specs(
         density, core_polys, nodes, points, x0, y0, cell, n_major=n_major_nuclei
@@ -2105,6 +2615,8 @@ def build_macro_blocks_with_cores(
         blocks=blocks,
         nuclei=nuclei,
         plaza_polys=plaza_polys,
+        n_endpoints_snapped=n_endpoints_snapped,
+        n_dangles_pruned=n_dangles_pruned,
     )
 
 
@@ -2163,6 +2675,10 @@ class MacroParams:
     r_plaza_major_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS
     spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG
     plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES
+    # Same-corridor geometry cleanup (slice T-geo); <= 0 disables each pass.
+    corridor_dedup_tol: float = CORRIDOR_DEDUP_TOL
+    ring_snap_tol: float = RING_SNAP_TOL
+    dangle_prune_len: float = DANGLE_PRUNE_LEN
 
     def to_dict(self) -> dict[str, Any]:
         """Plain-dict form for JSON manifests."""
@@ -2179,7 +2695,10 @@ class MacroLayer:
     nodes : macro nodes (cities/towns/villages).
     cost : the density-attracting routing cost field.
     raw_arterial_lines / raw_edges : the pre-clip arterial network, Chaikin-
-        smoothed (:func:`smooth_arterial_lines`) immediately after routing.
+        smoothed (:func:`smooth_arterial_lines`) immediately after routing,
+        then same-corridor DEDUPED (:func:`dedup_corridor_lines`, T-geo) --
+        deduping pre-clip keeps this the single source of truth every
+        downstream consumer derives from.
     core_polys / ring_lines : dense-core downtown polygons and their rings
         (``ring_lines`` also carries one plaza ring per major nucleus that
         got avenues, S3).
@@ -2192,6 +2711,10 @@ class MacroLayer:
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
     plaza_polys : one small inner plaza disc per major nucleus that got
         avenues (S3); see :attr:`MacroBlockBundle.plaza_polys`.
+    n_corridors_merged / n_endpoints_snapped / n_dangles_pruned :
+        informational T-geo cleanup counters (how many routed lines had a
+        near-coincident run absorbed pre-clip; how many endpoints snapped
+        onto a core ring; how many short degree-1 fragments were pruned).
     """
 
     params: MacroParams
@@ -2206,6 +2729,9 @@ class MacroLayer:
     blocks: list[sg.Polygon]
     nuclei: list[NucleusSpec]
     plaza_polys: list[sg.Polygon]
+    n_corridors_merged: int = 0
+    n_endpoints_snapped: int = 0
+    n_dangles_pruned: int = 0
 
 
 def build_macro_layer(
@@ -2294,8 +2820,7 @@ def build_macro_layer(
         iterations=params.smooth_iterations,
         post_tol=params.smooth_post_tol,
     )
-    raw_lines = smoothed_lines
-    raw_edges = [
+    smoothed_edges = [
         MacroEdge(
             node_a=rec.node_a,
             node_b=rec.node_b,
@@ -2306,6 +2831,16 @@ def build_macro_layer(
         )
         for line, rec in zip(smoothed_lines, routed_edges, strict=True)
     ]
+
+    # Same-corridor dedup (T-geo) -- PRE-clip, so the deduped network is the
+    # single pre-clip source of truth (raw_arterial_lines) AND so
+    # `clip_arterials_to_cores` / `_ring_junction_stations`' exact-on-ring
+    # matching runs on the deduped geometry.
+    raw_lines, raw_edges, n_corridors_merged = dedup_corridor_lines(
+        smoothed_lines,
+        smoothed_edges,
+        tol=params.corridor_dedup_tol,
+    )
 
     bundle = build_macro_blocks_with_cores(
         density,
@@ -2326,6 +2861,8 @@ def build_macro_layer(
         r_plaza_major_max=params.r_plaza_major_max,
         spoke_min_angle_deg=params.spoke_min_angle_deg,
         plaza_ring_vertices=params.plaza_ring_vertices,
+        ring_snap_tol=params.ring_snap_tol,
+        dangle_prune_len=params.dangle_prune_len,
     )
 
     return MacroLayer(
@@ -2341,6 +2878,9 @@ def build_macro_layer(
         blocks=bundle.blocks,
         nuclei=bundle.nuclei,
         plaza_polys=bundle.plaza_polys,
+        n_corridors_merged=n_corridors_merged,
+        n_endpoints_snapped=bundle.n_endpoints_snapped,
+        n_dangles_pruned=bundle.n_dangles_pruned,
     )
 
 

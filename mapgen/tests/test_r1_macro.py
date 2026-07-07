@@ -16,6 +16,7 @@ from mapgen.r1_macro import (
     DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
     DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    RING_SNAP_TOL,
     SPOKE_NODE_SENTINEL,
     TOWN_SIGMA,
     VILLAGE_SIGMA,
@@ -42,13 +43,16 @@ from mapgen.r1_macro import (
     clip_arterials_to_cores,
     cluster_centroids,
     compute_macro_arterials,
+    dedup_corridor_lines,
     detect_core_regions,
     grade_cities,
     major_plaza_radii,
     polygonize_macro_blocks,
+    prune_short_dangles,
     smooth_arterial_lines,
     smooth_polyline,
     snap_centroid_to_peak,
+    snap_endpoints_to_rings,
     snap_nodes_to_peaks,
     tier_for_tau,
     town_nodes_from_peaks,
@@ -1502,3 +1506,256 @@ def test_spokes_and_plaza_ring_gate_snap_as_arterial_and_ring() -> None:
     assert arterial_junction.distance < 1e-6
     assert ring_junction.kind == "ring"
     assert ring_junction.distance < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Slice T-geo: same-corridor dedup + endpoint snap-to-ring + dangle prune
+# ---------------------------------------------------------------------------
+
+
+def _tedge(
+    line: sg.LineString, tier: int, node_a: int = 0, node_b: int = 1
+) -> MacroEdge:
+    """A MacroEdge whose ``length`` matches ``line`` (the alignment invariant)."""
+    return MacroEdge(
+        node_a=node_a,
+        node_b=node_b,
+        tau=tier,
+        tier=tier,
+        path_cost=1.0,
+        length=round(float(line.length), 3),
+    )
+
+
+def _assert_aligned(lines: list[sg.LineString], edges: list[MacroEdge]) -> None:
+    """The fresh-aligned-pair contract: positional geometry<->record match."""
+    assert len(lines) == len(edges)
+    for line, rec in zip(lines, edges, strict=True):
+        assert rec.length == pytest.approx(round(float(line.length), 3), abs=2e-3)
+
+
+def test_dedup_collapses_braided_pair_keeps_max_tier() -> None:
+    """Two near-coincident routes collapse to ONE chain carrying the max tier."""
+    a = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    b = sg.LineString([(0.0, 0.5), (30.0, 0.5)])  # 0.5 < tol everywhere.
+    out_lines, out_edges, n_merged = dedup_corridor_lines(
+        [a, b], [_tedge(a, 2), _tedge(b, 1, node_a=2, node_b=3)]
+    )
+    assert n_merged == 1
+    assert len(out_lines) == 1
+    assert out_lines[0] is a  # higher tier wins; kept bit-identical.
+    assert out_edges[0].tier == 2  # max of contributors (2, 1).
+    _assert_aligned(out_lines, out_edges)
+
+    # Reversed tiers: the tier-2 twin has priority, absorbs the tier-1 one.
+    out_lines, out_edges, n_merged = dedup_corridor_lines(
+        [a, b], [_tedge(a, 1), _tedge(b, 2, node_a=2, node_b=3)]
+    )
+    assert n_merged == 1
+    assert len(out_lines) == 1
+    assert out_lines[0] is b
+    assert out_edges[0].tier == 2
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_dedup_spares_distant_twins_bit_identical() -> None:
+    """Twins farther apart than the tolerance are legitimate frontage roads."""
+    a = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    b = sg.LineString([(0.0, 3.0), (30.0, 3.0)])  # 3.0 > tol=1.2 everywhere.
+    out_lines, out_edges, n_merged = dedup_corridor_lines(
+        [a, b], [_tedge(a, 2), _tedge(b, 1)]
+    )
+    assert n_merged == 0
+    assert out_lines[0] is a and out_lines[1] is b  # untouched objects.
+    assert out_edges[0].tier == 2 and out_edges[1].tier == 1
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_dedup_transversal_crossing_untouched() -> None:
+    """A crossing dips in the buffer for < min-absorb length: both survive."""
+    a = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    b = sg.LineString([(15.0, -10.0), (15.0, 10.0)])  # 90-degree crossing.
+    out_lines, out_edges, n_merged = dedup_corridor_lines(
+        [a, b], [_tedge(a, 2), _tedge(b, 1)]
+    )
+    assert n_merged == 0
+    assert out_lines[0] is a and out_lines[1] is b
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_dedup_partial_braid_stitches_remainder_onto_corridor() -> None:
+    """A route that hugs then diverges keeps only its divergent piece, stitched.
+
+    The stitch endpoint must be an EXACT shared vertex of the kept corridor
+    line (this is what makes downstream polygonize noding fuse there).
+    """
+    a = sg.LineString([(0.0, 0.0), (40.0, 0.0)])
+    b = sg.LineString([(0.0, 0.5), (20.0, 0.5), (40.0, 12.0)])
+    rec_b = _tedge(b, 1, node_a=4, node_b=5)
+    out_lines, out_edges, n_merged = dedup_corridor_lines([a, b], [_tedge(a, 2), rec_b])
+    assert n_merged == 1
+    assert len(out_lines) == 2
+    _assert_aligned(out_lines, out_edges)
+
+    kept_a, piece = out_lines[0], out_lines[1]
+    # The corridor keeps A's exact path (a collinear stitch vertex may have
+    # been inserted, so compare geometry, not object identity).
+    assert kept_a.length == pytest.approx(40.0, abs=1e-9)
+    assert out_edges[0].tier == 2
+
+    # The remainder piece keeps B's informational record fields and ends
+    # (starts) at an exact vertex of the kept corridor line.
+    assert out_edges[1].node_a == 4 and out_edges[1].node_b == 5
+    assert out_edges[1].tier == 1
+    stitch = piece.coords[0]
+    assert stitch in set(kept_a.coords)
+    # B's original far endpoint survives exactly.
+    assert piece.coords[-1] == (40.0, 12.0)
+
+
+def test_dedup_deterministic() -> None:
+    """Same input -> identical output coordinates (no hidden state)."""
+    a = sg.LineString([(0.0, 0.0), (40.0, 0.0)])
+    b = sg.LineString([(0.0, 0.5), (20.0, 0.5), (40.0, 12.0)])
+    lines, edges = [a, b], [_tedge(a, 2), _tedge(b, 1)]
+    out1 = dedup_corridor_lines(lines, edges)
+    out2 = dedup_corridor_lines(lines, edges)
+    assert [list(g.coords) for g in out1[0]] == [list(g.coords) for g in out2[0]]
+    assert out1[1] == out2[1]
+    assert out1[2] == out2[2]
+
+
+def test_dedup_disabled_by_nonpositive_tol() -> None:
+    """``tol <= 0`` is an identity pass (fresh lists, same objects)."""
+    a = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    b = sg.LineString([(0.0, 0.5), (30.0, 0.5)])
+    edges = [_tedge(a, 2), _tedge(b, 1)]
+    out_lines, out_edges, n_merged = dedup_corridor_lines([a, b], edges, tol=0.0)
+    assert n_merged == 0
+    assert out_lines == [a, b]
+    assert out_edges == edges
+
+
+def test_snap_endpoints_to_rings_produces_exact_station() -> None:
+    """A near-ring endpoint snaps ONTO the ring; the station stays exact.
+
+    Exactness contract: the snapped endpoint must be found by
+    ``_ring_junction_stations`` at its 1e-6 tolerance (or spokes silently
+    vanish), which the vertex-insertion into the core exterior guarantees.
+    """
+    core = sg.box(-5.0, -5.0, 5.0, 5.0)
+    near = sg.LineString([(10.0, 0.0), (5.8, 0.0)])  # endpoint 0.8 off-ring.
+    far = sg.LineString([(10.0, 10.0), (20.0, 20.0)])  # nowhere near the ring.
+    on_ring = sg.LineString([(0.0, 8.0), (0.0, 5.0)])  # already exactly on it.
+    lines = [near, far, on_ring]
+    edges = [_tedge(near, 2), _tedge(far, 1), _tedge(on_ring, 1)]
+
+    out_lines, out_edges, out_polys, n_snapped = snap_endpoints_to_rings(
+        lines, edges, [core], tol=RING_SNAP_TOL
+    )
+    assert n_snapped == 1
+    _assert_aligned(out_lines, out_edges)
+    assert out_lines[1] is far  # untouched objects re-emitted as-is.
+    assert out_lines[2] is on_ring  # already-on-ring endpoint left alone.
+
+    snapped_end = out_lines[0].coords[-1]
+    assert snapped_end == (5.0, 0.0)
+    assert snapped_end in set(out_polys[0].exterior.coords)  # exact ring vertex.
+    assert out_polys[0].area == pytest.approx(core.area)  # collinear insert only.
+    stations = _ring_junction_stations([out_lines[0]], out_polys[0])
+    assert stations == [snapped_end]
+
+
+def test_snap_endpoints_to_rings_moves_shared_junction_consistently() -> None:
+    """All lines sharing a snapped macro-node endpoint move to the SAME point."""
+    core = sg.box(-5.0, -5.0, 5.0, 5.0)
+    shared = (5.9, 0.0)
+    l1 = sg.LineString([(10.0, 4.0), shared])
+    l2 = sg.LineString([shared, (12.0, -6.0)])
+    out_lines, _, _, n_snapped = snap_endpoints_to_rings(
+        [l1, l2], [_tedge(l1, 1), _tedge(l2, 1)], [core]
+    )
+    assert n_snapped == 1  # ONE unique endpoint snapped, shared by both lines.
+    assert out_lines[0].coords[-1] == out_lines[1].coords[0]
+
+
+def test_snap_endpoints_to_rings_drops_degenerate_line() -> None:
+    """A line whose both ends collapse onto one station is dropped, aligned."""
+    core = sg.box(-5.0, -5.0, 5.0, 5.0)
+    stub = sg.LineString([(5.9, 0.0), (6.0, 0.0)])  # both ends project to (5, 0).
+    keepme = sg.LineString([(10.0, 10.0), (20.0, 20.0)])
+    out_lines, out_edges, _, _ = snap_endpoints_to_rings(
+        [stub, keepme], [_tedge(stub, 1), _tedge(keepme, 1)], [core]
+    )
+    assert out_lines == [keepme]
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_prune_short_dangles_kills_stub_spares_ring_and_junctions() -> None:
+    """The degree-1 prune rules, all in one small network.
+
+    - ``stub``: short, one end on the backbone (junction), other end free ->
+      PRUNED (this is the switchback-hook shape).
+    - ``ring_frag``: short, terminates ON a ring -> spared, whatever its
+      other end does (ring stations feed the S3 spokes).
+    - ``cross``: short, BOTH ends at junctions -> no free end, spared.
+    - ``long_dangle``: free end but >= max_len -> spared.
+    """
+    backbone = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    upper = sg.LineString([(0.0, 4.0), (30.0, 4.0)])
+    stub = sg.LineString([(15.0, 0.0), (15.0, -3.0)])
+    cross = sg.LineString([(10.0, 0.0), (10.0, 4.0)])
+    long_dangle = sg.LineString([(25.0, 0.0), (25.0, 9.0)])
+    ring = sg.box(40.0, -5.0, 50.0, 5.0)
+    ring_lines = [sg.LineString(list(ring.exterior.coords))]
+    ring_frag = sg.LineString([(40.0, 0.0), (36.0, 0.0)])  # 4 u, free west end.
+
+    lines = [backbone, upper, stub, cross, long_dangle, ring_frag]
+    edges = [_tedge(ln, 1) for ln in lines]
+    out_lines, out_edges, n_pruned = prune_short_dangles(lines, edges, ring_lines)
+    assert n_pruned == 1
+    assert stub not in out_lines
+    assert out_lines == [backbone, upper, cross, long_dangle, ring_frag]
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_prune_short_dangles_protects_macro_node_endpoints() -> None:
+    """A short leaf arterial ending AT a macro node is not clip confetti."""
+    backbone = sg.LineString([(0.0, 0.0), (30.0, 0.0)])
+    leaf = sg.LineString([(20.0, 0.0), (20.0, 3.0)])  # village leaf, 3 u.
+    lines = [backbone, leaf]
+    edges = [_tedge(ln, 1) for ln in lines]
+
+    _, _, n_unprotected = prune_short_dangles(lines, edges, [])
+    assert n_unprotected == 1  # without protection the leaf IS a dangle...
+
+    out_lines, _, n_pruned = prune_short_dangles(
+        lines, edges, [], protected_points=[(20.0, 3.0)], protect_tol=0.5
+    )
+    assert n_pruned == 0  # ...but the node position protects it.
+    assert out_lines == [backbone, leaf]
+
+
+def test_prune_short_dangles_iterates_to_fixpoint() -> None:
+    """Pruning an outer stub frees the next one: isolated chains dissolve."""
+    h1 = sg.LineString([(50.0, 50.0), (53.0, 50.0)])
+    h2 = sg.LineString([(53.0, 50.0), (56.0, 50.0)])
+    h3 = sg.LineString([(56.0, 50.0), (59.0, 50.0)])
+    lines = [h1, h2, h3]
+    out_lines, out_edges, n_pruned = prune_short_dangles(
+        lines, [_tedge(ln, 1) for ln in lines], []
+    )
+    assert n_pruned == 3
+    assert out_lines == []
+    assert out_edges == []
+
+
+def test_build_macro_layer_exposes_tgeo_counters_and_stays_aligned() -> None:
+    """Composed pipeline: T-geo counters exist and alignment holds end-to-end."""
+    fields, boundary, points = _synthetic_island()
+    layer = build_macro_layer(fields, boundary, points, MacroParams())
+    assert layer.n_corridors_merged >= 0
+    assert layer.n_endpoints_snapped >= 0
+    assert layer.n_dangles_pruned >= 0
+    assert len(layer.raw_arterial_lines) == len(layer.raw_edges)
+    _assert_aligned(layer.arterial_lines, layer.edges)
