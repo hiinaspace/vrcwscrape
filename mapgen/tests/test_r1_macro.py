@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import pytest
 import shapely.geometry as sg
 from shapely.ops import unary_union
 
 from mapgen.r1_arm_a import IslandFields
+from mapgen.r1_connect import Gate, snap_gates_to_macro
 from mapgen.r1_macro import (
     CITY_SIGMA,
     DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    SPOKE_NODE_SENTINEL,
     TOWN_SIGMA,
     VILLAGE_SIGMA,
     MacroEdge,
@@ -20,12 +24,18 @@ from mapgen.r1_macro import (
     _cells_to_polygon,
     _chaikin_pass_closed,
     _chaikin_pass_open,
+    _dedupe_stations_by_angle,
     _delaunay_edges,
     _nearest_neighbor_chain,
+    _polygonize_macro_blocks_protecting_nuclei,
+    _ring_junction_stations,
+    add_intra_nucleus_avenues,
     assign_nearest_nucleus,
     build_density_cost_field,
+    build_macro_blocks_with_cores,
     build_macro_layer,
     build_macro_nodes_hierarchical,
+    build_nucleus_avenues,
     build_nucleus_specs,
     clip_arterials_to_cores,
     cluster_centroids,
@@ -993,3 +1003,375 @@ def test_assign_nearest_nucleus_empty_nuclei_returns_none() -> None:
     """No nuclei detected -> every polygon gets ``(None, None)``."""
     result = assign_nearest_nucleus([sg.box(0.0, 0.0, 1.0, 1.0)], [])
     assert result == [(None, None)]
+
+
+# ---------------------------------------------------------------------------
+# Intra-nucleus avenues (S3: the keystone slice)
+# ---------------------------------------------------------------------------
+
+# A 10x10-unit box core centered on the origin -- axis-aligned so a station at
+# a cardinal/diagonal-friendly angle lands EXACTLY on the boundary (no
+# discretized-circle approximation error to fuss over in a unit test).
+_BOX_CORE = sg.box(-5.0, -5.0, 5.0, 5.0)
+_BOX_NUCLEUS = NucleusSpec(
+    anchor=(0.0, 0.0),
+    polygon=_BOX_CORE,
+    mass=1.0,
+    rank=1,
+    label="downtown",
+    influence_radius=7.0710678,
+    is_major=True,
+)
+
+
+def _radial_line(
+    angle_deg: float, station_radius: float, outer_radius: float
+) -> sg.LineString:
+    """A line from ``outer_radius`` in to a station on ``_BOX_CORE``'s boundary.
+
+    ``station_radius`` must put the inner endpoint exactly on the box
+    boundary (5.0 for the 4 cardinal directions; ``5 / cos/sin`` for others
+    within the same quadrant works too, but callers stick to cardinals for
+    exactness). Coordinates are rounded to 9 decimals so a cardinal angle's
+    ~1e-16 ``cos``/``sin`` noise collapses to an EXACT 0.0 -- load-bearing
+    for tests that check exact station-point equality.
+    """
+    ang = np.radians(angle_deg)
+    outer = (
+        round(outer_radius * float(np.cos(ang)), 9),
+        round(outer_radius * float(np.sin(ang)), 9),
+    )
+    inner = (
+        round(station_radius * float(np.cos(ang)), 9),
+        round(station_radius * float(np.sin(ang)), 9),
+    )
+    return sg.LineString([outer, inner])
+
+
+def test_ring_junction_stations_finds_endpoints_on_boundary_only() -> None:
+    """Only the endpoint that actually sits on the polygon boundary counts."""
+    on_ring = _radial_line(0.0, 5.0, 10.0)  # inner endpoint (5, 0) is on the box.
+    off_ring = sg.LineString([(20.0, 20.0), (30.0, 30.0)])  # nowhere near the box.
+    stations = _ring_junction_stations([on_ring, off_ring], _BOX_CORE)
+    assert stations == [(5.0, 0.0)]
+
+
+def test_ring_junction_stations_dedupes_exact_duplicate_points() -> None:
+    """Two lines sharing the same station point contribute it only once."""
+    line_a = _radial_line(90.0, 5.0, 10.0)
+    line_b = sg.LineString(
+        [(0.0, 5.0), (0.0, 8.0)]
+    )  # same station, other end elsewhere.
+    stations = _ring_junction_stations([line_a, line_b], _BOX_CORE)
+    assert stations == [(0.0, 5.0)]
+
+
+def test_dedupe_stations_by_angle_merges_close_pair() -> None:
+    """Two stations within the min angular spacing dedupe to one."""
+    near_dup = (5.0, float(5.0 * np.tan(np.radians(10.0))))  # ~10 deg, on the box edge.
+    stations = [(5.0, 0.0), near_dup, (0.0, 5.0), (-5.0, 0.0), (0.0, -5.0)]
+    deduped = _dedupe_stations_by_angle(
+        stations, (0.0, 0.0), float(np.radians(DEFAULT_SPOKE_MIN_ANGLE_DEG))
+    )
+    assert len(deduped) == 4
+    assert (5.0, 0.0) in deduped
+    assert near_dup not in deduped
+
+
+def test_dedupe_stations_by_angle_noop_for_0_or_1_station() -> None:
+    """0 or 1 station -> nothing to dedupe, returned unchanged."""
+    assert _dedupe_stations_by_angle([], (0.0, 0.0), 0.5) == []
+    one = [(5.0, 0.0)]
+    assert _dedupe_stations_by_angle(one, (0.0, 0.0), 0.5) == one
+
+
+def test_build_nucleus_avenues_basic_spokes_and_plaza() -> None:
+    """4 well-separated stations -> 4 spokes to an exact plaza ring."""
+    lines = [
+        _radial_line(0.0, 5.0, 10.0),
+        _radial_line(90.0, 5.0, 10.0),
+        _radial_line(180.0, 5.0, 10.0),
+        _radial_line(270.0, 5.0, 10.0),
+    ]
+    result = build_nucleus_avenues(_BOX_NUCLEUS, lines)
+    assert result is not None
+    spoke_lines, spoke_edges, plaza_poly = result
+
+    assert len(spoke_lines) == 4
+    assert len(spoke_edges) == 4
+    assert all(e.tier == 1 for e in spoke_edges)
+    assert all(
+        e.node_a == SPOKE_NODE_SENTINEL and e.node_b == SPOKE_NODE_SENTINEL
+        for e in spoke_edges
+    )
+
+    # Outer endpoint of every spoke is exactly one of the 4 ring stations.
+    stations = {tuple(ln.coords[0]) for ln in spoke_lines}
+    assert stations == {(5.0, 0.0), (0.0, 5.0), (-5.0, 0.0), (0.0, -5.0)}
+
+    # Plaza ring: closed, valid, radius r_plaza, centered on the anchor.
+    assert list(plaza_poly.exterior.coords)[0] == list(plaza_poly.exterior.coords)[-1]
+    assert plaza_poly.is_valid
+    centroid = plaza_poly.centroid
+    assert abs(centroid.x) < 1e-6 and abs(centroid.y) < 1e-6
+
+    # Every spoke's inner (plaza-facing) endpoint lands EXACTLY on the plaza
+    # ring -- this is what lets polygonize fuse them into clean wedge faces.
+    for ln in spoke_lines:
+        inner = sg.Point(ln.coords[-1])
+        assert plaza_poly.exterior.distance(inner) < 1e-9
+        assert abs(inner.distance(sg.Point(0.0, 0.0)) - 0.85) < 1e-9
+
+
+def test_build_nucleus_avenues_deterministic() -> None:
+    """Same inputs -> byte-identical spokes/plaza (no unseeded randomness)."""
+    lines = [_radial_line(a, 5.0, 10.0) for a in (0.0, 90.0, 180.0, 270.0)]
+    r1 = build_nucleus_avenues(_BOX_NUCLEUS, lines)
+    r2 = build_nucleus_avenues(_BOX_NUCLEUS, lines)
+    assert r1 is not None and r2 is not None
+    lines1, edges1, plaza1 = r1
+    lines2, edges2, plaza2 = r2
+    assert [list(ln.coords) for ln in lines1] == [list(ln.coords) for ln in lines2]
+    assert edges1 == edges2
+    assert list(plaza1.exterior.coords) == list(plaza2.exterior.coords)
+
+
+def test_build_nucleus_avenues_no_stations_returns_none() -> None:
+    """An isolated core with no arterial reaching its ring -> no avenues."""
+    unrelated = sg.LineString([(50.0, 50.0), (60.0, 60.0)])
+    assert build_nucleus_avenues(_BOX_NUCLEUS, [unrelated]) is None
+
+
+def test_build_nucleus_avenues_tiny_core_below_plaza_radius_returns_none() -> None:
+    """A core smaller than ``r_plaza`` -> every spoke would be degenerate."""
+    tiny_core = sg.box(-0.5, -0.5, 0.5, 0.5)
+    tiny_nucleus = NucleusSpec(
+        anchor=(0.0, 0.0),
+        polygon=tiny_core,
+        mass=1.0,
+        rank=1,
+        label="hamlet",
+        influence_radius=0.7071,
+        is_major=True,
+    )
+    line = sg.LineString([(10.0, 0.0), (0.5, 0.0)])
+    assert build_nucleus_avenues(tiny_nucleus, [line], r_plaza=0.85) is None
+
+
+def test_add_intra_nucleus_avenues_only_major_nuclei() -> None:
+    """A non-major (town-center) nucleus gets no avenues at all."""
+    major_core = sg.box(-5.0, -5.0, 5.0, 5.0)
+    town_core = sg.box(95.0, -5.0, 105.0, 5.0)
+    major = NucleusSpec(
+        anchor=(0.0, 0.0),
+        polygon=major_core,
+        mass=10.0,
+        rank=1,
+        label="major",
+        influence_radius=7.07,
+        is_major=True,
+    )
+    town = NucleusSpec(
+        anchor=(100.0, 0.0),
+        polygon=town_core,
+        mass=1.0,
+        rank=2,
+        label="town",
+        influence_radius=7.07,
+        is_major=False,
+    )
+    lines = [
+        sg.LineString([(10.0, 0.0), (5.0, 0.0)]),  # touches the major core's ring.
+        sg.LineString([(90.0, 0.0), (95.0, 0.0)]),  # touches the town core's ring.
+    ]
+    spoke_lines, spoke_edges, plaza_polys = add_intra_nucleus_avenues(
+        [major, town], lines
+    )
+    assert len(plaza_polys) == 1
+    assert len(spoke_lines) == 1
+    assert list(spoke_lines[0].coords)[0] == (5.0, 0.0)
+    assert abs(plaza_polys[0].centroid.x) < 1e-6
+
+
+def test_add_intra_nucleus_avenues_empty_nuclei_is_empty() -> None:
+    """No nuclei at all -> nothing built, doesn't crash."""
+    spoke_lines, spoke_edges, plaza_polys = add_intra_nucleus_avenues([], [])
+    assert spoke_lines == []
+    assert spoke_edges == []
+    assert plaza_polys == []
+
+
+def test_polygonize_macro_blocks_protecting_nuclei_no_protect_matches_plain() -> None:
+    """No protected polygons -> byte-identical to ``polygonize_districts``."""
+    line = sg.LineString([(0.0, 30.0), (60.0, 30.0)])
+    boundary = sg.box(0.0, 0.0, 60.0, 60.0)
+    expected = polygonize_macro_blocks([line], boundary, min_block_area=60.0)
+    got = _polygonize_macro_blocks_protecting_nuclei([line], boundary, 60.0, [])
+    assert len(got) == len(expected)
+    for g, e in zip(got, expected, strict=True):
+        assert g.equals(e)
+
+
+def test_polygonize_macro_blocks_protecting_nuclei_keeps_small_protected_faces() -> (
+    None
+):
+    """A tiny face inside ``protect_polys`` survives the coarse merge floor.
+
+    A small closed ring (a self-contained boundary a dangling line can't
+    provide -- ``polygonize`` only closes loops) split by one chord into two
+    9-unit^2 halves, both far below the 60-unit^2 merge floor, sitting
+    entirely inside a matching ``protect_polys`` entry (the S3 stand-in for a
+    major nucleus's core polygon).
+    """
+    boundary = sg.box(0.0, 0.0, 60.0, 60.0)
+    ring_box = sg.box(20.0, 20.0, 26.0, 23.0)  # 6x3 = 18 unit^2.
+    ring = sg.LineString(list(ring_box.exterior.coords))
+    chord = sg.LineString([(23.0, 20.0), (23.0, 23.0)])  # splits it into two 9s.
+    blocks = _polygonize_macro_blocks_protecting_nuclei(
+        [ring, chord], boundary, 60.0, [ring_box]
+    )
+    small_faces = [b for b in blocks if b.area < 15.0]
+    assert len(small_faces) == 2
+    assert all(b.area == pytest.approx(9.0) for b in small_faces)
+    assert sum(b.area for b in blocks) == pytest.approx(boundary.area, rel=1e-6)
+
+
+def _downtown_fixture() -> tuple[
+    np.ndarray,
+    list[MacroNode],
+    list[sg.LineString],
+    list[MacroEdge],
+    sg.Polygon,
+    pl.DataFrame,
+]:
+    """One dense blob + 6 radial arterial spokes-in, 60 degrees apart.
+
+    Reuses ``_two_peak_raster`` with ``sep_cells=0`` (both blobs coincide) as
+    a convenient single-peak raster. The 6 arterials approach from outside
+    radius 20 and terminate AT the blob center (well inside the eventual
+    core), so ``clip_arterials_to_cores`` leaves exactly one outer segment
+    (and one ring station) per line -- evenly spaced 60 degrees apart, well
+    past the default 20-degree dedup spacing.
+    """
+    density = _two_peak_raster(sep_cells=0)
+    cx, cy = 30.5, 30.5
+    nodes = [MacroNode(x=cx, y=cy, sigma=TOWN_SIGMA, kind="town", label="downtown")]
+    lines: list[sg.LineString] = []
+    edges: list[MacroEdge] = []
+    for i in range(6):
+        ang = np.radians(60.0 * i)
+        outer = (cx + 20.0 * np.cos(ang), cy + 20.0 * np.sin(ang))
+        line = sg.LineString([outer, (cx, cy)])
+        lines.append(line)
+        edges.append(
+            MacroEdge(
+                node_a=0,
+                node_b=-2,
+                tau=2,
+                tier=2,
+                path_cost=round(line.length, 4),
+                length=round(line.length, 3),
+            )
+        )
+    boundary = sg.box(0.0, 0.0, 60.0, 60.0)
+    points = pl.DataFrame(
+        {"x": pl.Series([], dtype=pl.Float64), "y": pl.Series([], dtype=pl.Float64)}
+    )
+    return density, nodes, lines, edges, boundary, points
+
+
+def test_build_macro_blocks_with_cores_downtown_wedges_and_plaza() -> None:
+    """End-to-end S3 wiring: a downtown polygonizes into wedges + a plaza."""
+    density, nodes, lines, edges, boundary, points = _downtown_fixture()
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        lines,
+        edges,
+        boundary,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+        n_major_nuclei=1,
+    )
+    assert len(bundle.core_polys) == 1
+    assert len(bundle.nuclei) == 1
+    assert bundle.nuclei[0].is_major
+    assert len(bundle.plaza_polys) == 1
+
+    spoke_edges = [e for e in bundle.clipped_edges if e.node_a == SPOKE_NODE_SENTINEL]
+    assert len(spoke_edges) == 6
+    assert all(e.tier == 1 for e in spoke_edges)
+
+    # Fusion invariant: the block partition still exactly tiles the island
+    # (no gap, no double-covered area) despite the new wedge/plaza faces.
+    assert sum(b.area for b in bundle.blocks) == pytest.approx(boundary.area, rel=1e-6)
+    for i, a in enumerate(bundle.blocks):
+        for b in bundle.blocks[i + 1 :]:
+            assert a.intersection(b).area < 1e-6
+
+    # At least the plaza + the 6 wedges are present as distinct small blocks
+    # (not dissolved back into one ring-fenced blob by the coarse
+    # min_block_area=60 floor -- this is the whole point of the S3 protect
+    # mechanism).
+    core = bundle.core_polys[0]
+    inside_core = [b for b in bundle.blocks if core.buffer(1e-6).contains(b)]
+    assert len(inside_core) == 7  # 6 wedges + 1 plaza.
+    plaza_area = bundle.plaza_polys[0].area
+    assert any(abs(b.area - plaza_area) < 1e-6 for b in inside_core)
+
+
+def test_spokes_and_plaza_ring_gate_snap_as_arterial_and_ring() -> None:
+    """Fusion invariant: spokes/plaza are generic ``snap_gates_to_macro`` input.
+
+    No fusion code changes were made for S3 -- ``snap_gates_to_macro`` is
+    generic over ``arterial_lines + ring_lines``, so a gate sitting on a
+    spoke or on the plaza ring should snap exactly like any other arterial/
+    ring T-junction.
+    """
+    density, nodes, lines, edges, boundary, points = _downtown_fixture()
+    bundle = build_macro_blocks_with_cores(
+        density,
+        nodes,
+        lines,
+        edges,
+        boundary,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+        n_major_nuclei=1,
+    )
+    spoke_idx = next(
+        i for i, e in enumerate(bundle.clipped_edges) if e.node_a == SPOKE_NODE_SENTINEL
+    )
+    spoke_line = bundle.clipped_lines[spoke_idx]
+    mid = spoke_line.interpolate(0.5, normalized=True)
+    plaza_vertex = sg.Point(list(bundle.plaza_polys[0].exterior.coords)[0])
+
+    gates_by_block = {
+        0: [
+            Gate(x=mid.x, y=mid.y, street_id=0, vertex_id=0),
+            Gate(x=plaza_vertex.x, y=plaza_vertex.y, street_id=1, vertex_id=0),
+        ]
+    }
+    junctions = snap_gates_to_macro(
+        gates_by_block,
+        bundle.clipped_lines,
+        bundle.clipped_edges,
+        bundle.ring_lines,
+        boundary,
+    )
+    by_xy = {(round(j.x, 6), round(j.y, 6)): j for j in junctions}
+    arterial_junction = by_xy[(round(mid.x, 6), round(mid.y, 6))]
+    ring_junction = by_xy[(round(plaza_vertex.x, 6), round(plaza_vertex.y, 6))]
+    assert arterial_junction.kind == "arterial"
+    assert arterial_junction.tier == 1
+    assert arterial_junction.distance < 1e-6
+    assert ring_junction.kind == "ring"
+    assert ring_junction.distance < 1e-6

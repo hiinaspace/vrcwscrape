@@ -39,6 +39,14 @@ Pipeline
    with an anchor point, integrated mass, rank and top-K ``is_major`` flag —
    the interface downstream zone-massing and the 2D map consume. See
    ``docs/macro-roads-nuclei-plan.md``, slice S2.
+6. **Intra-nucleus avenues** (S3, the keystone) — every MAJOR nucleus's ring
+   T-junction stations (where clipped arterials meet its core ring) fan a
+   spoke in to a small inner plaza ring instead of leaving the core a single
+   ring-fenced, roadless blob (:func:`add_intra_nucleus_avenues`); this is
+   what a downtown's internal road structure comes from. Terminating on the
+   plaza ring (an annular sector) rather than the anchor point (an acute
+   pie-wedge) dodges Chen's acute-wedge subdivision pathology. See
+   ``docs/macro-roads-nuclei-plan.md``, slice S3.
 
 The module is deterministic: it depends only on the staged rasters/points and a
 fixed RNG seed (``DEFAULT_SEED``); no stochastic steps are used, but the seed is
@@ -58,12 +66,13 @@ import polars as pl
 import shapely
 import shapely.geometry as sg
 from scipy.spatial import Delaunay, QhullError
-from shapely.ops import unary_union
+from shapely.ops import polygonize, unary_union
 from skimage.graph import route_through_array
 
 from mapgen.chen_field import RasterDensityField
 from mapgen.r1_arm_a import IslandFields
 from mapgen.r1_arm_b import (
+    _merge_slivers,
     _prune_edges,
     _rowcol_to_xy,
     _xy_to_rowcol,
@@ -1376,6 +1385,24 @@ def clip_arterials_to_cores(
 # S2's ranked-mass table is what the orchestrator/user tune this against.
 DEFAULT_N_MAJOR_NUCLEI: int = 6
 
+# --- Intra-nucleus avenues (stage S3) ---
+#
+# Radius (island units) of the small inner plaza ring every MAJOR nucleus's
+# spokes terminate on, instead of the anchor point itself -- turns the
+# would-be acute pie-wedges into annular sectors (dodges Chen's acute-wedge
+# pathology; see docs/macro-roads-nuclei-plan.md, slice S3).
+DEFAULT_R_PLAZA_UNITS: float = 0.85
+# Minimum angular spacing (degrees, around the nucleus anchor) between two ring
+# T-junction stations before they're deduped to one spoke.
+DEFAULT_SPOKE_MIN_ANGLE_DEG: float = 20.0
+# Base vertex count for the (otherwise perfectly circular) plaza ring, before
+# the exact spoke-endpoint vertices are folded in.
+DEFAULT_PLAZA_RING_VERTICES: int = 24
+# Sentinel `MacroEdge.node_a`/`node_b` for a spoke: spokes fan between a ring
+# T-junction station and a plaza-ring point, neither of which is a real
+# MacroNode, so there is no node index to record.
+SPOKE_NODE_SENTINEL: int = -1
+
 
 @dataclass(frozen=True)
 class NucleusSpec:
@@ -1591,6 +1618,298 @@ def assign_nearest_nucleus(
     return out
 
 
+# ---------------------------------------------------------------------------
+# 5.6. Intra-nucleus avenues (stage S3, the keystone slice)
+# ---------------------------------------------------------------------------
+#
+# ``clip_arterials_to_cores`` (above) subtracts every dense core from the
+# arterial network, so a raw core is a single ring-fenced, roadless blob --
+# the densest places on the island have the LEAST internal road structure.
+# For each MAJOR nucleus only, this section reconnects the ring back to the
+# interior: it finds the ring T-junction "stations" (the on-ring endpoints
+# ``clip_arterials_to_cores`` already created), dedupes stations that are too
+# close together, and fans a spoke from each surviving station in to a small
+# inner PLAZA ring centered on the nucleus anchor -- terminating on the plaza
+# ring (an annular sector) rather than the anchor point itself (an acute
+# pie-wedge) is what dodges Chen's acute-wedge subdivision pathology. See
+# docs/macro-roads-nuclei-plan.md, slice S3.
+
+
+def _ring_junction_stations(
+    lines: list[sg.LineString],
+    polygon: sg.Polygon,
+    *,
+    tol: float = 1e-6,
+) -> list[tuple[float, float]]:
+    """Endpoints of ``lines`` that sit on ``polygon``'s boundary (T-junctions).
+
+    :func:`clip_arterials_to_cores` produces clipped arterial segments whose
+    newly-cut endpoint lies (to floating precision) exactly ON the core ring
+    it was clipped against -- this is how those "ring T-junction stations"
+    are recovered for one nucleus's core polygon, without re-deriving them
+    from the clip operation itself. Checks BOTH endpoints of every line (an
+    arterial can be clipped against more than one core, or only one end may
+    touch THIS particular ring); an endpoint that is a genuine macro-node
+    terminus (or touches a different core) is simply not within ``tol`` and
+    is skipped. Exact duplicate points (two segments meeting at the same
+    station) are deduplicated, first-seen order preserved -- deterministic
+    given a deterministic ``lines`` order.
+    """
+    boundary = polygon.exterior
+    seen: set[tuple[float, float]] = set()
+    stations: list[tuple[float, float]] = []
+    for line in lines:
+        if line.is_empty:
+            continue
+        coords = list(line.coords)
+        for pt in (coords[0], coords[-1]):
+            if pt in seen:
+                continue
+            if boundary.distance(sg.Point(pt)) > tol:
+                continue
+            seen.add(pt)
+            stations.append(pt)
+    return stations
+
+
+def _dedupe_stations_by_angle(
+    stations: list[tuple[float, float]],
+    anchor: tuple[float, float],
+    min_angle_rad: float,
+) -> list[tuple[float, float]]:
+    """Dedupe ring stations closer than ``min_angle_rad`` (circular) apart.
+
+    Stations are ordered by their angle around ``anchor``, then the circle is
+    "cut" at its single largest angular gap (so the dedup pass itself never
+    has to reason about the -pi/pi wraparound: the closing gap, by
+    definition the largest, is guaranteed >= every other gap and so never
+    needs merging) and walked forward as a plain ascending sequence, keeping
+    a station only once it is at least ``min_angle_rad`` past the last KEPT
+    one. No-op for 0 or 1 stations (nothing to dedupe).
+    """
+    if len(stations) <= 1:
+        return list(stations)
+    ax, ay = anchor
+    two_pi = 2.0 * np.pi
+    angled = sorted((float(np.arctan2(y - ay, x - ax)), x, y) for x, y in stations)
+    n = len(angled)
+    gaps = [(angled[(i + 1) % n][0] - angled[i][0]) % two_pi for i in range(n)]
+    cut = int(np.argmax(gaps))
+    ordered = angled[cut + 1 :] + angled[: cut + 1]
+
+    kept: list[tuple[float, float, float]] = [ordered[0]]
+    for ang, x, y in ordered[1:]:
+        diff = (ang - kept[-1][0]) % two_pi
+        if diff >= min_angle_rad:
+            kept.append((ang, x, y))
+    return [(x, y) for _, x, y in kept]
+
+
+def _plaza_ring_polygon(
+    anchor: tuple[float, float],
+    r_plaza: float,
+    spoke_angles: list[float],
+    *,
+    n_base: int = DEFAULT_PLAZA_RING_VERTICES,
+    angle_eps: float = 1e-6,
+) -> sg.Polygon:
+    """A circular plaza polygon at radius ``r_plaza`` around ``anchor``.
+
+    Every spoke must terminate EXACTLY on this ring for ``polygonize`` to fuse
+    them there (a spoke endpoint merely close to a discretized circle isn't
+    good enough -- the same ULP-snap lesson as the resolved wedge-subdivision
+    bug, see docs/macro-roads-nuclei-plan.md's "What the review found" #5/
+    the deferred-section RESOLVED note), so the ring's vertex set is the union
+    of ``n_base`` evenly-spaced base angles and every ``spoke_angles`` value,
+    ALL placed at the same exact radius ``r_plaza``. A base angle within
+    ``angle_eps`` (circular) of a spoke angle is dropped, keeping the spoke's
+    own exact vertex instead of a near-duplicate.
+    """
+    ax, ay = anchor
+    two_pi = 2.0 * np.pi
+
+    def _circ_dist(a: float, b: float) -> float:
+        return abs(((a - b + np.pi) % two_pi) - np.pi)
+
+    # Normalize EVERY angle into the same [0, 2*pi) convention before sorting
+    # -- ``spoke_angles`` come from ``atan2`` (range (-pi, pi]), which sorts
+    # inconsistently against a plain ``[0, 2*pi)`` base sweep and silently
+    # produces a self-intersecting (non-convex, wrongly-ordered) ring.
+    norm_spokes = [float(s % two_pi) for s in spoke_angles]
+    base_angles = [two_pi * k / n_base for k in range(n_base)]
+    kept_base = [
+        a for a in base_angles if all(_circ_dist(a, s) > angle_eps for s in norm_spokes)
+    ]
+    all_angles = sorted([*kept_base, *norm_spokes])
+    coords = [
+        (ax + r_plaza * float(np.cos(a)), ay + r_plaza * float(np.sin(a)))
+        for a in all_angles
+    ]
+    coords.append(coords[0])
+    return sg.Polygon(coords)
+
+
+def build_nucleus_avenues(
+    nucleus: NucleusSpec,
+    clipped_lines: list[sg.LineString],
+    *,
+    r_plaza: float = DEFAULT_R_PLAZA_UNITS,
+    min_spoke_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    n_plaza_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
+) -> tuple[list[sg.LineString], list[MacroEdge], sg.Polygon] | None:
+    """Build one MAJOR nucleus's intra-nucleus avenues (S3, the keystone slice).
+
+    Finds the ring T-junction stations where ``clipped_lines`` meet
+    ``nucleus.polygon``'s boundary (:func:`_ring_junction_stations`), dedupes
+    stations closer than ``min_spoke_angle_deg`` apart around the anchor
+    (:func:`_dedupe_stations_by_angle`), then emits one spoke LineString per
+    surviving station, from the station to a point on the plaza ring (radius
+    ``r_plaza``, centered on ``nucleus.anchor``) at THE SAME angle -- so the
+    plaza ring built from those exact angles (:func:`_plaza_ring_polygon`)
+    always meets every spoke exactly. Every spoke is tagged
+    ``tier=1`` ("major"); ``node_a``/``node_b`` are ``SPOKE_NODE_SENTINEL``
+    (a spoke doesn't tie to a real macro node, only to its ring station and
+    the plaza).
+
+    A station no farther from the anchor than ``r_plaza`` would produce a
+    degenerate/inverted spoke and is dropped; if that empties the (deduped)
+    station set entirely -- e.g. a core small enough that its ring sits
+    inside the plaza radius -- returns ``None``: no avenues, no plaza, for
+    that nucleus (a graceful degenerate-case fallback, not an error). Also
+    returns ``None`` if there are no ring stations at all (an isolated core
+    with no arterial reaching its ring).
+    """
+    stations = _ring_junction_stations(clipped_lines, nucleus.polygon)
+    if not stations:
+        return None
+    deduped = _dedupe_stations_by_angle(
+        stations, nucleus.anchor, float(np.radians(min_spoke_angle_deg))
+    )
+    ax, ay = nucleus.anchor
+    valid = [(x, y) for x, y in deduped if np.hypot(x - ax, y - ay) > r_plaza]
+    if not valid:
+        return None
+
+    angles = [float(np.arctan2(y - ay, x - ax)) for x, y in valid]
+    plaza_poly = _plaza_ring_polygon(
+        nucleus.anchor, r_plaza, angles, n_base=n_plaza_vertices
+    )
+
+    spoke_lines: list[sg.LineString] = []
+    spoke_edges: list[MacroEdge] = []
+    for (sx, sy), ang in zip(valid, angles, strict=True):
+        px = ax + r_plaza * float(np.cos(ang))
+        py = ay + r_plaza * float(np.sin(ang))
+        spoke = sg.LineString([(sx, sy), (px, py)])
+        spoke_lines.append(spoke)
+        spoke_edges.append(
+            MacroEdge(
+                node_a=SPOKE_NODE_SENTINEL,
+                node_b=SPOKE_NODE_SENTINEL,
+                tau=1,
+                tier=1,
+                path_cost=round(float(spoke.length), 4),
+                length=round(float(spoke.length), 3),
+            )
+        )
+    return spoke_lines, spoke_edges, plaza_poly
+
+
+def add_intra_nucleus_avenues(
+    nuclei: list[NucleusSpec],
+    clipped_lines: list[sg.LineString],
+    *,
+    r_plaza: float = DEFAULT_R_PLAZA_UNITS,
+    min_spoke_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    n_plaza_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
+) -> tuple[list[sg.LineString], list[MacroEdge], list[sg.Polygon]]:
+    """Build intra-nucleus avenues for every MAJOR nucleus (S3).
+
+    Town-center (non-major) nuclei are untouched -- they keep the pre-S3
+    ring-fenced, roadless core. Iterates ``nuclei`` in its given (rank-
+    ascending, see :func:`build_nucleus_specs`) order, so the result is
+    deterministic and independent of any upstream construction order.
+    Returns the combined spoke LineStrings, their parallel ``MacroEdge``
+    records, and one plaza Polygon per major nucleus that got avenues (a
+    nucleus :func:`build_nucleus_avenues` returned ``None`` for contributes
+    nothing to any of the three lists).
+    """
+    spoke_lines: list[sg.LineString] = []
+    spoke_edges: list[MacroEdge] = []
+    plaza_polys: list[sg.Polygon] = []
+    for nucleus in nuclei:
+        if not nucleus.is_major:
+            continue
+        result = build_nucleus_avenues(
+            nucleus,
+            clipped_lines,
+            r_plaza=r_plaza,
+            min_spoke_angle_deg=min_spoke_angle_deg,
+            n_plaza_vertices=n_plaza_vertices,
+        )
+        if result is None:
+            continue
+        lines, edges, plaza = result
+        spoke_lines.extend(lines)
+        spoke_edges.extend(edges)
+        plaza_polys.append(plaza)
+    return spoke_lines, spoke_edges, plaza_polys
+
+
+def _polygonize_macro_blocks_protecting_nuclei(
+    lines: list[sg.LineString],
+    boundary: sg.Polygon,
+    min_block_area: float,
+    protect_polys: list[sg.Polygon],
+) -> list[sg.Polygon]:
+    """Polygonize macro-blocks, exempting major-nucleus interiors from the
+    coarse sliver-merge floor.
+
+    ``min_block_area`` (default 60 island-units^2) is calibrated for coarse,
+    continent-scale macro-blocks; S3's intra-nucleus wedge/plaza faces are
+    deliberately much finer (a downtown split into a handful of wedges around
+    a ~2-unit^2 plaza) and would otherwise get dissolved right back into a
+    neighboring face by the generic merge, undoing the whole slice. Any raw
+    polygonize face whose area is MOSTLY covered by ``protect_polys`` (the
+    MAJOR nuclei's own core polygons -- both the wedges and the central
+    plaza fall entirely inside them by construction) is kept AS-IS regardless
+    of area; every other face still goes through the ordinary
+    :func:`mapgen.r1_arm_b._merge_slivers` pass, exactly as before. With no
+    ``protect_polys`` this is byte-identical to
+    :func:`mapgen.r1_arm_b.polygonize_districts` (the pre-S3 behavior).
+    """
+    if not protect_polys:
+        return polygonize_districts(lines, boundary, min_district_area=min_block_area)
+
+    boundary_ring = sg.LineString(list(boundary.exterior.coords))
+    merged = unary_union([*lines, boundary_ring])
+    raw_polys = list(polygonize(merged))
+    inside = [p for p in raw_polys if boundary.contains(p) or boundary.covers(p)]
+    if not inside:
+        inside = [
+            p.intersection(boundary)
+            for p in raw_polys
+            if not p.intersection(boundary).is_empty
+        ]
+        inside = [p for p in inside if p.geom_type == "Polygon"]
+    if not inside:
+        return [boundary]
+
+    protect_union = unary_union(protect_polys)
+    protected: list[sg.Polygon] = []
+    mergeable: list[sg.Polygon] = []
+    for p in inside:
+        if p.area > 0 and p.intersection(protect_union).area >= 0.5 * p.area:
+            protected.append(p)
+        else:
+            mergeable.append(p)
+
+    merged_rest = _merge_slivers(mergeable, min_block_area) if mergeable else []
+    out = [*protected, *merged_rest]
+    out.sort(key=lambda poly: poly.area, reverse=True)
+    return out
+
+
 @dataclass(frozen=True)
 class MacroBlockBundle:
     """Result of :func:`build_macro_blocks_with_cores`.
@@ -1598,10 +1917,22 @@ class MacroBlockBundle:
     Attributes
     ----------
     core_polys : detected dense-core "downtown" polygons (ringed blocks).
-    ring_lines : each core's exterior ring as a LineString (drawn as ring roads).
-    clipped_lines / clipped_edges : arterials with their core interiors removed.
-    blocks : polygonized macro-blocks over clipped arterials + rings + boundary.
+    ring_lines : each core's exterior ring as a LineString (drawn as ring
+        roads), PLUS one plaza ring per major nucleus that got avenues (S3)
+        -- both are "ring"-kind macro features downstream (gate snapping,
+        connectivity metrics) treat identically.
+    clipped_lines / clipped_edges : arterials with their core interiors
+        removed, PLUS the S3 intra-nucleus spoke LineStrings/records
+        (unclipped -- they are supposed to enter the core).
+    blocks : polygonized macro-blocks over clipped arterials + spokes + rings
+        (core + plaza) + boundary.
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
+    plaza_polys : one small inner plaza disc per MAJOR nucleus that got
+        avenues (S3); its interior becomes its own zero-world "park" block
+        via the existing world-count-based typology, no extra plumbing
+        needed. Shorter than ``nuclei`` whenever a major nucleus's core is
+        too small for any spoke to clear the plaza radius, or has no ring
+        T-junction stations at all (see :func:`build_nucleus_avenues`).
     """
 
     core_polys: list[sg.Polygon]
@@ -1610,6 +1941,7 @@ class MacroBlockBundle:
     clipped_edges: list[MacroEdge]
     blocks: list[sg.Polygon]
     nuclei: list[NucleusSpec]
+    plaza_polys: list[sg.Polygon]
 
 
 def build_macro_blocks_with_cores(
@@ -1632,6 +1964,9 @@ def build_macro_blocks_with_cores(
     core_smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI,
+    r_plaza: float = DEFAULT_R_PLAZA_UNITS,
+    spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
 ) -> MacroBlockBundle:
     """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
 
@@ -1642,15 +1977,22 @@ def build_macro_blocks_with_cores(
     2. Clip arterials to the cores' exterior (:func:`clip_arterials_to_cores`)
        so density-attracting arterials terminate ON the ring (T-junctions)
        rather than converging on the summit.
-    3. Polygonize ``clipped_arterials ∪ core_rings ∪ island_exterior`` (reusing
-       Arm B ``polygonize_districts`` + sliver merge) so each core interior is
-       its own block and non-core space splits along the clipped arterial web.
-    4. Wrap each surviving core into a ranked :class:`NucleusSpec`
+    3. Wrap each surviving core into a ranked :class:`NucleusSpec`
        (:func:`build_nucleus_specs`, S2).
+    4. Fan intra-nucleus avenues (spokes + a plaza ring) for every MAJOR
+       nucleus (:func:`add_intra_nucleus_avenues`, S3) -- UNCLIPPED, they are
+       supposed to enter the core.
+    5. Polygonize ``clipped_arterials ∪ spokes ∪ core_rings ∪ plaza_rings ∪
+       island_exterior``, protecting the (deliberately fine-grained) wedge/
+       plaza faces inside a major nucleus from the coarse macro-block
+       sliver-merge floor (:func:`_polygonize_macro_blocks_protecting_nuclei`)
+       so each core interior splits into its wedges + plaza rather than one
+       ring-fenced block, and non-core space splits along the clipped
+       arterial web exactly as before.
 
     Returns a :class:`MacroBlockBundle`. With no cores detected, the block set
-    matches the pre-3.5b polygonization (arterials + boundary) and ``nuclei``
-    is empty.
+    matches the pre-3.5b polygonization (arterials + boundary), ``nuclei`` is
+    empty, and no avenues are built.
     """
     core_polys = detect_core_regions(
         density,
@@ -1670,20 +2012,35 @@ def build_macro_blocks_with_cores(
     clipped_lines, clipped_edges = clip_arterials_to_cores(
         arterial_lines, edges, core_polys
     )
-    block_lines = [*clipped_lines, *ring_lines]
-    blocks = polygonize_districts(
-        block_lines, boundary, min_district_area=min_block_area
-    )
     nuclei = build_nucleus_specs(
         density, core_polys, nodes, points, x0, y0, cell, n_major=n_major_nuclei
     )
+
+    spoke_lines, spoke_edges, plaza_polys = add_intra_nucleus_avenues(
+        nuclei,
+        clipped_lines,
+        r_plaza=r_plaza,
+        min_spoke_angle_deg=spoke_min_angle_deg,
+        n_plaza_vertices=plaza_ring_vertices,
+    )
+    final_lines = [*clipped_lines, *spoke_lines]
+    final_edges = [*clipped_edges, *spoke_edges]
+    plaza_ring_lines = [sg.LineString(list(p.exterior.coords)) for p in plaza_polys]
+    final_ring_lines = [*ring_lines, *plaza_ring_lines]
+
+    protect_polys = [n.polygon for n in nuclei if n.is_major]
+    block_lines = [*final_lines, *final_ring_lines]
+    blocks = _polygonize_macro_blocks_protecting_nuclei(
+        block_lines, boundary, min_block_area, protect_polys
+    )
     return MacroBlockBundle(
         core_polys=core_polys,
-        ring_lines=ring_lines,
-        clipped_lines=clipped_lines,
-        clipped_edges=clipped_edges,
+        ring_lines=final_ring_lines,
+        clipped_lines=final_lines,
+        clipped_edges=final_edges,
         blocks=blocks,
         nuclei=nuclei,
+        plaza_polys=plaza_polys,
     )
 
 
@@ -1735,6 +2092,10 @@ class MacroParams:
     core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2
     # Ranked settlement nuclei (S2): top-K by mass flagged is_major.
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI
+    # Intra-nucleus avenues (S3): spokes + a plaza ring, MAJOR nuclei only.
+    r_plaza: float = DEFAULT_R_PLAZA_UNITS
+    spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG
+    plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES
 
     def to_dict(self) -> dict[str, Any]:
         """Plain-dict form for JSON manifests."""
@@ -1752,12 +2113,18 @@ class MacroLayer:
     cost : the density-attracting routing cost field.
     raw_arterial_lines / raw_edges : the pre-clip arterial network, Chaikin-
         smoothed (:func:`smooth_arterial_lines`) immediately after routing.
-    core_polys / ring_lines : dense-core downtown polygons and their rings.
+    core_polys / ring_lines : dense-core downtown polygons and their rings
+        (``ring_lines`` also carries one plaza ring per major nucleus that
+        got avenues, S3).
     arterial_lines / edges : the CLIPPED arterials (core interiors removed;
-        identical to the raw ones when no cores are detected). These are what
-        the stage scripts draw and export.
-    blocks : polygonized macro-blocks (clipped arterials + rings + boundary).
+        identical to the raw ones when no cores are detected) PLUS the S3
+        intra-nucleus spoke lines/records, UNCLIPPED. These are what the
+        stage scripts draw and export.
+    blocks : polygonized macro-blocks (clipped arterials + spokes + rings +
+        boundary).
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
+    plaza_polys : one small inner plaza disc per major nucleus that got
+        avenues (S3); see :attr:`MacroBlockBundle.plaza_polys`.
     """
 
     params: MacroParams
@@ -1771,6 +2138,7 @@ class MacroLayer:
     edges: list[MacroEdge]
     blocks: list[sg.Polygon]
     nuclei: list[NucleusSpec]
+    plaza_polys: list[sg.Polygon]
 
 
 def build_macro_layer(
@@ -1887,6 +2255,9 @@ def build_macro_layer(
         core_min_area_units2=params.core_min_area_units2,
         min_block_area=params.min_block_area,
         n_major_nuclei=params.n_major_nuclei,
+        r_plaza=params.r_plaza,
+        spoke_min_angle_deg=params.spoke_min_angle_deg,
+        plaza_ring_vertices=params.plaza_ring_vertices,
     )
 
     return MacroLayer(
@@ -1901,6 +2272,7 @@ def build_macro_layer(
         edges=bundle.clipped_edges,
         blocks=bundle.blocks,
         nuclei=bundle.nuclei,
+        plaza_polys=bundle.plaza_polys,
     )
 
 
