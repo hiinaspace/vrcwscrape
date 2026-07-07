@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -397,6 +398,23 @@ def connectivity_metrics(
 # same line) fuse into a single graph node — that fusion, not any explicit
 # "connect gate to junction" step, is what turns two independently-generated
 # per-block street networks into one connected T-junction.
+#
+# ``_all_nodes_on_boundary`` (stage 1) is an all-or-nothing per-street test: if
+# a single node's ``on_boundary`` flag is wrong (numeric drift, or a mesh merge
+# that didn't update it), a street that is otherwise the block's own boundary
+# ring gets classified "local" instead of "perimeter" and would be re-added
+# here as its own edge chain, running alongside the independently-added
+# arterial/ring line it actually traces — a doubled near-coincident road
+# (wave-2 F2, ``docs/macro-roads-nuclei-plan.md``). Rather than restructure
+# stage 1 into a per-edge classification (which would ripple
+# ``street_perimeter_flags``'s per-*street* bool-list shape through
+# ``r1_seam.py``/``run_r1_hybrid.py``, both of which consume it for several
+# unrelated purposes), the fix is applied here, geometrically:
+# :func:`build_unified_street_graph` drops (does not add) any "local" segment
+# whose both endpoints and midpoint sit within ``dedup_tolerance`` of an
+# arterial/ring line, before adding it. A genuinely local street only grazes
+# the boundary at its gate end, so this only ever catches segments that hug a
+# macro line over their whole length.
 
 
 def _node_key(x: float, y: float) -> tuple[int, int]:
@@ -443,19 +461,64 @@ def split_line_at_stations(
     ]
 
 
-def _add_polyline_edges(g: nx.Graph, line: LineString, **edge_attrs: Any) -> None:
+# Default near-coincident dedup tolerance (island units) for local-street
+# segments against arterial/ring lines (see the stage-3 preamble above and
+# ``build_unified_street_graph``'s ``dedup_tolerance`` param). Same band as
+# ``snap_gates_to_macro``'s default ``tol`` -- both describe "close enough to
+# be the same feature", just applied to a segment instead of a single gate.
+DEFAULT_LOCAL_DEDUP_TOLERANCE: float = 0.05
+
+
+def _segment_hugs_macro(
+    x0: float, y0: float, x1: float, y1: float, macro_tree: STRtree, tol: float
+) -> bool:
+    """True if segment ``(x0, y0)-(x1, y1)`` runs alongside a macro line.
+
+    Sampled at both endpoints and the midpoint (three points) against the
+    nearest of ``macro_tree``'s lines; ``tol`` must hold at all three, not
+    just one -- a segment that merely touches a macro line at one end (a
+    genuine local street's access point) must not be mistaken for one that
+    hugs it over its whole length.
+    """
+    for x, y in ((x0, y0), ((x0 + x1) / 2.0, (y0 + y1) / 2.0), (x1, y1)):
+        idx_arr, dist_arr = macro_tree.query_nearest(
+            Point(x, y), return_distance=True, all_matches=False
+        )
+        if idx_arr.size == 0 or float(dist_arr[0]) > tol:
+            return False
+    return True
+
+
+def _add_polyline_edges(
+    g: nx.Graph,
+    line: LineString,
+    *,
+    skip_segment: Callable[[float, float, float, float], bool] | None = None,
+    **edge_attrs: Any,
+) -> None:
     """Add ``line``'s vertex chain to ``g`` as consecutive edges.
 
     Coincident endpoints (by :func:`_node_key`) fuse into one node regardless
     of which feature introduced them first; a node's ``x``/``y`` attrs are
     fixed at first insertion. Degenerate zero-length hops (two consecutive
     coordinates rounding to the same node) are skipped.
+
+    ``skip_segment``, if given, is called with each segment's raw
+    ``(x0, y0, x1, y1)`` *before* either endpoint is added as a node; a
+    ``True`` return drops the segment entirely (no edge, and no node added
+    on its account -- a node only ever enters ``g`` via a segment that is
+    actually kept, so a fully-dropped line contributes nothing, not a chain
+    of isolated points). Used by :func:`build_unified_street_graph` to dedup
+    near-coincident local-street segments against arterial/ring lines (wave-2
+    F2).
     """
     coords = list(line.coords)
     for (x0, y0), (x1, y1) in zip(coords, coords[1:], strict=False):
         u = _node_key(x0, y0)
         v = _node_key(x1, y1)
         if u == v:
+            continue
+        if skip_segment is not None and skip_segment(x0, y0, x1, y1):
             continue
         if u not in g:
             g.add_node(u, x=x0, y=y0)
@@ -471,6 +534,8 @@ def build_unified_street_graph(
     junctions: list[SeamJunction],
     streets_by_block: dict[int, list[LineString]],
     perimeter_flags_by_block: dict[int, list[bool]],
+    *,
+    dedup_tolerance: float = DEFAULT_LOCAL_DEDUP_TOLERANCE,
 ) -> nx.Graph:
     """Fuse arterials, rings, and per-block local streets into one graph.
 
@@ -485,6 +550,18 @@ def build_unified_street_graph(
     becomes a chain of ``kind="local", tier=-1, block_id=block_id`` edges;
     perimeter-flagged paths are dropped (they duplicate the arterial/ring/
     coast geometry they run along, not new topology).
+
+    ``perimeter_flags_by_block`` classification is per *street*, not per
+    edge (see :func:`_all_nodes_on_boundary`): if it misses a
+    boundary-hugging street (one drifted node, see the stage-3 preamble
+    above), that street's segments still pass through here as "local". Each
+    local segment is therefore also checked against ``dedup_tolerance``: one
+    whose both endpoints and midpoint sit within ``dedup_tolerance`` of an
+    arterial/ring line is dropped (see :func:`_segment_hugs_macro`), so a
+    misclassified boundary-hugging street does not surface as a doubled,
+    near-coincident road alongside the arterial/ring it already duplicates.
+    ``dedup_tolerance <= 0`` (or no arterial/ring lines at all) disables this
+    check entirely.
 
     Node identity is :func:`_node_key`: a junction's gate coordinate and the
     station-projected point on its matched arterial/ring line round to the
@@ -549,6 +626,15 @@ def build_unified_street_graph(
         for segment in split_line_at_stations(line, stations):
             _add_polyline_edges(g, segment, kind="ring", tier=-1, block_id=-1)
 
+    macro_lines: list[LineString] = [*arterial_lines, *ring_lines]
+    macro_tree = STRtree(macro_lines) if macro_lines and dedup_tolerance > 0.0 else None
+    skip_segment: Callable[[float, float, float, float], bool] | None = None
+    if macro_tree is not None:
+        _macro_tree = macro_tree
+
+        def skip_segment(x0: float, y0: float, x1: float, y1: float) -> bool:
+            return _segment_hugs_macro(x0, y0, x1, y1, _macro_tree, dedup_tolerance)
+
     for block_id in sorted(streets_by_block):
         streets = streets_by_block[block_id]
         flags = perimeter_flags_by_block.get(block_id, [False] * len(streets))
@@ -565,7 +651,14 @@ def build_unified_street_graph(
                 ]
                 if coords != list(line.coords):
                     line = LineString(coords)
-            _add_polyline_edges(g, line, kind="local", tier=-1, block_id=block_id)
+            _add_polyline_edges(
+                g,
+                line,
+                kind="local",
+                tier=-1,
+                block_id=block_id,
+                skip_segment=skip_segment,
+            )
 
     return g
 

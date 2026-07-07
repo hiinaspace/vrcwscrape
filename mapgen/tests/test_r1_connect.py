@@ -1212,3 +1212,185 @@ def test_densify_gates_and_graph_fusion_reduces_components_and_adds_tjunction() 
     assert (
         summary_after["n_tjunctions_realized"] > summary_before["n_tjunctions_realized"]
     )
+
+
+# ---------------------------------------------------------------------------
+# build_unified_street_graph -- F2 near-coincident local-street dedup
+# ---------------------------------------------------------------------------
+#
+# ``street_perimeter_flags``/``_all_nodes_on_boundary`` is an all-or-nothing
+# per-street classification (stage 1): if a single node's ``on_boundary``
+# flag is wrong (numeric drift, or a merge that didn't update it), a street
+# that is really the block's own boundary ring is classified "local" instead
+# of "perimeter" and reaches ``build_unified_street_graph`` with its
+# perimeter flag ``False``, exactly as these fixtures construct directly
+# (this slice's fix lives downstream of stage 1, so the tests exercise it at
+# that boundary rather than re-deriving a real ``on_boundary`` bug from a
+# full Chen layout).
+
+
+def test_build_unified_street_graph_dedups_misclassified_boundary_hugging_street() -> (
+    None
+):
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions: list[SeamJunction] = []
+
+    # Boundary-hugging street misclassified as "local" (flag False): every
+    # node sits on the arterial except one interior vertex nudged 0.02 off
+    # the line -- well within DEFAULT_LOCAL_DEDUP_TOLERANCE (0.05) -- mirroring
+    # numeric drift rather than a genuine interior street.
+    streets_by_block = {
+        0: [
+            LineString(
+                [(0.0, 10.0), (5.0, 10.0), (10.0, 10.02), (15.0, 10.0), (20.0, 10.0)]
+            )
+        ]
+    }
+    perimeter_flags_by_block = {0: [False]}
+
+    g = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+
+    # No doubled local edge chain tracing the arterial: the only edges are
+    # the arterial's own (unsplit -- no junctions here) two endpoints.
+    kinds = {data["kind"] for _u, _v, data in g.edges(data=True)}
+    assert kinds == {"arterial"}
+    assert g.number_of_edges() == 1
+    assert g.number_of_nodes() == 2
+
+
+def test_build_unified_street_graph_dedup_tolerance_zero_disables_check() -> None:
+    # Same fixture as above, but dedup_tolerance=0.0 opts out: the misclassified
+    # street is added in full, reproducing the doubled-road bug this slice
+    # fixes -- demonstrates the parameter actually gates the behavior.
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions: list[SeamJunction] = []
+    streets_by_block = {
+        0: [
+            LineString(
+                [(0.0, 10.0), (5.0, 10.0), (10.0, 10.02), (15.0, 10.0), (20.0, 10.0)]
+            )
+        ]
+    }
+    perimeter_flags_by_block = {0: [False]}
+
+    g = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+        dedup_tolerance=0.0,
+    )
+
+    kinds = {data["kind"] for _u, _v, data in g.edges(data=True)}
+    assert kinds == {"arterial", "local"}
+    assert g.number_of_edges() > 1
+
+
+def test_build_unified_street_graph_dedup_is_per_segment_not_whole_street() -> None:
+    # A street that is PART duplicate-of-arterial, part genuinely interior:
+    # (0,10)->(5,10)->(10,10) hugs the arterial (dropped segment by segment),
+    # (10,10)->(10,5) is a real perpendicular interior branch (kept). Neither
+    # extreme (drop-nothing / drop-the-whole-street) is right here -- only
+    # the hugging segments should go.
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions: list[SeamJunction] = []
+    streets_by_block = {
+        0: [LineString([(0.0, 10.0), (5.0, 10.0), (10.0, 10.0), (10.0, 5.0)])]
+    }
+    perimeter_flags_by_block = {0: [False]}
+
+    g = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+
+    node_5_10 = (5_000_000, 10_000_000)
+    node_10_10 = (10_000_000, 10_000_000)
+    node_10_5 = (10_000_000, 5_000_000)
+
+    # (5,10) touched only dropped segments -- never enters the graph.
+    assert node_5_10 not in g
+    # (10,10) and (10,5) are the kept segment's endpoints.
+    assert node_10_10 in g
+    assert node_10_5 in g
+    assert g.edges[node_10_10, node_10_5]["kind"] == "local"
+    local_edges = [
+        (u, v) for u, v, data in g.edges(data=True) if data["kind"] == "local"
+    ]
+    assert local_edges == [(node_10_10, node_10_5)] or local_edges == [
+        (node_10_5, node_10_10)
+    ]
+
+
+def test_build_unified_street_graph_dedup_does_not_affect_genuine_local_streets() -> (
+    None
+):
+    # Control: the existing gate-fixture local streets (which run away from
+    # the arterial, not alongside it) must be unaffected by dedup being on by
+    # default -- this just re-runs the existing gate/graph fixture explicitly
+    # under the new default to guard against a regression in that direction.
+    arterial_lines, edges, ring_lines, junctions, streets_by_block, flags = (
+        _graph_fixture()
+    )
+    g = build_unified_street_graph(
+        arterial_lines, edges, ring_lines, junctions, streets_by_block, flags
+    )
+    local_block_ids = {
+        data["block_id"]
+        for _u, _v, data in g.edges(data=True)
+        if data["kind"] == "local"
+    }
+    assert local_block_ids == {0, 1}
+
+
+def test_build_unified_street_graph_dedup_is_deterministic() -> None:
+    arterial_lines = [LineString([(0.0, 10.0), (20.0, 10.0)])]
+    edges = [MacroEdge(node_a=0, node_b=1, tau=2, tier=2, path_cost=1.0, length=20.0)]
+    ring_lines: list[LineString] = []
+    junctions: list[SeamJunction] = []
+    streets_by_block = {
+        0: [
+            LineString(
+                [(0.0, 10.0), (5.0, 10.0), (10.0, 10.02), (15.0, 10.0), (20.0, 10.0)]
+            )
+        ]
+    }
+    perimeter_flags_by_block = {0: [False]}
+
+    g1 = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+    g2 = build_unified_street_graph(
+        arterial_lines,
+        edges,
+        ring_lines,
+        junctions,
+        streets_by_block,
+        perimeter_flags_by_block,
+    )
+    assert sorted(g1.nodes) == sorted(g2.nodes)
+    assert sorted(g1.edges) == sorted(g2.edges)
