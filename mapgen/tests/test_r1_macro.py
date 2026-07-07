@@ -5,15 +5,20 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 import shapely.geometry as sg
+from shapely.ops import unary_union
 
 from mapgen.r1_arm_a import IslandFields
 from mapgen.r1_macro import (
     CITY_SIGMA,
+    DEFAULT_CORE_SIMPLIFY_TOLERANCE,
     TOWN_SIGMA,
     VILLAGE_SIGMA,
     MacroEdge,
     MacroNode,
     MacroParams,
+    _cells_to_polygon,
+    _chaikin_pass_closed,
+    _chaikin_pass_open,
     _delaunay_edges,
     _nearest_neighbor_chain,
     build_density_cost_field,
@@ -24,6 +29,8 @@ from mapgen.r1_macro import (
     detect_core_regions,
     grade_cities,
     polygonize_macro_blocks,
+    smooth_arterial_lines,
+    smooth_polyline,
     tier_for_tau,
     town_nodes_from_peaks,
     visit_weighted_centroids,
@@ -518,3 +525,210 @@ def test_build_macro_layer_smoke_square_island() -> None:
     d = params.to_dict()
     assert d["hierarchical"] is True
     assert d["min_block_area"] == params.min_block_area
+
+
+# ---------------------------------------------------------------------------
+# Chaikin smoothing (S1: arterials + core rings)
+# ---------------------------------------------------------------------------
+
+
+def _max_turn_angle_deg(line: sg.LineString) -> float:
+    """Largest single-vertex turn angle (degrees) along an open polyline."""
+    coords = list(line.coords)
+    if len(coords) < 3:
+        return 0.0
+    max_turn = 0.0
+    for i in range(1, len(coords) - 1):
+        (x0, y0), (x1, y1), (x2, y2) = coords[i - 1], coords[i], coords[i + 1]
+        v1 = np.array([x1 - x0, y1 - y0])
+        v2 = np.array([x2 - x1, y2 - y1])
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        if n1 == 0.0 or n2 == 0.0:
+            continue
+        cosang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        max_turn = max(max_turn, float(np.degrees(np.arccos(cosang))))
+    return max_turn
+
+
+def test_smooth_polyline_preserves_endpoints_exactly() -> None:
+    """Endpoints must stay bit-for-bit identical (load-bearing for fusion)."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)])
+    smoothed = smooth_polyline(line, iterations=2, post_tol=0.15)
+    assert list(smoothed.coords)[0] == (0.0, 0.0)
+    assert list(smoothed.coords)[-1] == (20.0, 10.0)
+
+
+def test_smooth_polyline_reduces_max_turn_angle() -> None:
+    """Chaikin must strictly reduce the sharpest single-vertex turn."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)])
+    before = _max_turn_angle_deg(line)
+    smoothed = smooth_polyline(line, iterations=2, post_tol=0.15)
+    after = _max_turn_angle_deg(smoothed)
+    assert before == 90.0  # two right-angle kinks in the input
+    assert after < before
+    # More vertices too (rounded corners), even after the light post-simplify.
+    assert len(list(smoothed.coords)) > len(list(line.coords))
+
+
+def test_smooth_polyline_degenerate_two_point_passthrough() -> None:
+    """A 2-point line has no corner to cut; it must pass through unchanged."""
+    line = sg.LineString([(0.0, 0.0), (5.0, 5.0)])
+    smoothed = smooth_polyline(line, iterations=2, post_tol=0.15)
+    assert list(smoothed.coords) == list(line.coords)
+
+
+def test_smooth_polyline_zero_iterations_is_noop() -> None:
+    """``iterations=0`` disables smoothing (used for the unsmoothed A/B compare)."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)])
+    smoothed = smooth_polyline(line, iterations=0, post_tol=0.15)
+    assert list(smoothed.coords) == list(line.coords)
+
+
+def test_smooth_polyline_deterministic() -> None:
+    """Same input -> same output (no unseeded randomness)."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)])
+    a = smooth_polyline(line, iterations=2, post_tol=0.15)
+    b = smooth_polyline(line, iterations=2, post_tol=0.15)
+    assert list(a.coords) == list(b.coords)
+
+
+def test_chaikin_pass_open_preserves_endpoints_and_cuts_corner() -> None:
+    """Direct unit check of the endpoint-preserving open Chaikin pass."""
+    pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+    out = _chaikin_pass_open(pts)
+    assert out[0] == pts[0]
+    assert out[-1] == pts[-1]
+    # Interior corner is cut: R0 = 0.25*A + 0.75*B, Q1 = 0.75*B + 0.25*C.
+    assert out == [(0.0, 0.0), (7.5, 0.0), (10.0, 2.5), (10.0, 10.0)]
+
+
+def test_chaikin_pass_closed_wraps_and_drops_no_vertices() -> None:
+    """Direct unit check of the closed-ring Chaikin pass (a unit square)."""
+    ring = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)]
+    out = _chaikin_pass_closed(ring)
+    assert out[0] == out[-1]  # still a closed ring
+    assert len(out) == 2 * 4 + 1  # 4 edges -> 2 new points each, plus closure
+
+
+def test_smooth_arterial_lines_falls_back_when_smoothed_vertex_leaves_mask() -> None:
+    """Guard: a smoothed vertex stepping outside the mask reverts the WHOLE line.
+
+    Constructed so the single Chaikin corner-cut point (R0 = 0.25*A + 0.75*B)
+    for a right-angle A-B-C line lands in a specific cell that we block out.
+    """
+    mask = np.ones((10, 10), dtype=bool)
+    line = sg.LineString([(2.5, 2.5), (5.5, 2.5), (5.5, 5.5)])
+    # R0 = 0.25*(2.5,2.5) + 0.75*(5.5,2.5) = (4.75, 2.5) -> cell (row=2, col=4).
+    mask[2, 4] = False
+    out = smooth_arterial_lines(
+        [line], mask, x0=0.0, y0=0.0, cell=1.0, iterations=1, post_tol=0.0
+    )
+    assert list(out[0].coords) == list(line.coords)
+
+    # Control: with the cell unblocked, the line IS smoothed (not a no-op).
+    mask[2, 4] = True
+    out_ok = smooth_arterial_lines(
+        [line], mask, x0=0.0, y0=0.0, cell=1.0, iterations=1, post_tol=0.0
+    )
+    assert list(out_ok[0].coords) != list(line.coords)
+    assert list(out_ok[0].coords)[0] == (2.5, 2.5)
+    assert list(out_ok[0].coords)[-1] == (5.5, 5.5)
+
+
+def _staircase_cells(n: int) -> set[tuple[int, int]]:
+    """A jagged staircase-shaped cell region (deliberately un-smooth)."""
+    cells: set[tuple[int, int]] = set()
+    for r in range(n):
+        for c in range(n - r, n + 3):
+            cells.add((r, c))
+    return cells
+
+
+def test_cells_to_polygon_ring_is_smoother_than_raw_pixel_blob() -> None:
+    """Ring boundary smoothing (closing + Chaikin) beats the raw pixel union.
+
+    Compares the smoothed ``_cells_to_polygon`` output against the raw,
+    UNSIMPLIFIED cell-square union boundary (the literal "pixel-blob outline"
+    the bug report describes) over the same jagged staircase cell region: the
+    smoothed ring must have far fewer vertices and stay within a modest
+    fraction of the raw footprint's area.
+    """
+    cells = _staircase_cells(6)
+    boxes = [sg.box(c, r, c + 1, r + 1) for (r, c) in cells]
+    raw_union = unary_union(boxes)
+    raw_poly = sg.Polygon(raw_union.exterior)  # no simplify: the raw blob itself
+
+    smoothed = _cells_to_polygon(
+        cells,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        simplify_tolerance=DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    )
+    assert smoothed is not None
+    assert smoothed.is_valid
+    assert len(smoothed.exterior.coords) < len(raw_poly.exterior.coords)
+    sym_diff_area = smoothed.symmetric_difference(raw_union).area
+    assert sym_diff_area < 0.35 * raw_union.area
+
+
+def test_smoothing_preserves_shared_junction_coincidence_across_lines() -> None:
+    """Load-bearing fusion invariant: a shared macro-node endpoint stays EXACT.
+
+    Three arterials meeting at one macro-node junction, smoothed
+    independently, must still meet at EXACTLY the same point afterward --
+    that coincidence is what downstream T-junction fusion (gate snapping,
+    block polygonization) depends on. Also checks smoothing actually moved at
+    least one line's interior (the feature isn't silently a no-op).
+    """
+    shared = (20.0, 20.0)
+    line_a = sg.LineString([(0.0, 0.0), (10.0, 5.0), shared])
+    line_b = sg.LineString([shared, (25.0, 10.0), (40.0, 0.0)])
+    line_c = sg.LineString([shared, (20.0, 40.0)])
+    mask = np.ones((60, 60), dtype=bool)
+
+    smoothed = smooth_arterial_lines(
+        [line_a, line_b, line_c], mask, x0=0.0, y0=0.0, cell=1.0
+    )
+
+    assert list(smoothed[0].coords)[-1] == shared
+    assert list(smoothed[1].coords)[0] == shared
+    assert list(smoothed[2].coords)[0] == shared
+    # Sanity: smoothing actually changed at least one line's interior geometry.
+    assert list(smoothed[0].coords) != list(line_a.coords)
+    assert list(smoothed[1].coords) != list(line_b.coords)
+
+
+def test_build_macro_layer_smoothing_preserves_fusion_invariants() -> None:
+    """Smoothing on vs off must not change junction coincidence / block count.
+
+    Load-bearing safety check at the composed-pipeline level: the smoothed
+    and unsmoothed (``smooth_iterations=0``) layers must agree on block count,
+    core count, and every arterial's endpoints (so shared macro-node
+    junctions stay fused). NB: this particular synthetic island's routed
+    edges happen to come out perfectly straight (flat slope/river fields, no
+    obstacle to route around), so there is nothing for Chaikin to visibly
+    smooth here; the "smoothing actually changes geometry" check lives in
+    ``test_smoothing_preserves_shared_junction_coincidence_across_lines`` and
+    the ``smooth_polyline`` unit tests above instead.
+    """
+    fields, boundary, points = _synthetic_island()
+    layer_smoothed = build_macro_layer(fields, boundary, points, MacroParams())
+    layer_unsmoothed = build_macro_layer(
+        fields, boundary, points, MacroParams(smooth_iterations=0)
+    )
+
+    assert len(layer_smoothed.blocks) == len(layer_unsmoothed.blocks)
+    assert len(layer_smoothed.raw_arterial_lines) == len(
+        layer_unsmoothed.raw_arterial_lines
+    )
+    assert len(layer_smoothed.core_polys) == len(layer_unsmoothed.core_polys)
+
+    for ln_s, ln_u in zip(
+        layer_smoothed.raw_arterial_lines,
+        layer_unsmoothed.raw_arterial_lines,
+        strict=True,
+    ):
+        cs, cu = list(ln_s.coords), list(ln_u.coords)
+        assert cs[0] == cu[0]
+        assert cs[-1] == cu[-1]

@@ -24,6 +24,11 @@ Pipeline
    ``r1_arm_b`` private helpers) → beta-ratio pruning (Arm B ``_prune_edges``).
    Each kept edge carries ``tau = min(sigma_a, sigma_b)`` and a tier
    (2 = highway, 1 = major).
+3.5. **Chaikin smoothing** — the routed+DP-simplified arterials are jagged
+   (straight chords, abrupt kinks); Chaikin corner-cutting (endpoints pinned)
+   rounds them, right after routing and before core-clipping/polygonization,
+   so every downstream consumer (blocks, per-block Chen, gates, lots, both
+   exports) inherits the same smoothed network. See ``smooth_polyline``.
 4. **Macro-blocks** — polygonize (union of kept arterials + boundary exterior)
    and merge slivers, reusing Arm B ``polygonize_districts``.
 
@@ -120,6 +125,17 @@ DEFAULT_BETA_RATIO: float = 1.2
 # Arterial simplification tolerance (island units).
 DEFAULT_SIMPLIFY_TOLERANCE: float = 1.5
 
+# --- Arterial Chaikin smoothing (stage 3.4, applied post-route/pre-clip) ---
+#
+# The DP-simplified routed arterials are long straight chords joined at
+# abrupt kinks. Chaikin corner-cutting rounds those kinks; it deviates LESS
+# than the DP tolerance above already licenses, so it introduces no new
+# slope/river routing cost. See `smooth_polyline`.
+DEFAULT_SMOOTH_ITERATIONS: int = 2
+# Light post-Chaikin simplify (island units) to bound the vertex count back
+# down (Chaikin roughly doubles vertices per pass).
+DEFAULT_SMOOTH_POST_TOL: float = 0.15
+
 # Macro-block sliver-merge floor (island units²). Larger than Arm B's district
 # floor because macro-blocks are coarse by construction.
 DEFAULT_MIN_BLOCK_AREA: float = 60.0
@@ -140,8 +156,17 @@ DEFAULT_CORE_MIN_AREA_UNITS2: float = 8.0
 # Half-width (island units) of the window used to find the robust local peak
 # around a seed (so the node need not sit exactly on the summit).
 DEFAULT_CORE_PEAK_WINDOW_UNITS: float = 3.0
-# Boundary simplification tolerance (island units) for the extracted ring.
-DEFAULT_CORE_SIMPLIFY_TOLERANCE: float = 1.0
+# Light POST-Chaikin simplify tolerance (island units) for the extracted ring
+# boundary -- bounds the vertex count Chaikin corner-cutting adds back down.
+# Small relative to the historical raw simplify(1.0): the ring boundary is now
+# smoothed by morphological closing + Chaikin first (see `_cells_to_polygon`),
+# so this final pass only needs to trim near-collinear noise, not de-jag.
+DEFAULT_CORE_SIMPLIFY_TOLERANCE: float = 0.2
+# Chaikin passes applied to the closed core-ring boundary.
+DEFAULT_CORE_SMOOTH_ITERATIONS: int = 2
+# Morphological-closing half-width (island units) for the ring boundary; ``None``
+# resolves to one raster cell width at call time ("w ~= 1 cell").
+DEFAULT_CORE_CLOSE_WIDTH_UNITS: float | None = None
 
 NodeKind = Literal["city", "town", "village"]
 
@@ -734,6 +759,161 @@ def compute_macro_arterials(
 
 
 # ---------------------------------------------------------------------------
+# 3.5. Polyline smoothing (Chaikin corner-cutting)
+# ---------------------------------------------------------------------------
+#
+# The routed+DP-simplified arterials (above) and the raw pixel-blob core
+# rings (below, section 5) are both jagged: long straight chords / cell edges
+# meeting at abrupt kinks, no curve. Chaikin corner-cutting rounds those kinks
+# without moving far from the original path -- less, in fact, than the DP
+# `simplify` tolerance already licenses -- so it adds no new routing-cost risk.
+# `_chaikin_pass_open` is used for arterials (endpoints pinned, since shared
+# macro-node junctions must stay coincident for downstream fusion);
+# `_chaikin_pass_closed` is used for core-ring boundaries (no fixed point on a
+# loop).
+
+
+def _chaikin_pass_open(
+    coords: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """One Chaikin corner-cutting pass over an OPEN coordinate chain.
+
+    Preserves the first and last coordinate EXACTLY (only interior corners are
+    cut). Every interior corner ``coords[i]`` is replaced by the two points
+    1/4 and 3/4 along its two flanking edges. No-op for chains shorter than 3
+    points -- there is no interior corner to cut.
+    """
+    n = len(coords)
+    if n < 3:
+        return list(coords)
+    out: list[tuple[float, float]] = [coords[0]]
+    last_edge = n - 2
+    for i in range(n - 1):
+        (x0, y0), (x1, y1) = coords[i], coords[i + 1]
+        q = (0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1)
+        r = (0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1)
+        if i == 0:
+            out.append(r)
+        elif i == last_edge:
+            out.append(q)
+        else:
+            out.append(q)
+            out.append(r)
+    out.append(coords[-1])
+    return out
+
+
+def _chaikin_pass_closed(
+    coords: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """One Chaikin corner-cutting pass over a CLOSED ring coordinate chain.
+
+    ``coords`` is a closed ring (``coords[0] == coords[-1]``, the shapely
+    convention). Every original vertex is replaced -- there is no fixed
+    endpoint on a loop -- by the 1/4 and 3/4 points of its two flanking edges,
+    wrapping around. No-op for rings with fewer than 3 distinct vertices.
+    """
+    ring = coords[:-1] if coords[0] == coords[-1] else list(coords)
+    n = len(ring)
+    if n < 3:
+        return list(coords)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
+        (x0, y0), (x1, y1) = ring[i], ring[(i + 1) % n]
+        out.append((0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1))
+        out.append((0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1))
+    out.append(out[0])
+    return out
+
+
+def smooth_polyline(
+    line: sg.LineString,
+    *,
+    iterations: int = DEFAULT_SMOOTH_ITERATIONS,
+    post_tol: float = DEFAULT_SMOOTH_POST_TOL,
+) -> sg.LineString:
+    """Chaikin-smooth an OPEN arterial polyline, endpoints held EXACTLY fixed.
+
+    Applies ``iterations`` passes of endpoint-preserving Chaikin corner-cutting
+    (:func:`_chaikin_pass_open`) to round the abrupt kinks that Delaunay
+    least-cost routing + DP ``simplify`` leave behind, then a light
+    ``simplify(post_tol, preserve_topology=False)`` pass to bound the vertex
+    count back down (each Chaikin pass roughly doubles the interior vertex
+    count). Degenerate lines (fewer than 3 coordinates) or ``iterations <= 0``
+    pass through UNCHANGED -- there is no corner to cut, and this is how
+    smoothing is disabled for a comparison/no-op run.
+
+    Endpoint preservation is load-bearing: shared macro-node junctions must
+    stay bit-for-bit coincident across every smoothed arterial meeting there,
+    or downstream T-junction fusion (gate snapping, block polygonization)
+    desyncs. Douglas-Peucker ``simplify`` never relocates an open line's
+    endpoints, so this holds through the post-simplify pass too; the endpoint
+    coordinates are pinned back defensively regardless, in case of any
+    floating-point drift.
+    """
+    coords = list(line.coords)
+    if len(coords) < 3 or iterations <= 0:
+        return line
+    pts = coords
+    for _ in range(iterations):
+        pts = _chaikin_pass_open(pts)
+    smoothed = sg.LineString(pts)
+    if post_tol > 0:
+        smoothed = smoothed.simplify(post_tol, preserve_topology=False)
+    out_coords = list(smoothed.coords)
+    if out_coords[0] != coords[0] or out_coords[-1] != coords[-1]:
+        out_coords[0] = coords[0]
+        out_coords[-1] = coords[-1]
+        smoothed = sg.LineString(out_coords)
+    return smoothed
+
+
+def _line_stays_in_mask(
+    line: sg.LineString, mask: np.ndarray, x0: float, y0: float, cell: float
+) -> bool:
+    """True if every vertex of ``line`` lands on an inside-mask raster cell."""
+    nrows, ncols = mask.shape
+    xs = np.array([c[0] for c in line.coords], dtype=float)
+    ys = np.array([c[1] for c in line.coords], dtype=float)
+    rows, cols = _xy_to_rowcol(xs, ys, x0, y0, cell, nrows, ncols)
+    rows = np.clip(rows, 0, nrows - 1)
+    cols = np.clip(cols, 0, ncols - 1)
+    return bool(mask[rows, cols].all())
+
+
+def smooth_arterial_lines(
+    lines: list[sg.LineString],
+    mask: np.ndarray,
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    iterations: int = DEFAULT_SMOOTH_ITERATIONS,
+    post_tol: float = DEFAULT_SMOOTH_POST_TOL,
+) -> list[sg.LineString]:
+    """Chaikin-smooth every arterial, guarded against leaving the routing mask.
+
+    Chaikin corner-cutting deviates LESS than the DP ``simplify`` tolerance the
+    routed path already licenses, so it should never introduce new slope/river
+    infeasibility -- but a coastline-hugging arterial can sit close enough to
+    the mask boundary that a corner-cut noses a vertex into an outside-mask
+    (``inf``-cost) cell. Cheap guard: if any vertex of a smoothed line would
+    land outside ``mask``, that ENTIRE line falls back to its unsmoothed
+    original rather than partially smoothing it (this should be rare -- see
+    above -- so a whole-line fallback is an acceptable, simple, deterministic
+    conservative choice).
+    """
+    out: list[sg.LineString] = []
+    for line in lines:
+        smoothed = smooth_polyline(line, iterations=iterations, post_tol=post_tol)
+        if _line_stays_in_mask(smoothed, mask, x0, y0, cell):
+            out.append(smoothed)
+        else:
+            out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 4. Macro-blocks
 # ---------------------------------------------------------------------------
 
@@ -826,13 +1006,26 @@ def _cells_to_polygon(
     cell: float,
     *,
     simplify_tolerance: float,
+    close_width: float | None = DEFAULT_CORE_CLOSE_WIDTH_UNITS,
+    smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
 ) -> sg.Polygon | None:
-    """Union the cell squares of ``cells`` into a single simplified core polygon.
+    """Union the cell squares of ``cells`` into a single smoothed core polygon.
 
     Each ``(row, col)`` becomes its cell-centre-aligned square box; the union's
-    largest exterior ring is taken (interior holes dropped) and simplified. Cell
-    boxes span ``[x0 + col*cell, x0 + (col+1)*cell]`` etc., consistent with the
+    largest exterior ring is taken (interior holes dropped). Cell boxes span
+    ``[x0 + col*cell, x0 + (col+1)*cell]`` etc., consistent with the
     cell-centre convention ``x = x0 + (col + 0.5) * cell``.
+
+    The raw union is a pixel-blob (stair-step boundary along cell edges).
+    Boundary smoothing, in order:
+
+    1. Morphological CLOSE (``buffer(+w).buffer(-w)``, ``w = close_width`` or
+       one raster cell if ``None``) fills single-cell notches and rounds the
+       stair-step boundary.
+    2. Chaikin corner-cutting (:func:`_chaikin_pass_closed`, ``smooth_iterations``
+       passes) rounds the remaining corners into a smooth loop.
+    3. A final light ``simplify(simplify_tolerance)`` bounds the vertex count
+       Chaikin adds back down.
     """
     if not cells:
         return None
@@ -854,6 +1047,23 @@ def _cells_to_polygon(
         return None
     # Drop holes: keep only the exterior ring.
     poly = sg.Polygon(merged.exterior)
+
+    w = close_width if close_width is not None else cell
+    if w > 0:
+        closed = poly.buffer(w, quad_segs=2).buffer(-w, quad_segs=2)
+        if closed.geom_type == "MultiPolygon":
+            closed = max(closed.geoms, key=lambda p: p.area) if closed.geoms else poly
+        if not closed.is_empty and closed.geom_type == "Polygon":
+            poly = closed
+
+    if smooth_iterations > 0:
+        ring_coords = list(poly.exterior.coords)
+        for _ in range(smooth_iterations):
+            ring_coords = _chaikin_pass_closed(ring_coords)
+        smoothed_poly = sg.Polygon(ring_coords)
+        if smoothed_poly.is_valid and not smoothed_poly.is_empty:
+            poly = smoothed_poly
+
     if simplify_tolerance > 0:
         poly = poly.simplify(simplify_tolerance, preserve_topology=True)
     if poly.is_empty or not poly.is_valid:
@@ -875,6 +1085,8 @@ def detect_core_regions(
     core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
     peak_window_units: float = DEFAULT_CORE_PEAK_WINDOW_UNITS,
     simplify_tolerance: float = DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    close_width: float | None = DEFAULT_CORE_CLOSE_WIDTH_UNITS,
+    smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
 ) -> list[sg.Polygon]:
     """Detect dense "downtown" core regions around CITY/TOWN nodes.
 
@@ -919,7 +1131,13 @@ def detect_core_regions(
     polys: list[sg.Polygon] = []
     for region in merged_regions:
         poly = _cells_to_polygon(
-            region, x0, y0, cell, simplify_tolerance=simplify_tolerance
+            region,
+            x0,
+            y0,
+            cell,
+            simplify_tolerance=simplify_tolerance,
+            close_width=close_width,
+            smooth_iterations=smooth_iterations,
         )
         if poly is None:
             continue
@@ -1075,6 +1293,8 @@ def build_macro_blocks_with_cores(
     core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2,
     peak_window_units: float = DEFAULT_CORE_PEAK_WINDOW_UNITS,
     core_simplify_tolerance: float = DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    core_close_width: float | None = DEFAULT_CORE_CLOSE_WIDTH_UNITS,
+    core_smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
 ) -> MacroBlockBundle:
     """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
@@ -1104,6 +1324,8 @@ def build_macro_blocks_with_cores(
         core_min_area_units2=core_min_area_units2,
         peak_window_units=peak_window_units,
         simplify_tolerance=core_simplify_tolerance,
+        close_width=core_close_width,
+        smooth_iterations=core_smooth_iterations,
     )
     ring_lines = core_ring_boundaries(core_polys)
     clipped_lines, clipped_edges = clip_arterials_to_cores(
@@ -1158,6 +1380,9 @@ class MacroParams:
     # Importance-typed network.
     beta_ratio: float = DEFAULT_BETA_RATIO
     simplify_tolerance: float = DEFAULT_SIMPLIFY_TOLERANCE
+    # Arterial Chaikin smoothing (stage 3.4, post-route/pre-clip).
+    smooth_iterations: int = DEFAULT_SMOOTH_ITERATIONS
+    smooth_post_tol: float = DEFAULT_SMOOTH_POST_TOL
     # Macro-blocks + dense-core ring-roads (stage 3.5b).
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA
     core_frac: float = DEFAULT_CORE_FRAC
@@ -1178,7 +1403,8 @@ class MacroLayer:
     params : the exact :class:`MacroParams` recipe used.
     nodes : macro nodes (cities/towns/villages).
     cost : the density-attracting routing cost field.
-    raw_arterial_lines / raw_edges : the pre-clip arterial network.
+    raw_arterial_lines / raw_edges : the pre-clip arterial network, Chaikin-
+        smoothed (:func:`smooth_arterial_lines`) immediately after routing.
     core_polys / ring_lines : dense-core downtown polygons and their rings.
     arterial_lines / edges : the CLIPPED arterials (core interiors removed;
         identical to the raw ones when no cores are detected). These are what
@@ -1206,10 +1432,10 @@ def build_macro_layer(
 ) -> MacroLayer:
     """Assemble the full stage-1 macro layer from the staged inputs.
 
-    THE single shared nodes -> cost-field -> arterials -> blocks-with-cores
-    pipeline behind ``run_r1_macro``, ``run_r1_seam_spike`` and
-    ``run_r1_hybrid`` (previously each script hand-assembled its own copy).
-    Deterministic: depends only on the inputs and ``params``.
+    THE single shared nodes -> cost-field -> arterials -> smoothing ->
+    blocks-with-cores pipeline behind ``run_r1_macro``, ``run_r1_seam_spike``
+    and ``run_r1_hybrid`` (previously each script hand-assembled its own
+    copy). Deterministic: depends only on the inputs and ``params``.
 
     With no detectable cores the returned ``blocks`` match the pre-3.5b
     polygonization (:func:`polygonize_macro_blocks` over the raw arterials) and
@@ -1259,7 +1485,7 @@ def build_macro_layer(
         cost_floor=params.cost_floor,
     )
 
-    raw_lines, raw_edges = compute_macro_arterials(
+    routed_lines, routed_edges = compute_macro_arterials(
         nodes,
         cost,
         x0,
@@ -1268,6 +1494,33 @@ def build_macro_layer(
         beta_ratio=params.beta_ratio,
         simplify_tolerance=params.simplify_tolerance,
     )
+
+    # Chaikin-smooth the routed arterials HERE -- immediately after routing,
+    # BEFORE core clipping / polygonization -- so macro-blocks, per-block Chen,
+    # gate snapping, lots and both exports all derive from (and stay
+    # consistent with) the SAME smoothed lines. Smoothing bake-side instead
+    # would desync roads from blocks and put buildings back on the roads.
+    smoothed_lines = smooth_arterial_lines(
+        routed_lines,
+        mask,
+        x0,
+        y0,
+        cell,
+        iterations=params.smooth_iterations,
+        post_tol=params.smooth_post_tol,
+    )
+    raw_lines = smoothed_lines
+    raw_edges = [
+        MacroEdge(
+            node_a=rec.node_a,
+            node_b=rec.node_b,
+            tau=rec.tau,
+            tier=rec.tier,
+            path_cost=rec.path_cost,
+            length=round(float(line.length), 3),
+        )
+        for line, rec in zip(smoothed_lines, routed_edges, strict=True)
+    ]
 
     bundle = build_macro_blocks_with_cores(
         density,
