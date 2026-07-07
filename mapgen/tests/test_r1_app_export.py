@@ -20,6 +20,7 @@ from mapgen.r1_app_export import (
     blocks_feature_collection,
     derive_levels,
     filter_regions_by_bbox,
+    footprint_ring_xy,
     invert_geom,
     invert_xy,
     island_length_to_app,
@@ -163,6 +164,66 @@ def test_oriented_rect_degenerate_footprint_returns_zero_rect() -> None:
     assert r.width == 0.0
     assert r.depth == 0.0
     assert r.angle == 0.0
+
+
+# ---------------------------------------------------------------------------
+# footprint_ring_xy -- the true-polygon export used by web/src/Map.jsx's
+# buildingPolygon in place of the oriented_rect approximation.
+# ---------------------------------------------------------------------------
+
+
+def test_footprint_ring_xy_triangle_drops_closing_vertex() -> None:
+    # A wedge/triangular footprint is exactly the case an oriented rect
+    # overhangs (docs/wave2-plan.md-adjacent 2D-render bug this fixes).
+    poly = sg.Polygon([(0.0, 0.0), (4.0, 0.0), (0.0, 3.0)])
+
+    xs, ys = footprint_ring_xy(poly)
+
+    assert len(xs) == 3
+    assert len(ys) == 3
+    assert list(zip(xs, ys, strict=True)) == [(0.0, 0.0), (4.0, 0.0), (0.0, 3.0)]
+
+
+def test_footprint_ring_xy_matches_polygon_regardless_of_closing_vertex() -> None:
+    open_ring = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)]
+    closed = sg.Polygon(open_ring)  # shapely always closes the ring internally
+
+    xs, ys = footprint_ring_xy(closed)
+
+    assert list(zip(xs, ys, strict=True)) == open_ring
+
+
+def test_footprint_ring_xy_empty_polygon_returns_empty_lists() -> None:
+    xs, ys = footprint_ring_xy(sg.Polygon())
+
+    assert xs == []
+    assert ys == []
+
+
+def test_footprint_ring_xy_degenerate_collinear_returns_empty_lists() -> None:
+    # Same degenerate input oriented_rect treats as "no rectangle" -- the web
+    # falls back to the (also zero-sized) OBB rect for these rows.
+    poly = sg.Polygon([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)])
+
+    xs, ys = footprint_ring_xy(poly)
+
+    assert xs == []
+    assert ys == []
+
+
+def test_footprint_ring_xy_survives_invert_geom_roundtrip() -> None:
+    # footprint_ring_xy is always called on an already-inverse-affined
+    # (app-frame) footprint in run_r1_app_export.py; confirm the ring
+    # matches invert_geom's own vertex order/values for a realistic case.
+    affine = IslandAffine(offset_x=1.0, offset_y=-2.0, scale=5.0)
+    poly = sg.Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)])
+    app_poly = invert_geom(poly, affine)
+
+    xs, ys = footprint_ring_xy(app_poly)
+
+    expected = list(app_poly.exterior.coords[:-1])
+    assert xs == pytest.approx([p[0] for p in expected])
+    assert ys == pytest.approx([p[1] for p in expected])
 
 
 # ---------------------------------------------------------------------------

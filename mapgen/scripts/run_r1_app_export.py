@@ -41,6 +41,7 @@ from mapgen.r1_app_export import (
     blocks_feature_collection,
     derive_levels,
     filter_regions_by_bbox,
+    footprint_ring_xy,
     invert_geom,
     invert_xy,
     island_length_to_app,
@@ -210,23 +211,29 @@ def main(argv: list[str] | None = None) -> None:
 
     # -----------------------------------------------------------------
     # Assigned position (lot_x/lot_y, inverse-affined -- the world's
-    # DISPLACED position, docs/lots-wave-plan.md) + building rects (oriented
-    # min-rotated-rectangle of each occupied footprint, inverse-affined into
-    # the app frame -- a faithful representation of the new frontage-aligned,
-    # possibly lot-guard-clipped footprints).
+    # DISPLACED position, docs/lots-wave-plan.md) + building geometry
+    # (inverse-affined into the app frame -- a faithful representation of the
+    # new frontage-aligned, possibly lot-guard-clipped footprints): both the
+    # TRUE footprint polygon (footprint_x/footprint_y, a per-row coordinate
+    # list pair -- what the web actually renders/extrudes, see Map.jsx's
+    # buildingPolygon) and its oriented min-rotated-rectangle
+    # (building_width/depth/angle/cx/cy -- kept as the fallback for rows
+    # whose footprint didn't survive to a ring, and because web/src/duckdb.js
+    # sniffs building_width/depth to decide `isCity`).
     #
     # building_cx/building_cy (the oriented rect's OWN center) are exported
     # separately from x/y (the lot anchor): a clipped footprint (lot-guard
     # intersection) or a Voronoi-fallback district's footprint can have its
-    # true center offset from the lot anchor, and the viewer draws the
-    # building rect centered at building_cx/cy (falling back to x/y when
-    # absent) so buildings actually sit on their own footprints -- x/y stays
-    # the world's map/click/label position, unchanged.
+    # true center offset from the lot anchor, and the viewer's rect fallback
+    # centers there (falling back to x/y when absent) so a rect-fallback
+    # building still sits on its own footprint -- x/y stays the world's
+    # map/click/label position, unchanged.
     # -----------------------------------------------------------------
     xs, ys = invert_xy(joined["lot_x"].to_numpy(), joined["lot_y"].to_numpy(), affine)
 
     footprints_island = shapely.from_wkb(joined["footprint_wkb"].to_numpy())
     widths, depths, angles, cxs, cys = [], [], [], [], []
+    footprint_xs, footprint_ys = [], []
     for footprint in footprints_island:
         footprint_app = invert_geom(footprint, affine)
         rect = oriented_rect(footprint_app)
@@ -235,6 +242,9 @@ def main(argv: list[str] | None = None) -> None:
         angles.append(rect.angle)
         cxs.append(rect.cx)
         cys.append(rect.cy)
+        fx, fy = footprint_ring_xy(footprint_app)
+        footprint_xs.append(fx)
+        footprint_ys.append(fy)
 
     # All lots' polygons (occupied + greenspace), inverse-affined -- used by
     # parcels.geojson (every lot) and landuse.geojson (greenspace lots only).
@@ -273,6 +283,17 @@ def main(argv: list[str] | None = None) -> None:
             pl.Series("building_angle", angles, dtype=pl.Float64),
             pl.Series("building_cx", cxs, dtype=pl.Float64),
             pl.Series("building_cy", cys, dtype=pl.Float64),
+            # True footprint polygon (app frame), parallel x/y coordinate
+            # lists -- the web renders/extrudes THIS instead of the
+            # building_{width,depth,angle} oriented bounding rect, which can
+            # overhang a non-rectangular (wedge/triangular) footprint into
+            # roads/neighbors (2D-only artifact; the 3D bake already extrudes
+            # the real polygon via r1_mesh.py). building_* rect columns are
+            # kept: older datasets/fallback rows (empty footprint_x/y) still
+            # need them, and web/src/duckdb.js's `isCity` sniff keys off
+            # building_width/depth.
+            pl.Series("footprint_x", footprint_xs, dtype=pl.List(pl.Float64)),
+            pl.Series("footprint_y", footprint_ys, dtype=pl.List(pl.Float64)),
         )
         .rename({"height": "building_height", "district_id": "block_id"})
     )
@@ -291,6 +312,8 @@ def main(argv: list[str] | None = None) -> None:
             "building_height",
             "building_cx",
             "building_cy",
+            "footprint_x",
+            "footprint_y",
             "lot_id",
             "block_id",
         ]

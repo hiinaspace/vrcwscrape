@@ -148,6 +148,36 @@ def oriented_rect(poly: sg.Polygon) -> OrientedRect:
     return OrientedRect(float(cx), float(cy), width, depth, angle)
 
 
+def footprint_ring_xy(poly: sg.Polygon) -> tuple[list[float], list[float]]:
+    """Exterior-ring coordinates of a TRUE building footprint polygon (``lot ∩
+    setback-slab``, see ``mapgen.r1_lots._oriented_footprint``), as a pair of
+    parallel ``x``/``y`` lists with the closing duplicate vertex dropped --
+    ready for a per-world ``footprint_x``/``footprint_y`` ``List[Float64]``
+    parquet column pair.
+
+    This is the 2D-app counterpart of ``oriented_rect``: ``oriented_rect``
+    fits an OBB *around* the footprint (used for the legacy
+    ``building_width/depth/angle/cx/cy`` rect columns, kept for older-dataset
+    fallback and the ``isCity`` sniff in ``web/src/duckdb.js``/``Map.jsx``);
+    this instead hands back the polygon ITSELF so the web can render/extrude
+    the real shape (a wedge/triangle footprint no longer draws as an
+    overhanging bounding rect that pokes into roads/neighbors).
+
+    Degenerate footprints (empty polygon, or a footprint whose exterior ring
+    doesn't survive to a proper ring -- ``oriented_rect``'s same "no
+    rectangle" case) return ``([], [])``; the web falls back to the OBB rect
+    for those rows.
+    """
+    if poly.is_empty or poly.area <= 0.0 or poly.exterior is None:
+        return [], []
+    coords = list(poly.exterior.coords)
+    if len(coords) > 1 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 3:
+        return [], []
+    return [float(x) for x, _y in coords], [float(y) for _x, y in coords]
+
+
 # ---------------------------------------------------------------------------
 # Road tier -> app-schema kind + width. Widths are the plan-doc (Stage G1)
 # defaults in ISLAND units; ``island_length_to_app`` converts at export time.

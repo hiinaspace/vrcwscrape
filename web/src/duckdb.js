@@ -296,6 +296,17 @@ export async function getLevels() {
   return _levels;
 }
 
+// duckdb-wasm hands back a nested LIST<DOUBLE> column value as an Arrow Vector-like
+// object (iterable, sometimes with its own toArray()) rather than a plain JS array --
+// normalize either shape to a plain number array. Used for footprint_x/footprint_y
+// (the true building-footprint polygon ring, docs/wave2-plan.md's 2D-render fix).
+function listToArray(v) {
+  if (v == null) return null;
+  if (Array.isArray(v)) return v;
+  if (typeof v.toArray === "function") return Array.from(v.toArray());
+  return Array.from(v);
+}
+
 /** All map points as plain objects ready for deck.gl. */
 export async function loadPoints() {
   const conn = await getConn();
@@ -314,6 +325,8 @@ export async function loadPoints() {
     "building_height",
     "building_cx",
     "building_cy",
+    "footprint_x",
+    "footprint_y",
     "lot_id",
     "block_id",
     "road_id",
@@ -329,6 +342,15 @@ export async function loadPoints() {
   return res.toArray().map((r) => {
     const sid = []; // indexed by level number, so p.sid[level] works for any depth
     for (const i of levels) sid[i] = r[`l${i}_sid`];
+    const fx = listToArray(r.footprint_x);
+    const fy = listToArray(r.footprint_y);
+    // Real footprint polygon ring (app frame), already inverse-affined by
+    // run_r1_app_export.py -- absolute [x, y] pairs, no further transform. null
+    // (and Map.jsx's buildingPolygon falls back to the OBB rect) when the export
+    // couldn't produce a ring for this row (older dataset, or a degenerate
+    // footprint -- mapgen.r1_app_export.footprint_ring_xy's empty-list case).
+    const footprint =
+      fx && fy && fx.length >= 3 ? fx.map((x, i) => [x, fy[i]]) : null;
     return {
       world_id: r.world_id,
       position: [r.x, r.y],
@@ -348,6 +370,7 @@ export async function loadPoints() {
       buildingHeight: r.building_height == null ? null : Number(r.building_height),
       buildingCx: r.building_cx == null ? null : Number(r.building_cx),
       buildingCy: r.building_cy == null ? null : Number(r.building_cy),
+      footprint,
       lotId: r.lot_id == null ? null : Number(r.lot_id),
       blockId: r.block_id == null ? null : Number(r.block_id),
       roadId: r.road_id == null ? null : Number(r.road_id),

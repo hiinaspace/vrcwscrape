@@ -278,12 +278,22 @@ function parcelPolygon(point) {
 }
 
 function buildingPolygon(point) {
-  // The building rect is centered at its OWN footprint center (building_cx/cy,
-  // exported separately from the lot anchor) when the dataset provides it -- a
-  // clipped footprint or a Voronoi-fallback district's footprint can have its
-  // true center offset from point.position (the lot anchor / map-click/label
-  // position), and centering there instead would draw the building off its own
-  // footprint. Falls back to point.position for datasets without it.
+  // Prefer the TRUE footprint polygon (point.footprint -- app-frame [x, y] pairs,
+  // already absolute/inverse-affined by run_r1_app_export.py) over the oriented
+  // bounding-rect approximation below. A wedge/triangular footprint's OBB
+  // overhangs the real shape into roads/neighbors in 2D (the 3D bake already
+  // extrudes the real polygon, r1_mesh.py) -- this is the fix for that, and it
+  // also makes the ?extrude=1 / street-view 2.5D preview extrude the real shape
+  // instead of the rect, since both read this same polygon.
+  if (point.footprint) return point.footprint;
+  // Rect fallback (older datasets, or a row whose footprint didn't survive to a
+  // ring -- mapgen.r1_app_export.footprint_ring_xy's degenerate case): centered
+  // at its OWN footprint center (building_cx/cy, exported separately from the
+  // lot anchor) when the dataset provides it -- a clipped footprint or a
+  // Voronoi-fallback district's footprint can have its true center offset from
+  // point.position (the lot anchor / map-click/label position), and centering
+  // there instead would draw the building off its own footprint. Falls back to
+  // point.position for datasets without it.
   const [px, py] = point.position;
   const x = point.buildingCx ?? px;
   const y = point.buildingCy ?? py;
