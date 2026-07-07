@@ -16,13 +16,17 @@ from mapgen.r1_macro import (
     MacroEdge,
     MacroNode,
     MacroParams,
+    NucleusSpec,
     _cells_to_polygon,
     _chaikin_pass_closed,
     _chaikin_pass_open,
     _delaunay_edges,
     _nearest_neighbor_chain,
+    assign_nearest_nucleus,
     build_density_cost_field,
     build_macro_layer,
+    build_macro_nodes_hierarchical,
+    build_nucleus_specs,
     clip_arterials_to_cores,
     cluster_centroids,
     compute_macro_arterials,
@@ -31,6 +35,8 @@ from mapgen.r1_macro import (
     polygonize_macro_blocks,
     smooth_arterial_lines,
     smooth_polyline,
+    snap_centroid_to_peak,
+    snap_nodes_to_peaks,
     tier_for_tau,
     town_nodes_from_peaks,
     visit_weighted_centroids,
@@ -505,10 +511,18 @@ def test_build_macro_layer_smoke_square_island() -> None:
 
     assert layer.params is params
     # Hierarchical seeding: 2 L1 cities + 4 L0 towns (villages deduped away or
-    # few); positions are distinct.
+    # few).
     assert sum(1 for nd in layer.nodes if nd.kind == "city") == 2
     assert sum(1 for nd in layer.nodes if nd.kind == "town") == 4
-    assert len({(nd.x, nd.y) for nd in layer.nodes}) == len(layer.nodes)
+    # Peak-snapped seeding (S2): every node lands on one of its region's TWO
+    # density peaks -- in this fixture the child towns sit close enough to
+    # their parent city's blob that they snap onto the SAME peak (this is the
+    # intended structural change: a saddle-seeded core is weak/dropped, so
+    # nodes now sit on real summits rather than staying at their raw
+    # visit-weighted centroid). The two REGIONS (west/east) stay distinct.
+    positions = {(nd.x, nd.y) for nd in layer.nodes}
+    assert len(positions) == 2
+    assert {(nd.x, nd.y) for nd in layer.nodes if nd.kind == "city"} == positions
     # Lines and edge records stay parallel, raw and clipped.
     assert len(layer.raw_arterial_lines) == len(layer.raw_edges)
     assert len(layer.arterial_lines) == len(layer.edges)
@@ -732,3 +746,250 @@ def test_build_macro_layer_smoothing_preserves_fusion_invariants() -> None:
         cs, cu = list(ln_s.coords), list(ln_u.coords)
         assert cs[0] == cu[0]
         assert cs[-1] == cu[-1]
+
+
+# ---------------------------------------------------------------------------
+# Peak-snapped seeding (S2)
+# ---------------------------------------------------------------------------
+
+
+def test_snap_centroid_to_peak_saddle_snaps_to_known_peak() -> None:
+    """A centroid sitting in a saddle near a strong peak snaps onto it."""
+    peak_xs = np.array([20.0, 60.0])
+    peak_ys = np.array([20.0, 20.0])
+    peak_ds = np.array([5.0, 1.0])
+    # Centroid a few units off the strong peak (a "saddle" position).
+    snapped = snap_centroid_to_peak(23.0, 21.0, peak_xs, peak_ys, peak_ds, radius=6.0)
+    assert snapped == (20.0, 20.0)
+
+
+def test_snap_centroid_to_peak_no_peak_in_range_stays_put() -> None:
+    """No peak within radius -> centroid unchanged."""
+    peak_xs = np.array([100.0])
+    peak_ys = np.array([100.0])
+    peak_ds = np.array([5.0])
+    snapped = snap_centroid_to_peak(0.0, 0.0, peak_xs, peak_ys, peak_ds, radius=6.0)
+    assert snapped == (0.0, 0.0)
+
+
+def test_snap_centroid_to_peak_picks_highest_density_in_range() -> None:
+    """Two peaks in range -> the denser one wins, not the nearer one."""
+    peak_xs = np.array([2.0, 5.0])
+    peak_ys = np.array([0.0, 0.0])
+    peak_ds = np.array([1.0, 9.0])  # far one is denser
+    snapped = snap_centroid_to_peak(0.0, 0.0, peak_xs, peak_ys, peak_ds, radius=6.0)
+    assert snapped == (5.0, 0.0)
+
+
+def test_snap_centroid_to_peak_deterministic() -> None:
+    """Same inputs -> same output (no unseeded randomness)."""
+    peak_xs = np.array([2.0, 5.0])
+    peak_ys = np.array([0.0, 0.0])
+    peak_ds = np.array([1.0, 9.0])
+    a = snap_centroid_to_peak(0.0, 0.0, peak_xs, peak_ys, peak_ds, radius=6.0)
+    b = snap_centroid_to_peak(0.0, 0.0, peak_xs, peak_ys, peak_ds, radius=6.0)
+    assert a == b
+
+
+def test_snap_nodes_to_peaks_preserves_label_sigma_kind_mass() -> None:
+    """Snapping moves x/y only; label/sigma/kind/mass survive untouched."""
+    node = MacroNode(x=1.0, y=1.0, sigma=CITY_SIGMA, kind="city", label="a", mass=42.0)
+    peak_xs = np.array([1.5])
+    peak_ys = np.array([1.5])
+    peak_ds = np.array([9.0])
+    snapped = snap_nodes_to_peaks([node], peak_xs, peak_ys, peak_ds, radius=6.0)[0]
+    assert (snapped.x, snapped.y) == (1.5, 1.5)
+    assert snapped.label == "a"
+    assert snapped.sigma == CITY_SIGMA
+    assert snapped.kind == "city"
+    assert snapped.mass == 42.0
+
+
+def test_snap_nodes_to_peaks_out_of_range_node_unchanged_object() -> None:
+    """A node with no peak in range is returned AS-IS (not just equal)."""
+    node = MacroNode(x=1.0, y=1.0, sigma=CITY_SIGMA, kind="city", label="a", mass=1.0)
+    peak_xs = np.array([100.0])
+    peak_ys = np.array([100.0])
+    peak_ds = np.array([9.0])
+    out = snap_nodes_to_peaks([node], peak_xs, peak_ys, peak_ds, radius=6.0)
+    assert out[0] is node
+
+
+def test_build_macro_nodes_hierarchical_snaps_city_off_peak_onto_it() -> None:
+    """End-to-end: a city centroid in a density saddle snaps onto the real peak.
+
+    Two Gaussian blobs 20 units apart (unequal amplitude); the single L1/L0
+    cluster's points straddle the saddle between them so the visit-weighted
+    centroid lands near the midpoint x=40 (equidistant from both peaks, low
+    density itself) -- peak-snap must pick the TALLER peak, not just the
+    nearer one (both are equidistant here) and not leave the node at the
+    saddle.
+    """
+    n = 80
+    rr, cc = np.mgrid[0:n, 0:n]
+
+    def blob(r0: int, c0: int, amp: float) -> np.ndarray:
+        return amp * np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2 * 3.0**2)))
+
+    density = (blob(40, 30, 10.0) + blob(40, 50, 4.0)).astype(float)
+    points = pl.DataFrame(
+        {
+            "l0_id": [0, 0],
+            "l0_name": ["only", "only"],
+            "l1_id": [0, 0],
+            "l1_name": ["only", "only"],
+            "visits": [10, 10],
+            "x": [26.0, 54.0],  # visit-weighted mean x = 40 -- the saddle
+            "y": [40.5, 40.5],
+        }
+    )
+    nodes = build_macro_nodes_hierarchical(
+        density, x0=0.0, y0=0.0, cell=1.0, points=points, peak_snap_radius_units=15.0
+    )
+    city = next(nd for nd in nodes if nd.kind == "city")
+    assert abs(city.x - 30.5) < 1.0
+    assert abs(city.y - 40.5) < 1.0
+
+
+def test_build_macro_nodes_hierarchical_disabled_snap_keeps_raw_centroid() -> None:
+    """``peak_snap_radius_units<=0`` disables snapping (pre-S2 behavior)."""
+    n = 80
+    rr, cc = np.mgrid[0:n, 0:n]
+
+    def blob(r0: int, c0: int, amp: float) -> np.ndarray:
+        return amp * np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2 * 3.0**2)))
+
+    density = (blob(40, 30, 10.0) + blob(40, 50, 4.0)).astype(float)
+    points = pl.DataFrame(
+        {
+            "l0_id": [0, 0],
+            "l0_name": ["only", "only"],
+            "l1_id": [0, 0],
+            "l1_name": ["only", "only"],
+            "visits": [10, 10],
+            "x": [26.0, 54.0],
+            "y": [40.5, 40.5],
+        }
+    )
+    nodes = build_macro_nodes_hierarchical(
+        density, x0=0.0, y0=0.0, cell=1.0, points=points, peak_snap_radius_units=0.0
+    )
+    city = next(nd for nd in nodes if nd.kind == "city")
+    assert city.x == 40.0 and city.y == 40.5
+
+
+# ---------------------------------------------------------------------------
+# Ranked settlement nuclei (S2: NucleusSpec)
+# ---------------------------------------------------------------------------
+
+
+def test_build_nucleus_specs_anchor_inside_polygon_and_ranks_ordered() -> None:
+    """Anchor lies inside its own polygon; ranks strictly track mass."""
+    density = _two_peak_raster(sep_cells=24)
+    nodes = [
+        MacroNode(x=18.5, y=30.5, sigma=TOWN_SIGMA, kind="town", label="alpha"),
+        MacroNode(x=42.5, y=30.5, sigma=TOWN_SIGMA, kind="town", label="beta"),
+    ]
+    core_polys = detect_core_regions(
+        density,
+        nodes,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+    )
+    assert len(core_polys) == 2
+    # Two extra worlds near alpha's core, one near beta's -- density mass is
+    # symmetric for this fixture, so the world-count term must be what tips
+    # alpha's core to outrank beta's.
+    points = pl.DataFrame({"x": [18.5, 18.5, 42.5], "y": [30.5, 30.5, 30.5]})
+    specs = build_nucleus_specs(
+        density, core_polys, nodes, points, x0=0.0, y0=0.0, cell=1.0, n_major=1
+    )
+    assert len(specs) == 2
+    for spec in specs:
+        assert spec.polygon.contains(sg.Point(*spec.anchor))
+
+    by_rank = sorted(specs, key=lambda s: s.rank)
+    assert [s.rank for s in by_rank] == [1, 2]
+    assert by_rank[0].mass >= by_rank[1].mass
+    assert by_rank[0].label == "alpha"
+    # top-K=1 -> exactly 1 is_major, and it's the rank-1 nucleus.
+    assert sum(1 for s in specs if s.is_major) == 1
+    assert by_rank[0].is_major and not by_rank[1].is_major
+
+
+def test_build_nucleus_specs_top_k_is_major_count() -> None:
+    """``is_major`` count == ``min(K, n_cores)``, including K > n_cores."""
+    density = _two_peak_raster(sep_cells=24)
+    nodes = [
+        MacroNode(x=18.5, y=30.5, sigma=TOWN_SIGMA, kind="town", label="a"),
+        MacroNode(x=42.5, y=30.5, sigma=TOWN_SIGMA, kind="town", label="b"),
+    ]
+    core_polys = detect_core_regions(
+        density,
+        nodes,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        core_max_radius_units=6.0,
+        core_min_area_units2=4.0,
+    )
+    points = pl.DataFrame({"x": [18.5], "y": [30.5]})
+    specs = build_nucleus_specs(
+        density, core_polys, nodes, points, x0=0.0, y0=0.0, cell=1.0, n_major=10
+    )
+    assert sum(1 for s in specs if s.is_major) == min(10, len(core_polys))
+
+
+def test_build_nucleus_specs_empty_cores_is_empty() -> None:
+    """No surviving cores -> no nuclei (identity, doesn't crash)."""
+    density = _two_peak_raster(sep_cells=24)
+    nodes = [MacroNode(x=18.5, y=30.5, sigma=TOWN_SIGMA, kind="town", label="a")]
+    points = pl.DataFrame({"x": [18.5], "y": [30.5]})
+    specs = build_nucleus_specs(
+        density, [], nodes, points, x0=0.0, y0=0.0, cell=1.0, n_major=6
+    )
+    assert specs == []
+
+
+def test_assign_nearest_nucleus_small_fixture() -> None:
+    """Nearest-anchor assignment + normalized clamped distance, small fixture."""
+    nuclei = [
+        NucleusSpec(
+            anchor=(0.0, 0.0),
+            polygon=sg.box(-1, -1, 1, 1),
+            mass=10.0,
+            rank=1,
+            label="a",
+            influence_radius=2.0,
+            is_major=True,
+        ),
+        NucleusSpec(
+            anchor=(20.0, 0.0),
+            polygon=sg.box(19, -1, 21, 1),
+            mass=5.0,
+            rank=2,
+            label="b",
+            influence_radius=1.0,
+            is_major=False,
+        ),
+    ]
+    polys = [
+        sg.box(-0.5, -0.5, 0.5, 0.5),  # centroid (0,0) -> nucleus 0, dist 0
+        sg.box(0.5, -0.5, 1.5, 0.5),  # centroid (1,0) -> nucleus 0, dist 1/2=0.5
+        sg.box(24.0, -0.5, 26.0, 0.5),  # centroid (25,0) -> nucleus 1, clamp 1.0
+    ]
+    result = assign_nearest_nucleus(polys, nuclei)
+    assert result[0] == (0, 0.0)
+    nid, ndist = result[1]
+    assert nid == 0
+    assert ndist is not None and abs(ndist - 0.5) < 1e-9
+    assert result[2] == (1, 1.0)
+
+
+def test_assign_nearest_nucleus_empty_nuclei_returns_none() -> None:
+    """No nuclei detected -> every polygon gets ``(None, None)``."""
+    result = assign_nearest_nucleus([sg.box(0.0, 0.0, 1.0, 1.0)], [])
+    assert result == [(None, None)]

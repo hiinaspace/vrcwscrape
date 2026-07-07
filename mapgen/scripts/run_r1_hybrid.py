@@ -99,8 +99,10 @@ from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
     MacroLayer,
     MacroParams,
+    assign_nearest_nucleus,
     build_macro_layer,
     load_boundary,
+    nucleus_specs_to_geojson,
 )
 from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT  # noqa: E402
 from mapgen.r1_seam import (  # noqa: E402
@@ -767,19 +769,29 @@ def _district_typology_tier(
 
 
 def _greybox_districts_geojson(
-    district_records: list[tuple[int, int, sg.Polygon, int]],
+    district_records: list[tuple[int, int, sg.Polygon, int, int | None, float | None]],
     massing: MassingConfig,
     meters_per_unit: float,
 ) -> dict[str, Any]:
-    """``district_records``: ``(district_id, block_id, polygon, world_count)``.
+    """``district_records``: ``(district_id, block_id, polygon, world_count,
+    nucleus_id, nucleus_dist)``.
 
     ``typology`` is the district's AREA-ONLY tier (:func:`_district_typology_tier`)
     -- the classification map viewers/audit see at a glance; a district's
     individual lots can still classify ``"landmark"`` per world (see
-    ``lots.parquet``'s own ``typology`` column).
+    ``lots.parquet``'s own ``typology`` column). ``nucleus_id``/``nucleus_dist``
+    (S2 interface, :func:`mapgen.r1_macro.assign_nearest_nucleus`) are ``null``
+    when no cores were detected (``nuclei`` empty).
     """
     records: list[tuple[int, Any, dict[str, Any]]] = []
-    for district_id, block_id, poly, world_count in district_records:
+    for (
+        district_id,
+        block_id,
+        poly,
+        world_count,
+        nucleus_id,
+        nucleus_dist,
+    ) in district_records:
         kind = "fabric" if world_count > 0 else "park"
         records.append(
             (
@@ -793,6 +805,8 @@ def _greybox_districts_geojson(
                     "typology": _district_typology_tier(
                         poly, world_count, massing, meters_per_unit
                     ),
+                    "nucleus_id": nucleus_id,
+                    "nucleus_dist": nucleus_dist,
                 },
             )
         )
@@ -847,20 +861,27 @@ def export_greybox(
     call.
 
     Writes ``island.geojson``, ``arterials.geojson`` (clipped arterials +
-    core rings), ``blocks.geojson``, ``districts.geojson`` (now with a
-    ``typology`` property per district -- the AREA-ONLY tier, see
-    :func:`_district_typology_tier`), ``streets.geojson`` (perimeter-duplicate
-    paths excluded, reusing the connectivity wave's ``street_perimeter_flags``),
-    ``lots.parquet`` (now with ``lot_x``/``lot_y``/``kind``/``displacement``/
-    ``typology`` -- see ``mapgen.r1_lots.Lot``, ``kind="greenspace"`` rows
-    carry ``world_id=""`` -- plus a ``lot_id`` column: the row's index in this
-    function's own deterministic district-walk BUILD order, assigned before
-    the world_id sort below so downstream readers (``run_r1_app_export.py``)
-    can use it directly as a stable identifier instead of re-minting one via
-    a different sort), and ``greybox_manifest.json`` (``displacement_stats``/
-    ``fallback_districts`` keys and ``counts.n_greenspace``/
-    ``counts.n_fallback``, one shared ``fallback_stats`` dict threaded across
-    every district's ``build_lots`` call). Returns the manifest dict.
+    core rings), ``blocks.geojson``, ``nuclei.geojson`` (ranked settlement
+    nuclei -- anchor points with ``rank``/``mass``/``label``/``is_major``, see
+    :func:`mapgen.r1_macro.nucleus_specs_to_geojson`, S2),
+    ``districts.geojson`` (now with a ``typology`` property per district --
+    the AREA-ONLY tier, see :func:`_district_typology_tier` -- plus
+    ``nucleus_id``/``nucleus_dist``, the nearest-nucleus assignment from
+    :func:`mapgen.r1_macro.assign_nearest_nucleus`), ``streets.geojson``
+    (perimeter-duplicate paths excluded, reusing the connectivity wave's
+    ``street_perimeter_flags``), ``lots.parquet`` (now with
+    ``lot_x``/``lot_y``/``kind``/``displacement``/``typology`` -- see
+    ``mapgen.r1_lots.Lot``, ``kind="greenspace"`` rows carry ``world_id=""`` --
+    plus a ``lot_id`` column: the row's index in this function's own
+    deterministic district-walk BUILD order, assigned before the world_id sort
+    below so downstream readers (``run_r1_app_export.py``) can use it directly
+    as a stable identifier instead of re-minting one via a different sort --
+    and its district's ``nucleus_id``/``nucleus_dist``, same as
+    ``districts.geojson``), and ``greybox_manifest.json``
+    (``displacement_stats``/``fallback_districts`` keys and
+    ``counts.n_greenspace``/``counts.n_fallback``/``counts.n_nuclei``/
+    ``counts.n_major_nuclei``, one shared ``fallback_stats`` dict threaded
+    across every district's ``build_lots`` call). Returns the manifest dict.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     if massing is None:
@@ -876,10 +897,18 @@ def export_greybox(
     n_direct = sum(1 for kind in assigned_kind if kind == "direct")
     n_snapped = sum(1 for kind in assigned_kind if kind == "snapped")
 
+    # Nearest-nucleus assignment (S2 interface): one (nucleus_id, nucleus_dist)
+    # pair per district, aligned to district_polys / district_entries order
+    # (district_id IS that index -- see the enumerate() below), so
+    # nucleus_by_district[district_id] below is a direct lookup.
+    nucleus_by_district = assign_nearest_nucleus(district_polys, layer.nuclei)
+
     landmark_ids = top_landmark_ids(points, massing.landmark_count)
 
     all_lots: list[Lot] = []
-    district_records: list[tuple[int, int, sg.Polygon, int]] = []
+    district_records: list[
+        tuple[int, int, sg.Polygon, int, int | None, float | None]
+    ] = []
     n_park = 0
     # Shared across every district's build_lots call (docs/lots-wave-plan.md
     # slice L2) so the manifest reports ONE island-wide fallback tally rather
@@ -888,7 +917,10 @@ def export_greybox(
     for district_id, (block_id, poly) in enumerate(district_entries):
         row_indices = assignment.get(district_id, [])
         world_count = len(row_indices)
-        district_records.append((district_id, block_id, poly, world_count))
+        nucleus_id, nucleus_dist = nucleus_by_district[district_id]
+        district_records.append(
+            (district_id, block_id, poly, world_count, nucleus_id, nucleus_dist)
+        )
         if world_count == 0:
             n_park += 1
             continue
@@ -941,6 +973,8 @@ def export_greybox(
         )
     with (out_dir / "blocks.geojson").open("w") as f:
         json.dump(_greybox_blocks_geojson(layer.blocks), f, indent=2, sort_keys=True)
+    with (out_dir / "nuclei.geojson").open("w") as f:
+        json.dump(nucleus_specs_to_geojson(layer.nuclei), f, indent=2, sort_keys=True)
     with (out_dir / "districts.geojson").open("w") as f:
         json.dump(
             _greybox_districts_geojson(district_records, massing, meters_per_unit),
@@ -964,6 +998,17 @@ def export_greybox(
     all_lots_with_id.sort(key=lambda pair: pair[1].world_id)
     lot_ids = [pair[0] for pair in all_lots_with_id]
     all_lots = [pair[1] for pair in all_lots_with_id]
+
+    # Per-district nucleus_id/nucleus_dist (S2 interface), propagated onto
+    # every lot of that district -- both None when `layer.nuclei` is empty
+    # (no cores detected).
+    nucleus_by_district_id: dict[int, tuple[int | None, float | None]] = {
+        district_id: (nucleus_id, nucleus_dist)
+        for district_id, _block_id, _poly, _world_count, nucleus_id, nucleus_dist in (
+            district_records
+        )
+    }
+
     lots_df = pl.DataFrame(
         {
             "world_id": [lot.world_id for lot in all_lots],
@@ -987,6 +1032,19 @@ def export_greybox(
             "displacement": [lot.displacement for lot in all_lots],
             "typology": [lot.typology for lot in all_lots],
             "lot_id": lot_ids,
+            # Explicit dtype for the same reason as "name" above: with no
+            # nuclei detected every value is None, which polars would
+            # otherwise infer as its own Null dtype.
+            "nucleus_id": pl.Series(
+                "nucleus_id",
+                [nucleus_by_district_id[lot.district_id][0] for lot in all_lots],
+                dtype=pl.Int64,
+            ),
+            "nucleus_dist": pl.Series(
+                "nucleus_dist",
+                [nucleus_by_district_id[lot.district_id][1] for lot in all_lots],
+                dtype=pl.Float64,
+            ),
         }
     )
     lots_df.write_parquet(out_dir / "lots.parquet")
@@ -1021,6 +1079,8 @@ def export_greybox(
             "n_blocks": len(layer.blocks),
             "n_arterials": len(layer.arterial_lines),
             "n_ring_roads": len(layer.ring_lines),
+            "n_nuclei": len(layer.nuclei),
+            "n_major_nuclei": sum(1 for n in layer.nuclei if n.is_major),
             "n_streets_exported": n_streets_exported,
             "n_districts": len(district_entries),
             "n_park_districts": n_park,
@@ -1070,6 +1130,7 @@ def export_greybox(
             "island.geojson",
             "arterials.geojson",
             "blocks.geojson",
+            "nuclei.geojson",
             "districts.geojson",
             "streets.geojson",
             "lots.parquet",

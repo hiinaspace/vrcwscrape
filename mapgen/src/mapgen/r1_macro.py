@@ -31,6 +31,14 @@ Pipeline
    exports) inherits the same smoothed network. See ``smooth_polyline``.
 4. **Macro-blocks** — polygonize (union of kept arterials + boundary exterior)
    and merge slivers, reusing Arm B ``polygonize_districts``.
+5. **Ranked settlement nuclei** (S2) — the hierarchical city/town centroids are
+   first PEAK-SNAPPED onto the nearest strong density peak within a radius
+   (``snap_nodes_to_peaks``, so the dense-core growing step below starts from a
+   real summit, not a visit-weighted saddle); each surviving core region is
+   then wrapped into a ranked :class:`NucleusSpec` (:func:`build_nucleus_specs`)
+   with an anchor point, integrated mass, rank and top-K ``is_major`` flag —
+   the interface downstream zone-massing and the 2D map consume. See
+   ``docs/macro-roads-nuclei-plan.md``, slice S2.
 
 The module is deterministic: it depends only on the staged rasters/points and a
 fixed RNG seed (``DEFAULT_SEED``); no stochastic steps are used, but the seed is
@@ -41,17 +49,19 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 import polars as pl
+import shapely
 import shapely.geometry as sg
 from scipy.spatial import Delaunay, QhullError
 from shapely.ops import unary_union
 from skimage.graph import route_through_array
 
+from mapgen.chen_field import RasterDensityField
 from mapgen.r1_arm_a import IslandFields
 from mapgen.r1_arm_b import (
     _prune_edges,
@@ -118,6 +128,13 @@ DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS: float = 4.0
 DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC: float = 0.012
 # Drop a village peak within this radius of any city/town centroid.
 DEFAULT_VILLAGE_MERGE_RADIUS: float = 3.0
+
+# Peak-snap radius (island units, S2): a city/town centroid within this many
+# units of a real density peak snaps onto it -- ``detect_core_regions`` grows
+# cores FROM these exact node positions, so a visit-weighted centroid that
+# lands in a density SADDLE seeds a weak or dropped core. A centroid with no
+# peak in range stays put. See docs/macro-roads-nuclei-plan.md, slice S2.
+DEFAULT_PEAK_SNAP_RADIUS_UNITS: float = 6.0
 
 # Beta-ratio pruning (Arm B convention; inf keeps all edges).
 DEFAULT_BETA_RATIO: float = 1.2
@@ -461,6 +478,57 @@ def village_nodes_from_peaks(
     return villages
 
 
+def snap_centroid_to_peak(
+    cx: float,
+    cy: float,
+    peak_xs: np.ndarray,
+    peak_ys: np.ndarray,
+    peak_ds: np.ndarray,
+    *,
+    radius: float = DEFAULT_PEAK_SNAP_RADIUS_UNITS,
+) -> tuple[float, float]:
+    """Snap ``(cx, cy)`` onto the highest-density peak within ``radius``.
+
+    Returns that peak's own ``(x, y)`` if at least one of ``(peak_xs,
+    peak_ys)`` lies within ``radius`` island units (Euclidean) of ``(cx,
+    cy)``; otherwise ``(cx, cy)`` unchanged -- a centroid with no peak in range
+    stays put rather than being dragged toward a distant, unrelated summit.
+    Ties (equal peak density) break on array order, which is
+    ``find_density_peaks``'s own deterministic scan order, so this is
+    deterministic given fixed inputs.
+    """
+    if peak_xs.size == 0 or radius <= 0.0:
+        return cx, cy
+    d2 = (peak_xs - cx) ** 2 + (peak_ys - cy) ** 2
+    in_range = np.nonzero(d2 <= radius * radius)[0]
+    if in_range.size == 0:
+        return cx, cy
+    best = in_range[int(np.argmax(peak_ds[in_range]))]
+    return float(peak_xs[best]), float(peak_ys[best])
+
+
+def snap_nodes_to_peaks(
+    nodes: list[MacroNode],
+    peak_xs: np.ndarray,
+    peak_ys: np.ndarray,
+    peak_ds: np.ndarray,
+    *,
+    radius: float = DEFAULT_PEAK_SNAP_RADIUS_UNITS,
+) -> list[MacroNode]:
+    """Peak-snap every node's position (see :func:`snap_centroid_to_peak`).
+
+    Preserves ``sigma``/``kind``/``label``/``mass`` on every node -- only
+    ``(x, y)`` moves.
+    """
+    out: list[MacroNode] = []
+    for nd in nodes:
+        nx, ny = snap_centroid_to_peak(
+            nd.x, nd.y, peak_xs, peak_ys, peak_ds, radius=radius
+        )
+        out.append(nd if (nx == nd.x and ny == nd.y) else replace(nd, x=nx, y=ny))
+    return out
+
+
 def build_macro_nodes_hierarchical(
     density: np.ndarray,
     x0: float,
@@ -471,11 +539,14 @@ def build_macro_nodes_hierarchical(
     merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS,
     peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS,
     peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC,
+    peak_snap_radius_units: float = DEFAULT_PEAK_SNAP_RADIUS_UNITS,
 ) -> list[MacroNode]:
     """Build the 3-tier SEMANTIC macro node hierarchy (L1 / L0 / peaks).
 
-    - **Cities (sigma=2):** the 7 L1 cluster centroids (visit-weighted).
-    - **Towns (sigma=1):** the 18 L0 cluster centroids (visit-weighted).
+    - **Cities (sigma=2):** the 7 L1 cluster centroids (visit-weighted),
+      PEAK-SNAPPED (see below).
+    - **Towns (sigma=1):** the 18 L0 cluster centroids (visit-weighted),
+      PEAK-SNAPPED (see below).
     - **Villages (sigma=0):** loosened density peaks, deduped against any
       city/town within ``merge_radius``.
 
@@ -484,11 +555,42 @@ def build_macro_nodes_hierarchical(
     towns yields finer macro structure (more nodes -> finer macro-blocks) than
     the legacy graded-L0 seeding.
 
+    **Peak-snap (S2):** before villages are picked, every city/town centroid is
+    snapped onto the highest density peak within ``peak_snap_radius_units`` of
+    it (:func:`snap_nodes_to_peaks`) -- a visit-weighted cluster centroid can
+    land in a density SADDLE, and ``detect_core_regions`` grows cores FROM
+    these exact node positions, so a saddle-seeded core is weak or dropped
+    (see docs/macro-roads-nuclei-plan.md, slice S2, "What the review found"
+    #4). Peaks are found with the SAME loose village-tier parameters
+    (``peak_min_distance_units``/``peak_threshold_frac``) as the village pass
+    below, so a snapped city/town coincides EXACTLY with a peak
+    ``village_nodes_from_peaks`` would otherwise also emit as its own
+    village -- its existing ``merge_radius`` dedup then drops that duplicate
+    with no extra bookkeeping. Set ``peak_snap_radius_units <= 0`` to disable
+    (nodes stay at their raw cluster centroids, the pre-S2 behavior).
+
     Nodes are returned cities-then-towns-then-villages (each block in its own
     deterministic cluster-id / peak order).
     """
     cities = cluster_centroids(points, "l1_id", "l1_name", CITY_SIGMA, "city")
     towns = cluster_centroids(points, "l0_id", "l0_name", TOWN_SIGMA, "town")
+
+    if peak_snap_radius_units > 0.0:
+        peak_xs, peak_ys, peak_ds = find_density_peaks(
+            density,
+            x0,
+            y0,
+            cell,
+            min_distance_units=peak_min_distance_units,
+            threshold_frac=peak_threshold_frac,
+        )
+        cities = snap_nodes_to_peaks(
+            cities, peak_xs, peak_ys, peak_ds, radius=peak_snap_radius_units
+        )
+        towns = snap_nodes_to_peaks(
+            towns, peak_xs, peak_ys, peak_ds, radius=peak_snap_radius_units
+        )
+
     villages = village_nodes_from_peaks(
         density,
         x0,
@@ -1259,6 +1361,236 @@ def clip_arterials_to_cores(
     return out_lines, out_edges
 
 
+# ---------------------------------------------------------------------------
+# 5.5. Ranked settlement nuclei (stage S2)
+# ---------------------------------------------------------------------------
+#
+# Wraps each surviving core region (grown by `detect_core_regions`, UNCHANGED)
+# into a ranked NucleusSpec: a downtown "anchor" point + integrated mass +
+# rank + the seeding cluster's label. This is the interface the S3
+# intra-nucleus avenues, the S5 zone-graded massing, and the 2D map all
+# consume -- see docs/macro-roads-nuclei-plan.md, slice S2.
+
+# Top-K nuclei (by mass) flagged `is_major=True`; the rest are town centers.
+# Default matches the plan's starting guess (~6 of the ~13 detected cores);
+# S2's ranked-mass table is what the orchestrator/user tune this against.
+DEFAULT_N_MAJOR_NUCLEI: int = 6
+
+
+@dataclass(frozen=True)
+class NucleusSpec:
+    """A ranked settlement nucleus: one surviving dense core, wrapped.
+
+    Built by :func:`build_nucleus_specs` from :func:`detect_core_regions`'s
+    output (core polygons) -- one ``NucleusSpec`` per surviving core.
+
+    Attributes
+    ----------
+    anchor : density-weighted centroid of the core region (the downtown
+        center everything downstream -- exports, S5 zone massing, the 2D
+        map -- treats as "the" nucleus point). Always inside ``polygon``.
+    polygon : the core's ring polygon (same object ``detect_core_regions``
+        returned).
+    mass : ``RasterDensityField.mass(polygon)`` (integrated density) plus the
+        raw in-polygon world count -- a combined density+population size
+        proxy used only for ranking.
+    rank : 1-indexed, highest mass first.
+    label : the seeding CITY/TOWN node's cluster label (see
+        :func:`build_nucleus_specs`'s docstring for the tie-break rule);
+        ``None`` if there are no city/town seed nodes at all.
+    influence_radius : half the core polygon's bounding-box diagonal --
+        the reach used to normalize ``nucleus_dist`` downstream.
+    is_major : ``True`` for the top ``n_major`` nuclei by mass.
+    """
+
+    anchor: tuple[float, float]
+    polygon: sg.Polygon
+    mass: float
+    rank: int
+    label: str | None
+    influence_radius: float
+    is_major: bool
+
+
+def _density_weighted_centroid(
+    density: np.ndarray,
+    poly: sg.Polygon,
+    x0: float,
+    y0: float,
+    cell: float,
+) -> tuple[float, float]:
+    """Density-weighted centroid of the raster cells whose centre falls in ``poly``.
+
+    Midpoint rule (same convention as ``RasterDensityField.mass``): every
+    inside cell contributes its ``(x, y)`` weighted by its density value.
+    Falls back to ``poly.representative_point()`` (ALWAYS inside the polygon,
+    unlike ``.centroid`` on a concave ring) when no cell centre falls inside
+    the polygon, the in-polygon density sums to zero, or the weighted point
+    itself somehow lands outside ``poly`` (a pathological, very concave core
+    after ring smoothing) -- the anchor must always be inside its own core.
+    """
+    nrows, ncols = density.shape
+    minx, miny, maxx, maxy = poly.bounds
+    col_lo = max(int(np.floor((minx - x0) / cell - 0.5)), 0)
+    col_hi = min(int(np.ceil((maxx - x0) / cell - 0.5)), ncols - 1)
+    row_lo = max(int(np.floor((miny - y0) / cell - 0.5)), 0)
+    row_hi = min(int(np.ceil((maxy - y0) / cell - 0.5)), nrows - 1)
+
+    def _fallback() -> tuple[float, float]:
+        rp = poly.representative_point()
+        return float(rp.x), float(rp.y)
+
+    if col_hi < col_lo or row_hi < row_lo:
+        return _fallback()
+
+    rows_idx, cols_idx = np.meshgrid(
+        np.arange(row_lo, row_hi + 1), np.arange(col_lo, col_hi + 1), indexing="ij"
+    )
+    rows_flat = rows_idx.ravel()
+    cols_flat = cols_idx.ravel()
+    xs = x0 + (cols_flat + 0.5) * cell
+    ys = y0 + (rows_flat + 0.5) * cell
+    inside = shapely.contains_xy(poly, xs, ys)
+    if not np.any(inside):
+        return _fallback()
+
+    d = density[rows_flat[inside], cols_flat[inside]].astype(np.float64)
+    total = float(d.sum())
+    if total <= 0.0:
+        return _fallback()
+
+    cx = float((xs[inside] * d).sum() / total)
+    cy = float((ys[inside] * d).sum() / total)
+    if not poly.contains(sg.Point(cx, cy)):
+        return _fallback()
+    return cx, cy
+
+
+def _core_seed_label(poly: sg.Polygon, seed_nodes: list[MacroNode]) -> str | None:
+    """Label a core from the seed node that grew it (see ``detect_core_regions``).
+
+    Prefers a seed node (sigma >= 1: city or town) whose position falls
+    INSIDE the core polygon, breaking ties by sigma (city over town), then
+    mass, then original list order -- all deterministic. A core can be the
+    UNION of several nodes' grown regions (``_union_touching_regions``), so
+    more than one seed node's position can land inside; the highest-sigma /
+    highest-mass one names the downtown. Falls back to the nearest seed node
+    by distance to the polygon's centroid if none of them falls inside (only
+    possible after the ring's buffer/Chaikin smoothing nudges the boundary
+    past a seed that sat right at the grown region's edge). Returns ``None``
+    if there are no seed nodes at all.
+    """
+    if not seed_nodes:
+        return None
+    inside = [nd for nd in seed_nodes if poly.contains(sg.Point(nd.x, nd.y))]
+    if inside:
+        best = max(
+            range(len(inside)),
+            key=lambda i: (inside[i].sigma, inside[i].mass or 0.0, -i),
+        )
+        return inside[best].label
+    centroid = poly.centroid
+    best = min(
+        range(len(seed_nodes)),
+        key=lambda i: (
+            (seed_nodes[i].x - centroid.x) ** 2 + (seed_nodes[i].y - centroid.y) ** 2,
+            i,
+        ),
+    )
+    return seed_nodes[best].label
+
+
+def build_nucleus_specs(
+    density: np.ndarray,
+    core_polys: list[sg.Polygon],
+    nodes: list[MacroNode],
+    points: pl.DataFrame,
+    x0: float,
+    y0: float,
+    cell: float,
+    *,
+    n_major: int = DEFAULT_N_MAJOR_NUCLEI,
+) -> list[NucleusSpec]:
+    """Wrap each surviving core (``detect_core_regions`` output, UNCHANGED) into
+    a ranked :class:`NucleusSpec`.
+
+    ``mass`` combines the core's integrated density mass
+    (``RasterDensityField.mass``, the same population-surface integral the
+    Chen density-mass split/calibration uses elsewhere in this pipeline) with
+    its raw in-polygon world count, as a single size proxy for ranking; cores
+    are ranked descending by this ``mass`` (rank 1 = highest), ties broken by
+    ``core_polys`` input order (already descending-area from
+    ``detect_core_regions``) for determinism. The top ``n_major`` nuclei by
+    mass are flagged ``is_major=True``.
+
+    Returns the nuclei list ALREADY in ascending-rank order (index ``i`` ==
+    ``rank - 1``); this is the id :func:`assign_nearest_nucleus` and
+    :func:`nucleus_specs_to_geojson` both use.
+    """
+    density_field = RasterDensityField(density=density, x0=x0, y0=y0, cell=cell)
+    xs = points["x"].to_numpy()
+    ys = points["y"].to_numpy()
+    seed_nodes = [nd for nd in nodes if nd.sigma >= 1]
+
+    raw: list[tuple[tuple[float, float], sg.Polygon, float, str | None, float]] = []
+    for poly in core_polys:
+        anchor = _density_weighted_centroid(density, poly, x0, y0, cell)
+        world_count = int(shapely.contains_xy(poly, xs, ys).sum())
+        mass = float(density_field.mass(poly)) + float(world_count)
+        minx, miny, maxx, maxy = poly.bounds
+        influence_radius = 0.5 * float(np.hypot(maxx - minx, maxy - miny))
+        label = _core_seed_label(poly, seed_nodes)
+        raw.append((anchor, poly, mass, label, influence_radius))
+
+    order = sorted(range(len(raw)), key=lambda i: (-raw[i][2], i))
+    n_major_eff = min(max(n_major, 0), len(raw))
+    specs: list[NucleusSpec] = []
+    for rank0, i in enumerate(order):
+        anchor, poly, mass, label, influence_radius = raw[i]
+        specs.append(
+            NucleusSpec(
+                anchor=anchor,
+                polygon=poly,
+                mass=mass,
+                rank=rank0 + 1,
+                label=label,
+                influence_radius=influence_radius,
+                is_major=rank0 < n_major_eff,
+            )
+        )
+    return specs
+
+
+def assign_nearest_nucleus(
+    polys: list[sg.Polygon],
+    nuclei: list[NucleusSpec],
+) -> list[tuple[int | None, float | None]]:
+    """Nearest-nucleus assignment for a list of polygons (S5 / 2D-map interface).
+
+    One ``(nucleus_id, nucleus_dist)`` pair per polygon, ``polys`` order
+    preserved. ``nucleus_id`` is the 0-based index into ``nuclei`` (rank
+    order, see :func:`build_nucleus_specs`); ``nucleus_dist`` is the polygon
+    centroid -> nucleus anchor Euclidean distance, normalized by that
+    nucleus's ``influence_radius`` and clamped to ``[0, 1]`` (0 = at the
+    anchor, 1 = at or beyond its influence radius). Both entries are ``None``
+    for every polygon when ``nuclei`` is empty (no cores detected -- nothing
+    to assign to).
+    """
+    if not nuclei:
+        return [(None, None) for _ in polys]
+    anchors_x = np.array([n.anchor[0] for n in nuclei], dtype=float)
+    anchors_y = np.array([n.anchor[1] for n in nuclei], dtype=float)
+    radii = np.array([max(n.influence_radius, 1e-9) for n in nuclei], dtype=float)
+    out: list[tuple[int | None, float | None]] = []
+    for poly in polys:
+        c = poly.centroid
+        d2 = (anchors_x - c.x) ** 2 + (anchors_y - c.y) ** 2
+        idx = int(np.argmin(d2))
+        dist = float(np.sqrt(d2[idx]))
+        out.append((idx, float(np.clip(dist / radii[idx], 0.0, 1.0))))
+    return out
+
+
 @dataclass(frozen=True)
 class MacroBlockBundle:
     """Result of :func:`build_macro_blocks_with_cores`.
@@ -1269,6 +1601,7 @@ class MacroBlockBundle:
     ring_lines : each core's exterior ring as a LineString (drawn as ring roads).
     clipped_lines / clipped_edges : arterials with their core interiors removed.
     blocks : polygonized macro-blocks over clipped arterials + rings + boundary.
+    nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
     """
 
     core_polys: list[sg.Polygon]
@@ -1276,6 +1609,7 @@ class MacroBlockBundle:
     clipped_lines: list[sg.LineString]
     clipped_edges: list[MacroEdge]
     blocks: list[sg.Polygon]
+    nuclei: list[NucleusSpec]
 
 
 def build_macro_blocks_with_cores(
@@ -1284,6 +1618,7 @@ def build_macro_blocks_with_cores(
     arterial_lines: list[sg.LineString],
     edges: list[MacroEdge],
     boundary: sg.Polygon,
+    points: pl.DataFrame,
     x0: float,
     y0: float,
     cell: float,
@@ -1296,6 +1631,7 @@ def build_macro_blocks_with_cores(
     core_close_width: float | None = DEFAULT_CORE_CLOSE_WIDTH_UNITS,
     core_smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
+    n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI,
 ) -> MacroBlockBundle:
     """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
 
@@ -1309,9 +1645,12 @@ def build_macro_blocks_with_cores(
     3. Polygonize ``clipped_arterials ∪ core_rings ∪ island_exterior`` (reusing
        Arm B ``polygonize_districts`` + sliver merge) so each core interior is
        its own block and non-core space splits along the clipped arterial web.
+    4. Wrap each surviving core into a ranked :class:`NucleusSpec`
+       (:func:`build_nucleus_specs`, S2).
 
     Returns a :class:`MacroBlockBundle`. With no cores detected, the block set
-    matches the pre-3.5b polygonization (arterials + boundary).
+    matches the pre-3.5b polygonization (arterials + boundary) and ``nuclei``
+    is empty.
     """
     core_polys = detect_core_regions(
         density,
@@ -1335,12 +1674,16 @@ def build_macro_blocks_with_cores(
     blocks = polygonize_districts(
         block_lines, boundary, min_district_area=min_block_area
     )
+    nuclei = build_nucleus_specs(
+        density, core_polys, nodes, points, x0, y0, cell, n_major=n_major_nuclei
+    )
     return MacroBlockBundle(
         core_polys=core_polys,
         ring_lines=ring_lines,
         clipped_lines=clipped_lines,
         clipped_edges=clipped_edges,
         blocks=blocks,
+        nuclei=nuclei,
     )
 
 
@@ -1371,6 +1714,8 @@ class MacroParams:
     village_merge_radius: float = DEFAULT_VILLAGE_MERGE_RADIUS
     village_peak_min_distance_units: float = DEFAULT_VILLAGE_PEAK_MIN_DISTANCE_UNITS
     village_peak_threshold_frac: float = DEFAULT_VILLAGE_PEAK_THRESHOLD_FRAC
+    # Peak-snap radius for hierarchical city/town seeding (S2); <= 0 disables.
+    peak_snap_radius_units: float = DEFAULT_PEAK_SNAP_RADIUS_UNITS
     # Density-attracting cost field.
     cost_base: float = 1.0
     w_slope: float = 8.0
@@ -1388,6 +1733,8 @@ class MacroParams:
     core_frac: float = DEFAULT_CORE_FRAC
     core_max_radius_units: float = DEFAULT_CORE_MAX_RADIUS_UNITS
     core_min_area_units2: float = DEFAULT_CORE_MIN_AREA_UNITS2
+    # Ranked settlement nuclei (S2): top-K by mass flagged is_major.
+    n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI
 
     def to_dict(self) -> dict[str, Any]:
         """Plain-dict form for JSON manifests."""
@@ -1410,6 +1757,7 @@ class MacroLayer:
         identical to the raw ones when no cores are detected). These are what
         the stage scripts draw and export.
     blocks : polygonized macro-blocks (clipped arterials + rings + boundary).
+    nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
     """
 
     params: MacroParams
@@ -1422,6 +1770,7 @@ class MacroLayer:
     arterial_lines: list[sg.LineString]
     edges: list[MacroEdge]
     blocks: list[sg.Polygon]
+    nuclei: list[NucleusSpec]
 
 
 def build_macro_layer(
@@ -1459,6 +1808,7 @@ def build_macro_layer(
             merge_radius=params.village_merge_radius,
             peak_min_distance_units=params.village_peak_min_distance_units,
             peak_threshold_frac=params.village_peak_threshold_frac,
+            peak_snap_radius_units=params.peak_snap_radius_units,
         )
     else:
         nodes = build_macro_nodes(
@@ -1528,6 +1878,7 @@ def build_macro_layer(
         raw_lines,
         raw_edges,
         boundary,
+        points,
         x0,
         y0,
         cell,
@@ -1535,6 +1886,7 @@ def build_macro_layer(
         core_max_radius_units=params.core_max_radius_units,
         core_min_area_units2=params.core_min_area_units2,
         min_block_area=params.min_block_area,
+        n_major_nuclei=params.n_major_nuclei,
     )
 
     return MacroLayer(
@@ -1548,6 +1900,7 @@ def build_macro_layer(
         arterial_lines=bundle.clipped_lines,
         edges=bundle.clipped_edges,
         blocks=bundle.blocks,
+        nuclei=bundle.nuclei,
     )
 
 
@@ -1633,6 +1986,39 @@ def core_rings_to_geojson(core_polys: list[sg.Polygon]) -> dict[str, Any]:
                     "core_id": i,
                     "area": round(float(poly.area), 3),
                 },
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
+
+
+def nucleus_specs_to_geojson(specs: list[NucleusSpec]) -> dict[str, Any]:
+    """Serialize nuclei as anchor Point features (rank/mass/label/is_major).
+
+    ``nucleus_id`` is the 0-based position in ``specs`` (== ``rank - 1``,
+    since :func:`build_nucleus_specs` always returns nuclei in ascending-rank
+    order) -- the same id :func:`assign_nearest_nucleus` returns and every
+    district's ``nucleus_id`` refers to. The core polygon itself is already
+    exported via :func:`core_rings_to_geojson`.
+    """
+    features = []
+    for i, spec in enumerate(specs):
+        props: dict[str, Any] = {
+            "nucleus_id": i,
+            "rank": spec.rank,
+            "mass": round(spec.mass, 4),
+            "is_major": spec.is_major,
+            "influence_radius": round(spec.influence_radius, 4),
+        }
+        if spec.label is not None:
+            props["label"] = spec.label
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [spec.anchor[0], spec.anchor[1]],
+                },
+                "properties": props,
             }
         )
     return {"type": "FeatureCollection", "features": features}
