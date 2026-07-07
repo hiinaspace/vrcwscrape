@@ -51,13 +51,14 @@ from __future__ import annotations
 import hashlib
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 import polars as pl
 import shapely.geometry as sg
 from scipy.optimize import linear_sum_assignment
+from shapely import set_precision
 from shapely.ops import split as shapely_split
 from shapely.ops import unary_union, voronoi_diagram
 from shapely.strtree import STRtree
@@ -135,6 +136,25 @@ _JITTER_EPS: float = 1e-6
 # Buffer tolerance (island units) used to test "lies on the district exterior
 # ring" -- absorbs float noise from repeated split() calls, not a design knob.
 _FRONTAGE_TOUCH_TOL: float = 1e-6
+
+# Precision grid (island units) snapped onto every child polygon immediately
+# after a shapely_split() call (docs/macro-roads-nuclei-plan.md's pre-existing
+# `_assert_partition` blind spot, root-caused during the wave-2 "subdivision
+# robustness" slice). On some acute/near-degenerate districts (confirmed on
+# the raw triangle `Polygon([(0,0),(20,3),(20,-3)])` across several seeds),
+# repeated shapely_split calls leave adjacent leaves' shared edges misaligned
+# by a few ULPs -- geometrically meaningless, but enough that GEOS's cascaded
+# `unary_union` (used by both `_assert_partition` and this constant's other
+# call site) computes a WRONG total area, off by a large, non-precision-scale
+# margin, even though every leaf is individually `is_valid` and NO pairwise
+# `.intersection().area` is ever nonzero (verified directly -- this is a
+# `unary_union` robustness defect, not a real overlap in the split output).
+# Snapping every split's children to this grid (`shapely.set_precision`,
+# `mode="valid_output"`) keeps every leaf on a single shared grid throughout
+# the recursion, which eliminates the discrepancy (verified across seeds
+# 0-100 on the fixture above) while being far too small (1e-9 island units ~=
+# 2.5e-8 m at DEFAULT_METERS_PER_UNIT) to visibly perturb any real lot.
+_SPLIT_PRECISION_GRID: float = 1e-9
 
 
 class _SubdivisionFailure(Exception):
@@ -682,6 +702,13 @@ def _best_split(
     cleanly split without producing a sub-floor child simply stays whole
     (docs/macro-roads-nuclei-plan.md F1) rather than emitting a sliver.
 
+    Every candidate's two raw ``shapely_split`` parts are snapped to
+    ``_SPLIT_PRECISION_GRID`` before any further check (docs/
+    macro-roads-nuclei-plan.md's pre-existing ``_assert_partition`` blind
+    spot -- see that constant's docstring) so leaves stay on a shared
+    precision grid throughout the whole recursion, not just at the final
+    :func:`_assert_partition` check.
+
     ``ext_buffer``, if given, is ``ext_ring``'s precomputed frontage-touch
     buffer (see :func:`_frontage_length`) -- threaded through by
     :func:`subdivide_district`/:func:`_fill_deficit` so it's computed once per
@@ -696,8 +723,13 @@ def _best_split(
             result = shapely_split(poly, line)
         except Exception:
             continue
-        parts = [g for g in result.geoms if g.geom_type == "Polygon" and not g.is_empty]
-        if len(parts) != 2:
+        raw_parts = [
+            g for g in result.geoms if g.geom_type == "Polygon" and not g.is_empty
+        ]
+        if len(raw_parts) != 2:
+            continue
+        parts = [set_precision(p, _SPLIT_PRECISION_GRID) for p in raw_parts]
+        if any(p.is_empty or p.geom_type != "Polygon" for p in parts):
             continue
         if parts[0].area <= min_area or parts[1].area <= min_area:
             continue
@@ -947,19 +979,33 @@ def _assert_partition(
     """Defensive runtime check of the partition invariant :func:`subdivide_district`
     documents as "achieved naturally" -- guards against an unexpected
     topology edge case slipping through, in which case :func:`build_lots`
-    falls back to Voronoi rather than exporting bad geometry."""
+    falls back to Voronoi rather than exporting bad geometry.
+
+    Both the ``unary_union``-area check AND the pairwise-STRtree check below
+    run against ``lot_polys`` snapped to ``_SPLIT_PRECISION_GRID`` first --
+    without that snap, GEOS's cascaded ``unary_union`` can compute a WRONG
+    (short) area for a set of otherwise-valid, genuinely non-overlapping
+    polygons whose adjacent edges are misaligned by only a few ULPs (see
+    ``_SPLIT_PRECISION_GRID``'s docstring), which would make this the
+    unreliable check :func:`subdivide_district`'s callers already suspected
+    it to be (docs/macro-roads-nuclei-plan.md's pre-existing blind spot).
+    :func:`_best_split` already snaps every split's children as they're
+    produced, so this is normally a no-op for subdivision-path input; it
+    still matters for any ``lot_polys`` that didn't come through that path
+    (e.g. a hand-constructed test fixture)."""
     if not lot_polys:
         raise _SubdivisionFailure("empty subdivision result")
     total = max(district.area, 1e-12)
-    union = unary_union(lot_polys)
+    snapped = [set_precision(p, _SPLIT_PRECISION_GRID) for p in lot_polys]
+    union = unary_union(snapped)
     if abs(union.area - district.area) > rel_tol * total:
         raise _SubdivisionFailure("subdivision union area does not match district area")
-    tree = STRtree(lot_polys)
-    for i, poly in enumerate(lot_polys):
+    tree = STRtree(snapped)
+    for i, poly in enumerate(snapped):
         for j in sorted(int(k) for k in tree.query(poly)):
             if j <= i:
                 continue
-            if poly.intersection(lot_polys[j]).area > rel_tol * total:
+            if poly.intersection(snapped[j]).area > rel_tol * total:
                 raise _SubdivisionFailure("subdivision lots overlap")
 
 
@@ -1472,6 +1518,43 @@ def _build_lots_voronoi(
 # ---------------------------------------------------------------------------
 
 
+def _relaxed_lot_configs(cfg: LotConfig) -> list[LotConfig]:
+    """Progressive shape-floor relaxation ladder for :func:`build_lots`'s
+    per-district subdivision retry (docs/macro-roads-nuclei-plan.md wave-2
+    "subdivision robustness": F1's hard shape-floor -- reject-outright, not
+    merely score-down -- made dense districts (where the target per-lot area
+    forces a width below ``cfg.min_lot_width``) trip an unfillable deficit and
+    fall back to the whole-district Voronoi mechanism far more often than the
+    pre-F1 code did).
+
+    ``cfg`` itself is always first (the caller's strict floor -- a district
+    that already reaches ``n_lots`` under it never sees any other entry, so a
+    normal district's behavior is byte-identical to before this fix). Each
+    following step halves ``min_lot_width`` and raises ``max_aspect_reject``
+    by 50% (three steps), and the final entry disables the floor entirely
+    (``min_lot_width=0``, ``max_aspect_reject=0``) -- :func:`build_lots` only
+    falls back to :func:`_build_lots_voronoi` once even THAT no-floor attempt
+    fails (which then means a genuine geometry pathology, e.g. empty/zero-area
+    district, rather than an over-tight shape floor). Returns ``[cfg]``
+    unchanged when ``cfg`` already has both halves of the floor disabled --
+    nothing left to relax. Every other ``LotConfig`` field (``stop_area_factor``,
+    ``aspect_clamp``, ``inset``, etc.) is copied from ``cfg`` untouched at every
+    step."""
+    if cfg.min_lot_width <= 0.0 and cfg.max_aspect_reject <= 0.0:
+        return [cfg]
+    ladder = [cfg]
+    width = cfg.min_lot_width
+    aspect = cfg.max_aspect_reject
+    for _ in range(3):
+        if width <= 0.0 and aspect <= 0.0:
+            break
+        width = width * 0.5 if width > 0.0 else 0.0
+        aspect = aspect * 1.5 if aspect > 0.0 else 0.0
+        ladder.append(replace(cfg, min_lot_width=width, max_aspect_reject=aspect))
+    ladder.append(replace(cfg, min_lot_width=0.0, max_aspect_reject=0.0))
+    return ladder
+
+
 def build_lots(
     district: sg.Polygon,
     district_id: int,
@@ -1508,7 +1591,15 @@ def build_lots(
     if given a dict, gets ``"n_fallback"`` incremented and a
     ``"fallback_districts"`` list entry appended (``{"district_id",
     "reason"}``) whenever THIS district falls back to
-    :func:`_build_lots_voronoi`.
+    :func:`_build_lots_voronoi` -- i.e. even the fully-relaxed (floor-disabled)
+    end of :func:`_relaxed_lot_configs`'s ladder failed. It also gets
+    ``"n_relaxed"`` incremented and a ``"relaxed_districts"`` list entry
+    appended (``{"district_id", "relax_step"}``, ``relax_step`` the index
+    (>= 1) into :func:`_relaxed_lot_configs`'s ladder that finally succeeded --
+    equivalently, how many relaxation steps beyond ``cfg``'s own strict floor
+    were needed) whenever this district
+    needed ANY relaxation to reach ``n`` lots -- a district that reaches ``n``
+    under ``cfg``'s own strict floor records neither.
 
     Typology/height are computed PER WORLD from the district-level
     ``(district.area, len(member_points))`` pair (:func:`classify_typology`)
@@ -1523,10 +1614,12 @@ def build_lots(
     - **1 point**: the lot IS the whole district (no subdivision needed).
     - **Subdivision failure** (invalid geometry, pathological concavity, or
       :func:`subdivide_district` cannot reach ``n`` lots even after its
-      largest-first re-split retries): falls back to
-      :func:`_build_lots_voronoi` for this ENTIRE district (never a partial
-      fallback -- mixing the two lot mechanisms within one district would
-      make the partition invariant meaningless).
+      largest-first re-split retries -- AND after :func:`_relaxed_lot_configs`'s
+      whole progressive-relaxation ladder, up to and including a no-floor
+      attempt, is exhausted): falls back to :func:`_build_lots_voronoi` for
+      this ENTIRE district (never a partial fallback -- mixing the two lot
+      mechanisms within one district would make the partition invariant
+      meaningless).
 
     Otherwise: ``subdivide_district`` produces ``M >= N`` lot polygons
     (``N = len(member_points)``); ``scipy.optimize.linear_sum_assignment``
@@ -1606,30 +1699,49 @@ def build_lots(
             )
         ]
 
-    # Subdivision path (falls back to the old Voronoi mechanism for this
-    # whole district on ANY failure -- invalid geometry, pathological
-    # concavity, or an unfillable deficit -- deliberately broad because the
-    # fallback exists precisely to absorb geometry pathologies we cannot
-    # enumerate in advance).
-    try:
-        lot_polys = subdivide_district(district, n, seed, cfg)
-        if len(lot_polys) < n:
-            # Belt-and-braces: subdivide_district's own contract is M >= N,
-            # but this is the IO/logic boundary where a future change to that
-            # function (or a pathological case it doesn't itself detect)
-            # could silently under-deliver. Treat it exactly like any other
-            # subdivision failure rather than letting a short lot_polys list
-            # reach the Hungarian assignment below (which would raise or
-            # silently mismatch instead of falling back cleanly).
-            raise _SubdivisionFailure(
-                f"subdivide_district returned {len(lot_polys)} lots < {n} requested"
-            )
-        _assert_partition(district, lot_polys)
-    except Exception as exc:
+    # Subdivision path: try cfg's strict shape-floor first, then -- ONLY if
+    # that can't reach n lots -- progressively relax it per _relaxed_lot_configs
+    # (docs/macro-roads-nuclei-plan.md wave-2 "subdivision robustness": F1's
+    # hard-reject shape-floor made dense districts trip an unfillable deficit
+    # and fall back to the whole-district Voronoi mechanism far more often
+    # than intended). Falls back to _build_lots_voronoi only once even the
+    # ladder's final no-floor attempt fails -- invalid geometry, pathological
+    # concavity, or a genuinely unfillable deficit -- deliberately broad
+    # because the fallback exists precisely to absorb geometry pathologies we
+    # cannot enumerate in advance. A district that already succeeds under
+    # cfg's strict floor (the common case) takes exactly one attempt, so its
+    # behavior is unchanged from before this fix.
+    lot_polys: list[sg.Polygon] | None = None
+    last_exc: Exception | None = None
+    relaxed_step = 0
+    for attempt_idx, attempt_cfg in enumerate(_relaxed_lot_configs(cfg)):
+        try:
+            candidate = subdivide_district(district, n, seed, attempt_cfg)
+            if len(candidate) < n:
+                # Belt-and-braces: subdivide_district's own contract is M >=
+                # N, but this is the IO/logic boundary where a future change
+                # to that function (or a pathological case it doesn't itself
+                # detect) could silently under-deliver. Treat it exactly like
+                # any other subdivision failure rather than letting a short
+                # candidate list reach the Hungarian assignment below (which
+                # would raise or silently mismatch instead of retrying/
+                # falling back cleanly).
+                raise _SubdivisionFailure(
+                    f"subdivide_district returned {len(candidate)} lots < {n} requested"
+                )
+            _assert_partition(district, candidate)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        lot_polys = candidate
+        relaxed_step = attempt_idx
+        break
+
+    if lot_polys is None:
         if fallback_stats is not None:
             fallback_stats["n_fallback"] = fallback_stats.get("n_fallback", 0) + 1
             fallback_stats.setdefault("fallback_districts", []).append(
-                {"district_id": district_id, "reason": str(exc)}
+                {"district_id": district_id, "reason": str(last_exc)}
             )
         return _build_lots_voronoi(
             district,
@@ -1638,6 +1750,11 @@ def build_lots(
             inset=cfg.inset,
             min_lot_area_frac=cfg.voronoi_min_lot_area_frac,
             massing=massing,
+        )
+    if fallback_stats is not None and relaxed_step > 0:
+        fallback_stats["n_relaxed"] = fallback_stats.get("n_relaxed", 0) + 1
+        fallback_stats.setdefault("relaxed_districts", []).append(
+            {"district_id": district_id, "relax_step": relaxed_step}
         )
 
     anchors: list[tuple[float, float]] = []

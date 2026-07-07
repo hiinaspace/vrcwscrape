@@ -1089,6 +1089,10 @@ def export_greybox(
             "n_sliver_reassignments": n_sliver,
             "n_greenspace": n_greenspace,
             "n_fallback": fallback_stats.get("n_fallback", 0),
+            # districts that reached N lots via the shape-floor relaxation ladder
+            # (subdivision-robustness slice) instead of a full Voronoi fallback --
+            # a soft-degradation count, distinct from the hard n_fallback above.
+            "n_relaxed": fallback_stats.get("n_relaxed", 0),
             "typology_counts": {
                 typ: sum(
                     1 for lot in all_lots if lot.kind == "lot" and lot.typology == typ
