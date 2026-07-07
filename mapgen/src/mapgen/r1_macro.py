@@ -1544,33 +1544,60 @@ def _cells_to_polygon(
     return poly
 
 
-def _open_ring_polygon(poly: sg.Polygon, width: float) -> sg.Polygon:
+def _open_ring_polygon(
+    poly: sg.Polygon,
+    width: float,
+    anchor: tuple[float, float] | None = None,
+) -> tuple[sg.Polygon, bool]:
     """Morphological OPENING (erode then dilate) to shed thin necks/lobes.
 
     ``buffer(-width).buffer(+width)`` severs any neck narrower than
     ``2 * width`` from the bulge it feeds -- the mechanism that turns a
     keyhole-shaped core (narrow neck + bulge) into just the main lobe. If the
-    erosion splits the polygon into several pieces, only the LARGEST (by
-    area) survives the dilation: a ring boundary must stay a single closed
-    loop for :func:`core_ring_boundaries` / :func:`clip_arterials_to_cores` /
-    :func:`snap_endpoints_to_rings` to treat it as one ring. ``width <= 0`` is
-    an identity pass (villages/minor cores; see
+    erosion splits the polygon into several pieces, the surviving piece is
+    the one CONTAINING ``anchor`` (the core's density-weighted anchor / peak,
+    see :func:`_regularize_ring_polygons`) -- a ring boundary must stay a
+    single closed loop for :func:`core_ring_boundaries` /
+    :func:`clip_arterials_to_cores` / :func:`snap_endpoints_to_rings` to
+    treat it as one ring, and it must be the loop the nucleus is actually
+    centered on, not merely the biggest one: an opening that severs a core
+    into lobes can leave the density peak in a SMALLER lobe, and keeping
+    largest-area there would silently discard the lobe the nucleus anchor
+    lives in, moving the nucleus. Falls back to largest-by-area (the old
+    behaviour) when ``anchor`` is ``None``, or when ``anchor`` falls inside
+    NONE of the split pieces (the opening ate the core's own peak) --
+    ``anchor_fallback`` in the returned tuple flags this second case so the
+    caller can count/log it as a warning; it never raises.
+
+    ``width <= 0`` is an identity pass (villages/minor cores; see
     :func:`_regularize_ring_polygons`). Falls back to ``poly`` unchanged if
     the opened result is empty or degenerates to a non-polygon (e.g. the
     whole shape erodes away for a core slimmer than ``2 * width``).
+
+    Returns ``(polygon, anchor_fallback)``.
     """
     if width <= 0.0:
-        return poly
+        return poly, False
     opened = poly.buffer(-width, quad_segs=2).buffer(width, quad_segs=2)
     if opened.is_empty:
-        return poly
+        return poly, False
+    anchor_fallback = False
     if opened.geom_type == "MultiPolygon":
         if not opened.geoms:
-            return poly
-        opened = max(opened.geoms, key=lambda p: p.area)
+            return poly, False
+        containing = (
+            [g for g in opened.geoms if g.contains(sg.Point(anchor))]
+            if anchor is not None
+            else []
+        )
+        if containing:
+            opened = containing[0]
+        else:
+            anchor_fallback = anchor is not None
+            opened = max(opened.geoms, key=lambda p: p.area)
     if opened.geom_type != "Polygon" or opened.is_empty:
-        return poly
-    return opened
+        return poly, False
+    return opened, anchor_fallback
 
 
 def _fourier_low_pass_refit(
@@ -1660,7 +1687,7 @@ def _regularize_ring_polygons(
     open_width_minor: float = DEFAULT_RING_OPEN_WIDTH_MINOR_UNITS,
     fourier_refit: bool = False,
     fourier_harmonics: int = DEFAULT_RING_FOURIER_HARMONICS,
-) -> list[sg.Polygon]:
+) -> tuple[list[sg.Polygon], int]:
     """Rank-scaled ring regularization: morphological opening (+ optional
     Fourier low-pass refit), applied to ``detect_core_regions``'s output
     BEFORE clip/snap/station derivation (slice R).
@@ -1668,13 +1695,17 @@ def _regularize_ring_polygons(
     Rank is not known at ``_cells_to_polygon`` time -- mass integration needs
     the exact core polygon as its domain, so ranking has to happen on cores
     that already exist -- so this runs a lightweight PRELIMINARY
-    :func:`build_nucleus_specs` pass purely to read off ``is_major``
-    (matched back to ``core_polys`` by polygon object identity, since
-    ``build_nucleus_specs`` reuses the input polygon objects unchanged),
-    then opens major cores at ``open_width_major`` and minor cores at
-    ``open_width_minor`` (``0`` = skip, today's cheap contour) -- de-blobbing
-    the biggest downtowns while leaving villages cheap, which also de-stamps
-    the identical "wheel" ring motif every core shared before.
+    :func:`build_nucleus_specs` pass purely to read off ``is_major`` AND the
+    density-weighted ``anchor`` (matched back to ``core_polys`` by polygon
+    object identity, since ``build_nucleus_specs`` reuses the input polygon
+    objects unchanged), then opens major cores at ``open_width_major`` and
+    minor cores at ``open_width_minor`` (``0`` = skip, today's cheap
+    contour) -- de-blobbing the biggest downtowns while leaving villages
+    cheap, which also de-stamps the identical "wheel" ring motif every core
+    shared before. Each core's preliminary anchor is threaded into
+    :func:`_open_ring_polygon` so a lobe-severing opening keeps the piece
+    the nucleus is actually centered on (see that function's docstring for
+    the bug this fixes).
 
     MUST run before :func:`clip_arterials_to_cores` /
     :func:`snap_endpoints_to_rings` / :func:`build_nucleus_specs`: the core
@@ -1686,26 +1717,36 @@ def _regularize_ring_polygons(
     Identity pass if ``core_polys`` is empty or every knob is a no-op
     (``open_width_major <= 0``, ``open_width_minor <= 0``, no Fourier
     refit).
+
+    Returns ``(polygons, n_anchor_fallback)`` -- ``n_anchor_fallback`` counts
+    how many cores hit :func:`_open_ring_polygon`'s anchor-eaten fallback
+    (opening split the core AND ate its own anchor), for the caller to
+    surface as an observability counter.
     """
     if not core_polys:
-        return core_polys
+        return core_polys, 0
     if open_width_major <= 0.0 and open_width_minor <= 0.0 and not fourier_refit:
-        return core_polys
+        return core_polys, 0
 
     prelim_nuclei = build_nucleus_specs(
         density, core_polys, nodes, points, x0, y0, cell, n_major=n_major_nuclei
     )
     major_ids = {id(n.polygon) for n in prelim_nuclei if n.is_major}
+    anchor_by_id = {id(n.polygon): n.anchor for n in prelim_nuclei}
 
     out: list[sg.Polygon] = []
+    n_anchor_fallback = 0
     for poly in core_polys:
         is_major = id(poly) in major_ids
         width = open_width_major if is_major else open_width_minor
-        opened = _open_ring_polygon(poly, width)
+        anchor = anchor_by_id.get(id(poly))
+        opened, anchor_fell_back = _open_ring_polygon(poly, width, anchor=anchor)
+        if anchor_fell_back:
+            n_anchor_fallback += 1
         if fourier_refit and is_major:
             opened = _fourier_low_pass_refit(opened, n_harmonics=fourier_harmonics)
         out.append(opened)
-    return out
+    return out, n_anchor_fallback
 
 
 def detect_core_regions(
@@ -3107,6 +3148,11 @@ class MacroBlockBundle:
         whenever a major nucleus's core is too small for any spoke to clear
         the plaza radius, or has no ring T-junction stations at all (see
         :func:`build_nucleus_avenues`).
+    n_ring_open_anchor_fallback : count of cores where slice R's morphological
+        opening (:func:`_regularize_ring_polygons`) split the core AND ate
+        its own density-weighted anchor, falling back to largest-area (see
+        :func:`_open_ring_polygon`) -- should be ``0`` on a well-behaved
+        dataset, an observability counter for a future one (slice R-harden).
     """
 
     core_polys: list[sg.Polygon]
@@ -3128,6 +3174,11 @@ class MacroBlockBundle:
     ring_arc_edges: list[MacroEdge] = field(default_factory=list)
     n_tier_changed: int = 0
     n_disconnected_nucleus_pairs: int = 0
+    # Slice R-harden: how many cores hit _open_ring_polygon's anchor-eaten
+    # fallback (opening split the core AND ate its own density-weighted
+    # anchor, so the largest-area piece was kept instead) -- see
+    # _regularize_ring_polygons.
+    n_ring_open_anchor_fallback: int = 0
 
 
 def build_macro_blocks_with_cores(
@@ -3222,7 +3273,7 @@ def build_macro_blocks_with_cores(
         close_width=core_close_width,
         smooth_iterations=core_smooth_iterations,
     )
-    core_polys = _regularize_ring_polygons(
+    core_polys, n_ring_open_anchor_fallback = _regularize_ring_polygons(
         core_polys,
         density,
         nodes,
@@ -3316,6 +3367,7 @@ def build_macro_blocks_with_cores(
         ring_arc_edges=ring_arc_edges,
         n_tier_changed=n_tier_changed,
         n_disconnected_nucleus_pairs=n_disconnected_pairs,
+        n_ring_open_anchor_fallback=n_ring_open_anchor_fallback,
     )
 
 
@@ -3433,6 +3485,9 @@ class MacroLayer:
     n_tier_changed / n_disconnected_nucleus_pairs : slice-B counters (how
         many arterial/spoke records changed tier under the functional
         relabel; how many nucleus pairs had no connecting path).
+    n_ring_open_anchor_fallback : slice R-harden counter (how many cores hit
+        :func:`_open_ring_polygon`'s anchor-eaten fallback); see
+        :attr:`MacroBlockBundle.n_ring_open_anchor_fallback`.
     """
 
     params: MacroParams
@@ -3454,6 +3509,7 @@ class MacroLayer:
     ring_arc_edges: list[MacroEdge] = field(default_factory=list)
     n_tier_changed: int = 0
     n_disconnected_nucleus_pairs: int = 0
+    n_ring_open_anchor_fallback: int = 0
 
 
 def build_macro_layer(
@@ -3612,6 +3668,7 @@ def build_macro_layer(
         ring_arc_edges=bundle.ring_arc_edges,
         n_tier_changed=bundle.n_tier_changed,
         n_disconnected_nucleus_pairs=bundle.n_disconnected_nucleus_pairs,
+        n_ring_open_anchor_fallback=bundle.n_ring_open_anchor_fallback,
     )
 
 

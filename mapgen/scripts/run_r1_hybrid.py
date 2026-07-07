@@ -1776,6 +1776,10 @@ def run_hybrid(
     n_hwy = sum(1 for e in edges if e.tier == 2)
     n_major = sum(1 for e in edges if e.tier == 1)
     n_local = sum(1 for e in edges if e.tier == 0)
+    # R-harden (#2): major-tier total length, so a future hub-spoke macro
+    # graph that promotes almost everything to highway (leaving major
+    # near-empty) is visible at a glance, not just via the record count.
+    major_tier_total_length = round(sum(e.length for e in edges if e.tier == 1), 3)
 
     # Invariant pass rate over the blocks where Chen actually ran (non-fallback).
     ran = [r for r in results if not r.failed]
@@ -1813,6 +1817,7 @@ def run_hybrid(
         "n_highway_arterials": n_hwy,
         "n_major_arterials": n_major,
         "n_local_arterials": n_local,
+        "major_tier_total_length": major_tier_total_length,
         # T-geo cleanup + slice-B functional-relabel observability counters.
         "tgeo_b_counters": {
             "n_corridors_merged": layer.n_corridors_merged,
@@ -1820,6 +1825,9 @@ def run_hybrid(
             "n_dangles_pruned": layer.n_dangles_pruned,
             "n_tier_changed": layer.n_tier_changed,
             "n_disconnected_nucleus_pairs": layer.n_disconnected_nucleus_pairs,
+            # R-harden (#3): cores where the ring opening split AND ate its
+            # own density-weighted anchor (see _open_ring_polygon).
+            "n_ring_open_anchor_fallback": layer.n_ring_open_anchor_fallback,
         },
         "per_block_district_counts": [r.district_count for r in results],
         "per_block_seed_used": [r.seed_used for r in results],

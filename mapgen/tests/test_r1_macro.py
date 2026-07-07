@@ -733,37 +733,105 @@ def _keyhole_polygon() -> tuple[sg.Polygon, sg.Polygon, sg.Polygon]:
 
 
 def test_open_ring_polygon_severs_keyhole_neck_keeps_main_lobe() -> None:
-    """A neck narrower than ``2w`` is severed; only the main lobe remains."""
+    """A neck narrower than ``2w`` is severed; only the main lobe remains.
+
+    No anchor supplied -- falls back to the old largest-area behaviour, and
+    that fallback is NOT counted as an anchor-eaten warning (no anchor was
+    ever given to eat).
+    """
     keyhole, main_lobe, satellite = _keyhole_polygon()
-    opened = _open_ring_polygon(keyhole, width=1.0)  # 2w=2.0 > 1.0 neck width
+    opened, anchor_fallback = _open_ring_polygon(
+        keyhole, width=1.0
+    )  # 2w=2.0 > 1.0 neck width
     assert opened.geom_type == "Polygon"
     assert opened.contains(sg.Point(5.0, 5.0))  # inside the main lobe
     assert not opened.contains(satellite.centroid)  # satellite dropped
     # The main lobe survives close to its original footprint (corner
     # rounding from the erode/dilate round-trip, not a big resize).
     assert opened.area == pytest.approx(main_lobe.area, rel=0.15)
+    assert anchor_fallback is False
 
 
 def test_open_ring_polygon_largest_component_selection() -> None:
-    """If the erosion splits the polygon, only the LARGEST piece survives."""
+    """No anchor -> the LARGEST piece survives (byte-identical to pre-R-harden)."""
     lobe_a = sg.box(0.0, 0.0, 10.0, 10.0)  # 100 unit^2 -- larger.
     lobe_b = sg.box(14.0, 2.0, 20.0, 8.0)  # 36 unit^2 -- smaller.
     neck = sg.box(10.0, 4.5, 14.0, 5.5)
     dumbbell = unary_union([lobe_a, neck, lobe_b])
     assert dumbbell.geom_type == "Polygon"
 
-    opened = _open_ring_polygon(dumbbell, width=1.0)
+    opened, anchor_fallback = _open_ring_polygon(dumbbell, width=1.0)
     assert opened.geom_type == "Polygon"
     assert opened.contains(lobe_a.centroid)
     assert not opened.contains(lobe_b.centroid)
     assert opened.area == pytest.approx(lobe_a.area, rel=0.15)
+    assert anchor_fallback is False
+
+
+def test_open_ring_polygon_anchor_in_smaller_lobe_is_kept() -> None:
+    """R-harden #3: the anchor-bearing lobe is kept even when it's SMALLER.
+
+    Same dumbbell as ``test_open_ring_polygon_largest_component_selection``,
+    but this time the nucleus anchor sits in the smaller lobe (``lobe_b``) --
+    the density peak the opening must not silently discard.
+    """
+    lobe_a = sg.box(0.0, 0.0, 10.0, 10.0)  # 100 unit^2 -- larger.
+    lobe_b = sg.box(14.0, 2.0, 20.0, 8.0)  # 36 unit^2 -- smaller.
+    neck = sg.box(10.0, 4.5, 14.0, 5.5)
+    dumbbell = unary_union([lobe_a, neck, lobe_b])
+
+    anchor = (float(lobe_b.centroid.x), float(lobe_b.centroid.y))
+    opened, anchor_fallback = _open_ring_polygon(dumbbell, width=1.0, anchor=anchor)
+    assert opened.geom_type == "Polygon"
+    assert opened.contains(sg.Point(anchor))
+    assert not opened.contains(lobe_a.centroid)  # the LARGER lobe is dropped
+    assert opened.area == pytest.approx(lobe_b.area, rel=0.2)
+    assert anchor_fallback is False
+
+
+def test_open_ring_polygon_anchor_eaten_falls_back_to_largest_area() -> None:
+    """If the opening eats the anchor entirely, fall back to largest-area.
+
+    The anchor sits in the neck, which is narrower than ``2w`` and is fully
+    eroded away -- it lands inside NEITHER surviving piece, so the function
+    falls back to the old largest-area behaviour and flags it.
+    """
+    lobe_a = sg.box(0.0, 0.0, 10.0, 10.0)  # 100 unit^2 -- larger.
+    lobe_b = sg.box(14.0, 2.0, 20.0, 8.0)  # 36 unit^2 -- smaller.
+    neck = sg.box(10.0, 4.5, 14.0, 5.5)
+    dumbbell = unary_union([lobe_a, neck, lobe_b])
+
+    anchor = (12.0, 5.0)  # inside the neck, eaten by the erosion.
+    opened, anchor_fallback = _open_ring_polygon(dumbbell, width=1.0, anchor=anchor)
+    assert opened.geom_type == "Polygon"
+    assert opened.contains(lobe_a.centroid)  # fell back to the larger piece
+    assert not opened.contains(lobe_b.centroid)
+    assert anchor_fallback is True
+
+
+def test_open_ring_polygon_unsplit_ignores_anchor() -> None:
+    """A polygon the opening does NOT split ignores ``anchor`` entirely --
+    byte-identical result whether or not an anchor is supplied (and however
+    nonsensical it is)."""
+    poly = sg.box(0.0, 0.0, 10.0, 6.0)
+    no_anchor, fallback_no = _open_ring_polygon(poly, width=1.0)
+    with_anchor, fallback_with = _open_ring_polygon(
+        poly, width=1.0, anchor=(500.0, 500.0)
+    )
+    assert fallback_no is False
+    assert fallback_with is False
+    assert list(no_anchor.exterior.coords) == list(with_anchor.exterior.coords)
 
 
 def test_open_ring_polygon_zero_width_is_identity() -> None:
     """``width <= 0`` (village/minor cores) is a no-op, same object back."""
     poly = sg.box(0.0, 0.0, 10.0, 6.0)
-    assert _open_ring_polygon(poly, width=0.0) is poly
-    assert _open_ring_polygon(poly, width=-1.0) is poly
+    opened, fallback = _open_ring_polygon(poly, width=0.0)
+    assert opened is poly
+    assert fallback is False
+    opened, fallback = _open_ring_polygon(poly, width=-1.0)
+    assert opened is poly
+    assert fallback is False
 
 
 def test_regularize_ring_polygons_rank_scaled_major_only() -> None:
@@ -776,7 +844,7 @@ def test_regularize_ring_polygons_rank_scaled_major_only() -> None:
     keyhole, _main_lobe, satellite = _keyhole_polygon()
     minor = sg.box(30.0, 30.0, 33.0, 33.0)  # 9 unit^2 -- far smaller mass.
 
-    out = _regularize_ring_polygons(
+    out, n_fallback = _regularize_ring_polygons(
         [keyhole, minor],
         density,
         nodes,
@@ -793,6 +861,48 @@ def test_regularize_ring_polygons_rank_scaled_major_only() -> None:
     assert not out[0].contains(satellite.centroid)
     # Minor: width=0 is an identity pass, exact same geometry back.
     assert out[1].equals_exact(minor, 1e-9)
+    # Uniform density -> the keyhole's anchor lands in the (much bigger)
+    # main lobe, which the opening keeps anyway -- no fallback needed.
+    assert n_fallback == 0
+
+
+def test_regularize_ring_polygons_anchor_threading_keeps_smaller_lobe() -> None:
+    """R-harden #3, end-to-end: a mass-concentrated smaller lobe is kept.
+
+    Density is zeroed everywhere except over ``lobe_b`` (the smaller half of
+    a dumbbell core), so the preliminary ``build_nucleus_specs`` pass anchors
+    the core there -- proving the anchor is actually THREADED from that pass
+    into ``_open_ring_polygon``, not just defaulted to largest-area.
+    """
+    lobe_a = sg.box(0.0, 0.0, 10.0, 10.0)  # 100 unit^2 -- larger, but massless.
+    lobe_b = sg.box(14.0, 2.0, 20.0, 8.0)  # 36 unit^2 -- smaller, all the mass.
+    neck = sg.box(10.0, 4.5, 14.0, 5.5)
+    dumbbell = unary_union([lobe_a, neck, lobe_b])
+    assert dumbbell.geom_type == "Polygon"
+
+    density = np.zeros((60, 60), dtype=float)
+    density[2:8, 14:20] = 1.0  # rows -> y in [2,8), cols -> x in [14,20): lobe_b.
+    nodes: list[MacroNode] = []
+    points = pl.DataFrame(
+        {"x": pl.Series([], dtype=pl.Float64), "y": pl.Series([], dtype=pl.Float64)}
+    )
+
+    out, n_fallback = _regularize_ring_polygons(
+        [dumbbell],
+        density,
+        nodes,
+        points,
+        x0=0.0,
+        y0=0.0,
+        cell=1.0,
+        n_major_nuclei=1,
+        open_width_major=1.0,
+        open_width_minor=0.0,
+    )
+    assert len(out) == 1
+    assert out[0].contains(lobe_b.centroid)
+    assert not out[0].contains(lobe_a.centroid)  # larger lobe correctly dropped
+    assert n_fallback == 0
 
 
 def test_regularize_ring_polygons_all_widths_zero_is_identity() -> None:
@@ -804,7 +914,7 @@ def test_regularize_ring_polygons_all_widths_zero_is_identity() -> None:
     )
     core = sg.box(0.0, 0.0, 5.0, 5.0)
     core_polys = [core]
-    out = _regularize_ring_polygons(
+    out, n_fallback = _regularize_ring_polygons(
         core_polys,
         density,
         nodes,
@@ -819,6 +929,7 @@ def test_regularize_ring_polygons_all_widths_zero_is_identity() -> None:
     )
     assert out is core_polys  # identity pass: the same input list object back.
     assert out[0] is core
+    assert n_fallback == 0
 
 
 def test_regularize_ring_polygons_is_deterministic() -> None:
@@ -831,7 +942,7 @@ def test_regularize_ring_polygons_is_deterministic() -> None:
     keyhole, _main_lobe, _satellite = _keyhole_polygon()
     minor = sg.box(30.0, 30.0, 33.0, 33.0)
 
-    def _run() -> list[sg.Polygon]:
+    def _run() -> tuple[list[sg.Polygon], int]:
         return _regularize_ring_polygons(
             [keyhole, minor],
             density,
@@ -845,8 +956,9 @@ def test_regularize_ring_polygons_is_deterministic() -> None:
             open_width_minor=0.0,
         )
 
-    out_a = _run()
-    out_b = _run()
+    out_a, n_fallback_a = _run()
+    out_b, n_fallback_b = _run()
+    assert n_fallback_a == n_fallback_b
     for pa, pb in zip(out_a, out_b, strict=True):
         assert list(pa.exterior.coords) == list(pb.exterior.coords)
 
