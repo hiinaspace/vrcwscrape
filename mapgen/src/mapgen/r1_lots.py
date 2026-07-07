@@ -99,12 +99,44 @@ DEFAULT_MAX_ASPECT_REJECT: float = 8.0
 # (median area-per-world ~274 m2): "suburb by default, densest areas -> row",
 # tuned against the real distribution + in-viewer massing review (2026-07-06).
 DEFAULT_A_DETACHED_M2: float = 150.0
-DEFAULT_LANDMARK_COUNT: int = 100
+DEFAULT_TOTAL_LANDMARK_BUDGET: int = 100
 DEFAULT_STORY_HEIGHT_M: float = 3.1
 DEFAULT_HEIGHT_JITTER_M: float = 0.4
 DEFAULT_DETACHED_STORIES: tuple[int, int] = (1, 2)
 DEFAULT_ROW_STORIES: tuple[int, int] = (2, 3)
 DEFAULT_LANDMARK_STORIES: tuple[int, int] = (4, 6)
+# S5 zone-graded massing (docs/macro-roads-nuclei-plan.md): a district's zone
+# is "core"/"inner"/"fringe", major-nucleus districts only (see
+# run_r1_hybrid.py's _zone_for_district) -- thresholded against
+# mapgen.r1_macro.assign_nearest_nucleus's ``nucleus_dist`` (Euclidean
+# distance from the district centroid to its nearest nucleus anchor,
+# normalized by that nucleus's influence_radius, clamped to [0, 1]; 0 = at
+# the anchor, 1 = at/beyond the influence radius). Chosen from the R-baseline
+# bake's per-major nucleus_dist histogram (artifacts/r1/greybox/districts.
+# geojson, all 756 districts, 2026-07-07): every one of the 6 majors has >= 8
+# districts at/within 0.3 and >= 11 more within (0.3, 0.6] (nucleus 5, the
+# smallest major, has only 15 districts total -- 3 core + 8 inner at these
+# thresholds); beyond 0.6 the tail is dominated by districts that are merely
+# NEAREST that nucleus rather than part of its downtown (e.g. nucleus 3/4
+# have >60% of their mass beyond dist 0.9).
+DEFAULT_CORE_ZONE_MAX_DIST: float = 0.3
+DEFAULT_INNER_ZONE_MAX_DIST: float = 0.6
+# Core/inner story bands (user taste call, docs/macro-roads-nuclei-plan.md
+# "User taste calls (2026-07-07)"): core row 3-5, core landmark 8-12 --
+# per-taste-call numbers, verbatim. Inner is an intermediate step between
+# core and the suburb-wide fringe bands (DEFAULT_ROW_STORIES/
+# DEFAULT_LANDMARK_STORIES) rather than a hard cliff at the core boundary.
+# Detached keeps the suburban band in BOTH graded zones -- a dense downtown
+# core rarely classifies "detached" at all (area-per-world there is small,
+# see DEFAULT_A_DETACHED_M2), so grading it up would mostly be inert; kept as
+# its own named fields (not hardcoded to DEFAULT_DETACHED_STORIES at the call
+# site) so a future tune can move it without touching code.
+DEFAULT_CORE_DETACHED_STORIES: tuple[int, int] = DEFAULT_DETACHED_STORIES
+DEFAULT_CORE_ROW_STORIES: tuple[int, int] = (3, 5)
+DEFAULT_CORE_LANDMARK_STORIES: tuple[int, int] = (8, 12)
+DEFAULT_INNER_DETACHED_STORIES: tuple[int, int] = DEFAULT_DETACHED_STORIES
+DEFAULT_INNER_ROW_STORIES: tuple[int, int] = (2, 4)
+DEFAULT_INNER_LANDMARK_STORIES: tuple[int, int] = (6, 9)
 # Representative front clearance from the frontage LOT LINE: Chen street
 # half-width (0.25 island-unit "street" ribbon * DEFAULT_METERS_PER_UNIT 25 /
 # 2 = 3.125m, see mapgen.r1_mesh.DEFAULT_STREET_WIDTHS/buffer_ribbon) +
@@ -225,15 +257,26 @@ class MassingConfig:
     to island units via a ``meters_per_unit`` argument threaded separately
     (this dataclass itself carries no unit-conversion state).
 
-    - ``a_detached_m2`` / ``landmark_count``: typology thresholds (see
+    - ``a_detached_m2`` / ``total_landmark_budget``: typology thresholds (see
       :func:`classify_typology`) -- area-per-world >= ``a_detached_m2`` is
-      ``"detached"``, else ``"row"``; the top ``landmark_count`` worlds by
-      visits (island-wide, :func:`top_landmark_ids`) are ``"landmark"``
-      regardless of area.
+      ``"detached"``, else ``"row"``; ``total_landmark_budget`` worlds total
+      are ``"landmark"`` regardless of area, split into per-MAJOR-nucleus
+      quotas proportional to nucleus mass rather than one island-wide top-N
+      (S5, :func:`mapgen.r1_macro.NucleusSpec`; the quota math itself lives
+      in ``scripts/run_r1_hybrid.py`` -- this field is just the total budget.
+      Renamed from the pre-S5 ``landmark_count``, same default value).
     - ``story_height_m`` / ``height_jitter_m`` / ``*_stories``: height model
       (:func:`_massing_height`) -- ``stories`` (drawn from the typology's
       inclusive ``(lo, hi)`` band, deterministic per ``world_id``) times
       ``story_height_m``, plus jitter uniform in ``+-height_jitter_m``.
+    - ``core_zone_max_dist`` / ``inner_zone_max_dist`` / ``core_*_stories`` /
+      ``inner_*_stories``: S5 zone-graded story bands for MAJOR-nucleus
+      districts (:func:`_stories_for_typology`'s ``zone`` argument) --
+      ``detached``/``row``/``landmark`` each get their own ``core_*``/
+      ``inner_*`` band, the plain (unprefixed) ``*_stories`` fields above
+      stay the ``"fringe"`` (suburb-wide, pre-S5) band. See the module-level
+      ``DEFAULT_CORE_ZONE_MAX_DIST`` comment for the threshold units and
+      how the defaults were chosen.
     - ``road_clear_m``: representative front clearance from the FRONTAGE LOT
       LINE (not the lot's own OBB) -- see the module-level constant's TODO:
       slice 2 replaces this flat value with a per-segment one.
@@ -249,12 +292,20 @@ class MassingConfig:
     """
 
     a_detached_m2: float = DEFAULT_A_DETACHED_M2
-    landmark_count: int = DEFAULT_LANDMARK_COUNT
+    total_landmark_budget: int = DEFAULT_TOTAL_LANDMARK_BUDGET
     story_height_m: float = DEFAULT_STORY_HEIGHT_M
     height_jitter_m: float = DEFAULT_HEIGHT_JITTER_M
     detached_stories: tuple[int, int] = DEFAULT_DETACHED_STORIES
     row_stories: tuple[int, int] = DEFAULT_ROW_STORIES
     landmark_stories: tuple[int, int] = DEFAULT_LANDMARK_STORIES
+    core_zone_max_dist: float = DEFAULT_CORE_ZONE_MAX_DIST
+    inner_zone_max_dist: float = DEFAULT_INNER_ZONE_MAX_DIST
+    core_detached_stories: tuple[int, int] = DEFAULT_CORE_DETACHED_STORIES
+    core_row_stories: tuple[int, int] = DEFAULT_CORE_ROW_STORIES
+    core_landmark_stories: tuple[int, int] = DEFAULT_CORE_LANDMARK_STORIES
+    inner_detached_stories: tuple[int, int] = DEFAULT_INNER_DETACHED_STORIES
+    inner_row_stories: tuple[int, int] = DEFAULT_INNER_ROW_STORIES
+    inner_landmark_stories: tuple[int, int] = DEFAULT_INNER_LANDMARK_STORIES
     road_clear_m: float = DEFAULT_ROAD_CLEAR_M
     detached_yard_front_m: float = DEFAULT_DETACHED_YARD_FRONT_M
     detached_side_m: float = DEFAULT_DETACHED_SIDE_M
@@ -409,12 +460,16 @@ def select_member_points(
 
 
 def top_landmark_ids(points: pl.DataFrame, landmark_count: int) -> frozenset[str]:
-    """The ``landmark_count`` ``world_id``s with the highest ``visits``,
-    ISLAND-WIDE (not per-district) -- ties broken by ascending ``world_id``
-    for determinism regardless of ``points``' row order. ``landmark_count <=
-    0`` or an empty ``points`` returns an empty set. Feeds
-    :func:`classify_typology` via :func:`build_lots`'s ``landmark_ids`` kwarg
-    (docs/wave2-plan.md "The massing model")."""
+    """The ``landmark_count`` ``world_id``s with the highest ``visits`` in
+    ``points`` -- ties broken by ascending ``world_id`` for determinism
+    regardless of ``points``' row order. ``landmark_count <= 0`` or an empty
+    ``points`` returns an empty set. Feeds :func:`classify_typology` via
+    :func:`build_lots`'s ``landmark_ids`` kwarg (docs/wave2-plan.md "The
+    massing model"). A generic top-N-by-visits helper: pre-S5 callers pass
+    the WHOLE island's ``points`` for one island-wide top ``landmark_count``;
+    S5's per-nucleus quota (``scripts/run_r1_hybrid.py``'s
+    ``landmark_ids_by_nucleus``) reuses it UNCHANGED, calling it once per
+    MAJOR nucleus with that nucleus's member-world subset and its own quota."""
     if landmark_count <= 0 or points.height == 0:
         return frozenset()
     ordered = points.select(["world_id", "visits"]).sort(
@@ -466,10 +521,33 @@ def _setbacks_for_typology(
     return cfg.detached_yard_front_m, cfg.detached_side_m, cfg.detached_depth_max_m
 
 
-def _stories_for_typology(typology: str, cfg: MassingConfig) -> tuple[int, int]:
-    """Inclusive ``(lo, hi)`` story band for ``typology`` -- unknown
-    typologies (should not occur -- :func:`classify_typology` only ever
-    returns the three known values) fall back to the detached band."""
+def _stories_for_typology(
+    typology: str, cfg: MassingConfig, *, zone: str = "fringe"
+) -> tuple[int, int]:
+    """Inclusive ``(lo, hi)`` story band for ``(typology, zone)`` (S5,
+    docs/macro-roads-nuclei-plan.md).
+
+    ``zone`` grades the band for MAJOR-nucleus districts: ``"core"``/
+    ``"inner"`` pick ``cfg``'s ``core_*``/``inner_*`` fields; any other value
+    -- including the default ``"fringe"`` -- reproduces the pre-S5
+    suburb-wide band (``cfg.row_stories``/``cfg.landmark_stories``/
+    ``cfg.detached_stories``) byte-identically, so every pre-S5 caller that
+    doesn't pass ``zone`` is unaffected. Unknown typologies (should not
+    occur -- :func:`classify_typology` only ever returns the three known
+    values) fall back to the resolved zone's detached band.
+    """
+    if zone == "core":
+        if typology == "row":
+            return cfg.core_row_stories
+        if typology == "landmark":
+            return cfg.core_landmark_stories
+        return cfg.core_detached_stories
+    if zone == "inner":
+        if typology == "row":
+            return cfg.inner_row_stories
+        if typology == "landmark":
+            return cfg.inner_landmark_stories
+        return cfg.inner_detached_stories
     if typology == "row":
         return cfg.row_stories
     if typology == "landmark":
@@ -477,20 +555,24 @@ def _stories_for_typology(typology: str, cfg: MassingConfig) -> tuple[int, int]:
     return cfg.detached_stories
 
 
-def _massing_height(world_id: str, typology: str, cfg: MassingConfig) -> float:
+def _massing_height(
+    world_id: str, typology: str, cfg: MassingConfig, *, zone: str = "fringe"
+) -> float:
     """``stories * cfg.story_height_m + jitter`` (meters). ``stories`` is
-    picked within the typology's inclusive ``(lo, hi)`` band and ``jitter``
-    is drawn uniformly from ``[-height_jitter_m, height_jitter_m]`` -- BOTH
-    keyed off a deterministic hash of ``world_id`` (``hashlib.sha256``,
-    stable across processes/``PYTHONHASHSEED`` -- unlike the builtin
-    ``hash()``, which is salted per-process by default) rather than any RNG
-    draw or dict/set iteration order, per the module's determinism contract
-    (same discipline as :func:`_jitter_duplicates`). Two independent hashes
-    (distinct salt strings) so story selection and jitter don't correlate.
-    Per-lot variation within a row run is intentionally KEPT (real terraces
-    vary story-to-story) -- only the visits-driven height formula is retired.
+    picked within the ``(typology, zone)`` inclusive ``(lo, hi)`` band (S5,
+    :func:`_stories_for_typology`; ``zone`` defaults to ``"fringe"``, the
+    pre-S5 suburb-wide band) and ``jitter`` is drawn uniformly from
+    ``[-height_jitter_m, height_jitter_m]`` -- BOTH keyed off a deterministic
+    hash of ``world_id`` (``hashlib.sha256``, stable across processes/
+    ``PYTHONHASHSEED`` -- unlike the builtin ``hash()``, which is salted
+    per-process by default) rather than any RNG draw or dict/set iteration
+    order, per the module's determinism contract (same discipline as
+    :func:`_jitter_duplicates`). Two independent hashes (distinct salt
+    strings) so story selection and jitter don't correlate. Per-lot variation
+    within a row run is intentionally KEPT (real terraces vary story-to-
+    story) -- only the visits-driven height formula is retired.
     """
-    lo, hi = _stories_for_typology(typology, cfg)
+    lo, hi = _stories_for_typology(typology, cfg, zone=zone)
     n_options = max(hi - lo + 1, 1)
     story_digest = hashlib.sha256(f"massing_stories:{world_id}".encode()).digest()
     stories = lo + (int.from_bytes(story_digest[:8], "big") % n_options)
@@ -1344,6 +1426,7 @@ def _build_lots_voronoi(
     inset: float = DEFAULT_INSET,
     min_lot_area_frac: float = DEFAULT_MIN_LOT_AREA_FRAC,
     massing: MassingConfig | None = None,
+    zone: str = "fringe",
 ) -> list[Lot]:
     """The pre-L1 naive per-district Voronoi tessellation, kept verbatim as
     :func:`build_lots`'s fallback for districts where street-fronting
@@ -1357,8 +1440,13 @@ def _build_lots_voronoi(
     and doesn't attempt area-per-world typology classification against
     Hungarian-displaced Chen-district geometry it never touches -- see
     ``docs/wave2-plan.md``'s massing model, which targets the NORMAL
-    subdivision path). Footprint is unchanged from pre-2a: the plain inset
-    (:func:`_footprint`), not the frontage-setback model.
+    subdivision path). ``zone`` (S5) still applies to that fixed "detached"
+    typology's story band -- passed through from :func:`build_lots`'s own
+    ``zone`` kwarg so a major-nucleus district that happens to fall back to
+    Voronoi doesn't silently lose its zone grading (in practice inert by
+    default: ``core``/``inner`` detached bands equal the suburb-wide one, see
+    ``DEFAULT_CORE_DETACHED_STORIES``). Footprint is unchanged from pre-2a:
+    the plain inset (:func:`_footprint`), not the frontage-setback model.
 
     ``member_points`` needs ``world_id, x, y, visits, assigned`` columns
     (``name`` optional, else every ``Lot.name`` is ``None``) -- see
@@ -1406,7 +1494,9 @@ def _build_lots_voronoi(
     else:
         names = [None] * n
 
-    heights = [_massing_height(wid, "detached", massing) for wid in world_ids]
+    heights = [
+        _massing_height(wid, "detached", massing, zone=zone) for wid in world_ids
+    ]
 
     if n == 1:
         lot_poly = district
@@ -1568,6 +1658,7 @@ def build_lots(
     meters_per_unit: float = DEFAULT_METERS_PER_UNIT,
     landmark_ids: frozenset[str] = frozenset(),
     fallback_stats: dict[str, Any] | None = None,
+    zone: str = "fringe",
 ) -> list[Lot]:
     """Tessellate ``district`` into street-fronting lots, assign its member
     worlds onto them (Hungarian, exact), and give each a massing-model
@@ -1585,7 +1676,16 @@ def build_lots(
     :func:`_oriented_footprint` for every world in ``member_points`` --
     ``massing`` defaults to ``MassingConfig()`` and ``landmark_ids`` defaults
     to an empty set (no world classifies ``"landmark"``) so existing callers
-    that don't yet pass them keep the suburb-default behavior. ``seed``
+    that don't yet pass them keep the suburb-default behavior. ``zone`` (S5,
+    docs/macro-roads-nuclei-plan.md) is this WHOLE district's massing zone --
+    ``"core"``/``"inner"``/``"fringe"``, a district-level property the caller
+    derives once from ``nucleus_dist`` (see ``scripts/run_r1_hybrid.py``'s
+    ``_zone_for_district``) and passes straight through to every world's
+    :func:`_massing_height` here; it does NOT affect typology (
+    :func:`classify_typology` is unchanged) or footprint, only the story
+    band. Defaults to ``"fringe"``, which reproduces the pre-S5 suburb-wide
+    story bands byte-identically, so existing callers that don't pass it are
+    unaffected. ``seed``
     defaults to ``district_id`` (deterministic given a fixed district walk
     order, decorrelated across districts sharing a shape). ``fallback_stats``,
     if given a dict, gets ``"n_fallback"`` incremented and a
@@ -1659,7 +1759,7 @@ def build_lots(
         for wid in world_ids
     ]
     heights = [
-        _massing_height(wid, typ, massing)
+        _massing_height(wid, typ, massing, zone=zone)
         for wid, typ in zip(world_ids, typologies, strict=True)
     ]
 
@@ -1750,6 +1850,7 @@ def build_lots(
             inset=cfg.inset,
             min_lot_area_frac=cfg.voronoi_min_lot_area_frac,
             massing=massing,
+            zone=zone,
         )
     if fallback_stats is not None and relaxed_step > 0:
         fallback_stats["n_relaxed"] = fallback_stats.get("n_relaxed", 0) + 1

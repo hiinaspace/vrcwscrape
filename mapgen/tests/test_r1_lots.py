@@ -26,6 +26,7 @@ from mapgen.r1_lots import (
     _massing_height,
     _obb_axes,
     _oriented_footprint,
+    _stories_for_typology,
     _touches_ext_ring,
     assign_worlds_to_districts,
     build_lots,
@@ -1040,6 +1041,124 @@ def test_build_lots_uses_massing_typology_and_landmark_ids() -> None:
     assert by_id["a"].typology == "landmark"
     assert by_id["b"].typology in ("detached", "row")
     assert by_id["a"].height == pytest.approx(_massing_height("a", "landmark", massing))
+
+
+# ---------------------------------------------------------------------------
+# S5: zone-graded massing (docs/macro-roads-nuclei-plan.md slice S5)
+# ---------------------------------------------------------------------------
+
+
+def test_stories_for_typology_fringe_matches_pre_s5_bands() -> None:
+    """Default zone ("fringe") reproduces the pre-S5 suburb-wide bands
+    byte-identically -- the S5 regression guard at the story-band level."""
+    cfg = MassingConfig()
+    for typology, expected in (
+        ("detached", cfg.detached_stories),
+        ("row", cfg.row_stories),
+        ("landmark", cfg.landmark_stories),
+    ):
+        assert _stories_for_typology(typology, cfg) == expected
+        assert _stories_for_typology(typology, cfg, zone="fringe") == expected
+        # An unrecognized zone string also falls back to fringe (defensive).
+        assert _stories_for_typology(typology, cfg, zone="nonsense") == expected
+
+
+def test_stories_for_typology_core_zone_bands() -> None:
+    cfg = MassingConfig()
+    assert _stories_for_typology("row", cfg, zone="core") == cfg.core_row_stories
+    assert cfg.core_row_stories == (3, 5)
+    assert (
+        _stories_for_typology("landmark", cfg, zone="core") == cfg.core_landmark_stories
+    )
+    assert cfg.core_landmark_stories == (8, 12)
+    assert (
+        _stories_for_typology("detached", cfg, zone="core") == cfg.core_detached_stories
+    )
+
+
+def test_stories_for_typology_inner_zone_bands() -> None:
+    cfg = MassingConfig()
+    assert _stories_for_typology("row", cfg, zone="inner") == cfg.inner_row_stories
+    assert (
+        _stories_for_typology("landmark", cfg, zone="inner")
+        == cfg.inner_landmark_stories
+    )
+    assert (
+        _stories_for_typology("detached", cfg, zone="inner")
+        == cfg.inner_detached_stories
+    )
+
+
+def test_massing_height_zone_affects_row_and_landmark_not_detached() -> None:
+    cfg = MassingConfig()
+    for typology in ("row", "landmark"):
+        fringe_lo, fringe_hi = _stories_for_typology(typology, cfg, zone="fringe")
+        core_lo, core_hi = _stories_for_typology(typology, cfg, zone="core")
+        # Core bands are strictly taller than fringe (the user taste call).
+        assert core_lo >= fringe_lo
+        assert core_hi > fringe_hi
+    for world_id in ("world_a", "world_b", "another_world"):
+        for typology in ("row", "landmark"):
+            h_core = _massing_height(world_id, typology, cfg, zone="core")
+            lo, hi = (
+                cfg.core_row_stories if typology == "row" else cfg.core_landmark_stories
+            )
+            lo_bound = lo * cfg.story_height_m - cfg.height_jitter_m
+            hi_bound = hi * cfg.story_height_m + cfg.height_jitter_m
+            assert lo_bound - 1e-9 <= h_core <= hi_bound + 1e-9
+        # Detached: core/inner default to the SAME band as fringe, so height
+        # is unaffected by zone (this bake's chosen default -- "keep
+        # suburban", see DEFAULT_CORE_DETACHED_STORIES).
+        h_fringe = _massing_height(world_id, "detached", cfg, zone="fringe")
+        h_core = _massing_height(world_id, "detached", cfg, zone="core")
+        assert h_core == pytest.approx(h_fringe)
+
+
+def test_build_lots_default_zone_is_fringe_byte_identical() -> None:
+    """Regression guard: build_lots with no zone kwarg reproduces the
+    pre-S5 output exactly (same call, zone="fringe" passed explicitly)."""
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member = _member_points(
+        ["a", "b", "c"], [2.0, 5.0, 8.0], [2.0, 5.0, 8.0], [1, 5, 20]
+    )
+    massing = MassingConfig()
+    default_lots = build_lots(district, 0, member, massing=massing)
+    explicit_fringe_lots = build_lots(
+        district, 0, member, massing=massing, zone="fringe"
+    )
+    assert [lot.height for lot in default_lots] == [
+        lot.height for lot in explicit_fringe_lots
+    ]
+    assert [lot.typology for lot in default_lots] == [
+        lot.typology for lot in explicit_fringe_lots
+    ]
+
+
+def test_build_lots_core_zone_raises_row_and_landmark_height() -> None:
+    district = sg.box(0.0, 0.0, 10.0, 10.0)
+    member = _member_points(["a", "b"], [3.0, 7.0], [3.0, 7.0], [1, 1])
+    massing = MassingConfig()
+    fringe_lots = build_lots(
+        district, 0, member, massing=massing, landmark_ids=frozenset({"a"})
+    )
+    core_lots = build_lots(
+        district,
+        0,
+        member,
+        massing=massing,
+        landmark_ids=frozenset({"a"}),
+        zone="core",
+    )
+    fringe_by_id = {lot.world_id: lot for lot in fringe_lots}
+    core_by_id = {lot.world_id: lot for lot in core_lots}
+    # "a" classifies "landmark" regardless of zone (landmark_ids override) --
+    # core's landmark band (8-12 stories) is strictly taller than fringe's
+    # (4-6 stories), so height must increase.
+    assert fringe_by_id["a"].typology == "landmark"
+    assert core_by_id["a"].typology == "landmark"
+    assert core_by_id["a"].height > fringe_by_id["a"].height
+    # Typology itself (classify_typology) never depends on zone.
+    assert fringe_by_id["b"].typology == core_by_id["b"].typology
 
 
 # ---------------------------------------------------------------------------

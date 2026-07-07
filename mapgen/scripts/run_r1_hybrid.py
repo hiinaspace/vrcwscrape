@@ -101,6 +101,7 @@ from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
     MacroLayer,
     MacroParams,
+    NucleusSpec,
     assign_nearest_nucleus,
     build_macro_layer,
     load_boundary,
@@ -858,24 +859,29 @@ def _district_typology_tier(
 
 
 def _greybox_districts_geojson(
-    district_records: list[tuple[int, int, sg.Polygon, int, int | None, float | None]],
+    district_records: list[
+        tuple[int, int, sg.Polygon, int, int | None, float | None, str]
+    ],
     massing: MassingConfig,
     meters_per_unit: float,
     plaza_ids: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     """``district_records``: ``(district_id, block_id, polygon, world_count,
-    nucleus_id, nucleus_dist)``.
+    nucleus_id, nucleus_dist, zone)``.
 
     ``typology`` is the district's AREA-ONLY tier (:func:`_district_typology_tier`)
     -- the classification map viewers/audit see at a glance; a district's
     individual lots can still classify ``"landmark"`` per world (see
     ``lots.parquet``'s own ``typology`` column). ``nucleus_id``/``nucleus_dist``
     (S2 interface, :func:`mapgen.r1_macro.assign_nearest_nucleus`) are ``null``
-    when no cores were detected (``nuclei`` empty). A ``plaza_ids`` member
-    (slice P, :func:`plaza_district_ids`) is FORCED ``kind="park"`` --
-    belt-and-suspenders on top of the world_count==0 path, which already
-    holds for plaza districts because :func:`assign_worlds_excluding` never
-    assigns worlds to them (:func:`export_greybox` asserts it).
+    when no cores were detected (``nuclei`` empty). ``zone`` (S5,
+    :func:`_zone_for_district`) is ``"core"``/``"inner"``/``"fringe"`` -- the
+    massing zone every occupied lot in this district was built with. A
+    ``plaza_ids`` member (slice P, :func:`plaza_district_ids`) is FORCED
+    ``kind="park"`` -- belt-and-suspenders on top of the world_count==0 path,
+    which already holds for plaza districts because
+    :func:`assign_worlds_excluding` never assigns worlds to them
+    (:func:`export_greybox` asserts it).
     """
     records: list[tuple[int, Any, dict[str, Any]]] = []
     for (
@@ -885,6 +891,7 @@ def _greybox_districts_geojson(
         world_count,
         nucleus_id,
         nucleus_dist,
+        zone,
     ) in district_records:
         is_park = world_count <= 0 or district_id in plaza_ids
         kind = "park" if is_park else "fabric"
@@ -902,6 +909,7 @@ def _greybox_districts_geojson(
                     ),
                     "nucleus_id": nucleus_id,
                     "nucleus_dist": nucleus_dist,
+                    "zone": zone,
                 },
             )
         )
@@ -984,6 +992,120 @@ def assign_worlds_excluding(
     return assignment, assigned_kind
 
 
+# ---------------------------------------------------------------------------
+# Slice S5: zone-graded massing + per-nucleus landmark quotas
+# (docs/macro-roads-nuclei-plan.md)
+# ---------------------------------------------------------------------------
+
+
+def _zone_for_district(
+    nucleus_id: int | None,
+    nucleus_dist: float | None,
+    nuclei: list[NucleusSpec],
+    massing: MassingConfig,
+) -> str:
+    """``"core"``/``"inner"``/``"fringe"`` massing zone for ONE district (S5).
+
+    Only districts whose NEAREST nucleus is MAJOR ever grade up: a district
+    nearest a minor/village nucleus, or with no nucleus at all (``nucleus_id``
+    ``None`` -- ``layer.nuclei`` empty, no cores detected), is always
+    ``"fringe"`` -- the validated pre-S5 suburban massing, unchanged. For a
+    major-nucleus district, ``nucleus_dist`` (already normalized to
+    ``[0, 1]`` by that nucleus's ``influence_radius``, see
+    :func:`mapgen.r1_macro.assign_nearest_nucleus`) is thresholded against
+    ``massing.core_zone_max_dist`` / ``massing.inner_zone_max_dist``. Zone is
+    a per-DISTRICT property (not sub-divided within a district -- a district
+    is one Chen-subdivided face, small relative to a nucleus's reach).
+    """
+    if nucleus_id is None or nucleus_dist is None:
+        return "fringe"
+    if not nuclei[nucleus_id].is_major:
+        return "fringe"
+    if nucleus_dist <= massing.core_zone_max_dist:
+        return "core"
+    if nucleus_dist <= massing.inner_zone_max_dist:
+        return "inner"
+    return "fringe"
+
+
+def landmark_quotas_by_nucleus(
+    nuclei: list[NucleusSpec],
+    total_landmark_budget: int,
+) -> dict[int, int]:
+    """Per-MAJOR-nucleus landmark quota (S5), mass-proportional:
+    ``quota_i = round(total_landmark_budget * mass_i / sum(mass over majors))``.
+
+    Keyed by ``nucleus_id`` (0-based index into ``nuclei`` -- the same id
+    :func:`mapgen.r1_macro.assign_nearest_nucleus` returns and
+    ``districts.geojson``/``lots.parquet`` carry). Minor/village nuclei
+    (``is_major=False``) get NO entry -- landmarks concentrate in the 6
+    downtowns by design (docs/macro-roads-nuclei-plan.md slice S5's "User
+    taste calls"); a weak island-edge major (e.g. rank-6 "core4" per the
+    wave gate notes) is left to starve naturally from its small mass share
+    rather than hand-boosted. Each quota is rounded independently (Python's
+    ``round``, banker's rounding on exact ties -- deterministic), so the sum
+    across nuclei can be off from ``total_landmark_budget`` by a few either
+    way ("sums to budget within rounding", not exactly). Empty when there
+    are no major nuclei or ``total_landmark_budget <= 0``.
+    """
+    majors = [(i, n) for i, n in enumerate(nuclei) if n.is_major]
+    if not majors or total_landmark_budget <= 0:
+        return {}
+    total_mass = sum(n.mass for _, n in majors)
+    if total_mass <= 0.0:
+        return {}
+    return {
+        i: int(round(total_landmark_budget * n.mass / total_mass)) for i, n in majors
+    }
+
+
+def landmark_ids_by_nucleus(
+    points: pl.DataFrame,
+    assignment: dict[int, list[int]],
+    nucleus_by_district: list[tuple[int | None, float | None]],
+    quotas: dict[int, int],
+) -> dict[int, frozenset[str]]:
+    """Per-MAJOR-nucleus top-``quota`` landmark ids (S5), keyed by
+    ``nucleus_id`` -- replaces the pre-S5 island-wide
+    :func:`mapgen.r1_lots.top_landmark_ids` call with per-downtown quotas
+    (:func:`landmark_quotas_by_nucleus`).
+
+    A world's nucleus is its DISTRICT's ``nucleus_id`` (``assignment``:
+    district index -> point row indices, from
+    :func:`mapgen.r1_lots.assign_worlds_to_districts`/
+    :func:`assign_worlds_excluding`; ``nucleus_by_district``: district index
+    -> ``(nucleus_id, nucleus_dist)``, index-aligned with ``assignment``'s
+    district keys, from :func:`mapgen.r1_macro.assign_nearest_nucleus`).
+    Within each quota'd nucleus, its member worlds are ranked by visits (ties
+    broken by ascending ``world_id`` -- :func:`top_landmark_ids` is reused
+    UNCHANGED, called once per nucleus with that nucleus's own points subset
+    and quota) and the top ``quota`` become landmarks; a world whose district
+    is nearest a MINOR/village nucleus, or has no nucleus at all, is never a
+    landmark under this function (only nuclei present in ``quotas`` --
+    i.e. major -- are grouped). A nucleus with a quota but zero member worlds
+    is simply absent from the result (nothing to rank).
+    """
+    if not quotas:
+        return {}
+    rows_by_nucleus: dict[int, list[int]] = {nid: [] for nid in quotas}
+    for district_id, row_indices in assignment.items():
+        if not row_indices:
+            continue
+        nucleus_id, _nucleus_dist = nucleus_by_district[district_id]
+        if nucleus_id in rows_by_nucleus:
+            rows_by_nucleus[nucleus_id].extend(row_indices)
+    result: dict[int, frozenset[str]] = {}
+    for nucleus_id in sorted(quotas):
+        rows = rows_by_nucleus.get(nucleus_id, [])
+        if not rows:
+            continue
+        sub = points[sorted(rows)]
+        ids = top_landmark_ids(sub, quotas[nucleus_id])
+        if ids:
+            result[nucleus_id] = ids
+    return result
+
+
 def export_greybox(
     out_dir: Path,
     in_dir: Path,
@@ -1014,11 +1136,19 @@ def export_greybox(
     with no lots, per ``docs/greybox-plan.md`` Stage G0.
 
     ``massing`` (default ``MassingConfig()``) + ``meters_per_unit`` drive the
-    wave-2 typology/height/footprint model (``docs/wave2-plan.md``);
-    ``landmark_ids`` (the top ``massing.landmark_count`` worlds by visits,
-    island-wide -- :func:`mapgen.r1_lots.top_landmark_ids`) is computed once
-    here from ``points`` and threaded into every district's ``build_lots``
-    call.
+    wave-2 typology/height/footprint model (``docs/wave2-plan.md``), now
+    zone-graded per district (S5, ``docs/macro-roads-nuclei-plan.md``):
+    ``landmark_ids`` is the UNION of per-MAJOR-nucleus top-quota worlds by
+    visits (:func:`landmark_ids_by_nucleus`, quotas from
+    :func:`landmark_quotas_by_nucleus`, mass-proportional over
+    ``massing.total_landmark_budget`` -- replaces the pre-S5 island-wide
+    :func:`mapgen.r1_lots.top_landmark_ids` call), computed once here from
+    ``points``/``assignment``/``nucleus_by_district`` and threaded into every
+    district's ``build_lots`` call; each district also gets its own
+    ``zone`` (:func:`_zone_for_district`, ``"core"``/``"inner"``/
+    ``"fringe"`` by ``nucleus_dist`` -- major-nucleus districts only grade
+    up), which zone-grades that district's story bands
+    (:func:`mapgen.r1_lots._stories_for_typology`).
 
     Writes ``island.geojson``, ``arterials.geojson`` (clipped arterials +
     core rings), ``blocks.geojson``, ``nuclei.geojson`` (ranked settlement
@@ -1027,7 +1157,8 @@ def export_greybox(
     ``districts.geojson`` (now with a ``typology`` property per district --
     the AREA-ONLY tier, see :func:`_district_typology_tier` -- plus
     ``nucleus_id``/``nucleus_dist``, the nearest-nucleus assignment from
-    :func:`mapgen.r1_macro.assign_nearest_nucleus`), ``streets.geojson``
+    :func:`mapgen.r1_macro.assign_nearest_nucleus`, and ``zone`` (S5)),
+    ``streets.geojson``
     (perimeter-duplicate paths excluded, reusing the connectivity wave's
     ``street_perimeter_flags``), ``lots.parquet`` (now with
     ``lot_x``/``lot_y``/``kind``/``displacement``/``typology`` -- see
@@ -1040,8 +1171,11 @@ def export_greybox(
     ``districts.geojson``), and ``greybox_manifest.json``
     (``displacement_stats``/``fallback_districts`` keys and
     ``counts.n_greenspace``/``counts.n_fallback``/``counts.n_nuclei``/
-    ``counts.n_major_nuclei``, one shared ``fallback_stats`` dict threaded
-    across every district's ``build_lots`` call). Returns the manifest dict.
+    ``counts.n_major_nuclei``/``counts.zone_counts``/
+    ``counts.zone_typology_counts`` (S5) and ``lot_config.
+    landmark_quota_by_nucleus``/``lot_config.landmark_count_by_nucleus``
+    (S5), one shared ``fallback_stats`` dict threaded across every
+    district's ``build_lots`` call). Returns the manifest dict.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     if massing is None:
@@ -1071,13 +1205,31 @@ def export_greybox(
     # nucleus_by_district[district_id] below is a direct lookup.
     nucleus_by_district = assign_nearest_nucleus(district_polys, layer.nuclei)
 
-    landmark_ids = top_landmark_ids(points, massing.landmark_count)
+    # S5: per-MAJOR-nucleus landmark quotas (mass-proportional), replacing
+    # the pre-S5 island-wide top_landmark_ids call -- see
+    # landmark_quotas_by_nucleus/landmark_ids_by_nucleus docstrings.
+    landmark_quotas = landmark_quotas_by_nucleus(
+        layer.nuclei, massing.total_landmark_budget
+    )
+    landmark_ids_map = landmark_ids_by_nucleus(
+        points, assignment, nucleus_by_district, landmark_quotas
+    )
+    landmark_ids: frozenset[str] = frozenset(
+        wid for ids in landmark_ids_map.values() for wid in ids
+    )
 
     all_lots: list[Lot] = []
     district_records: list[
-        tuple[int, int, sg.Polygon, int, int | None, float | None]
+        tuple[int, int, sg.Polygon, int, int | None, float | None, str]
     ] = []
     n_park = 0
+    # S5 gate artifacts: districts per zone (all districts, fabric + park --
+    # a plaza IS "core" even though it holds no lots) and occupied-lot counts
+    # per (zone, typology), threaded straight from this loop instead of a
+    # second pass over all_lots (zone isn't stored on Lot itself -- it's a
+    # district-level property, see _zone_for_district).
+    zone_counts: dict[str, int] = {}
+    zone_typology_counts: dict[tuple[str, str], int] = {}
     # Shared across every district's build_lots call (docs/lots-wave-plan.md
     # slice L2) so the manifest reports ONE island-wide fallback tally rather
     # than only the last district's.
@@ -1094,26 +1246,33 @@ def export_greybox(
             "plaza districts must stay zero-world parks (slice P)"
         )
         nucleus_id, nucleus_dist = nucleus_by_district[district_id]
+        zone = _zone_for_district(nucleus_id, nucleus_dist, layer.nuclei, massing)
+        zone_counts[zone] = zone_counts.get(zone, 0) + 1
         district_records.append(
-            (district_id, block_id, poly, world_count, nucleus_id, nucleus_dist)
+            (district_id, block_id, poly, world_count, nucleus_id, nucleus_dist, zone)
         )
         if world_count == 0:
             n_park += 1
             continue
         member = select_member_points(points, row_indices, assigned_kind)
-        all_lots.extend(
-            build_lots(
-                poly,
-                district_id,
-                member,
-                inset=inset,
-                min_lot_area_frac=min_lot_area_frac,
-                massing=massing,
-                meters_per_unit=meters_per_unit,
-                landmark_ids=landmark_ids,
-                fallback_stats=fallback_stats,
-            )
+        district_lots = build_lots(
+            poly,
+            district_id,
+            member,
+            inset=inset,
+            min_lot_area_frac=min_lot_area_frac,
+            massing=massing,
+            meters_per_unit=meters_per_unit,
+            landmark_ids=landmark_ids,
+            fallback_stats=fallback_stats,
+            zone=zone,
         )
+        all_lots.extend(district_lots)
+        for lot in district_lots:
+            if lot.kind != "lot":
+                continue
+            key = (zone, lot.typology)
+            zone_typology_counts[key] = zone_typology_counts.get(key, 0) + 1
     n_sliver = count_sliver_reassignments(all_lots)
     n_greenspace = sum(1 for lot in all_lots if lot.kind == "greenspace")
 
@@ -1186,9 +1345,15 @@ def export_greybox(
     # (no cores detected).
     nucleus_by_district_id: dict[int, tuple[int | None, float | None]] = {
         district_id: (nucleus_id, nucleus_dist)
-        for district_id, _block_id, _poly, _world_count, nucleus_id, nucleus_dist in (
-            district_records
-        )
+        for (
+            district_id,
+            _block_id,
+            _poly,
+            _world_count,
+            nucleus_id,
+            nucleus_dist,
+            _zone,
+        ) in district_records
     }
 
     lots_df = pl.DataFrame(
@@ -1285,6 +1450,20 @@ def export_greybox(
                 )
                 for typ in ("detached", "row", "landmark")
             },
+            # S5 (docs/macro-roads-nuclei-plan.md): the massing-model gate
+            # artifact -- how many districts fell in each zone (ALL
+            # districts, fabric + park -- see _zone_for_district) and, for
+            # occupied lots only, story-band typology counts per zone.
+            "zone_counts": {
+                z: zone_counts.get(z, 0) for z in ("core", "inner", "fringe")
+            },
+            "zone_typology_counts": {
+                z: {
+                    typ: zone_typology_counts.get((z, typ), 0)
+                    for typ in ("detached", "row", "landmark")
+                }
+                for z in ("core", "inner", "fringe")
+            },
         },
         "lot_config": {
             "inset": inset,
@@ -1292,6 +1471,19 @@ def export_greybox(
             "meters_per_unit": meters_per_unit,
             "massing": asdict(massing),
             "n_landmark_ids": len(landmark_ids),
+            # S5: per-MAJOR-nucleus landmark quota (target, mass-proportional
+            # -- landmark_quotas_by_nucleus) vs actual count of landmark ids
+            # drawn from that nucleus's member worlds (<= quota always; only
+            # < quota if the nucleus has fewer worlds than its quota). Keyed
+            # by nucleus_id (0-based, same id nuclei.geojson's "nucleus_id"/
+            # districts.geojson's "nucleus_id" use); empty when there are no
+            # major nuclei.
+            "landmark_quota_by_nucleus": {
+                str(nid): quota for nid, quota in sorted(landmark_quotas.items())
+            },
+            "landmark_count_by_nucleus": {
+                str(nid): len(ids) for nid, ids in sorted(landmark_ids_map.items())
+            },
         },
         "displacement_stats": displacement_stats(all_lots),
         "fallback_districts": fallback_stats.get("fallback_districts", []),
@@ -1680,6 +1872,21 @@ def run_hybrid(
             f"({counts['n_sliver_reassignments']} sliver reassignments)",
             flush=True,
         )
+        zc = counts["zone_counts"]
+        print(
+            f"  S5 zones (districts): core={zc['core']} inner={zc['inner']} "
+            f"fringe={zc['fringe']}",
+            flush=True,
+        )
+        lot_config = greybox_manifest["lot_config"]
+        quota_by_nucleus = lot_config["landmark_quota_by_nucleus"]
+        count_by_nucleus = lot_config["landmark_count_by_nucleus"]
+        if quota_by_nucleus:
+            quota_str = ", ".join(
+                f"nucleus{nid}={count_by_nucleus.get(nid, 0)}/{quota}"
+                for nid, quota in quota_by_nucleus.items()
+            )
+            print(f"  S5 landmark quotas (actual/target): {quota_str}", flush=True)
 
     return manifest
 

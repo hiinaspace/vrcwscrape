@@ -24,17 +24,20 @@ if str(_SCRIPTS) not in sys.path:
 from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
     BlockResult,
     _select_seam_block,
+    _zone_for_district,
     assign_worlds_excluding,
     export_greybox,
     junctions_to_geojson,
+    landmark_ids_by_nucleus,
+    landmark_quotas_by_nucleus,
     plaza_district_ids,
     run_all_blocks,
 )
 
 from mapgen.r1_arm_a import IslandFields  # noqa: E402
 from mapgen.r1_connect import SeamJunction  # noqa: E402
-from mapgen.r1_lots import assign_worlds_to_districts  # noqa: E402
-from mapgen.r1_macro import MacroLayer, MacroParams  # noqa: E402
+from mapgen.r1_lots import MassingConfig, assign_worlds_to_districts  # noqa: E402
+from mapgen.r1_macro import MacroLayer, MacroParams, NucleusSpec  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # junctions_to_geojson
@@ -414,3 +417,225 @@ def test_export_greybox_plaza_district_flows_as_park_end_to_end(tmp_path) -> Non
     assert set(lots["district_id"].to_list()) == {0}
     occupied = lots.filter(pl.col("kind") == "lot")
     assert set(occupied["world_id"].to_list()) == {"wa", "wb", "wc", "w_plaza"}
+
+
+# ---------------------------------------------------------------------------
+# S5: zone-graded massing + per-nucleus landmark quotas
+# (docs/macro-roads-nuclei-plan.md slice S5)
+# ---------------------------------------------------------------------------
+
+
+def _nucleus(
+    *,
+    anchor: tuple[float, float] = (0.0, 0.0),
+    mass: float = 100.0,
+    is_major: bool = True,
+    influence_radius: float = 10.0,
+    rank: int = 1,
+) -> NucleusSpec:
+    return NucleusSpec(
+        anchor=anchor,
+        polygon=sg.Point(anchor).buffer(1.0),
+        mass=mass,
+        rank=rank,
+        label=None,
+        influence_radius=influence_radius,
+        is_major=is_major,
+    )
+
+
+def test_zone_for_district_none_nucleus_is_fringe() -> None:
+    massing = MassingConfig()
+    assert _zone_for_district(None, None, [], massing) == "fringe"
+
+
+def test_zone_for_district_minor_nucleus_is_always_fringe() -> None:
+    massing = MassingConfig()
+    minor = _nucleus(is_major=False)
+    # Even a tiny nucleus_dist (right at the anchor) stays fringe -- only
+    # MAJOR-nucleus districts ever grade up.
+    assert _zone_for_district(0, 0.0, [minor], massing) == "fringe"
+
+
+def test_zone_for_district_major_nucleus_thresholds() -> None:
+    massing = MassingConfig()
+    major = _nucleus(is_major=True)
+    assert _zone_for_district(0, 0.0, [major], massing) == "core"
+    assert _zone_for_district(0, massing.core_zone_max_dist, [major], massing) == "core"
+    just_past_core = massing.core_zone_max_dist + 1e-6
+    assert _zone_for_district(0, just_past_core, [major], massing) == "inner"
+    assert (
+        _zone_for_district(0, massing.inner_zone_max_dist, [major], massing) == "inner"
+    )
+    just_past_inner = massing.inner_zone_max_dist + 1e-6
+    assert _zone_for_district(0, just_past_inner, [major], massing) == "fringe"
+    assert _zone_for_district(0, 1.0, [major], massing) == "fringe"
+
+
+def test_landmark_quotas_by_nucleus_mass_proportional_and_sums_near_budget() -> None:
+    nuclei = [
+        _nucleus(mass=600.0, is_major=True, rank=1),
+        _nucleus(mass=300.0, is_major=True, rank=2),
+        _nucleus(mass=100.0, is_major=True, rank=3),
+        _nucleus(mass=1000.0, is_major=False, rank=4),  # minor -- excluded
+    ]
+    quotas = landmark_quotas_by_nucleus(nuclei, 100)
+    assert set(quotas) == {0, 1, 2}
+    assert quotas[0] == 60
+    assert quotas[1] == 30
+    assert quotas[2] == 10
+    assert sum(quotas.values()) == 100  # exact here (round numbers)
+    # "Within rounding" of the budget in general -- exact in this fixture.
+    assert abs(sum(quotas.values()) - 100) <= len(quotas)
+
+
+def test_landmark_quotas_by_nucleus_deterministic() -> None:
+    nuclei = [_nucleus(mass=7.0, rank=1), _nucleus(mass=13.0, rank=2)]
+    first = landmark_quotas_by_nucleus(nuclei, 50)
+    second = landmark_quotas_by_nucleus(nuclei, 50)
+    assert first == second
+
+
+def test_landmark_quotas_by_nucleus_no_majors_or_zero_budget_is_empty() -> None:
+    assert landmark_quotas_by_nucleus([_nucleus(is_major=False)], 100) == {}
+    assert landmark_quotas_by_nucleus([_nucleus(is_major=True)], 0) == {}
+    assert landmark_quotas_by_nucleus([], 100) == {}
+
+
+def test_landmark_ids_by_nucleus_grouping_and_minor_exclusion() -> None:
+    """A high-visits world in a MAJOR nucleus's district becomes a landmark;
+    the same-visits world in a MINOR nucleus's district does not."""
+    points = pl.DataFrame(
+        {
+            "world_id": ["major_hi", "major_lo", "minor_hi", "minor_lo"],
+            "visits": [1000, 1, 1000, 1],
+        }
+    )
+    # district 0 -> major nucleus 0 (rows 0, 1); district 1 -> minor nucleus 1
+    # (rows 2, 3).
+    assignment = {0: [0, 1], 1: [2, 3]}
+    nucleus_by_district: list[tuple[int | None, float | None]] = [
+        (0, 0.1),
+        (1, 0.1),
+    ]
+    # Only the major nucleus (0) has a quota -- landmark_quotas_by_nucleus
+    # never gives a minor one, so the minor's worlds are never grouped.
+    quotas = {0: 1}
+    result = landmark_ids_by_nucleus(points, assignment, nucleus_by_district, quotas)
+    assert set(result) == {0}
+    assert result[0] == frozenset({"major_hi"})
+
+
+def test_landmark_ids_by_nucleus_empty_quotas_is_empty() -> None:
+    points = pl.DataFrame({"world_id": ["a"], "visits": [1]})
+    assert landmark_ids_by_nucleus(points, {0: [0]}, [(0, 0.0)], {}) == {}
+
+
+def test_landmark_ids_by_nucleus_quota_never_exceeded() -> None:
+    points = pl.DataFrame(
+        {"world_id": [f"w{i}" for i in range(10)], "visits": list(range(10))}
+    )
+    assignment = {0: list(range(10))}
+    nucleus_by_district: list[tuple[int | None, float | None]] = [(0, 0.0)]
+    result = landmark_ids_by_nucleus(points, assignment, nucleus_by_district, {0: 3})
+    assert len(result[0]) == 3
+    # Top-3 by visits: w9, w8, w7.
+    assert result[0] == frozenset({"w9", "w8", "w7"})
+
+
+def _zone_export_fixture() -> tuple[
+    sg.Polygon, MacroLayer, list[BlockResult], pl.DataFrame
+]:
+    """One district near a MAJOR nucleus (-> "core"), one near a MINOR
+    nucleus (-> "fringe", since only major-nucleus districts grade up)."""
+    boundary = sg.box(0.0, 0.0, 30.0, 10.0)
+    near_major = sg.box(0.0, 0.0, 4.0, 4.0)  # centroid (2, 2)
+    near_minor = sg.box(20.0, 0.0, 24.0, 4.0)  # centroid (22, 2)
+    major = _nucleus(anchor=(2.0, 2.0), mass=100.0, is_major=True, rank=1)
+    minor = _nucleus(anchor=(22.0, 2.0), mass=50.0, is_major=False, rank=2)
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[],
+        arterial_lines=[],
+        edges=[],
+        blocks=[boundary],
+        nuclei=[major, minor],
+        plaza_polys=[],
+    )
+    result = BlockResult(
+        block_id=0,
+        districts=[near_major, near_minor],
+        streets=[],
+        failed=False,
+        seed_used=0,
+        district_count=2,
+        geometry_valid_pass=True,
+        paper_invariant_pass=True,
+        seconds=0.0,
+        gates=[],
+        street_perimeter_flags=[],
+        n_connectors=0,
+    )
+    points = pl.DataFrame(
+        {
+            "world_id": ["major_lo", "major_hi", "minor_lo", "minor_hi"],
+            "x": [1.0, 3.0, 21.0, 23.0],
+            "y": [1.0, 3.0, 1.0, 3.0],
+            "visits": [5, 500, 5, 500],
+        }
+    )
+    return boundary, layer, [result], points
+
+
+def test_export_greybox_zone_and_landmark_quota_end_to_end(tmp_path) -> None:
+    """S5 end-to-end: the major-nucleus district grades to "core" and wins
+    the landmark quota; the minor-nucleus district stays "fringe" and NEVER
+    gets a landmark, regardless of visits."""
+    import json
+
+    boundary, layer, results, points = _zone_export_fixture()
+    massing = MassingConfig(total_landmark_budget=1)
+    out_dir = tmp_path / "greybox"
+    manifest = export_greybox(
+        out_dir,
+        tmp_path,
+        boundary=boundary,
+        layer=layer,
+        results=results,
+        points=points,
+        massing=massing,
+    )
+
+    with (out_dir / "districts.geojson").open() as f:
+        districts_gj = json.load(f)
+    by_district_id = {
+        feat["properties"]["district_id"]: feat["properties"]
+        for feat in districts_gj["features"]
+    }
+    assert by_district_id[0]["zone"] == "core"
+    assert by_district_id[1]["zone"] == "fringe"
+
+    zone_counts = manifest["counts"]["zone_counts"]
+    assert zone_counts == {"core": 1, "inner": 0, "fringe": 1}
+
+    lot_config = manifest["lot_config"]
+    assert lot_config["landmark_quota_by_nucleus"] == {"0": 1}
+    assert lot_config["landmark_count_by_nucleus"] == {"0": 1}
+
+    lots = pl.read_parquet(out_dir / "lots.parquet")
+    by_world = {row["world_id"]: row for row in lots.to_dicts()}
+    # The major nucleus's high-visits world wins the (single) landmark slot
+    # and gets the core landmark story band.
+    assert by_world["major_hi"]["typology"] == "landmark"
+    core_lo, core_hi = massing.core_landmark_stories
+    lo_bound = core_lo * massing.story_height_m - massing.height_jitter_m
+    hi_bound = core_hi * massing.story_height_m + massing.height_jitter_m
+    assert lo_bound - 1e-6 <= by_world["major_hi"]["height"] <= hi_bound + 1e-6
+    # The minor nucleus's equally-high-visits world is NEVER a landmark --
+    # minor nuclei get no landmark tier by default (S5).
+    assert by_world["minor_hi"]["typology"] != "landmark"
