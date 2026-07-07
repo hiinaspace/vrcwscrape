@@ -150,6 +150,13 @@ is where prototype effort will concentrate. Worth a small spike before committin
   density = rugged uplands. Periphery roughness is what *motivates* switchback /
   wiggly local roads and irregular country lots. The same terrain feeds the road
   cost field, so surface and roads are co-generated.
+  > **RESCINDED 2026-07-07.** This inverse-density clause was never implemented
+  > and is formally dropped. The shipped + validated terrain uses **direct**
+  > density = height (dense cores = hills), which under the "sprawling city of
+  > nuclei" identity ([macro-roads-nuclei-plan.md](macro-roads-nuclei-plan.md))
+  > *reinforces* distinct downtowns (downtown-on-a-hill). The "periphery
+  > roughness" intent survives separately as the density-inverse roughness octave
+  > (`terrain-roads-research.md` §1), which is orthogonal to the base-height sign.
 - **Latitude:** world points may be **moved/relaxed** if it improves a style;
   generation may take **hours** (offline, re-run periodically as new worlds
   appear — not realtime/incremental). Technique is otherwise unconstrained.

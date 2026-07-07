@@ -52,7 +52,7 @@ One typology decision per district, from **area-per-world**
 
 | condition | typology | massing |
 |---|---|---|
-| `a ≥ A_detached` (~420 m², tune to ~P60–P70 of the real histogram) | `detached` | 1–2 stories, house + front/side/rear yards |
+| `a ≥ A_detached` (**150 m²**, tuned 2026-07-06 → ~72% detached / 28% row on the 698-district bake; median a/world ~274 m²) | `detached` | 1–2 stories, house + front/side/rear yards |
 | `a < A_detached` | `row` | 2–3 stories, shared-wall terrace (side_setback = 0) |
 | world in top-N by visits | `landmark` | distinct taller/civic, capped count |
 
