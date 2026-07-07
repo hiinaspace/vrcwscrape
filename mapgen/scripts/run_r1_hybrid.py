@@ -1555,6 +1555,14 @@ def run_hybrid(
         "n_highway_arterials": n_hwy,
         "n_major_arterials": n_major,
         "n_local_arterials": n_local,
+        # T-geo cleanup + slice-B functional-relabel observability counters.
+        "tgeo_b_counters": {
+            "n_corridors_merged": layer.n_corridors_merged,
+            "n_endpoints_snapped": layer.n_endpoints_snapped,
+            "n_dangles_pruned": layer.n_dangles_pruned,
+            "n_tier_changed": layer.n_tier_changed,
+            "n_disconnected_nucleus_pairs": layer.n_disconnected_nucleus_pairs,
+        },
         "per_block_district_counts": [r.district_count for r in results],
         "per_block_seed_used": [r.seed_used for r in results],
         "invariant_pass_rate": pass_rate,

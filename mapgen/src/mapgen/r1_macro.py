@@ -55,6 +55,13 @@ Pipeline
    plaza ring (an annular sector) rather than the anchor point (an acute
    pie-wedge) dodges Chen's acute-wedge subdivision pathology. See
    ``docs/macro-roads-nuclei-plan.md``, slice S3.
+7. **Functional road hierarchy** (slice B) — construction tiers are an
+   order-of-growth label and fragment under clipping ("confetti"); the final
+   macro linework is therefore noded into a junction graph and tier is
+   re-derived as PATH COVERAGE between the ranked nuclei anchors (highways =
+   major-pair paths, majors = all-pair paths, rest local), with
+   length-weighted edge betweenness stored per record for S7-slim's widths
+   (:func:`assign_functional_tiers`).
 
 The module is deterministic: it depends only on the staged rasters/points and a
 fixed RNG seed (``DEFAULT_SEED``); no stochastic steps are used, but the seed is
@@ -65,10 +72,11 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+import networkx as nx
 import numpy as np
 import polars as pl
 import shapely
@@ -720,14 +728,27 @@ def build_density_cost_field(
 
 @dataclass(frozen=True)
 class MacroEdge:
-    """A kept arterial edge between two macro nodes."""
+    """A kept arterial edge between two macro nodes.
+
+    ``tier`` starts life as the CONSTRUCTION level (2 = highway, 1 = major,
+    0 = local -- the per-level Delaunay pass an edge was built in, see
+    :func:`compute_macro_arterials`). The slice-B functional relabel
+    (:func:`assign_functional_tiers`, run on the FINAL macro geometry) then
+    overwrites ``tier`` with the path-coverage FUNCTIONAL tier, preserves the
+    original construction level in ``build_tier`` (``-1`` = relabel not run /
+    no construction tier, e.g. ring arcs) and fills ``betweenness`` with the
+    edge's length-weighted betweenness centrality on the junction graph
+    (0.0 before the relabel) -- S7-slim's width input.
+    """
 
     node_a: int
     node_b: int
     tau: int  # min(sigma_a, sigma_b)
-    tier: int  # construction level: 2 = highway, 1 = major, 0 = local
+    tier: int  # construction level pre-relabel, functional tier post-relabel
     path_cost: float
     length: float
+    build_tier: int = -1  # construction tier preserved by the B relabel
+    betweenness: float = 0.0  # length-weighted edge betweenness (slice B)
 
 
 def tier_for_tau(tau: int) -> int:
@@ -2442,6 +2463,426 @@ def _polygonize_macro_blocks_protecting_nuclei(
     return out
 
 
+# ---------------------------------------------------------------------------
+# 5.7. Functional road hierarchy (slice B: path-coverage tier promotion)
+# ---------------------------------------------------------------------------
+#
+# Construction tiers (compute_macro_arterials) record the ORDER the network
+# was grown in, not the role a segment plays in the final geometry: tiers are
+# routed independently and `clip_arterials_to_cores` preserves tier per
+# fragment, so at overview the highway tier reads as short red fragments
+# interleaved along mostly-lower-tier corridors ("confetti") instead of a
+# continuous skeleton between the major downtowns. This pass re-derives tier
+# as a FUNCTION of the final macro geometry (post clip + snap + prune +
+# spokes): the linework -- clipped arterials, spokes, core rings, plaza
+# rings -- is noded into a junction graph, least-cost (length-weighted)
+# paths are traced between the ranked nuclei anchors, and
+#
+#   highway (2) = union of edges on a MAJOR-nuclei pair path,
+#   major   (1) = union of edges on any other nuclei pair path,
+#   local   (0) = everything else.
+#
+# Corridors are continuous by construction (a path is connected), and rings/
+# spokes participate identically: a ring arc that carries a city-city path IS
+# a highway arc. Length-weighted edge betweenness centrality is computed
+# once on the same graph and stored per record -- S7-slim's width input; it
+# is NOT otherwise consumed in this slice.
+# See docs/macro-roads-nuclei-plan.md, "Road-hierarchy restructure", slice B.
+
+# Node-merge / on-line tolerance (island units) for the junction graph. Real
+# junctions are EXACT shared vertices by T-geo/S3 construction; this matches
+# `_ring_junction_stations`'s exact-on-ring tolerance so clip-cut arterial
+# endpoints (on a ring edge to floating precision, not necessarily a ring
+# vertex) still register as ring junctions.
+JUNCTION_NODE_TOL: float = 1e-6
+# Sentinel `MacroEdge.node_a`/`node_b` for a ring-arc record (like
+# SPOKE_NODE_SENTINEL: a ring arc ties to no real MacroNode).
+RING_ARC_NODE_SENTINEL: int = -2
+
+
+def _iter_intersection_points(geom: Any, out: set[tuple[float, float]]) -> None:
+    """Collect junction point coords from a pairwise line intersection.
+
+    Point/MultiPoint components are junctions directly; a 1-D component (a
+    collinear overlap, which post-dedup should not occur between distinct
+    macro lines but is handled defensively) contributes its two end points.
+    GeometryCollections recurse.
+    """
+    if geom.is_empty:
+        return
+    gtype = geom.geom_type
+    if gtype == "Point":
+        out.add((float(geom.x), float(geom.y)))
+    elif gtype in ("LineString", "LinearRing"):
+        coords = list(geom.coords)
+        out.add((float(coords[0][0]), float(coords[0][1])))
+        out.add((float(coords[-1][0]), float(coords[-1][1])))
+    elif hasattr(geom, "geoms"):
+        for g in geom.geoms:
+            _iter_intersection_points(g, out)
+
+
+def _merge_close_points(
+    points: list[tuple[float, float]], tol: float
+) -> dict[tuple[float, float], tuple[float, float]]:
+    """Map each point to a canonical representative, clustering within ``tol``.
+
+    Union-find over the (sorted) input points, joining pairs within ``tol``
+    (Euclidean); each cluster's canonical point is its lexicographically
+    smallest member, so the result is deterministic and independent of input
+    order. Real junctions share EXACT coordinates by construction, so
+    clusters are almost always singletons -- this guards the rare case of a
+    transversal-crossing intersection landing within tolerance of an exact
+    endpoint junction.
+    """
+    pts = sorted(set(points))
+    if not pts:
+        return {}
+    parent = list(range(len(pts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    geoms = [sg.Point(p) for p in pts]
+    tree = STRtree(geoms)
+    left, right = tree.query(geoms, predicate="dwithin", distance=tol)
+    for i, j in zip(left.tolist(), right.tolist(), strict=True):
+        if i >= j:
+            continue
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    canon: dict[tuple[float, float], tuple[float, float]] = {}
+    cluster_min: dict[int, tuple[float, float]] = {}
+    for i, p in enumerate(pts):
+        root = find(i)
+        if root not in cluster_min or p < cluster_min[root]:
+            cluster_min[root] = p
+    for i, p in enumerate(pts):
+        canon[p] = cluster_min[find(i)]
+    return canon
+
+
+@dataclass(frozen=True)
+class _GraphSeg:
+    """One junction-to-junction segment of one source line."""
+
+    src: int  # index into the combined (arterials+spokes, then rings) list
+    seg: int  # ordinal along the source line (station order)
+    u: int  # graph node id (sorted-canonical-point index)
+    v: int
+    geom: sg.LineString
+
+
+def build_macro_junction_graph(
+    all_lines: list[sg.LineString],
+    *,
+    tol: float = JUNCTION_NODE_TOL,
+) -> tuple[nx.MultiGraph, list[tuple[float, float]], list[_GraphSeg]]:
+    """Node the final macro linework into a junction MultiGraph (slice B).
+
+    Junction nodes are (a) every line endpoint (for a closed ring, its seam
+    vertex -- an arbitrary degree-2 node that harmlessly splits one arc) and
+    (b) every true pairwise intersection point, clustered within ``tol``
+    (:func:`_merge_close_points`). Each line is then split at every node
+    lying within ``tol`` of it; the pieces become graph edges weighted by
+    geometric length, keyed ``(src, seg)`` so parallel edges between the
+    same node pair (e.g. the two arcs of a ring between two stations) keep
+    independent identities. Cut-end coordinates are replaced by the exact
+    canonical node point, so pieces sharing a junction share an exact
+    vertex.
+
+    Returns ``(graph, node_points, segments)``: node ``i``'s coordinate is
+    ``node_points[i]`` (lexicographically sorted -- deterministic ids), and
+    ``segments`` lists every emitted piece in ``(src, station)`` order.
+    Deterministic: node ids, adjacency insertion order and segment order are
+    all functions of the input geometry alone.
+    """
+    G: nx.MultiGraph = nx.MultiGraph()
+    if not all_lines:
+        return G, [], []
+
+    # --- Junction candidate points: endpoints + pairwise intersections. ---
+    raw_pts: set[tuple[float, float]] = set()
+    for line in all_lines:
+        coords = line.coords
+        raw_pts.add((float(coords[0][0]), float(coords[0][1])))
+        raw_pts.add((float(coords[-1][0]), float(coords[-1][1])))
+    tree = STRtree(all_lines)
+    left, right = tree.query(all_lines, predicate="intersects")
+    for i, j in zip(left.tolist(), right.tolist(), strict=True):
+        if i >= j:
+            continue
+        _iter_intersection_points(all_lines[i].intersection(all_lines[j]), raw_pts)
+
+    canon = _merge_close_points(list(raw_pts), tol)
+    node_pts = sorted(set(canon.values()))
+    node_id = {p: i for i, p in enumerate(node_pts)}
+    node_geoms = [sg.Point(p) for p in node_pts]
+    node_tree = STRtree(node_geoms)
+
+    # --- Split every line at its on-line nodes; add pieces as edges. ---
+    segments: list[_GraphSeg] = []
+    for src, line in enumerate(all_lines):
+        total = float(line.length)
+        coords = list(line.coords)
+        closed = coords[0] == coords[-1]
+        near = sorted(node_tree.query(line, predicate="dwithin", distance=tol).tolist())
+        stations: list[tuple[float, int]] = []
+        for k in near:
+            s = float(line.project(node_geoms[k]))
+            if s <= tol:
+                s = 0.0
+            elif s >= total - tol and not closed:
+                s = total
+            stations.append((s, k))
+        stations.sort()
+        # Drop stations collapsing onto an earlier one (post-merge this only
+        # happens when two merged candidates project to the same spot).
+        deduped: list[tuple[float, int]] = []
+        for s, k in stations:
+            if deduped and (s - deduped[-1][0] <= 1e-9 or k == deduped[-1][1]):
+                continue
+            deduped.append((s, k))
+        if not deduped:
+            # Degenerate: no node within tol. Cannot happen for nonempty
+            # lines (their endpoints are nodes); guarded for robustness.
+            continue
+        if closed:
+            # The seam vertex projects to station 0 and is always a node, so
+            # arcs are consecutive station pairs plus a closing arc back to
+            # the seam node (no wraparound bookkeeping needed).
+            pairs = list(zip(deduped, deduped[1:], strict=False))
+            pairs.append(((deduped[-1][0], deduped[-1][1]), (total, deduped[0][1])))
+        else:
+            pairs = list(zip(deduped, deduped[1:], strict=False))
+        seg_ord = 0
+        for (s_a, k_a), (s_b, k_b) in pairs:
+            if s_b - s_a <= 1e-9:
+                continue
+            piece = substring(line, s_a, s_b)
+            pcoords = list(piece.coords)
+            if len(pcoords) < 2:
+                continue
+            pcoords[0] = node_pts[k_a]
+            pcoords[-1] = node_pts[k_b]
+            if len(pcoords) == 2 and pcoords[0] == pcoords[-1]:
+                continue
+            piece = sg.LineString(pcoords)
+            u, v = node_id[node_pts[k_a]], node_id[node_pts[k_b]]
+            G.add_edge(u, v, key=(src, seg_ord), length=float(piece.length))
+            segments.append(_GraphSeg(src=src, seg=seg_ord, u=u, v=v, geom=piece))
+            seg_ord += 1
+    return G, node_pts, segments
+
+
+def _nearest_node(
+    anchor: tuple[float, float], node_pts: list[tuple[float, float]]
+) -> int:
+    """Graph node nearest ``anchor`` (ties break on the lower node id)."""
+    ax, ay = anchor
+    return min(
+        range(len(node_pts)),
+        key=lambda i: (
+            (node_pts[i][0] - ax) ** 2 + (node_pts[i][1] - ay) ** 2,
+            i,
+        ),
+    )
+
+
+def _min_parallel_key(G: nx.MultiGraph, a: int, b: int) -> tuple[int, int]:
+    """The parallel edge between ``a``/``b`` a length-weighted Dijkstra uses.
+
+    networkx Dijkstra on a MultiGraph relaxes with the MINIMUM weight over
+    parallel edges, so the min-``length`` edge (key tie-break: smallest key)
+    is the one a returned path traverses -- deterministic.
+    """
+    return min(G[a][b].items(), key=lambda kv: (kv[1]["length"], kv[0]))[0]
+
+
+def _promote_pair_paths(
+    G: nx.MultiGraph,
+    anchor_nodes: list[int],
+    pair_indices: list[tuple[int, int]],
+) -> tuple[set[tuple[int, int]], int]:
+    """Union of edge keys on least-cost paths between anchor pairs.
+
+    Runs one ``single_source_dijkstra`` per unique source anchor node (cached)
+    and walks each pair's path, collecting the traversed edge keys via
+    :func:`_min_parallel_key`. Returns ``(keys, n_disconnected)`` where
+    ``n_disconnected`` counts the pairs with NO path (distinct anchors in
+    different graph components) -- reported, never raised.
+    """
+    keys: set[tuple[int, int]] = set()
+    n_disconnected = 0
+    paths_from: dict[int, dict[int, list[int]]] = {}
+    for i, j in pair_indices:
+        s, t = anchor_nodes[i], anchor_nodes[j]
+        if s == t:
+            continue  # two nuclei sharing one anchor node: trivially connected.
+        if s not in paths_from:
+            _dist, paths = nx.single_source_dijkstra(G, s, weight="length")
+            paths_from[s] = paths
+        path = paths_from[s].get(t)
+        if path is None:
+            n_disconnected += 1
+            continue
+        for a, b in zip(path, path[1:], strict=False):
+            keys.add(_min_parallel_key(G, a, b))
+    return keys, n_disconnected
+
+
+def assign_functional_tiers(
+    lines: list[sg.LineString],
+    edges: list[MacroEdge],
+    ring_lines: list[sg.LineString],
+    nuclei: list[NucleusSpec],
+    *,
+    tol: float = JUNCTION_NODE_TOL,
+) -> tuple[
+    list[sg.LineString],
+    list[MacroEdge],
+    list[sg.LineString],
+    list[MacroEdge],
+    int,
+    int,
+]:
+    """Re-derive road tier as path coverage on the final macro geometry (B).
+
+    Nodes ``lines`` (clipped arterials + spokes) together with ``ring_lines``
+    (core + plaza rings) into a junction graph
+    (:func:`build_macro_junction_graph`), maps every nucleus anchor to its
+    nearest graph node (:func:`_nearest_node` -- for a major with a plaza
+    that is a plaza-ring spoke junction; for a ringed core with no stations,
+    the nearest junction elsewhere, deterministically), then:
+
+    1. **Highway (tier 2):** union of edges on least-cost (length-weighted)
+       paths between all pairs of MAJOR nuclei (``NucleusSpec.is_major``).
+    2. **Major (tier 1):** union of edges on paths between all nuclei pairs,
+       minus the highway set.
+    3. **Local (tier 0):** every other edge.
+
+    Emission re-segments the inputs at graph junctions: each arterial/spoke
+    record is re-emitted as one record PER junction-to-junction piece
+    (fragments of one line stay adjacent, station-ordered -- the same
+    fresh-aligned-pair convention as ``clip_arterials_to_cores``), carrying
+    the functional ``tier``, the construction tier in ``build_tier``, its
+    graph edge's length-weighted betweenness centrality (exact,
+    ``normalized=True``) in ``betweenness``, and an updated ``length``.
+    Ring arcs are emitted as a NEW aligned pair (``ring_lines`` itself stays
+    whole rings for every existing consumer); their records use
+    ``RING_ARC_NODE_SENTINEL`` node ids and ``build_tier=-1``.
+
+    Determinism: node ids are sorted canonical coordinates, Dijkstra
+    tie-breaks follow the deterministic adjacency insertion order, and
+    parallel edges resolve via :func:`_min_parallel_key`.
+
+    Degenerate inputs -- fewer than two nuclei (no pair to trace: relabeling
+    would demote EVERYTHING to local) or no linework -- are an identity
+    pass: the inputs are returned unchanged (fresh lists, same objects), no
+    ring arcs, zero counters.
+
+    Returns ``(lines, edges, ring_arc_lines, ring_arc_edges, n_tier_changed,
+    n_disconnected_pairs)`` where ``n_tier_changed`` counts arterial/spoke
+    records whose functional tier differs from their construction tier and
+    ``n_disconnected_pairs`` counts nucleus pairs with no connecting path
+    (over the all-nuclei pass, which includes the major pairs).
+    """
+    if len(nuclei) < 2 or not (lines or ring_lines):
+        return list(lines), list(edges), [], [], 0, 0
+
+    n_art = len(lines)
+    all_lines = [*lines, *ring_lines]
+    G, node_pts, segments = build_macro_junction_graph(all_lines, tol=tol)
+    if not node_pts:
+        return list(lines), list(edges), [], [], 0, 0
+
+    anchor_nodes = [_nearest_node(n.anchor, node_pts) for n in nuclei]
+    major_idx = [i for i, n in enumerate(nuclei) if n.is_major]
+    major_pairs = [
+        (major_idx[a], major_idx[b])
+        for a in range(len(major_idx))
+        for b in range(a + 1, len(major_idx))
+    ]
+    all_pairs = [(a, b) for a in range(len(nuclei)) for b in range(a + 1, len(nuclei))]
+
+    highway_keys, _ = _promote_pair_paths(G, anchor_nodes, major_pairs)
+    all_keys, n_disconnected = _promote_pair_paths(G, anchor_nodes, all_pairs)
+    major_keys = all_keys - highway_keys
+
+    bt_raw = nx.edge_betweenness_centrality(G, weight="length", normalized=True)
+    bt_by_key: dict[tuple[int, int], float] = {
+        k: b for (_u, _v, k), b in bt_raw.items()
+    }
+
+    def _tier_of(key: tuple[int, int]) -> int:
+        if key in highway_keys:
+            return 2
+        if key in major_keys:
+            return 1
+        return 0
+
+    out_lines: list[sg.LineString] = []
+    out_edges: list[MacroEdge] = []
+    ring_arc_lines: list[sg.LineString] = []
+    ring_arc_edges: list[MacroEdge] = []
+    n_tier_changed = 0
+    pieces_per_src: dict[int, int] = {}
+    for s in segments:
+        pieces_per_src[s.src] = pieces_per_src.get(s.src, 0) + 1
+    for s in segments:  # already in (src, station) order
+        key = (s.src, s.seg)
+        tier = _tier_of(key)
+        bt = round(float(bt_by_key.get(key, 0.0)), 6)
+        if s.src < n_art:
+            rec = edges[s.src]
+            geom = s.geom
+            # A line emitted as a single unsplit piece keeps its original
+            # geometry object (bit-identical), like every prior re-emit pass.
+            if pieces_per_src[s.src] == 1 and list(geom.coords) == list(
+                lines[s.src].coords
+            ):
+                geom = lines[s.src]
+            out_lines.append(geom)
+            out_edges.append(
+                replace(
+                    rec,
+                    tier=tier,
+                    build_tier=rec.tier,
+                    betweenness=bt,
+                    length=round(float(geom.length), 3),
+                )
+            )
+            if tier != rec.tier:
+                n_tier_changed += 1
+        else:
+            ring_arc_lines.append(s.geom)
+            ring_arc_edges.append(
+                MacroEdge(
+                    node_a=RING_ARC_NODE_SENTINEL,
+                    node_b=RING_ARC_NODE_SENTINEL,
+                    tau=0,
+                    tier=tier,
+                    path_cost=round(float(s.geom.length), 4),
+                    length=round(float(s.geom.length), 3),
+                    build_tier=-1,
+                    betweenness=bt,
+                )
+            )
+    return (
+        out_lines,
+        out_edges,
+        ring_arc_lines,
+        ring_arc_edges,
+        n_tier_changed,
+        n_disconnected,
+    )
+
+
 @dataclass(frozen=True)
 class MacroBlockBundle:
     """Result of :func:`build_macro_blocks_with_cores`.
@@ -2455,7 +2896,10 @@ class MacroBlockBundle:
         connectivity metrics) treat identically.
     clipped_lines / clipped_edges : arterials with their core interiors
         removed, PLUS the S3 intra-nucleus spoke LineStrings/records
-        (unclipped -- they are supposed to enter the core).
+        (unclipped -- they are supposed to enter the core). After the
+        slice-B functional relabel (:func:`assign_functional_tiers`, ``>= 2``
+        nuclei) these are re-segmented at graph junctions and carry
+        functional ``tier`` / ``build_tier`` / ``betweenness``.
     blocks : polygonized macro-blocks over clipped arterials + spokes + rings
         (core + plaza) + boundary.
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
@@ -2483,6 +2927,14 @@ class MacroBlockBundle:
     # and prune_short_dangles).
     n_endpoints_snapped: int = 0
     n_dangles_pruned: int = 0
+    # Slice B: junction-to-junction ring arcs with functional tiers +
+    # betweenness (``ring_lines`` above stays whole rings for existing
+    # consumers; these aligned arc records are S7-slim's per-arc width
+    # input), plus the relabel counters (see assign_functional_tiers).
+    ring_arc_lines: list[sg.LineString] = field(default_factory=list)
+    ring_arc_edges: list[MacroEdge] = field(default_factory=list)
+    n_tier_changed: int = 0
+    n_disconnected_nucleus_pairs: int = 0
 
 
 def build_macro_blocks_with_cores(
@@ -2511,6 +2963,7 @@ def build_macro_blocks_with_cores(
     plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
     ring_snap_tol: float = RING_SNAP_TOL,
     dangle_prune_len: float = DANGLE_PRUNE_LEN,
+    functional_tiers: bool = True,
 ) -> MacroBlockBundle:
     """Fold dense cores into ringed downtown blocks (stage 3.5b wrapper).
 
@@ -2532,6 +2985,13 @@ def build_macro_blocks_with_cores(
     4. Fan intra-nucleus avenues (spokes + a plaza ring) for every MAJOR
        nucleus (:func:`add_intra_nucleus_avenues`, S3) -- UNCLIPPED, they are
        supposed to enter the core.
+    4b. Re-derive tier as PATH COVERAGE on the final geometry
+       (:func:`assign_functional_tiers`, slice B, when ``functional_tiers``
+       and at least two nuclei exist): arterials + spokes are re-segmented
+       at graph junctions and relabeled (construction tier preserved in
+       ``build_tier``, length-weighted betweenness stored), and ring arcs
+       are emitted as a new aligned pair. Geometry union is unchanged, so
+       the polygonization below is unaffected.
     5. Polygonize ``clipped_arterials ∪ spokes ∪ core_rings ∪ plaza_rings ∪
        island_exterior``, protecting the (deliberately fine-grained) wedge/
        plaza faces inside a major nucleus from the coarse macro-block
@@ -2595,6 +3055,23 @@ def build_macro_blocks_with_cores(
     plaza_ring_lines = [sg.LineString(list(p.exterior.coords)) for p in plaza_polys]
     final_ring_lines = [*ring_lines, *plaza_ring_lines]
 
+    # Slice B: functional road hierarchy on the FINAL geometry (post clip +
+    # snap + prune + spokes). Pure relabel/re-segmentation -- the geometry
+    # union feeding the polygonization below is unchanged.
+    ring_arc_lines: list[sg.LineString] = []
+    ring_arc_edges: list[MacroEdge] = []
+    n_tier_changed = 0
+    n_disconnected_pairs = 0
+    if functional_tiers:
+        (
+            final_lines,
+            final_edges,
+            ring_arc_lines,
+            ring_arc_edges,
+            n_tier_changed,
+            n_disconnected_pairs,
+        ) = assign_functional_tiers(final_lines, final_edges, final_ring_lines, nuclei)
+
     # Protect both the major cores AND the plaza discs themselves: a
     # mass-scaled plaza (slice P) can poke past its core ring when the
     # anchor sits off-center in an irregular core, and the resulting
@@ -2617,6 +3094,10 @@ def build_macro_blocks_with_cores(
         plaza_polys=plaza_polys,
         n_endpoints_snapped=n_endpoints_snapped,
         n_dangles_pruned=n_dangles_pruned,
+        ring_arc_lines=ring_arc_lines,
+        ring_arc_edges=ring_arc_edges,
+        n_tier_changed=n_tier_changed,
+        n_disconnected_nucleus_pairs=n_disconnected_pairs,
     )
 
 
@@ -2679,6 +3160,10 @@ class MacroParams:
     corridor_dedup_tol: float = CORRIDOR_DEDUP_TOL
     ring_snap_tol: float = RING_SNAP_TOL
     dangle_prune_len: float = DANGLE_PRUNE_LEN
+    # Functional road hierarchy (slice B): path-coverage tier relabel +
+    # stored betweenness on the final geometry; False keeps construction
+    # tiers (the pre-B behavior).
+    functional_tiers: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Plain-dict form for JSON manifests."""
@@ -2704,17 +3189,25 @@ class MacroLayer:
         got avenues, S3).
     arterial_lines / edges : the CLIPPED arterials (core interiors removed;
         identical to the raw ones when no cores are detected) PLUS the S3
-        intra-nucleus spoke lines/records, UNCLIPPED. These are what the
-        stage scripts draw and export.
+        intra-nucleus spoke lines/records, UNCLIPPED; after the slice-B
+        relabel (``params.functional_tiers``, >= 2 nuclei) re-segmented at
+        graph junctions with functional ``tier`` / ``build_tier`` /
+        ``betweenness``. These are what the stage scripts draw and export.
     blocks : polygonized macro-blocks (clipped arterials + spokes + rings +
         boundary).
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
     plaza_polys : one small inner plaza disc per major nucleus that got
         avenues (S3); see :attr:`MacroBlockBundle.plaza_polys`.
+    ring_arc_lines / ring_arc_edges : junction-to-junction ring arcs with
+        functional tiers + betweenness (slice B; ``ring_lines`` stays whole
+        rings) -- S7-slim's per-arc ring width input.
     n_corridors_merged / n_endpoints_snapped / n_dangles_pruned :
         informational T-geo cleanup counters (how many routed lines had a
         near-coincident run absorbed pre-clip; how many endpoints snapped
         onto a core ring; how many short degree-1 fragments were pruned).
+    n_tier_changed / n_disconnected_nucleus_pairs : slice-B counters (how
+        many arterial/spoke records changed tier under the functional
+        relabel; how many nucleus pairs had no connecting path).
     """
 
     params: MacroParams
@@ -2732,6 +3225,10 @@ class MacroLayer:
     n_corridors_merged: int = 0
     n_endpoints_snapped: int = 0
     n_dangles_pruned: int = 0
+    ring_arc_lines: list[sg.LineString] = field(default_factory=list)
+    ring_arc_edges: list[MacroEdge] = field(default_factory=list)
+    n_tier_changed: int = 0
+    n_disconnected_nucleus_pairs: int = 0
 
 
 def build_macro_layer(
@@ -2863,6 +3360,7 @@ def build_macro_layer(
         plaza_ring_vertices=params.plaza_ring_vertices,
         ring_snap_tol=params.ring_snap_tol,
         dangle_prune_len=params.dangle_prune_len,
+        functional_tiers=params.functional_tiers,
     )
 
     return MacroLayer(
@@ -2881,6 +3379,10 @@ def build_macro_layer(
         n_corridors_merged=n_corridors_merged,
         n_endpoints_snapped=bundle.n_endpoints_snapped,
         n_dangles_pruned=bundle.n_dangles_pruned,
+        ring_arc_lines=bundle.ring_arc_lines,
+        ring_arc_edges=bundle.ring_arc_edges,
+        n_tier_changed=bundle.n_tier_changed,
+        n_disconnected_nucleus_pairs=bundle.n_disconnected_nucleus_pairs,
     )
 
 
@@ -2932,6 +3434,8 @@ def arterials_to_geojson(
                     "tier_name": _TIER_NAME.get(rec.tier, f"tier{rec.tier}"),
                     "path_cost": rec.path_cost,
                     "length": rec.length,
+                    "build_tier": rec.build_tier,
+                    "betweenness": rec.betweenness,
                 },
             }
         )

@@ -16,6 +16,7 @@ from mapgen.r1_macro import (
     DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
     DEFAULT_SPOKE_MIN_ANGLE_DEG,
+    RING_ARC_NODE_SENTINEL,
     RING_SNAP_TOL,
     SPOKE_NODE_SENTINEL,
     TOWN_SIGMA,
@@ -33,6 +34,7 @@ from mapgen.r1_macro import (
     _polygonize_macro_blocks_protecting_nuclei,
     _ring_junction_stations,
     add_intra_nucleus_avenues,
+    assign_functional_tiers,
     assign_nearest_nucleus,
     build_density_cost_field,
     build_macro_blocks_with_cores,
@@ -1759,3 +1761,275 @@ def test_build_macro_layer_exposes_tgeo_counters_and_stays_aligned() -> None:
     assert layer.n_dangles_pruned >= 0
     assert len(layer.raw_arterial_lines) == len(layer.raw_edges)
     _assert_aligned(layer.arterial_lines, layer.edges)
+
+
+# ---------------------------------------------------------------------------
+# Slice B: functional road hierarchy (path-coverage tiers + betweenness)
+# ---------------------------------------------------------------------------
+
+
+def _bnucleus(
+    anchor: tuple[float, float], rank: int, *, is_major: bool = True
+) -> NucleusSpec:
+    """Minimal NucleusSpec anchored at ``anchor`` (polygon geometry unused)."""
+    return NucleusSpec(
+        anchor=anchor,
+        polygon=sg.Point(anchor).buffer(1.0, quad_segs=2),
+        mass=10.0,
+        rank=rank,
+        label=f"b{rank}",
+        influence_radius=2.0,
+        is_major=is_major,
+    )
+
+
+def test_functional_tiers_y_network_promotes_city_branch() -> None:
+    """Path coverage: the major-pair route is highway, other branches demote.
+
+    A Y at (10, 0): the west+east trunks carry the only major-major path
+    (-> tier 2, regardless of construction tier), the north branch carries
+    only paths to the non-major nucleus (-> tier 1, DEMOTED from its
+    construction highway label), and the south dangle carries no
+    nucleus-pair path at all (-> tier 0).
+    """
+    west = sg.LineString([(0.0, 0.0), (10.0, 0.0)])
+    east = sg.LineString([(10.0, 0.0), (20.0, 0.0)])
+    north = sg.LineString([(10.0, 0.0), (10.0, 10.0)])
+    south = sg.LineString([(10.0, 0.0), (10.0, -5.0)])
+    lines = [west, east, north, south]
+    edges = [_tedge(west, 1), _tedge(east, 1), _tedge(north, 2), _tedge(south, 1)]
+    nuclei = [
+        _bnucleus((0.0, 0.0), 1),
+        _bnucleus((20.0, 0.0), 2),
+        _bnucleus((10.0, 10.0), 3, is_major=False),
+    ]
+
+    out_lines, out_edges, arc_lines, arc_edges, n_changed, n_disc = (
+        assign_functional_tiers(lines, edges, [], nuclei)
+    )
+    assert n_disc == 0
+    _assert_aligned(out_lines, out_edges)
+    assert arc_lines == [] and arc_edges == []
+    # No mid-line junctions here: 4 records out, original objects reused.
+    assert len(out_lines) == 4
+    assert out_lines[0] is west and out_lines[3] is south
+    assert [e.tier for e in out_edges] == [2, 2, 1, 0]
+    # Construction tiers preserved under the rename.
+    assert [e.build_tier for e in out_edges] == [1, 1, 2, 1]
+    assert n_changed == 4  # every record's functional tier differs here.
+    # Betweenness stored and exact: every edge here is a leaf edge of a
+    # 5-node star-ish tree, carrying the 4 node pairs that involve its leaf
+    # out of the 10 total pairs -> normalized 0.4 each.
+    assert all(e.betweenness == pytest.approx(0.4) for e in out_edges)
+
+
+def test_functional_tiers_ring_arc_on_path_promotes() -> None:
+    """A ring arc carrying the major-major path IS a highway arc.
+
+    Square ring, stations at (-5, 0) (west artery) and (5, 2) (east artery):
+    the top route between them (18 u) beats the bottom (22 u), so exactly
+    one ring arc -- the top one -- promotes to tier 2; the bottom arcs
+    (split by the ring's seam vertex) stay local.
+    """
+    ring = sg.LineString(list(sg.box(-5.0, -5.0, 5.0, 5.0).exterior.coords))
+    west = sg.LineString([(-20.0, 0.0), (-5.0, 0.0)])
+    east = sg.LineString([(20.0, 2.0), (5.0, 2.0)])
+    lines = [west, east]
+    edges = [_tedge(west, 1), _tedge(east, 1)]
+    nuclei = [_bnucleus((-20.0, 0.0), 1), _bnucleus((20.0, 2.0), 2)]
+
+    out_lines, out_edges, arc_lines, arc_edges, _n_changed, n_disc = (
+        assign_functional_tiers(lines, edges, [ring], nuclei)
+    )
+    assert n_disc == 0
+    _assert_aligned(out_lines, out_edges)
+    _assert_aligned(arc_lines, arc_edges)
+    assert [e.tier for e in out_edges] == [2, 2]
+    # Ring arcs: 3 nodes on the ring (seam + 2 stations) -> 3 arcs.
+    assert len(arc_lines) == 3
+    assert all(e.node_a == RING_ARC_NODE_SENTINEL for e in arc_edges)
+    assert all(e.build_tier == -1 for e in arc_edges)
+    promoted = [
+        (ln, e) for ln, e in zip(arc_lines, arc_edges, strict=True) if e.tier == 2
+    ]
+    assert len(promoted) == 1
+    assert promoted[0][0].length == pytest.approx(18.0)
+    assert sum(e.length for e in arc_edges if e.tier == 0) == pytest.approx(22.0)
+    # The promoted arc shares EXACT endpoints with the artery stations.
+    arc_ends = {promoted[0][0].coords[0], promoted[0][0].coords[-1]}
+    assert arc_ends == {(-5.0, 0.0), (5.0, 2.0)}
+
+
+def test_functional_tiers_betweenness_bridge_is_max() -> None:
+    """The bridge between two triangle communities has maximal betweenness."""
+    left = [
+        sg.LineString([(0.0, 0.0), (10.0, 0.0)]),
+        sg.LineString([(0.0, 0.0), (5.0, 8.0)]),
+        sg.LineString([(5.0, 8.0), (10.0, 0.0)]),
+    ]
+    right = [
+        sg.LineString([(20.0, 0.0), (30.0, 0.0)]),
+        sg.LineString([(20.0, 0.0), (25.0, 8.0)]),
+        sg.LineString([(25.0, 8.0), (30.0, 0.0)]),
+    ]
+    bridge = sg.LineString([(10.0, 0.0), (20.0, 0.0)])
+    lines = [*left, bridge, *right]
+    edges = [_tedge(ln, 1) for ln in lines]
+    nuclei = [_bnucleus((0.0, 0.0), 1), _bnucleus((30.0, 0.0), 2)]
+
+    _out_lines, out_edges, _al, _ae, _nc, n_disc = assign_functional_tiers(
+        lines, edges, [], nuclei
+    )
+    assert n_disc == 0
+    bridge_rec = out_edges[3]
+    assert bridge_rec.length == pytest.approx(10.0)
+    assert bridge_rec.tier == 2  # on the only major-major path.
+    assert bridge_rec.betweenness > 0.0
+    assert bridge_rec.betweenness == max(e.betweenness for e in out_edges)
+
+
+def test_functional_tiers_parallel_edges_both_kept() -> None:
+    """Two distinct routes between the same junctions keep independent identity.
+
+    The shorter (straight) twin carries the major-major path and all
+    shortest paths (tier 2, positive betweenness); the longer detour is
+    still EMITTED (never silently dropped) but carries nothing (tier 0,
+    betweenness 0).
+    """
+    straight = sg.LineString([(0.0, 0.0), (10.0, 0.0)])
+    detour = sg.LineString([(0.0, 0.0), (5.0, 4.0), (10.0, 0.0)])
+    lines = [straight, detour]
+    edges = [_tedge(straight, 1), _tedge(detour, 1)]
+    nuclei = [_bnucleus((0.0, 0.0), 1), _bnucleus((10.0, 0.0), 2)]
+
+    out_lines, out_edges, _al, _ae, _nc, n_disc = assign_functional_tiers(
+        lines, edges, [], nuclei
+    )
+    assert n_disc == 0
+    assert len(out_lines) == 2  # both survive with independent records.
+    _assert_aligned(out_lines, out_edges)
+    assert out_edges[0].tier == 2
+    assert out_edges[0].betweenness > 0.0
+    assert out_edges[1].tier == 0
+    assert out_edges[1].betweenness == 0.0
+
+
+def test_functional_tiers_splits_at_mid_line_junction() -> None:
+    """A through-line is re-emitted as junction-to-junction records.
+
+    A branch endpoint touching the through-line's interior nodes it: the
+    through-line becomes two adjacent aligned records sharing the exact
+    junction vertex, and tier is assigned PER SEGMENT (both halves are on
+    the major-major path here, the branch only on non-major paths).
+    """
+    through = sg.LineString([(0.0, 0.0), (20.0, 0.0)])
+    branch = sg.LineString([(10.0, 0.0), (10.0, 8.0)])
+    lines = [through, branch]
+    edges = [_tedge(through, 2), _tedge(branch, 1)]
+    nuclei = [
+        _bnucleus((0.0, 0.0), 1),
+        _bnucleus((20.0, 0.0), 2),
+        _bnucleus((10.0, 8.0), 3, is_major=False),
+    ]
+
+    out_lines, out_edges, _al, _ae, n_changed, n_disc = assign_functional_tiers(
+        lines, edges, [], nuclei
+    )
+    assert n_disc == 0
+    _assert_aligned(out_lines, out_edges)
+    # Through-line splits into 2 pieces (adjacent, station-ordered), branch 1.
+    assert len(out_lines) == 3
+    assert [round(ln.length, 3) for ln in out_lines] == [10.0, 10.0, 8.0]
+    assert out_lines[0].coords[-1] == (10.0, 0.0)
+    assert out_lines[1].coords[0] == (10.0, 0.0)
+    assert branch.coords[0] == (10.0, 0.0)  # exact shared junction vertex.
+    # Functional tiers match construction tiers here: nothing "changed".
+    assert [e.tier for e in out_edges] == [2, 2, 1]
+    assert [e.build_tier for e in out_edges] == [2, 2, 1]
+    assert n_changed == 0
+
+
+def test_functional_tiers_disconnected_pair_counted_not_raised() -> None:
+    """Nucleus pairs in different components are counted, never raised."""
+    connected = sg.LineString([(0.0, 0.0), (10.0, 0.0)])
+    island = sg.LineString([(100.0, 100.0), (110.0, 100.0)])
+    lines = [connected, island]
+    edges = [_tedge(connected, 1), _tedge(island, 1)]
+    nuclei = [
+        _bnucleus((0.0, 0.0), 1),
+        _bnucleus((10.0, 0.0), 2),
+        _bnucleus((100.0, 100.0), 3, is_major=False),
+    ]
+
+    out_lines, out_edges, _al, _ae, _nc, n_disc = assign_functional_tiers(
+        lines, edges, [], nuclei
+    )
+    # Pairs (1,3) and (2,3) have no path; (1,2) does.
+    assert n_disc == 2
+    assert out_edges[0].tier == 2
+    assert out_edges[1].tier == 0
+    _assert_aligned(out_lines, out_edges)
+
+
+def test_functional_tiers_identity_below_two_nuclei() -> None:
+    """< 2 nuclei -> identity (no relabel that would demote everything)."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0)])
+    ring = sg.LineString(list(sg.box(20.0, 20.0, 30.0, 30.0).exterior.coords))
+    edges = [_tedge(line, 2)]
+    for nuclei in ([], [_bnucleus((0.0, 0.0), 1)]):
+        out_lines, out_edges, arc_lines, arc_edges, n_changed, n_disc = (
+            assign_functional_tiers([line], edges, [ring], nuclei)
+        )
+        assert out_lines == [line]  # same objects, fresh list.
+        assert out_edges == edges
+        assert arc_lines == [] and arc_edges == []
+        assert n_changed == 0 and n_disc == 0
+
+
+def test_functional_tiers_deterministic() -> None:
+    """Same inputs -> byte-identical outputs (fixed tie-breaks, no state)."""
+    ring = sg.LineString(list(sg.box(-5.0, -5.0, 5.0, 5.0).exterior.coords))
+    west = sg.LineString([(-20.0, 0.0), (-5.0, 0.0)])
+    east = sg.LineString([(20.0, 2.0), (5.0, 2.0)])
+    lines = [west, east]
+    edges = [_tedge(west, 1), _tedge(east, 1)]
+    nuclei = [_bnucleus((-20.0, 0.0), 1), _bnucleus((20.0, 2.0), 2)]
+
+    r1 = assign_functional_tiers(lines, edges, [ring], nuclei)
+    r2 = assign_functional_tiers(lines, edges, [ring], nuclei)
+    assert [list(g.coords) for g in r1[0]] == [list(g.coords) for g in r2[0]]
+    assert r1[1] == r2[1]
+    assert [list(g.coords) for g in r1[2]] == [list(g.coords) for g in r2[2]]
+    assert r1[3] == r2[3]
+    assert r1[4:] == r2[4:]
+
+
+def test_build_macro_layer_functional_tiers_wired_and_alignment_holds() -> None:
+    """Composed pipeline: the B relabel runs, stays aligned, and is optional.
+
+    The synthetic island detects >= 2 nuclei, so the default layer's edges
+    must carry functional tiers (``build_tier`` filled) and aligned ring
+    arcs; ``functional_tiers=False`` keeps the pre-B construction labels.
+    """
+    fields, boundary, points = _synthetic_island()
+    layer = build_macro_layer(fields, boundary, points, MacroParams())
+    assert len(layer.nuclei) >= 2  # precondition for the relabel to run.
+    _assert_aligned(layer.arterial_lines, layer.edges)
+    _assert_aligned(layer.ring_arc_lines, layer.ring_arc_edges)
+    assert all(e.build_tier >= 0 for e in layer.edges)
+    assert all(0.0 <= e.betweenness <= 1.0 for e in layer.edges)
+    assert layer.n_tier_changed >= 0
+    assert layer.n_disconnected_nucleus_pairs >= 0
+    # The relabel is a pure relabel/re-segmentation: same block partition as
+    # the disabled run, same total arterial length.
+    layer_off = build_macro_layer(
+        fields, boundary, points, MacroParams(functional_tiers=False)
+    )
+    assert all(e.build_tier == -1 for e in layer_off.edges)
+    assert layer_off.ring_arc_lines == [] and layer_off.ring_arc_edges == []
+    assert len(layer.blocks) == len(layer_off.blocks)
+    for got, want in zip(layer.blocks, layer_off.blocks, strict=True):
+        assert got.equals(want)
+    assert sum(ln.length for ln in layer.arterial_lines) == pytest.approx(
+        sum(ln.length for ln in layer_off.arterial_lines)
+    )
