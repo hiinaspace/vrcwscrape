@@ -1387,11 +1387,22 @@ DEFAULT_N_MAJOR_NUCLEI: int = 6
 
 # --- Intra-nucleus avenues (stage S3) ---
 #
-# Radius (island units) of the small inner plaza ring every MAJOR nucleus's
-# spokes terminate on, instead of the anchor point itself -- turns the
-# would-be acute pie-wedges into annular sectors (dodges Chen's acute-wedge
-# pathology; see docs/macro-roads-nuclei-plan.md, slice S3).
+# Base radius (island units) of the inner plaza ring a nucleus's spokes
+# terminate on, instead of the anchor point itself -- turns the would-be
+# acute pie-wedges into annular sectors (dodges Chen's acute-wedge pathology;
+# see docs/macro-roads-nuclei-plan.md, slice S3). This is roundabout-scale:
+# it remains :func:`build_nucleus_avenues`'s per-call default, but MAJOR
+# nuclei (the only ones that get plazas today) use the mass-scaled bounds
+# below instead (slice P) -- 0.85 u (~21 m) was unreadable as a downtown
+# plaza in 3D.
 DEFAULT_R_PLAZA_UNITS: float = 0.85
+# Mass-scaled MAJOR plaza radius bounds (island units; slice P): each major
+# nucleus's plaza radius is interpolated between these by sqrt-of-mass among
+# the majors (largest-mass major -> max, smallest -> min; see
+# :func:`major_plaza_radii`). 3.0--4.0 u is 75--100 m at the production
+# 25 m/unit -- a readable downtown plaza rather than a roundabout.
+DEFAULT_R_PLAZA_MAJOR_MIN_UNITS: float = 3.0
+DEFAULT_R_PLAZA_MAJOR_MAX_UNITS: float = 4.0
 # Minimum angular spacing (degrees, around the nucleus anchor) between two ring
 # T-junction stations before they're deduped to one spoke.
 DEFAULT_SPOKE_MIN_ANGLE_DEG: float = 20.0
@@ -1815,18 +1826,56 @@ def build_nucleus_avenues(
     return spoke_lines, spoke_edges, plaza_poly
 
 
+def major_plaza_radii(
+    nuclei: list[NucleusSpec],
+    *,
+    r_min: float = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
+    r_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
+) -> dict[int, float]:
+    """Mass-scaled plaza radius per MAJOR nucleus, keyed by ``NucleusSpec.rank``.
+
+    Interpolates between ``r_min`` and ``r_max`` on sqrt-of-mass among the
+    majors (slice P): the largest-mass major gets exactly ``r_max``, the
+    smallest exactly ``r_min``, the rest linear in sqrt(mass) between them.
+    sqrt is the natural interpolant here because ``mass`` is an area-
+    integrated (quadratic-in-length) size proxy, so sqrt(mass) is
+    length-scale-proportional -- a plaza radius is a length. Non-major
+    nuclei get NO entry (they get no plaza at all, see
+    :func:`add_intra_nucleus_avenues`). Degenerate cases -- a single major,
+    or all majors with equal mass -- make every major "the largest", so all
+    get ``r_max``. Keys are ranks (1-indexed, unique per nucleus), values a
+    deterministic function of the majors' masses alone.
+    """
+    majors = [n for n in nuclei if n.is_major]
+    if not majors:
+        return {}
+    roots = {n.rank: float(np.sqrt(max(n.mass, 0.0))) for n in majors}
+    lo = min(roots.values())
+    hi = max(roots.values())
+    if hi - lo <= 1e-12:
+        return {rank: r_max for rank in roots}
+    return {
+        rank: r_min + (root - lo) / (hi - lo) * (r_max - r_min)
+        for rank, root in roots.items()
+    }
+
+
 def add_intra_nucleus_avenues(
     nuclei: list[NucleusSpec],
     clipped_lines: list[sg.LineString],
     *,
-    r_plaza: float = DEFAULT_R_PLAZA_UNITS,
+    r_plaza_major_min: float = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
+    r_plaza_major_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     min_spoke_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
     n_plaza_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
 ) -> tuple[list[sg.LineString], list[MacroEdge], list[sg.Polygon]]:
     """Build intra-nucleus avenues for every MAJOR nucleus (S3).
 
     Town-center (non-major) nuclei are untouched -- they keep the pre-S3
-    ring-fenced, roadless core. Iterates ``nuclei`` in its given (rank-
+    ring-fenced, roadless core. Each major's plaza radius is mass-scaled
+    between ``r_plaza_major_min`` and ``r_plaza_major_max``
+    (:func:`major_plaza_radii`, slice P) rather than the single roundabout-
+    scale ``DEFAULT_R_PLAZA_UNITS``. Iterates ``nuclei`` in its given (rank-
     ascending, see :func:`build_nucleus_specs`) order, so the result is
     deterministic and independent of any upstream construction order.
     Returns the combined spoke LineStrings, their parallel ``MacroEdge``
@@ -1834,6 +1883,7 @@ def add_intra_nucleus_avenues(
     nucleus :func:`build_nucleus_avenues` returned ``None`` for contributes
     nothing to any of the three lists).
     """
+    radii = major_plaza_radii(nuclei, r_min=r_plaza_major_min, r_max=r_plaza_major_max)
     spoke_lines: list[sg.LineString] = []
     spoke_edges: list[MacroEdge] = []
     plaza_polys: list[sg.Polygon] = []
@@ -1843,7 +1893,7 @@ def add_intra_nucleus_avenues(
         result = build_nucleus_avenues(
             nucleus,
             clipped_lines,
-            r_plaza=r_plaza,
+            r_plaza=radii[nucleus.rank],
             min_spoke_angle_deg=min_spoke_angle_deg,
             n_plaza_vertices=n_plaza_vertices,
         )
@@ -1927,12 +1977,17 @@ class MacroBlockBundle:
     blocks : polygonized macro-blocks over clipped arterials + spokes + rings
         (core + plaza) + boundary.
     nuclei : ranked :class:`NucleusSpec` list, one per surviving core (S2).
-    plaza_polys : one small inner plaza disc per MAJOR nucleus that got
-        avenues (S3); its interior becomes its own zero-world "park" block
-        via the existing world-count-based typology, no extra plumbing
-        needed. Shorter than ``nuclei`` whenever a major nucleus's core is
-        too small for any spoke to clear the plaza radius, or has no ring
-        T-junction stations at all (see :func:`build_nucleus_avenues`).
+    plaza_polys : one inner plaza disc per MAJOR nucleus that got avenues
+        (S3), mass-scaled between ``DEFAULT_R_PLAZA_MAJOR_MIN/MAX_UNITS``
+        (slice P). The greybox export (``scripts/run_r1_hybrid.py``) must
+        EXCLUDE the districts covered by these discs from world assignment
+        and force them ``kind="park"`` -- the S3 assumption that the
+        zero-world typology alone would park them was wrong: worlds whose
+        raw coordinates fall inside a plaza otherwise direct-assign there
+        and turn the plaza into subdivided fabric. Shorter than ``nuclei``
+        whenever a major nucleus's core is too small for any spoke to clear
+        the plaza radius, or has no ring T-junction stations at all (see
+        :func:`build_nucleus_avenues`).
     """
 
     core_polys: list[sg.Polygon]
@@ -1964,7 +2019,8 @@ def build_macro_blocks_with_cores(
     core_smooth_iterations: int = DEFAULT_CORE_SMOOTH_ITERATIONS,
     min_block_area: float = DEFAULT_MIN_BLOCK_AREA,
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI,
-    r_plaza: float = DEFAULT_R_PLAZA_UNITS,
+    r_plaza_major_min: float = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
+    r_plaza_major_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
     spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG,
     plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES,
 ) -> MacroBlockBundle:
@@ -2019,7 +2075,8 @@ def build_macro_blocks_with_cores(
     spoke_lines, spoke_edges, plaza_polys = add_intra_nucleus_avenues(
         nuclei,
         clipped_lines,
-        r_plaza=r_plaza,
+        r_plaza_major_min=r_plaza_major_min,
+        r_plaza_major_max=r_plaza_major_max,
         min_spoke_angle_deg=spoke_min_angle_deg,
         n_plaza_vertices=plaza_ring_vertices,
     )
@@ -2028,7 +2085,14 @@ def build_macro_blocks_with_cores(
     plaza_ring_lines = [sg.LineString(list(p.exterior.coords)) for p in plaza_polys]
     final_ring_lines = [*ring_lines, *plaza_ring_lines]
 
-    protect_polys = [n.polygon for n in nuclei if n.is_major]
+    # Protect both the major cores AND the plaza discs themselves: a
+    # mass-scaled plaza (slice P) can poke past its core ring when the
+    # anchor sits off-center in an irregular core, and the resulting
+    # plaza-outside-core lens faces must stay their own (plaza-covered,
+    # later park-forced) faces rather than sliver-merging into a
+    # neighboring fabric block. For plazas fully inside their core (the
+    # common case) this is a no-op: those faces were already core-covered.
+    protect_polys = [n.polygon for n in nuclei if n.is_major] + plaza_polys
     block_lines = [*final_lines, *final_ring_lines]
     blocks = _polygonize_macro_blocks_protecting_nuclei(
         block_lines, boundary, min_block_area, protect_polys
@@ -2093,7 +2157,10 @@ class MacroParams:
     # Ranked settlement nuclei (S2): top-K by mass flagged is_major.
     n_major_nuclei: int = DEFAULT_N_MAJOR_NUCLEI
     # Intra-nucleus avenues (S3): spokes + a plaza ring, MAJOR nuclei only.
-    r_plaza: float = DEFAULT_R_PLAZA_UNITS
+    # Plaza radius is mass-scaled per major between these bounds (slice P,
+    # :func:`major_plaza_radii`).
+    r_plaza_major_min: float = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS
+    r_plaza_major_max: float = DEFAULT_R_PLAZA_MAJOR_MAX_UNITS
     spoke_min_angle_deg: float = DEFAULT_SPOKE_MIN_ANGLE_DEG
     plaza_ring_vertices: int = DEFAULT_PLAZA_RING_VERTICES
 
@@ -2255,7 +2322,8 @@ def build_macro_layer(
         core_min_area_units2=params.core_min_area_units2,
         min_block_area=params.min_block_area,
         n_major_nuclei=params.n_major_nuclei,
-        r_plaza=params.r_plaza,
+        r_plaza_major_min=params.r_plaza_major_min,
+        r_plaza_major_max=params.r_plaza_major_max,
         spoke_min_angle_deg=params.spoke_min_angle_deg,
         plaza_ring_vertices=params.plaza_ring_vertices,
     )

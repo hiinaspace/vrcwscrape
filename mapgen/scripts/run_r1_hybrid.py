@@ -60,7 +60,9 @@ import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import polars as pl  # noqa: E402
+import shapely  # noqa: E402
 import shapely.geometry as sg  # noqa: E402
+from shapely.ops import unary_union  # noqa: E402
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO / "src") not in sys.path:
@@ -315,6 +317,7 @@ def _draw_layers(
     point_size: float,
     point_alpha: float,
     junction_size: float,
+    plaza_polys: list[sg.Polygon] | None = None,
 ) -> None:
     """Draw the shared hybrid layer stack on ``ax`` (backdrop -> junctions)."""
     density = fields.density
@@ -326,7 +329,11 @@ def _draw_layers(
     )
     _render_boundary(ax, boundary)
 
-    # World points: tiny, low alpha, colored by l0 cluster.
+    # World points: tiny, low alpha, colored by l0 cluster. Callers pass
+    # PLAZA-MASKED coordinate arrays (see ``run_hybrid``): a world whose raw
+    # coordinates fall inside a plaza disc is re-assigned to the nearest
+    # non-plaza district by the greybox export (slice P), so drawing its raw
+    # position inside the park would misrepresent the fabric.
     pt_colors = [colors[int(i)] for i in lp_l0]
     ax.scatter(
         lp_xs,
@@ -337,6 +344,25 @@ def _draw_layers(
         linewidths=0.0,
         zorder=2,
     )
+
+    # Plaza park discs (slice P): filled light green ABOVE the world dots
+    # (which are masked out of plazas anyway) but BELOW district edges and
+    # Chen streets, so any fabric wrongly landing inside a plaza stays
+    # visible to the visual gate rather than being painted over.
+    for poly in plaza_polys or []:
+        if poly.is_empty:
+            continue
+        px, py = poly.exterior.xy
+        ax.fill(px, py, color="#a9dfbf", alpha=0.75, lw=0.0, zorder=2.5)
+        ax.plot(
+            px,
+            py,
+            color="#1e8449",
+            lw=ring_lw * 0.8,
+            alpha=0.95,
+            zorder=9,
+            solid_capstyle="round",
+        )
 
     # All Chen district edges: very thin, low alpha.
     for res in results:
@@ -429,6 +455,7 @@ def _legend_handles() -> list[Any]:
         plt.Line2D(
             [0], [0], color="#d35400", lw=2.0, ls=(0, (5, 2)), label="Core ring road"
         ),
+        mpatches.Patch(color="#a9dfbf", label="Plaza (park)"),
         plt.Line2D([0], [0], color="#1a1a1a", lw=1.2, label="Chen street (local)"),
         plt.Line2D([0], [0], color="#555555", lw=0.8, label="Chen district edge"),
         plt.Line2D(
@@ -458,6 +485,7 @@ def render_overview(
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
+    plaza_polys: list[sg.Polygon] | None = None,
     total_districts: int,
     total_streets: int,
     out_path: Path,
@@ -478,6 +506,7 @@ def render_overview(
         lp_l0=lp_l0,
         colors=colors,
         junctions=junctions,
+        plaza_polys=plaza_polys,
         district_lw=0.25,
         district_alpha=0.35,
         street_lw=0.4,
@@ -517,6 +546,7 @@ def render_core(
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
+    plaza_polys: list[sg.Polygon] | None = None,
     window: tuple[float, float, float, float],
     rank: int,
     cx: float,
@@ -539,6 +569,7 @@ def render_core(
         lp_l0=lp_l0,
         colors=colors,
         junctions=junctions,
+        plaza_polys=plaza_polys,
         district_lw=0.6,
         district_alpha=0.7,
         street_lw=1.1,
@@ -577,6 +608,7 @@ def render_seam(
     lp_l0: np.ndarray,
     colors: dict[int, tuple[float, float, float, float]],
     junctions: list[SeamJunction],
+    plaza_polys: list[sg.Polygon] | None = None,
     window: tuple[float, float, float, float],
     block_id: int,
     tjunction_count: int,
@@ -598,6 +630,7 @@ def render_seam(
         lp_l0=lp_l0,
         colors=colors,
         junctions=junctions,
+        plaza_polys=plaza_polys,
         district_lw=0.7,
         district_alpha=0.75,
         street_lw=1.3,
@@ -772,6 +805,7 @@ def _greybox_districts_geojson(
     district_records: list[tuple[int, int, sg.Polygon, int, int | None, float | None]],
     massing: MassingConfig,
     meters_per_unit: float,
+    plaza_ids: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     """``district_records``: ``(district_id, block_id, polygon, world_count,
     nucleus_id, nucleus_dist)``.
@@ -781,7 +815,11 @@ def _greybox_districts_geojson(
     individual lots can still classify ``"landmark"`` per world (see
     ``lots.parquet``'s own ``typology`` column). ``nucleus_id``/``nucleus_dist``
     (S2 interface, :func:`mapgen.r1_macro.assign_nearest_nucleus`) are ``null``
-    when no cores were detected (``nuclei`` empty).
+    when no cores were detected (``nuclei`` empty). A ``plaza_ids`` member
+    (slice P, :func:`plaza_district_ids`) is FORCED ``kind="park"`` --
+    belt-and-suspenders on top of the world_count==0 path, which already
+    holds for plaza districts because :func:`assign_worlds_excluding` never
+    assigns worlds to them (:func:`export_greybox` asserts it).
     """
     records: list[tuple[int, Any, dict[str, Any]]] = []
     for (
@@ -792,7 +830,8 @@ def _greybox_districts_geojson(
         nucleus_id,
         nucleus_dist,
     ) in district_records:
-        kind = "fabric" if world_count > 0 else "park"
+        is_park = world_count <= 0 or district_id in plaza_ids
+        kind = "park" if is_park else "fabric"
         records.append(
             (
                 district_id,
@@ -827,6 +866,68 @@ def _greybox_streets_geojson(results: list[BlockResult]) -> dict[str, Any]:
     return _feature_collection(records)
 
 
+def plaza_district_ids(
+    district_polys: list[sg.Polygon],
+    plaza_polys: list[sg.Polygon],
+    *,
+    cover_frac: float = 0.5,
+) -> frozenset[int]:
+    """District indices that are plaza-derived (slice P).
+
+    A district counts as plaza-derived when at least ``cover_frac`` of its
+    area lies inside ANY single ``plaza_polys`` member. Plazas are protected
+    macro-block faces (see ``mapgen.r1_macro.build_macro_blocks_with_cores``),
+    so the expectation is ~1 district per plaza -- but Chen may subdivide a
+    plaza block further, so any number of districts can match one plaza.
+    Zero-area districts never match. Deterministic: a plain index scan with
+    a bounds pre-check, no set iteration order in the result (frozenset of
+    ints).
+    """
+    ids: set[int] = set()
+    for district_id, poly in enumerate(district_polys):
+        if poly.is_empty or poly.area <= 0.0:
+            continue
+        dminx, dminy, dmaxx, dmaxy = poly.bounds
+        for plaza in plaza_polys:
+            pminx, pminy, pmaxx, pmaxy = plaza.bounds
+            if dminx > pmaxx or dmaxx < pminx or dminy > pmaxy or dmaxy < pminy:
+                continue
+            if poly.intersection(plaza).area >= cover_frac * poly.area:
+                ids.add(district_id)
+                break
+    return frozenset(ids)
+
+
+def assign_worlds_excluding(
+    points: pl.DataFrame,
+    district_polys: list[sg.Polygon],
+    excluded_ids: frozenset[int],
+) -> tuple[dict[int, list[int]], list[str]]:
+    """``assign_worlds_to_districts`` with some districts removed as candidates.
+
+    Same return shape as :func:`mapgen.r1_lots.assign_worlds_to_districts`
+    (assignment keyed by GLOBAL district index over ALL of ``district_polys``,
+    plus the per-row direct/snapped kinds), but districts in ``excluded_ids``
+    (slice P: the plaza-derived ones) are never candidates: they always come
+    back with an empty row list, and a world whose coordinates fall inside
+    one is "snapped" to the nearest non-excluded district instead of
+    direct-assigning into it. Assignment semantics for every other world are
+    unchanged -- district polygons are disjoint, so removing candidates
+    cannot alter another world's direct match. With nothing excluded this is
+    exactly ``assign_worlds_to_districts``.
+    """
+    if not excluded_ids:
+        return assign_worlds_to_districts(points, district_polys)
+    candidate_ids = [i for i in range(len(district_polys)) if i not in excluded_ids]
+    sub_assignment, assigned_kind = assign_worlds_to_districts(
+        points, [district_polys[i] for i in candidate_ids]
+    )
+    assignment: dict[int, list[int]] = {i: [] for i in range(len(district_polys))}
+    for sub_idx, rows in sub_assignment.items():
+        assignment[candidate_ids[sub_idx]] = rows
+    return assignment, assigned_kind
+
+
 def export_greybox(
     out_dir: Path,
     in_dir: Path,
@@ -847,11 +948,14 @@ def export_greybox(
     block, in that block's own ``districts`` list order -- both deterministic
     given fixed inputs/seeds, so the resulting ``district_id`` (its position
     in that walk) is stable across runs. Every world in ``points`` is then
-    assigned to exactly one district (``mapgen.r1_lots
-    .assign_worlds_to_districts``, direct point-in-polygon or nearest-snap),
-    and every district with at least one world gets its lots tessellated
-    (``mapgen.r1_lots.build_lots``); a district with zero worlds is exported
-    as ``kind="park"`` with no lots, per ``docs/greybox-plan.md`` Stage G0.
+    assigned to exactly one NON-plaza district (:func:`assign_worlds_excluding`
+    over ``mapgen.r1_lots.assign_worlds_to_districts`` -- direct
+    point-in-polygon or nearest-snap, with the plaza-derived districts of
+    :func:`plaza_district_ids` removed from the candidate set, slice P), and
+    every district with at least one world gets its lots tessellated
+    (``mapgen.r1_lots.build_lots``); a district with zero worlds -- which
+    every plaza district is, asserted below -- is exported as ``kind="park"``
+    with no lots, per ``docs/greybox-plan.md`` Stage G0.
 
     ``massing`` (default ``MassingConfig()``) + ``meters_per_unit`` drive the
     wave-2 typology/height/footprint model (``docs/wave2-plan.md``);
@@ -893,7 +997,15 @@ def export_greybox(
             district_entries.append((res.block_id, poly))
     district_polys = [poly for _block_id, poly in district_entries]
 
-    assignment, assigned_kind = assign_worlds_to_districts(points, district_polys)
+    # Slice P: plaza-derived districts are excluded from the assignment
+    # candidate set, so a world whose raw coordinates fall inside a plaza
+    # disc snaps to the nearest NON-plaza district instead of turning the
+    # plaza into subdivided fabric (the S3 "no extra plumbing needed"
+    # assumption this replaces).
+    plaza_ids = plaza_district_ids(district_polys, layer.plaza_polys)
+    assignment, assigned_kind = assign_worlds_excluding(
+        points, district_polys, plaza_ids
+    )
     n_direct = sum(1 for kind in assigned_kind if kind == "direct")
     n_snapped = sum(1 for kind in assigned_kind if kind == "snapped")
 
@@ -917,6 +1029,14 @@ def export_greybox(
     for district_id, (block_id, poly) in enumerate(district_entries):
         row_indices = assignment.get(district_id, [])
         world_count = len(row_indices)
+        # Slice P invariant: a plaza district can NEVER hold worlds --
+        # assign_worlds_excluding structurally guarantees it, and this assert
+        # keeps any future assignment change from silently regressing plazas
+        # back into fabric.
+        assert district_id not in plaza_ids or world_count == 0, (
+            f"plaza district {district_id} was assigned {world_count} worlds; "
+            "plaza districts must stay zero-world parks (slice P)"
+        )
         nucleus_id, nucleus_dist = nucleus_by_district[district_id]
         district_records.append(
             (district_id, block_id, poly, world_count, nucleus_id, nucleus_dist)
@@ -977,7 +1097,9 @@ def export_greybox(
         json.dump(nucleus_specs_to_geojson(layer.nuclei), f, indent=2, sort_keys=True)
     with (out_dir / "districts.geojson").open("w") as f:
         json.dump(
-            _greybox_districts_geojson(district_records, massing, meters_per_unit),
+            _greybox_districts_geojson(
+                district_records, massing, meters_per_unit, plaza_ids
+            ),
             f,
             indent=2,
             sort_keys=True,
@@ -1084,6 +1206,10 @@ def export_greybox(
             "n_streets_exported": n_streets_exported,
             "n_districts": len(district_entries),
             "n_park_districts": n_park,
+            # Plaza-derived park districts (slice P): a subset of
+            # n_park_districts -- excluded from world assignment and forced
+            # kind="park", see plaza_district_ids/assign_worlds_excluding.
+            "n_plaza_districts": len(plaza_ids),
             "n_fabric_districts": len(district_entries) - n_park,
             "n_lots": len(all_lots),
             "n_sliver_reassignments": n_sliver,
@@ -1269,9 +1395,26 @@ def run_hybrid(
     with (out_dir / "hybrid_junctions.geojson").open("w") as f:
         json.dump(junctions_to_geojson(junctions), f, indent=2)
 
-    # Points (loaded once, reused across renders).
+    # Points (loaded once, reused across renders). Worlds whose raw
+    # coordinates fall inside a plaza disc are masked out of the render
+    # scatter (slice P): the greybox assignment excludes plaza districts, so
+    # those worlds live in the nearest non-plaza district now -- drawing
+    # their raw position inside the park would misrepresent the fabric (the
+    # colors lookup still spans EVERY l0 cluster so palette assignment is
+    # unchanged by the mask).
     lp = load_points_with_labels(str(in_dir / "island_points.parquet"))
     colors = _color_lookup(lp.l0_ids)
+    if layer.plaza_polys:
+        plaza_union = unary_union(layer.plaza_polys)
+        keep = ~shapely.contains_xy(plaza_union, lp.xs, lp.ys)
+        dot_xs, dot_ys, dot_l0 = lp.xs[keep], lp.ys[keep], lp.l0_ids[keep]
+        print(
+            f"  render mask: {int((~keep).sum())} world dots inside plaza "
+            "discs hidden (re-assigned outward by the greybox exclusion)",
+            flush=True,
+        )
+    else:
+        dot_xs, dot_ys, dot_l0 = lp.xs, lp.ys, lp.l0_ids
 
     print("Rendering hybrid_overview.png…", flush=True)
     render_overview(
@@ -1281,11 +1424,12 @@ def run_hybrid(
         arterial_lines=arterial_lines,
         edges=edges,
         core_polys=core_polys,
-        lp_xs=lp.xs,
-        lp_ys=lp.ys,
-        lp_l0=lp.l0_ids,
+        lp_xs=dot_xs,
+        lp_ys=dot_ys,
+        lp_l0=dot_l0,
         colors=colors,
         junctions=junctions,
+        plaza_polys=layer.plaza_polys,
         total_districts=total_districts,
         total_streets=total_streets,
         out_path=out_dir / "hybrid_overview.png",
@@ -1315,11 +1459,12 @@ def run_hybrid(
             arterial_lines=arterial_lines,
             edges=edges,
             core_polys=core_polys,
-            lp_xs=lp.xs,
-            lp_ys=lp.ys,
-            lp_l0=lp.l0_ids,
+            lp_xs=dot_xs,
+            lp_ys=dot_ys,
+            lp_l0=dot_l0,
             colors=colors,
             junctions=junctions,
+            plaza_polys=layer.plaza_polys,
             window=window,
             rank=rank,
             cx=cx,
@@ -1355,11 +1500,12 @@ def run_hybrid(
         arterial_lines=arterial_lines,
         edges=edges,
         core_polys=core_polys,
-        lp_xs=lp.xs,
-        lp_ys=lp.ys,
-        lp_l0=lp.l0_ids,
+        lp_xs=dot_xs,
+        lp_ys=dot_ys,
+        lp_l0=dot_l0,
         colors=colors,
         junctions=junctions,
+        plaza_polys=layer.plaza_polys,
         window=seam_window,
         block_id=seam_block_id,
         tjunction_count=seam_tjunction_count,

@@ -13,6 +13,8 @@ from mapgen.r1_connect import Gate, snap_gates_to_macro
 from mapgen.r1_macro import (
     CITY_SIGMA,
     DEFAULT_CORE_SIMPLIFY_TOLERANCE,
+    DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
+    DEFAULT_R_PLAZA_MAJOR_MIN_UNITS,
     DEFAULT_SPOKE_MIN_ANGLE_DEG,
     SPOKE_NODE_SENTINEL,
     TOWN_SIGMA,
@@ -42,6 +44,7 @@ from mapgen.r1_macro import (
     compute_macro_arterials,
     detect_core_regions,
     grade_cities,
+    major_plaza_radii,
     polygonize_macro_blocks,
     smooth_arterial_lines,
     smooth_polyline,
@@ -1201,6 +1204,114 @@ def test_add_intra_nucleus_avenues_empty_nuclei_is_empty() -> None:
     assert plaza_polys == []
 
 
+# --- Mass-scaled major plaza radii (slice P) ---
+
+
+def _spec(rank: int, mass: float, *, is_major: bool = True) -> NucleusSpec:
+    """Minimal NucleusSpec for radius-policy tests (geometry unused)."""
+    return NucleusSpec(
+        anchor=(0.0, 0.0),
+        polygon=sg.box(-5.0, -5.0, 5.0, 5.0),
+        mass=mass,
+        rank=rank,
+        label=f"n{rank}",
+        influence_radius=7.07,
+        is_major=is_major,
+    )
+
+
+def test_major_plaza_radii_mass_ordering_and_bounds() -> None:
+    """Largest mass -> exactly r_max, smallest -> exactly r_min, sqrt between.
+
+    Masses 100/25/4 have sqrt 10/5/2, so the middle major sits at
+    t=(5-2)/(10-2)=0.375 of the way from r_min to r_max.
+    """
+    radii = major_plaza_radii([_spec(1, 100.0), _spec(2, 25.0), _spec(3, 4.0)])
+    assert radii[1] == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MAX_UNITS)
+    assert radii[3] == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MIN_UNITS)
+    expected_mid = DEFAULT_R_PLAZA_MAJOR_MIN_UNITS + 0.375 * (
+        DEFAULT_R_PLAZA_MAJOR_MAX_UNITS - DEFAULT_R_PLAZA_MAJOR_MIN_UNITS
+    )
+    assert radii[2] == pytest.approx(expected_mid)
+    # Radius ordering follows mass ordering.
+    assert radii[1] > radii[2] > radii[3]
+
+
+def test_major_plaza_radii_non_major_gets_no_entry() -> None:
+    """Town-center nuclei are unaffected: no radius entry at all."""
+    radii = major_plaza_radii(
+        [_spec(1, 100.0), _spec(2, 25.0), _spec(3, 900.0, is_major=False)]
+    )
+    assert set(radii) == {1, 2}
+    # ...and the non-major's (huge) mass doesn't perturb the major scale.
+    assert radii[1] == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MAX_UNITS)
+    assert radii[2] == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MIN_UNITS)
+
+
+def test_major_plaza_radii_degenerate_single_or_equal_masses_get_r_max() -> None:
+    """A single major (or all-equal masses) is 'the largest' -> r_max."""
+    assert major_plaza_radii([_spec(1, 42.0)]) == {1: DEFAULT_R_PLAZA_MAJOR_MAX_UNITS}
+    equal = major_plaza_radii([_spec(1, 7.0), _spec(2, 7.0)])
+    assert equal == {
+        1: DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
+        2: DEFAULT_R_PLAZA_MAJOR_MAX_UNITS,
+    }
+    assert major_plaza_radii([]) == {}
+
+
+def test_major_plaza_radii_custom_bounds() -> None:
+    """r_min/r_max are honored as the exact interpolation endpoints."""
+    radii = major_plaza_radii([_spec(1, 100.0), _spec(2, 4.0)], r_min=1.0, r_max=2.0)
+    assert radii == {1: pytest.approx(2.0), 2: pytest.approx(1.0)}
+
+
+def test_add_intra_nucleus_avenues_uses_mass_scaled_radii() -> None:
+    """The built plaza rings sit at the per-major mass-scaled radius."""
+    big_core = sg.box(-10.0, -10.0, 10.0, 10.0)
+    small_core = sg.box(90.0, -10.0, 110.0, 10.0)
+    big = NucleusSpec(
+        anchor=(0.0, 0.0),
+        polygon=big_core,
+        mass=100.0,
+        rank=1,
+        label="metro",
+        influence_radius=14.14,
+        is_major=True,
+    )
+    small = NucleusSpec(
+        anchor=(100.0, 0.0),
+        polygon=small_core,
+        mass=4.0,
+        rank=2,
+        label="second",
+        influence_radius=14.14,
+        is_major=True,
+    )
+    lines = [
+        sg.LineString([(20.0, 0.0), (10.0, 0.0)]),  # station on the big core ring.
+        sg.LineString([(80.0, 0.0), (90.0, 0.0)]),  # station on the small core ring.
+    ]
+    spoke_lines, _spoke_edges, plaza_polys = add_intra_nucleus_avenues(
+        [big, small], lines
+    )
+    assert len(plaza_polys) == 2
+    assert len(spoke_lines) == 2
+    # Plaza ring radius == distance from the anchor to any exterior vertex;
+    # nuclei order is rank-ascending, so plaza_polys[0] is the big major.
+    r_big = sg.Point(0.0, 0.0).distance(
+        sg.Point(list(plaza_polys[0].exterior.coords)[0])
+    )
+    r_small = sg.Point(100.0, 0.0).distance(
+        sg.Point(list(plaza_polys[1].exterior.coords)[0])
+    )
+    assert r_big == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MAX_UNITS)
+    assert r_small == pytest.approx(DEFAULT_R_PLAZA_MAJOR_MIN_UNITS)
+    # Spokes terminate ON their own plaza ring (the S3 exact-fusion invariant
+    # holds at mass-scaled radii too).
+    assert plaza_polys[0].exterior.distance(sg.Point(spoke_lines[0].coords[-1])) < 1e-9
+    assert plaza_polys[1].exterior.distance(sg.Point(spoke_lines[1].coords[-1])) < 1e-9
+
+
 def test_polygonize_macro_blocks_protecting_nuclei_no_protect_matches_plain() -> None:
     """No protected polygons -> byte-identical to ``polygonize_districts``."""
     line = sg.LineString([(0.0, 30.0), (60.0, 30.0)])
@@ -1296,6 +1407,14 @@ def test_build_macro_blocks_with_cores_downtown_wedges_and_plaza() -> None:
         core_max_radius_units=6.0,
         core_min_area_units2=4.0,
         n_major_nuclei=1,
+        # The fixture core (a sigma=3-cell blob at core_frac=0.45) has only a
+        # ~3.8-unit radius -- smaller than the production mass-scaled major
+        # plaza radii (3.0-4.0 u, slice P), which would swallow most ring
+        # stations. Pin the S3-era radius here: these tests cover the S3
+        # wedge/plaza WIRING, not the slice-P radius policy (covered by the
+        # major_plaza_radii tests above).
+        r_plaza_major_min=0.85,
+        r_plaza_major_max=0.85,
     )
     assert len(bundle.core_polys) == 1
     assert len(bundle.nuclei) == 1
@@ -1346,6 +1465,14 @@ def test_spokes_and_plaza_ring_gate_snap_as_arterial_and_ring() -> None:
         core_max_radius_units=6.0,
         core_min_area_units2=4.0,
         n_major_nuclei=1,
+        # The fixture core (a sigma=3-cell blob at core_frac=0.45) has only a
+        # ~3.8-unit radius -- smaller than the production mass-scaled major
+        # plaza radii (3.0-4.0 u, slice P), which would swallow most ring
+        # stations. Pin the S3-era radius here: these tests cover the S3
+        # wedge/plaza WIRING, not the slice-P radius policy (covered by the
+        # major_plaza_radii tests above).
+        r_plaza_major_min=0.85,
+        r_plaza_major_max=0.85,
     )
     spoke_idx = next(
         i for i, e in enumerate(bundle.clipped_edges) if e.node_a == SPOKE_NODE_SENTINEL
