@@ -122,4 +122,78 @@ if (extrudeErrors.length > 0) {
 }
 await extrudePage.close();
 
+// ---------------------------------------------------------------------------
+// Third pass: street-level walkthrough mode. Fresh page/listeners, same as the
+// extrude pass above, but loads plain `?data=island-chen&extrude=1` first and
+// zooms in (mouse wheel, same technique as the default pass's `zoom()` helper)
+// BEFORE switching to street view -- building massing only loads from the "mid"
+// zoom tier in (BUILDINGS.renderFromTier), same as ?extrude=1 itself; entering
+// street view at the raw whole-dataset fit view would show an empty ground/sky
+// void (confirmed while developing this: the pre-zoom screenshot is empty, same
+// as the existing extrude pass's own un-zoomed screenshot). Switching into
+// street mode itself is exercised via the on-canvas "Street view" toggle button
+// (not the `?view=street` URL flag) so this pass also covers that toggle path.
+// Asserts canvas presence + zero console errors; a real visual (is-the-eye-
+// level-read-good) review is a main-thread/Fable-vision task, not this script's.
+// ---------------------------------------------------------------------------
+const streetErrors = [];
+const streetPage = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+streetPage.on("console", (m) => {
+  console.log(`[street console.${m.type()}]`, m.text());
+  if (m.type() === "error") streetErrors.push(m.text());
+});
+streetPage.on("pageerror", (e) => {
+  console.log("[street pageerror]", e.message);
+  streetErrors.push(e.message);
+});
+
+const streetBaseUrl = `${URL}?data=island-chen&extrude=1`;
+await streetPage.goto(streetBaseUrl, { waitUntil: "networkidle" });
+await streetPage.waitForTimeout(8000);
+
+const streetBox = await streetPage.$eval("canvas", (c) => {
+  const r = c.getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+});
+async function streetZoom(steps) {
+  await streetPage.mouse.move(streetBox.x, streetBox.y);
+  for (let i = 0; i < steps; i++) {
+    await streetPage.mouse.wheel(0, -80);
+    await streetPage.waitForTimeout(140);
+  }
+  await streetPage.waitForTimeout(1800);
+}
+await streetZoom(8); // same total notch count as the default pass's zoom(3)+zoom(5) -> near tier
+
+// click the on-canvas "Street view" toggle button (additive UI, see Map.jsx)
+const clicked = await streetPage.evaluate(() => {
+  const btn = [...document.querySelectorAll("button")].find((b) =>
+    b.textContent.includes("Street view"),
+  );
+  if (!btn) return false;
+  btn.click();
+  return true;
+});
+await streetPage.waitForTimeout(2000);
+
+const streetHasCanvas = (await streetPage.$("canvas")) != null;
+console.log(
+  "STREET HAS CANVAS:",
+  streetHasCanvas,
+  "| toggle button clicked:",
+  clicked,
+  "| console errors:",
+  streetErrors.length,
+);
+await streetPage.screenshot({ path: "/tmp/map-street.png" });
+if (!streetHasCanvas || !clicked) {
+  console.log("STREET SMOKE FAILED: no canvas or toggle button not found");
+  process.exitCode = 1;
+}
+if (streetErrors.length > 0) {
+  console.log("STREET SMOKE FAILED: console errors present:", streetErrors);
+  process.exitCode = 1;
+}
+await streetPage.close();
+
 await browser.close();

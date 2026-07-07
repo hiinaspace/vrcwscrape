@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeckGL from "@deck.gl/react";
-import { OrbitView, OrthographicView } from "@deck.gl/core";
+import { FirstPersonController, FirstPersonView, OrbitView, OrthographicView } from "@deck.gl/core";
 import { GeoJsonLayer, PolygonLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import { Delaunay } from "d3-delaunay";
-import { DATA_DIR, EXTRUDE_MODE, getLevels, getManifest, loadPoints } from "./duckdb.js";
+import {
+  DATA_DIR,
+  EXTRUDE_MODE,
+  STREET_VIEW_PARAM,
+  getLevels,
+  getManifest,
+  loadPoints,
+} from "./duckdb.js";
 import { hexToRgb, labelPoint } from "./util.js";
 import {
   BLOCKS,
@@ -23,9 +30,29 @@ import {
   ROADS,
   SEARCH_PIN,
   SELECTED,
+  STREETVIEW,
   WORLD_LABELS,
   ZOOM,
 } from "./config.js";
+
+// WASD + Q/E (turn) + arrows (translate) key codes the street-view movement loop
+// reacts to; Shift is the "fast" modifier. Movement is handled entirely by our own
+// rAF loop (not deck's built-in FirstPersonController keyboard handling) so WASD and
+// arrows behave identically and Q/E can add keyboard turning alongside mouse-drag.
+const STREET_MOVE_KEYS = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "KeyQ",
+  "KeyE",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "ShiftLeft",
+  "ShiftRight",
+]);
 
 // CollisionFilterExtension priorities must live in ~[-1000,1000]; carve brackets so
 // level dominates: continents 900+ > capitols 700 > sub-regions 500+ > worlds 0-400.
@@ -440,6 +467,118 @@ export default function WorldMap({
     });
   }, [land, points, viewState, size, isCity]);
 
+  // Street-level walkthrough mode (?view=street, city datasets only). A separate
+  // FirstPersonView viewState (position/bearing/pitch, not target/zoom) that only
+  // applies when streetActive; kept independent of the ortho/orbit `viewState` above
+  // so toggling back to the map view restores exactly where you left it.
+  const [streetMode, setStreetMode] = useState(STREET_VIEW_PARAM);
+  const [streetViewState, setStreetViewState] = useState(null);
+  const streetActive = streetMode && isCity;
+  // Latest elevationScale for the keyboard-movement rAF loop below, which reads it
+  // from a plain ref (not React state) so the loop's own closure never goes stale
+  // without having to restart the effect every time the manifest fetch resolves.
+  const elevationScaleRef = useRef(elevationScale);
+  elevationScaleRef.current = elevationScale;
+
+  // Enter street view anchored at the CURRENT ortho/orbit target (x, y), at eye
+  // height above the ground plane -- like clicking a "pegman" at the point you were
+  // just looking at. Re-anchoring on every entry (rather than only once) keeps the
+  // start point predictable even if you've panned the map view a lot in between.
+  const enterStreetView = (fromViewState) => {
+    const source = fromViewState ?? viewState;
+    if (!source) return;
+    setStreetViewState({
+      position: [
+        source.target[0],
+        source.target[1],
+        STREETVIEW.eyeHeightMeters * elevationScaleRef.current,
+      ],
+      bearing: STREETVIEW.initialBearing,
+      pitch: STREETVIEW.initialPitch,
+      minPitch: STREETVIEW.lookPitchMin,
+      maxPitch: STREETVIEW.lookPitchMax,
+    });
+    setStreetMode(true);
+  };
+
+  // ?view=street on initial load: enter as soon as the base viewState (for the
+  // anchor point) and the building-dataset check are both ready.
+  useEffect(() => {
+    if (!STREET_VIEW_PARAM || streetViewState || !viewState || !isCity) return;
+    enterStreetView(viewState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewState, isCity]);
+
+  // WASD/arrow ground-plane translation + Q/E turning, continuous while keys are
+  // held (a requestAnimationFrame loop, not per-keydown steps, so movement is frame
+  // rate-smooth). Mouse-drag look (pitch/bearing) is handled separately by deck's
+  // own FirstPersonController (see the `controller` prop below) -- this loop only
+  // ever touches position + bearing-from-keyboard-turn.
+  useEffect(() => {
+    if (!streetActive) return;
+    const keys = new Set();
+    const onKeyDown = (e) => {
+      if (!STREET_MOVE_KEYS.has(e.code)) return;
+      keys.add(e.code);
+      e.preventDefault();
+    };
+    const onKeyUp = (e) => keys.delete(e.code);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    let last = performance.now();
+    let raf;
+    function tick(now) {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      if (keys.size) {
+        const fast = keys.has("ShiftLeft") || keys.has("ShiftRight");
+        const speed =
+          STREETVIEW.moveSpeedMps *
+          elevationScaleRef.current *
+          (fast ? STREETVIEW.fastMultiplier : 1) *
+          dt;
+        const turn = STREETVIEW.turnSpeedDegPerSec * dt;
+        setStreetViewState((vs) => {
+          if (!vs) return vs;
+          const rad = (vs.bearing * Math.PI) / 180;
+          // deck's FirstPersonController bearing convention: 0 = +Y (north),
+          // increasing clockwise -- see math.gl SphericalCoordinates.toVector3(),
+          // matched here so keyboard movement tracks the mouse-look direction.
+          const fwd = [Math.sin(rad), Math.cos(rad)];
+          const right = [Math.cos(rad), -Math.sin(rad)];
+          let [x, y, z] = vs.position;
+          let bearing = vs.bearing;
+          if (keys.has("KeyW") || keys.has("ArrowUp")) {
+            x += fwd[0] * speed;
+            y += fwd[1] * speed;
+          }
+          if (keys.has("KeyS") || keys.has("ArrowDown")) {
+            x -= fwd[0] * speed;
+            y -= fwd[1] * speed;
+          }
+          if (keys.has("KeyD") || keys.has("ArrowRight")) {
+            x += right[0] * speed;
+            y += right[1] * speed;
+          }
+          if (keys.has("KeyA") || keys.has("ArrowLeft")) {
+            x -= right[0] * speed;
+            y -= right[1] * speed;
+          }
+          if (keys.has("KeyE")) bearing += turn;
+          if (keys.has("KeyQ")) bearing -= turn;
+          return { ...vs, position: [x, y, z], bearing };
+        });
+      }
+      raf = requestAnimationFrame(tick);
+    }
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [streetActive]);
+
   useEffect(() => {
     if (import.meta.env.DEV) {
       window.__vs = viewState;
@@ -809,6 +948,9 @@ export default function WorldMap({
   const landuseFillColor = (f) =>
     f.properties.kind === "park" ? LANDUSE.parkColor : LANDUSE.developedColor;
   const extrudeMode = EXTRUDE_MODE && isCity;
+  // Street view always walks the extruded massing (flat 2D buildings at eye level
+  // wouldn't be a useful preview), even if the page wasn't also given `?extrude=1`.
+  const massingActive = extrudeMode || streetActive;
   const roadWidth = (f) =>
     f.properties.kind === "arterial"
       ? ROADS.arterialWidth
@@ -936,7 +1078,11 @@ export default function WorldMap({
           ? [...regionRGB(d.point.region).map((c) => Math.round(c * SELECTED.valueMul)), SELECTED.fillAlpha]
           : [
               ...regionRGB(d.point.region),
-              isCity ? BUILDINGS.fillAlpha : CELLS.fillAlpha,
+              massingActive
+                ? EXTRUDE.fillAlpha
+                : isCity
+                  ? BUILDINGS.fillAlpha
+                  : CELLS.fillAlpha,
             ],
       getLineColor: (d) =>
         d.point.world_id === selected
@@ -948,19 +1094,21 @@ export default function WorldMap({
       filled: true,
       pickable: true,
       onClick: (info) => info.object && onSelect(info.object.point.world_id),
-      // 2.5D mode (?extrude=1, city datasets only): extrude each building footprint
-      // by building_height, scaled down to the layout's normalized units (see the
-      // EXTRUDE comment in config.js — height and footprint size live on very
-      // different scales in this dataset; elevationScale here is derived per-dataset
-      // from manifest.json's meters_per_app_unit, see the state hook above).
-      extruded: extrudeMode,
+      // 2.5D mode (?extrude=1, or street view, city datasets only): extrude each
+      // building footprint by building_height, scaled down to the layout's
+      // normalized units (see the EXTRUDE comment in config.js — height and
+      // footprint size live on very different scales in this dataset; elevationScale
+      // here is derived per-dataset from manifest.json's meters_per_app_unit, see the
+      // state hook above). Street view reuses this SAME massing (massingActive),
+      // it's a camera change only, not new geometry.
+      extruded: massingActive,
       wireframe: EXTRUDE.wireframe,
-      material: extrudeMode ? EXTRUDE.material : null,
-      getElevation: extrudeMode
+      material: massingActive ? EXTRUDE.material : null,
+      getElevation: massingActive
         ? (d) => (d.point.buildingHeight ?? 0) * elevationScale
         : 0,
       updateTriggers: {
-        getFillColor: selected,
+        getFillColor: [selected, massingActive],
         getLineColor: selected,
         getLineWidth: selected,
       },
@@ -1068,19 +1216,48 @@ export default function WorldMap({
       : []),
   ];
 
+  // Street view only actually swaps the DeckGL view/controller/viewState once its
+  // own viewState has been anchored (enterStreetView/the ?view=street effect) --
+  // covers the one-frame gap between "toggled on" and "anchor point ready" by just
+  // staying on the previous camera until then, instead of feeding FirstPersonView a
+  // null/mismatched viewState shape.
+  const streetReady = streetActive && streetViewState != null;
+  // near/far clip planes given in config.js as METERS, converted to the dataset's
+  // app-unit space the same way as eye height / move speed (see STREETVIEW comment).
+  const streetNear = STREETVIEW.nearMeters * elevationScale;
+  const streetFar = STREETVIEW.farMeters * elevationScale;
+
   return (
     <div ref={wrapRef} className="map-wrap" style={{ background: OCEAN }}>
       <DeckGL
         views={
-          extrudeMode
-            ? new OrbitView({ orthographic: true, controller: true })
-            : new OrthographicView({ flipY: false })
+          streetReady
+            ? new FirstPersonView({ fovy: STREETVIEW.fovy, near: streetNear, far: streetFar })
+            : extrudeMode
+              ? new OrbitView({ orthographic: true, controller: true })
+              : new OrthographicView({ flipY: false })
         }
-        viewState={viewState}
-        controller={true}
+        viewState={streetReady ? streetViewState : viewState}
+        controller={
+          streetReady
+            ? {
+                type: FirstPersonController,
+                keyboard: false, // WASD/arrows/Q-E are our own rAF loop above
+                dragPan: false, // avoid the FPS controller's secondary strafe-drag
+                scrollZoom: false, // avoid wheel = teleport-forward while walking
+                doubleClickZoom: false,
+              }
+            : true
+        }
         pickingRadius={6}
         layers={layers}
         onViewStateChange={({ viewState: vs, interactionState }) => {
+          if (streetReady) {
+            // Mouse-drag look (deck's FirstPersonController rotate) lands here;
+            // merge rather than replace so our own position updates aren't lost.
+            setStreetViewState((prev) => (prev ? { ...prev, ...vs } : vs));
+            return;
+          }
           if (
             interactionState?.isDragging ||
             interactionState?.isPanning ||
@@ -1091,9 +1268,47 @@ export default function WorldMap({
           setViewState((prev) => withViewConstraints(prev, vs));
         }}
         getCursor={({ isDragging, isHovering }) =>
-          isDragging ? "grabbing" : isHovering ? "pointer" : "grab"
+          isDragging ? "grabbing" : isHovering ? "pointer" : streetReady ? "crosshair" : "grab"
         }
       />
+      {isCity && (
+        <button
+          onClick={() => (streetActive ? setStreetMode(false) : enterStreetView(viewState))}
+          style={{
+            position: "absolute",
+            top: 12,
+            right: 12,
+            zIndex: 5,
+            padding: "6px 12px",
+            borderRadius: 6,
+            border: "1px solid rgba(0,0,0,0.25)",
+            background: "rgba(255,255,255,0.9)",
+            color: "#222",
+            font: "600 12px Inter, -apple-system, sans-serif",
+            cursor: "pointer",
+          }}
+        >
+          {streetActive ? "Map view" : "Street view"}
+        </button>
+      )}
+      {streetReady && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: 12,
+            zIndex: 5,
+            padding: "6px 10px",
+            borderRadius: 6,
+            background: "rgba(0,0,0,0.55)",
+            color: "#fff",
+            font: "500 11px Inter, -apple-system, sans-serif",
+            pointerEvents: "none",
+          }}
+        >
+          WASD / arrows: move · drag or Q/E: turn · Shift: run
+        </div>
+      )}
     </div>
   );
 }

@@ -55,6 +55,12 @@ export const EXTRUDE = {
   // non-geospatial like Orthographic) pitched by rotationX degrees.
   rotationX: 50,
   rotationOrbit: 0,
+  // Building fill alpha in massing modes (extrude / street view). The flat 2D map
+  // uses BUILDINGS.fillAlpha (180, semi-transparent so overlapping cells read); at
+  // eye level that looks like ghostly glass, so massing modes render (near-)opaque
+  // for a solid mass read. 255 = fully solid; drop slightly if you want to see
+  // depth through faces.
+  fillAlpha: 255,
   material: {
     ambient: 0.55,
     diffuse: 0.65,
@@ -62,6 +68,30 @@ export const EXTRUDE = {
     specularColor: [255, 255, 255],
   },
   wireframe: false,
+};
+
+// Street-level walkthrough mode (?view=street, city datasets only). A near-eye-level
+// deck.gl FirstPersonView over the SAME extruded building massing as ?extrude=1 (no
+// new geometry) -- lets you judge canyon-vs-suburb / street-length / row-house read
+// in-browser instead of an oni/Unity round-trip. All distances below are given in
+// METERS (human-intuitive) and converted to the dataset's app-unit space at runtime
+// via the same elevationScale derived from manifest.json's meters_per_app_unit that
+// EXTRUDE uses for building height -- x/y and building footprints are already in
+// that same app-unit space (see the EXTRUDE comment above), so one factor converts
+// eye height, move speed, and near/far clipping consistently.
+export const STREETVIEW = {
+  eyeHeightMeters: 1.7, // human eye height
+  moveSpeedMps: 4.5, // WASD/arrow ground-plane translation speed, a brisk walk
+  fastMultiplier: 3, // hold Shift to move at moveSpeedMps * this (a jog/vehicle peek)
+  turnSpeedDegPerSec: 90, // Q/E keyboard turn rate (mouse-drag also turns, via deck's
+  // FirstPersonController default drag-to-rotate behavior)
+  lookPitchMin: -60, // degrees; clamps mouse-drag look up/down
+  lookPitchMax: 60,
+  initialPitch: -6, // slight downward tilt so the near street is in frame on entry
+  initialBearing: 0,
+  fovy: 75, // vertical field of view, degrees
+  nearMeters: 0.5, // clip-plane distances (see unit-conversion note above)
+  farMeters: 4000,
 };
 
 // "Ocean" (the viewport backdrop) + "land" (where worlds actually sit). The land is

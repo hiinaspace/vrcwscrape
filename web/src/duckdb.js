@@ -21,6 +21,15 @@ export const EXTRUDE_MODE = ["1", "true", "yes"].includes(
   (_params.get("extrude") || "").toLowerCase(),
 );
 
+// Street-level walkthrough mode (city datasets only; see STREETVIEW in config.js and
+// its use in Map.jsx). `?view=street` requests it as the initial camera on load; a
+// toggle button in the app can also switch into/out of it at runtime regardless of
+// this initial value. Independent of EXTRUDE_MODE -- entering street view forces the
+// same building-massing extrusion on even without `extrude=1` (it reuses that data).
+export const STREET_VIEW_PARAM = ["street", "streetview", "walk"].includes(
+  (_params.get("view") || "").toLowerCase(),
+);
+
 function datasetFromParams(data, layout) {
   if (data === "20k") return { key: "20k", dir: "", label: "20k UMAP" };
   if (
