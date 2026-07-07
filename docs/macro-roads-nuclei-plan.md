@@ -86,6 +86,66 @@ adds no feasibility risk; endpoints preserved keep macro-node junctions fused.
 | **S6** | per-block `guidance_strength = 6·(1−norm_density)` grading + graded greenspace-share in sparse districts | `run_r1_hybrid.py`, `r1_seam.py`, `r1_lots.py` | fan-metric + render |
 | **S7** | betweenness-scaled widths + per-segment setback (`road_clear_m` flat 4.6 m → per-tier) on final geometry — the real fix for buildings-on-arterials | `r1_mesh.py`, `r1_lots.py`, `r1_connect.py` | mesh bake + oni walk |
 
+## Visual gate outcome (2026-07-07 — Opus vision + Fable senior review, concurring)
+
+**Identity B: PASS.** Polycentric read achieved at overview (western arm reads as
+a bead-chain of satellite towns feeding the metro); downtowns read as structured
+ring+spokes+plaza at zoom. Arterial/ring jaggedness gone. **S4: SKIP** — trunks
+do not wander post-Chaikin; the residual island-scale pathology is tier
+fragmentation + corridor duplication, which a blurred cost field would not fix.
+
+Two hard sequencing gates added (both concurring reviews):
+
+| # | Slice | Files | Gate |
+|---|---|---|---|
+| **P** (pre-S5) | **plaza park+size fix** — S3's "no extra plumbing needed" assumption was wrong: `kind` derives from world_count and worlds ARE assigned inside plaza discs (4/6 plazas subdivided as fabric). Exclude plaza-derived districts from `assign_worlds_to_districts` candidates, force `kind="park"` end-to-end (macro → lots → app export), and mass-scale plaza radius (majors ~3–4 u ≈ 75–100 m; villages keep small — 0.85 u is roundabout-scale, unreadable as a plaza in 3D) | `r1_macro.py`, `run_r1_hybrid.py`, `r1_lots.py` | unit + re-render cores 1/2/6 (zero dots in plazas) |
+| ~~**T** (pre-S7)~~ | ~~trunk cleanup (tier-continuity label patching)~~ **SUPERSEDED** by the road-hierarchy restructure below — T's tier-continuity/handoff logic is obsoleted by functional tiers; its geometry half survives as slice T-geo | | |
+
+Other gate findings folded into existing slices: S5 keeps landmark quota ∝ mass
+(core4 is a weak island-edge nucleus — let quotas starve it naturally, don't
+hand-boost); S7 additionally gives ring roads + spoke avenues explicit
+tiers/widths so the 6 majors differentiate from village rings (all ~15 rings
+currently use an identical "stamped wheel" motif). Minor/cosmetic, not slotted:
+core-interior Chen grain no coarser than suburbs (S5 height contrast carries the
+downtown read); onion-ring nested district edges on core6's north keyhole;
+core4 render window off-data white band (artifact script only). S6 unchanged —
+seam block 24 shows the deferred interior-fabric-gap trigger is NOT fired.
+
+## Road-hierarchy restructure (2026-07-07, post-gate — USER ADOPTED option B)
+
+The user's gate observation — highways/rings "degenerate into short segments
+with parallel/frontage roads … the hierarchy levels are unaware of each other"
+— is the verified mechanism: **tier = construction order, not function.** Each
+Delaunay tier's edges are independently least-cost routed; tiers share only a
+node-pair exclusion set, never geometry (braiding), and `clip_arterials_to_cores`
+preserves tier per fragment (confetti). A Fable design review traced every tier
+consumer: tier is read ONLY at render/width/export layers (`r1_mesh.py` width
+dicts, `r1_app_export.py` TIER_KIND/TIER_WIDTH, render color tables, connect
+metrics) — nothing structural. So re-deriving tier inside `build_macro_layer`
+propagates everywhere automatically at near-zero risk to the validated stack.
+Rejected: full bottom-up regrowth (discards gate-praised corridor geometry);
+bake-side relabel (desyncs the single source of truth — same lesson as S1
+smoothing); raw-betweenness tier thresholds (parallel near-core paths split
+flow → holes in the red skeleton exactly where the eye looks).
+
+**Adopted plan (replaces T and slims S7):**
+
+| # | Slice | Content | Files | Gate |
+|---|---|---|---|---|
+| **T-geo** | same-corridor geometry dedup PRE-clip (collapse near-coincident trunks, tolerance ≈ 1–1.5 u — just under one buildable lot depth, so surviving twins ARE frontage roads and F1's shape-floor catches residual slivers; no frontage-detection logic); endpoint snap-to-ring; degree-1 dangle prune < ~8 u post-clip (kills switchback hooks). Dedup must re-emit a fresh aligned `arterial_lines`/`edges` pair (gate snapping, unified graph, geojson writers assume alignment); dedup must stay pre-clip so `_ring_junction_stations`' exact-on-ring matching (tol=1e-6) keeps working | `r1_macro.py` | unit + overview render (no braids, no hooks) |
+| **B** | junction-noded macro graph inside `build_macro_layer` (post-clip, post-spokes, post-dedup); **tier = path-coverage promotion**: highways = union of least-cost paths between all MAJOR-nuclei pairs (NucleusSpec top-K), majors = union over all nuclei/town pairs not already highway, rest local — deterministic, no thresholds, corridors continuous by construction; rings + spokes tiered by the same pass (deletes S7's ring/spoke-tiering line). Store length-weighted edge betweenness as a new `MacroEdge` scalar field — S7-slim's width input, computed once here | `r1_macro.py` | unit + overview render (continuous red skeleton, red reaches into cores) |
+| **R** | ring regularization: morphological **opening** (`buffer(-w).buffer(+w)`, largest component) before the existing close in `_cells_to_polygon`, road-scale w ≈ 1.5–2 u, rank-scaled (majors get full treatment, villages keep today's cheap contour → de-stamps the motif); elliptic-Fourier/periodic-spline low-pass (~8 harmonics) behind a flag, only if majors still read blobby, with `buffer(0)` validity guard + fallback. **Never convex-hull** (annexes fabric → corrupts core mass → rank → is_major → plaza assignment) | `r1_macro.py` | core-zoom renders 1/2/6 |
+| — | **mini visual gate** (main thread + user; cheap 2D overview + 2–3 core zooms). Blocks/districts WILL reshuffle under dedup+R: re-pin goldens, re-check the S2 ranked-mass table (rank flips at the K=6 margin are the real risk) | | |
+| S5 ∥ S6 | unchanged, but AFTER the mini gate — S5's `nucleus_dist` massing must not tune against pre-dedup fabric | | |
+| **S7-slim** | widths from the stored betweenness scalar + per-tier setbacks (`road_clear_m` flat → per-tier) + mesh emission. Deleted from S7: tier assignment, ring/spoke tiering, betweenness derivation (all moved into B) | `r1_mesh.py`, `r1_lots.py` | mesh bake + oni walk |
+
+Do-NOT-do (from the review): no network regrowth; no bake-side/export-side
+relabel; no betweenness before dedup; no ring convex-hull; no silent
+`arterial_lines`/`edges` desync; no S5 before the mini gate; no `chen_*` edits.
+Fused-graph (Chen-local) betweenness deferred until a gate shows local street
+widths need it. The user's "adjust T-junctions/curvature to be highway-like"
+idea: optional cosmetic slice AFTER B's renders exist, decided then.
+
 ## Deferred / known-limits (recorded, not dropped)
 
 - **Interior-fabric gap:** 14/26 non-core blocks have zero arterial↔local
