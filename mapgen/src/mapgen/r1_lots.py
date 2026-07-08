@@ -164,6 +164,20 @@ DEFAULT_LANDMARK_DEPTH_MAX_M: float = 20.0
 DEFAULT_DETACHED_WIDTH_MAX_M: float = 11.0
 DEFAULT_ROW_WIDTH_MAX_M: float = 0.0
 DEFAULT_LANDMARK_WIDTH_MAX_M: float = 0.0
+# Footprint ASPECT cap (long/short OBB ratio; 0.0 = uncapped). The width cap
+# above bounds absolute footprint width, but a lot NARROWER than the cap (or one
+# whose rear-guard forced a shallow slab) still yields a thin, needle-like
+# building -- the "tiny thin building in a rectangular lot" defect (measured on
+# the idx4 bake: 15% of detached footprints had OBB aspect > 3, tail to ~1575).
+# Capping detached aspect biases those back to squarish by shrinking the LONGER
+# footprint dimension (width symmetric; depth trimmed from the REAR so the front
+# setback is preserved). Row stays uncapped (0.0): its elongation IS the
+# continuous terrace, which the user wants. Landmark stays uncapped: downtown
+# landmarks are intentionally large/prominent. 2.5 clears the genuinely-thin
+# tail while leaving normal rectangular houses (<= 2.5:1) untouched.
+DEFAULT_DETACHED_ASPECT_MAX: float = 2.5
+DEFAULT_ROW_ASPECT_MAX: float = 0.0
+DEFAULT_LANDMARK_ASPECT_MAX: float = 0.0
 DEFAULT_REAR_MIN_M: float = 3.0
 # S7b (docs/macro-roads-nuclei-plan.md): pedestrian/sidewalk margin (METERS)
 # added to a fronting road's ribbon HALF-WIDTH to form that lot's front
@@ -348,6 +362,9 @@ class MassingConfig:
     detached_width_max_m: float = DEFAULT_DETACHED_WIDTH_MAX_M
     row_width_max_m: float = DEFAULT_ROW_WIDTH_MAX_M
     landmark_width_max_m: float = DEFAULT_LANDMARK_WIDTH_MAX_M
+    detached_aspect_max: float = DEFAULT_DETACHED_ASPECT_MAX
+    row_aspect_max: float = DEFAULT_ROW_ASPECT_MAX
+    landmark_aspect_max: float = DEFAULT_LANDMARK_ASPECT_MAX
     rear_min_m: float = DEFAULT_REAR_MIN_M
     pedestrian_clearance_m: float = DEFAULT_PEDESTRIAN_CLEARANCE_M
 
@@ -685,6 +702,17 @@ def _width_max_for_typology(typology: str, cfg: MassingConfig) -> float:
     if typology == "landmark":
         return cfg.landmark_width_max_m
     return cfg.detached_width_max_m
+
+
+def _aspect_max_for_typology(typology: str, cfg: MassingConfig) -> float:
+    """Max footprint OBB aspect (long/short) for ``typology``; ``0.0`` means
+    uncapped. Unknown typologies use the detached cap (same convention as
+    :func:`_width_max_for_typology`)."""
+    if typology == "row":
+        return cfg.row_aspect_max
+    if typology == "landmark":
+        return cfg.landmark_aspect_max
+    return cfg.detached_aspect_max
 
 
 def _stories_for_typology(
@@ -1410,7 +1438,71 @@ def _footprint_clamped(lot_poly: sg.Polygon, inset: float) -> sg.Polygon:
     return clipped
 
 
+def _apply_footprint_aspect_cap(fp: sg.Polygon, aspect_max: float) -> sg.Polygon:
+    """Bias a needle-thin footprint back to squarish: if ``fp``'s OBB long/short
+    ratio exceeds ``aspect_max`` (> 0), intersect it with a band centered on the
+    OBB, keeping the short axis full and shrinking the LONG axis to
+    ``short * aspect_max``. The shrink is SYMMETRIC about the OBB center, so it
+    only pulls the two long-axis edges inward -- a frontage footprint's front
+    edge moves AWAY from the road (its setback can only grow, never shrink), and
+    the result always stays inside the original footprint (hence inside the lot).
+    ``aspect_max <= 0`` (row/landmark, or any disabled cap) returns ``fp``
+    unchanged. A degenerate footprint (empty / zero-area / zero-width OBB) is
+    returned untouched -- there is no long axis to square."""
+    if aspect_max <= 0.0 or fp.is_empty or fp.area <= 0.0:
+        return fp
+    center, axis_long, axis_short, long_len, short_len = _obb_axes(fp)
+    if short_len <= 1e-12 or long_len <= short_len * aspect_max:
+        return fp
+    half_long = 0.5 * short_len * aspect_max
+    half_short = 0.5 * short_len + 1.0  # generous: the band spans the short axis
+    corners = [
+        (
+            center[0] + s1 * half_long * axis_long[0] + s2 * half_short * axis_short[0],
+            center[1] + s1 * half_long * axis_long[1] + s2 * half_short * axis_short[1],
+        )
+        for s1, s2 in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+    ]
+    capped = _largest_polygon_part(fp.intersection(sg.Polygon(corners)))
+    return capped if (not capped.is_empty and capped.area > 0.0) else fp
+
+
 def _oriented_footprint(
+    lot_poly: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    typology: str,
+    massing: MassingConfig,
+    meters_per_unit: float,
+    cfg: LotConfig,
+    ext_buffer: sg.base.BaseGeometry | None = None,
+    road_clear_m_override: float | None = None,
+    rear_anchor_degenerate: bool = False,
+) -> sg.Polygon:
+    """Public footprint entry: build the raw footprint
+    (:func:`_oriented_footprint_raw`), then apply the typology's aspect cap
+    (:func:`_apply_footprint_aspect_cap`) so a squarish bias reaches EVERY path
+    -- including the clamped-fallback slivers that the raw construction emits for
+    lots too shallow/narrow to seat a setback footprint (empirically the main
+    source of thin detached buildings). The cap is skipped for the S7b rear-
+    anchored degenerate case, whose whole purpose is to shove a building off a
+    wide arterial -- a symmetric squaring would pull it back toward the road."""
+    fp = _oriented_footprint_raw(
+        lot_poly,
+        ext_ring,
+        typology,
+        massing,
+        meters_per_unit,
+        cfg,
+        ext_buffer,
+        road_clear_m_override,
+        rear_anchor_degenerate,
+    )
+    if rear_anchor_degenerate:
+        return fp
+    return _apply_footprint_aspect_cap(fp, _aspect_max_for_typology(typology, massing))
+
+
+def _oriented_footprint_raw(
     lot_poly: sg.Polygon,
     ext_ring: sg.LinearRing,
     typology: str,

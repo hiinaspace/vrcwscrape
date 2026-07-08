@@ -914,6 +914,88 @@ def test_oriented_footprint_landlocked_width_capped() -> None:
     assert min(long_len, short_len) <= cap_units + 1e-6
 
 
+def _footprint_aspect(fp: sg.Polygon) -> float:
+    _c, _al, _as2, long_len, short_len = _obb_axes(fp)
+    return long_len / short_len if short_len > 1e-12 else float("inf")
+
+
+def test_oriented_footprint_landlocked_aspect_capped() -> None:
+    # A long, very SHORT interior lot (no frontage): the OBB short axis forces a
+    # thin footprint (the width cap only bounds the LONG axis). The aspect cap
+    # shrinks the long half-axis so the result is squarish.
+    lot = sg.box(0.0, 0.0, 20.0, 0.3)
+    landlocked = LotConfig(min_frontage=1.0e9)
+    fp_capped = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        MassingConfig(),
+        DEFAULT_METERS_PER_UNIT,
+        landlocked,
+    )
+    fp_uncapped = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        MassingConfig(detached_aspect_max=0.0),
+        DEFAULT_METERS_PER_UNIT,
+        landlocked,
+    )
+    assert _footprint_aspect(fp_uncapped) > 2.5
+    assert _footprint_aspect(fp_capped) <= 2.5 + 1e-6
+    # Capping the long axis can only shrink the footprint.
+    assert fp_capped.area <= fp_uncapped.area + 1e-9
+
+
+def test_oriented_footprint_frontage_shallow_lot_aspect_capped() -> None:
+    # A wide but SHALLOW lot: the width cap sets an 11 m along-frontage width
+    # while the shallow depth (rear guard) yields a thin slab -> "too wide".
+    # The aspect cap tightens the width to keep it squarish.
+    lot = sg.box(0.0, 0.0, 20.0, 0.5)
+    massing = MassingConfig()
+    fp = _oriented_footprint(
+        lot, lot.exterior, "detached", massing, DEFAULT_METERS_PER_UNIT, LotConfig()
+    )
+    assert not fp.is_empty
+    assert _footprint_aspect(fp) <= massing.detached_aspect_max + 1e-6
+    # Still centered in the frontage span (symmetric side yards preserved).
+    minx, _miny, maxx, _maxy = fp.bounds
+    assert (minx + maxx) / 2.0 == pytest.approx(10.0, abs=0.1)
+
+
+def test_oriented_footprint_clamped_fallback_aspect_capped() -> None:
+    # A long, narrow lot too shallow to seat the front setback + depth + rear
+    # guard degenerates to the clamped-fallback sliver (a lot-inset buffer) --
+    # empirically the main source of thin detached buildings. The post-hoc cap
+    # squares it too (it wraps EVERY return, not just the construction paths).
+    lot = sg.box(0.0, 0.0, 0.35, 20.0)
+    massing = MassingConfig()
+    fp_capped = _oriented_footprint(
+        lot, lot.exterior, "detached", massing, DEFAULT_METERS_PER_UNIT, LotConfig()
+    )
+    fp_uncapped = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        MassingConfig(detached_aspect_max=0.0),
+        DEFAULT_METERS_PER_UNIT,
+        LotConfig(),
+    )
+    assert _footprint_aspect(fp_uncapped) > 2.5  # the raw sliver
+    assert not fp_capped.is_empty
+    assert _footprint_aspect(fp_capped) <= massing.detached_aspect_max + 1e-6
+    assert lot.covers(fp_capped)  # never escapes the lot
+
+
+def test_oriented_footprint_row_aspect_uncapped() -> None:
+    # Row (terrace) keeps its elongated footprint -- aspect cap is 0.0 for row.
+    lot = sg.box(0.0, 0.0, 20.0, 0.5)
+    fp = _oriented_footprint(
+        lot, lot.exterior, "row", MassingConfig(), DEFAULT_METERS_PER_UNIT, LotConfig()
+    )
+    assert _footprint_aspect(fp) > 2.5
+
+
 # ---------------------------------------------------------------------------
 # displacement_stats
 # ---------------------------------------------------------------------------
