@@ -71,30 +71,43 @@ macro-blocks by mass (cap districts/block) before per-block Chen.
 Artifacts: `mapgen/artifacts/r1/scale/idx{0,12}/` (gitignored). A full-res idx12
 bake is available for the next in-viewer review.
 
-## 3. Braided / overlapping roads — INVESTIGATED (real, not just display)
+## 3. Braided / overlapping roads — FIXED (root cause was the ring double-emit)
 
 **User:** major roads look duplicated / "braided" with close overlapping roads
 including minor ones; suspected a display artifact or an easy merge pass.
 
-**Findings (measured on the idx4 greybox export):**
-- **Real geometry braiding exists.** ~**79 near-parallel offset runs** between
-  distinct centerlines (arterial↔arterial and arterial↔Chen-street), 1.25–10 m
-  apart, <20° angle, ~25 m long each, **~77u total**. With road ribbons several
-  metres wide these visually overlap → the braids the user saw. `T-geo`'s
-  `dedup_corridor_lines` (tol 1.2u) only merges near-coincident arterials; it does
-  **not** dedup arterial-vs-Chen-street parallelism (the F2 boundary-hugging-street
-  case). **This is not display-only.**
-- **Secondary display effect:** the export emits each ring both as a whole-ring
-  record (`tier=ring`) and as promoted tier-arc records (`tier=ring`+`ring_tier`);
-  the arcs sit a **median 0.87 m (max 3.25 m) off** the whole rings (different
-  regularized geometry). Drawing both layers gives a minor doubled/thickened ring
-  — real but small; not the dramatic braid.
+**Initial (partly-wrong) read, then corrected by a Fable senior review + my
+verification:** I first measured ~79 near-parallel centerline runs (art-art 21 /
+st-st 49 / art-st 9) and framed it as real geometry braiding. The senior review
+**re-rooted it**: the dominant, visible effect the user saw is the **ring
+double-emit at the draw layer**, not centerline braiding.
+- The greybox export emits each ring both as a whole-ring record (`tier=ring`)
+  AND as ~165 **promoted ring-arc records** (`tier=ring`+`ring_tier`) that are
+  subsegments of it. After the S7c fillet (closed pass on whole rings, open
+  endpoint-pinned pass on arcs) the arcs sit ~1 m off the whole ring. Both road
+  draw consumers (`run_r1_app_export.py` → `roads.geojson`; `run_r1_greybox_mesh.py`
+  → OBJ) iterated arterials with **no `ring_tier` filter** and styled rings/arcs
+  identically → **every ring (18.7 km of the heaviest-styled road) stroked twice
+  at ~1 m offset** = verbatim "major roads duplicated, braided with minor roads."
+  This is the island-chen viewer dataset the user actually reviewed.
+- The true art-art centerline braids (~40u) are **~19× smaller** and mostly
+  legitimate junction tangents — 13/21 pairs involve rings (built AFTER
+  `dedup_corridor_lines`, so structurally invisible to it), the rest sub-threshold
+  spoke-meets-ring approaches. Extending centerline dedup was **rejected** (Do-NOT
+  list risk, tiny payoff). st-st is Chen grain (ribbons don't even overlap).
 
-**Recommended fix (a real slice, not tonight — needs a visual gate):** extend the
-corridor dedup to arterial↔local-street parallelism (a per-edge merge, the F2
-idea generalized), OR add a post-fusion pass that snaps a Chen boundary street
-onto a coincident arterial. Also reconcile the whole-ring vs promoted-arc ring
-geometry to a single source so rings aren't drawn twice offset.
+**Shipped fix (commit, verified):** skip `ring_tier` arc records at the two
+drawing consumers — whole rings already cover the full geometry, and neither
+consumer used `ring_tier`, so it's pure de-duplication with zero width/style
+change and **zero contact with the validated centerline stack**. idx4 re-export:
+roads.geojson **341 → 176 features**; before/after render shows doubled ring
+strokes collapse to single. The live island-chen viewer dataset was re-exported
+(with the aspect cap too).
+
+**Deferred (filed):** OBJ tier-priority ribbon flattening (all road ribbons are
+coplanar at one y with per-tier materials → junction z-fighting in a depth-tested
+viewer like VRChat) — braid-unrelated, invisible in the 2D viewer; do it when the
+OBJ is the eyeballed deliverable.
 
 ## 4. 3D / extrude viewer polish — INVESTIGATED ONLY
 
