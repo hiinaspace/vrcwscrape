@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 import shapely.geometry as sg
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -21,12 +22,19 @@ if str(_SCRIPTS) not in sys.path:
 # ty (unlike pytest at runtime) doesn't see the sys.path.insert above, so it
 # can't resolve this as a first-party module -- same reason a `noqa: E402` is
 # needed for the runtime import-position lint.
+import run_r1_hybrid  # ty: ignore[unresolved-import]  # noqa: E402
 from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
+    S6_BASE_GUIDANCE_STRENGTH,
+    S6_GUIDANCE_STRENGTH_FLOOR,
     BlockResult,
+    _block_mean_density,
+    _resolve_guidance_strength,
     _select_seam_block,
     _zone_for_district,
     assign_worlds_excluding,
+    block_norm_density,
     export_greybox,
+    graded_guidance_strength,
     junctions_to_geojson,
     landmark_ids_by_nucleus,
     landmark_quotas_by_nucleus,
@@ -38,6 +46,7 @@ from mapgen.r1_arm_a import IslandFields  # noqa: E402
 from mapgen.r1_connect import SeamJunction  # noqa: E402
 from mapgen.r1_lots import MassingConfig, assign_worlds_to_districts  # noqa: E402
 from mapgen.r1_macro import MacroLayer, MacroParams, NucleusSpec  # noqa: E402
+from mapgen.r1_seam import ChenInBlockResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # junctions_to_geojson
@@ -253,6 +262,185 @@ def test_run_all_blocks_max_gate_spacing_set_appends_connectors_gates_and_flags(
     # densify_gates's contract) -- distinguishable from organic gates.
     new_gates = densified.gates[len(baseline.gates) :]
     assert all(g.street_id < 0 for g in new_gates)
+
+
+# ---------------------------------------------------------------------------
+# Slice S6: density-graded street guidance
+# (block_norm_density / graded_guidance_strength / _resolve_guidance_strength)
+# ---------------------------------------------------------------------------
+
+
+def _gradient_fields(
+    *, nrows: int = 10, ncols: int = 30, cell: float = 1.0
+) -> IslandFields:
+    """Density increases with column (x): cell (r, c) density == c.
+
+    Cell centers land at x = c + 0.5, y = r + 0.5 (x0=y0=0, cell=1.0), and the
+    density VALUE at column c is c itself (not its center x-coordinate), so a
+    block spanning columns [lo, hi) has a known, hand-computable mean density
+    of (lo + hi - 1) / 2.
+    """
+    density = np.tile(np.arange(ncols, dtype=float), (nrows, 1))
+    flat = np.zeros((nrows, ncols), dtype=float)
+    return IslandFields(
+        density=density,
+        height=flat,
+        flow_accum=flat,
+        height_carved=flat,
+        slope=flat,
+        x0=0.0,
+        y0=0.0,
+        cell=cell,
+    )
+
+
+def test_block_mean_density_matches_hand_computed_column_average() -> None:
+    fields = _gradient_fields()
+    block = _square(0, 0, 5)  # columns 0..4 (density values 0..4) -> mean 2.0
+    assert _block_mean_density(block, fields) == pytest.approx(2.0)
+
+
+def test_block_norm_density_min_max_and_monotonic_mid() -> None:
+    fields = _gradient_fields()
+    low = _square(0, 0, 5)  # columns 0..4    -> mean 2.0   (least dense)
+    mid = sg.box(10, 0, 20, 10)  # columns 10..19 -> mean 14.5
+    high = sg.box(24, 0, 30, 10)  # columns 24..29 -> mean 26.5 (most dense)
+
+    norm = block_norm_density([low, mid, high], fields)
+
+    assert norm[0] == pytest.approx(0.0)
+    assert norm[2] == pytest.approx(1.0)
+    assert 0.0 < norm[1] < 1.0
+    # Monotonic: denser block -> higher norm_density.
+    assert norm[0] < norm[1] < norm[2]
+
+
+def test_block_norm_density_uniform_field_is_all_zero() -> None:
+    fields = _flat_fields(10.0)
+    blocks = [_square(0, 0, 5), _square(5, 0, 5), _square(0, 5, 5)]
+    norm = block_norm_density(blocks, fields)
+    assert norm == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_block_norm_density_empty_blocks_is_empty() -> None:
+    assert block_norm_density([], _flat_fields(10.0)) == []
+
+
+def test_graded_guidance_strength_sparsest_block_is_unchanged_baseline() -> None:
+    assert graded_guidance_strength(0.0) == pytest.approx(S6_BASE_GUIDANCE_STRENGTH)
+
+
+def test_graded_guidance_strength_densest_block_is_floor() -> None:
+    assert graded_guidance_strength(1.0) == pytest.approx(S6_GUIDANCE_STRENGTH_FLOOR)
+
+
+def test_graded_guidance_strength_mid_density_unclamped() -> None:
+    # 0.5 -> BASE * 0.5 == 3.0, strictly between floor (1.5) and BASE (6.0).
+    assert graded_guidance_strength(0.5) == pytest.approx(3.0)
+
+
+def test_graded_guidance_strength_clamps_at_floor_before_reaching_zero() -> None:
+    # raw = 6.0 * (1 - 0.9) = 0.6, below the 1.5 floor -> clamped up to it.
+    assert graded_guidance_strength(0.9) == pytest.approx(S6_GUIDANCE_STRENGTH_FLOOR)
+
+
+def test_graded_guidance_strength_monotonic_decreasing_in_density() -> None:
+    sparse = graded_guidance_strength(0.1)
+    mid = graded_guidance_strength(0.6)
+    dense = graded_guidance_strength(0.9)
+    assert sparse > mid > dense
+    # Never above today's uniform baseline, never below the floor.
+    for nd in (0.0, 0.1, 0.5, 0.9, 1.0):
+        strength = graded_guidance_strength(nd)
+        assert S6_GUIDANCE_STRENGTH_FLOOR <= strength <= S6_BASE_GUIDANCE_STRENGTH
+
+
+def test_graded_guidance_strength_deterministic() -> None:
+    assert graded_guidance_strength(0.37) == graded_guidance_strength(0.37)
+
+
+def test_block_norm_density_deterministic() -> None:
+    fields = _gradient_fields()
+    blocks = [_square(0, 0, 5), sg.box(10, 0, 20, 10), sg.box(24, 0, 30, 10)]
+    first = block_norm_density(blocks, fields)
+    second = block_norm_density(blocks, fields)
+    assert first == second
+
+
+def test_uniform_density_synthetic_collapses_grading_to_base_for_every_block() -> None:
+    """Contract: a flat density field grades every block to ~BASE (today's
+    pre-S6 uniform behavior), not some arbitrary mid-range value."""
+    fields = _flat_fields(10.0)
+    blocks = [_square(0, 0, 5), _square(5, 0, 5), _square(0, 5, 5)]
+    norm = block_norm_density(blocks, fields)
+    strengths = [graded_guidance_strength(nd) for nd in norm]
+    assert strengths == pytest.approx([S6_BASE_GUIDANCE_STRENGTH] * 3)
+
+
+def test_resolve_guidance_strength_float_is_uniform() -> None:
+    assert _resolve_guidance_strength(4.5, 0) == 4.5
+    assert _resolve_guidance_strength(4.5, 3) == 4.5
+
+
+def test_resolve_guidance_strength_sequence_is_indexed() -> None:
+    values = [1.0, 2.0, 3.0]
+    assert _resolve_guidance_strength(values, 0) == 1.0
+    assert _resolve_guidance_strength(values, 2) == 3.0
+
+
+def test_resolve_guidance_strength_callable_is_invoked_with_block_id() -> None:
+    calls: list[int] = []
+
+    def strength_fn(block_id: int) -> float:
+        calls.append(block_id)
+        return float(block_id) * 2.0
+
+    assert _resolve_guidance_strength(strength_fn, 5) == 10.0
+    assert calls == [5]
+
+
+def test_run_all_blocks_threads_per_block_guidance_strength(monkeypatch) -> None:
+    """``run_all_blocks`` passes the per-block resolved strength through to
+    ``chen_in_block`` (spied via monkeypatch so the test stays fast/cheap --
+    the actual grading math is covered by the pure-function tests above)."""
+    captured: list[float] = []
+
+    def _fake_chen_in_block(block, fields, **kwargs):  # noqa: ANN001, ANN003
+        captured.append(kwargs["guidance_strength"])
+        return ChenInBlockResult(generated=None, info={"seed_used": "all_failed"})
+
+    monkeypatch.setattr(run_r1_hybrid, "chen_in_block", _fake_chen_in_block)
+
+    blocks = [_square(0, 0, 5), _square(5, 0, 5), _square(0, 5, 5)]
+    fields = _flat_fields(10.0)
+    run_all_blocks(
+        blocks,
+        fields,
+        max_parcel_mass=6.0,
+        min_parcel_area=1.0,
+        guidance_strength=[1.5, 3.0, 6.0],
+    )
+    assert captured == [1.5, 3.0, 6.0]
+
+
+def test_run_all_blocks_default_guidance_strength_is_pre_s6_uniform_baseline(
+    monkeypatch,
+) -> None:
+    """No ``guidance_strength`` argument -> every block gets
+    ``S6_BASE_GUIDANCE_STRENGTH`` (== ``chen_in_block``'s own pre-S6 default),
+    i.e. byte-identical to the pre-S6 uniform call."""
+    captured: list[float] = []
+
+    def _fake_chen_in_block(block, fields, **kwargs):  # noqa: ANN001, ANN003
+        captured.append(kwargs["guidance_strength"])
+        return ChenInBlockResult(generated=None, info={"seed_used": "all_failed"})
+
+    monkeypatch.setattr(run_r1_hybrid, "chen_in_block", _fake_chen_in_block)
+
+    blocks = [_square(0, 0, 5), _square(5, 0, 5)]
+    fields = _flat_fields(10.0)
+    run_all_blocks(blocks, fields, max_parcel_mass=6.0, min_parcel_area=1.0)
+    assert captured == [S6_BASE_GUIDANCE_STRENGTH, S6_BASE_GUIDANCE_STRENGTH]
 
 
 # ---------------------------------------------------------------------------

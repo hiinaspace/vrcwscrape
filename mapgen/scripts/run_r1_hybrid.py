@@ -48,9 +48,10 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import matplotlib
 
@@ -184,6 +185,143 @@ class BlockResult:
         self.n_connectors = n_connectors
 
 
+# ---------------------------------------------------------------------------
+# Slice S6: density-graded street guidance (docs/macro-roads-nuclei-plan.md)
+#
+# The per-block Chen micro-engine (``r1_seam.chen_in_block``) already accepts a
+# ``guidance_strength`` knob; pre-S6 every block ran it at the same uniform
+# default. S6 grades that knob per block from local density, so street PATTERN
+# itself varies -- dense blocks read straighter/grid-like, sparse blocks
+# curvier/organic -- on top of the (already-present but visually flat) density
+# gradient. Greenspace grading (the plan's other S6 half) is explicitly out of
+# scope for this slice.
+# ---------------------------------------------------------------------------
+
+# chen_in_block's pre-S6 uniform guidance_strength (mapgen.r1_seam.chen_in_
+# block's own default) -- the ceiling every graded block still respects; the
+# sparsest block lands exactly here (today's behavior, unchanged).
+S6_BASE_GUIDANCE_STRENGTH = 6.0
+# Dense-block floor: some guidance always survives so the densest block never
+# collapses to a pure lattice grid (zero terrain-following).
+S6_GUIDANCE_STRENGTH_FLOOR = 1.5
+
+
+def _block_mean_density(block: sg.Polygon, fields: IslandFields) -> float:
+    """Mean ``fields.density`` over raster cell centers inside ``block``.
+
+    Mirrors ``mapgen.chen_field.RasterDensityField.mass``'s bbox-windowed
+    cell-center sampling (identical cell-center transform, identical
+    ``contains_xy`` inside test) but AVERAGES instead of summing, so the
+    result is comparable across blocks of very different area/cell-count
+    (``mass`` alone would just track block size).
+    """
+    density = fields.density
+    nrows, ncols = density.shape
+    if nrows == 0 or ncols == 0 or fields.cell <= 0.0:
+        return 0.0
+    minx, miny, maxx, maxy = block.bounds
+    col_lo = int(np.floor((minx - fields.x0) / fields.cell - 0.5))
+    col_hi = int(np.ceil((maxx - fields.x0) / fields.cell - 0.5))
+    row_lo = int(np.floor((miny - fields.y0) / fields.cell - 0.5))
+    row_hi = int(np.ceil((maxy - fields.y0) / fields.cell - 0.5))
+    col_lo = max(col_lo, 0)
+    row_lo = max(row_lo, 0)
+    col_hi = min(col_hi, ncols - 1)
+    row_hi = min(row_hi, nrows - 1)
+    if col_hi < col_lo or row_hi < row_lo:
+        return 0.0
+
+    cols = np.arange(col_lo, col_hi + 1)
+    rows = np.arange(row_lo, row_hi + 1)
+    cx = fields.x0 + (cols + 0.5) * fields.cell
+    cy = fields.y0 + (rows + 0.5) * fields.cell
+    gx, gy = np.meshgrid(cx, cy)
+    inside = shapely.contains_xy(block, gx.ravel(), gy.ravel()).reshape(gx.shape)
+    window = density[row_lo : row_hi + 1, col_lo : col_hi + 1]
+    if inside.any():
+        return float(window[inside].mean())
+    # Sub-cell block (rare sliver, smaller than one raster cell): no cell
+    # center falls inside it. Fall back to the single cell nearest the
+    # centroid so it still gets a defined density instead of a spurious 0.0
+    # (which would wrongly read as "sparsest").
+    centroid = block.centroid
+    col = int(
+        np.clip(round((centroid.x - fields.x0) / fields.cell - 0.5), 0, ncols - 1)
+    )
+    row = int(
+        np.clip(round((centroid.y - fields.y0) / fields.cell - 0.5), 0, nrows - 1)
+    )
+    return float(density[row, col])
+
+
+def block_norm_density(
+    macro_blocks: list[sg.Polygon], fields: IslandFields
+) -> list[float]:
+    """Per-block mean density, min-max normalized to ``[0, 1]`` (S6).
+
+    Sampling method: :func:`_block_mean_density` per block (mean of
+    ``fields.density`` over raster cell centers inside the block polygon).
+    Min-max normalized across ALL of ``macro_blocks``: the least-dense block
+    -> ``0.0``, the most-dense -> ``1.0``, index-aligned with ``macro_blocks``.
+
+    A uniform-density island (every block's mean equal, within ``1e-12``)
+    returns all zeros rather than dividing by ~0 -- combined with
+    :func:`graded_guidance_strength` mapping ``norm_density=0`` to the
+    unchanged baseline strength, a flat density field collapses the grading
+    back to today's uniform ``guidance_strength=6.0`` behavior.
+    """
+    means = [_block_mean_density(block, fields) for block in macro_blocks]
+    if not means:
+        return []
+    lo = min(means)
+    hi = max(means)
+    if hi - lo <= 1e-12:
+        return [0.0 for _ in means]
+    return [(m - lo) / (hi - lo) for m in means]
+
+
+def graded_guidance_strength(norm_density: float) -> float:
+    """Per-block ``chen_in_block`` ``guidance_strength`` from ``norm_density`` (S6).
+
+    Direction, verified against ``r1_arm_a.build_terrain_guidance`` (the
+    weight raster scales LINEARLY with ``strength``) and
+    ``scripts/run_r2_fan_probe.py`` (config A -- today's uniform
+    ``guidance_strength=6.0`` -- is the summit sliver-fan-inducing control;
+    config C, ``guidance=None`` i.e. strength 0, removes the fans): HIGHER
+    ``guidance_strength`` means MORE terrain-following curvature, so dense
+    blocks must stay at the LOW end (straighter/grid-like, less curvature,
+    lower summit-fan risk) while only sparse blocks graduate up toward the
+    unchanged baseline (curvy/organic).
+
+    ``clamp(BASE * (1 - norm_density), floor, BASE)``: the sparsest block
+    (``norm_density=0``) lands exactly at ``BASE`` (today's value, unchanged
+    -- so the sparsest block alone reproduces pre-S6 behavior); the densest
+    (``norm_density=1``) lands at ``floor`` (never below it, so even the
+    densest block keeps SOME terrain guidance, not a pure lattice). No block
+    is ever graded ABOVE today's uniform baseline.
+    """
+    raw = S6_BASE_GUIDANCE_STRENGTH * (1.0 - norm_density)
+    return min(S6_BASE_GUIDANCE_STRENGTH, max(S6_GUIDANCE_STRENGTH_FLOOR, raw))
+
+
+def _resolve_guidance_strength(
+    guidance_strength: float | Sequence[float] | Callable[[int], float],
+    block_id: int,
+) -> float:
+    """One block's ``guidance_strength`` from ``run_all_blocks``'s flexible input.
+
+    Accepts a single float (uniform, the pre-S6 behavior), a per-block
+    sequence index-aligned with ``macro_blocks`` (S6's graded list), or a
+    callable ``block_id -> strength`` for callers that want to derive it
+    lazily.
+    """
+    if isinstance(guidance_strength, int | float):
+        return float(guidance_strength)
+    if isinstance(guidance_strength, Sequence):
+        return float(cast("float", guidance_strength[block_id]))
+    return float(guidance_strength(block_id))
+
+
 def run_all_blocks(
     macro_blocks: list[sg.Polygon],
     fields: IslandFields,
@@ -192,6 +330,9 @@ def run_all_blocks(
     min_parcel_area: float,
     seeds: tuple[int, ...] = DEFAULT_RETRY_SEEDS,
     max_gate_spacing: float | None = None,
+    guidance_strength: float | Sequence[float] | Callable[[int], float] = (
+        S6_BASE_GUIDANCE_STRENGTH
+    ),
 ) -> list[BlockResult]:
     """Run Chen/R2 inside every macro-block with the global calibration.
 
@@ -209,17 +350,27 @@ def run_all_blocks(
     call, exactly like organically-extracted gates. A fallback block (no Chen
     layout) is never densified — it has no interior corner graph to route
     through.
+
+    ``guidance_strength`` (S6, optional) is the per-block
+    ``chen_in_block(..., guidance_strength=...)`` input: a single float applies
+    uniformly to every block (the default, ``S6_BASE_GUIDANCE_STRENGTH`` ==
+    ``chen_in_block``'s own pre-S6 default, so the default call here is
+    byte-identical to pre-S6 behavior), or a per-block sequence/callable (see
+    :func:`_resolve_guidance_strength`) grades it, e.g. from
+    :func:`graded_guidance_strength`.
     """
     results: list[BlockResult] = []
     n = len(macro_blocks)
     for i, block in enumerate(macro_blocks):
         t0 = time.perf_counter()
+        strength = _resolve_guidance_strength(guidance_strength, i)
         res = chen_in_block(
             block,
             fields,
             max_parcel_mass=max_parcel_mass,
             min_parcel_area=min_parcel_area,
             seeds=seeds,
+            guidance_strength=strength,
         )
         seconds = time.perf_counter() - t0
         if res.generated is None:
@@ -1587,6 +1738,21 @@ def run_hybrid(
         flush=True,
     )
 
+    # S6: density-graded per-block guidance strength (dense -> straighter/
+    # grid-like, sparse -> curvier/terrain-following) -- see
+    # block_norm_density / graded_guidance_strength docs above.
+    norm_density = block_norm_density(macro_blocks, fields)
+    guidance_strengths = [graded_guidance_strength(nd) for nd in norm_density]
+    print(
+        f"  S6 guidance grading: norm_density "
+        f"min={min(norm_density):.3f} median={float(np.median(norm_density)):.3f} "
+        f"max={max(norm_density):.3f}; guidance_strength "
+        f"min={min(guidance_strengths):.3f} "
+        f"median={float(np.median(guidance_strengths)):.3f} "
+        f"max={max(guidance_strengths):.3f}",
+        flush=True,
+    )
+
     print(f"Running Chen/R2 in {n_blocks} macro-blocks (global M)…", flush=True)
     results = run_all_blocks(
         macro_blocks,
@@ -1594,6 +1760,7 @@ def run_hybrid(
         max_parcel_mass=global_m,
         min_parcel_area=min_parcel_area,
         max_gate_spacing=max_gate_spacing,
+        guidance_strength=guidance_strengths,
     )
 
     total_districts = sum(r.district_count for r in results)
@@ -1831,6 +1998,19 @@ def run_hybrid(
         },
         "per_block_district_counts": [r.district_count for r in results],
         "per_block_seed_used": [r.seed_used for r in results],
+        # S6: density-graded per-block street guidance strength.
+        "s6_guidance_grading": {
+            "base_guidance_strength": S6_BASE_GUIDANCE_STRENGTH,
+            "guidance_strength_floor": S6_GUIDANCE_STRENGTH_FLOOR,
+            "norm_density_min": round(min(norm_density), 4),
+            "norm_density_median": round(float(np.median(norm_density)), 4),
+            "norm_density_max": round(max(norm_density), 4),
+            "guidance_strength_min": round(min(guidance_strengths), 4),
+            "guidance_strength_median": round(float(np.median(guidance_strengths)), 4),
+            "guidance_strength_max": round(max(guidance_strengths), 4),
+        },
+        "per_block_norm_density": [round(v, 4) for v in norm_density],
+        "per_block_guidance_strength": [round(v, 4) for v in guidance_strengths],
         "invariant_pass_rate": pass_rate,
         "retry_seeds": list(DEFAULT_RETRY_SEEDS),
         "connectivity": {
