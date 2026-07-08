@@ -808,11 +808,14 @@ def test_frontage_direction_matches_long_edge_of_rectangular_district() -> None:
 
 def test_oriented_footprint_angle_matches_long_district_edge() -> None:
     district = sg.box(0.0, 0.0, 20.0, 8.0)
+    # S5.1's width cap would shrink this 20-wide single-lot footprint below its
+    # depth and flip the OBB long axis; disable it here since this test is about
+    # frontage ORIENTATION, not width.
     footprint = _oriented_footprint(
         district,
         district.exterior,
         "detached",
-        MassingConfig(),
+        MassingConfig(detached_width_max_m=0.0),
         DEFAULT_METERS_PER_UNIT,
         LotConfig(),
     )
@@ -820,6 +823,89 @@ def test_oriented_footprint_angle_matches_long_district_edge() -> None:
     angle = abs(math.atan2(axis_long[1], axis_long[0]))
     angle_mod_pi = min(angle, abs(math.pi - angle))
     assert angle_mod_pi == pytest.approx(0.0, abs=0.05)
+
+
+def test_oriented_footprint_detached_width_capped() -> None:
+    # A wide, short district: frontage runs along the long (x) edge, so the
+    # footprint's x-extent IS its along-frontage width. S5.1 caps it.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    massing = MassingConfig()
+    fp = _oriented_footprint(
+        district,
+        district.exterior,
+        "detached",
+        massing,
+        DEFAULT_METERS_PER_UNIT,
+        LotConfig(),
+    )
+    cap_units = massing.detached_width_max_m / DEFAULT_METERS_PER_UNIT
+    minx, _miny, maxx, _maxy = fp.bounds
+    assert (maxx - minx) <= cap_units + 1e-6
+    # ... and centered in the frontage span (symmetric side yards).
+    assert (minx + maxx) / 2.0 == pytest.approx(10.0, abs=0.1)
+
+
+def test_oriented_footprint_row_width_uncapped() -> None:
+    # Row (terrace) keeps its full-width footprint -- width cap is 0.0.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    massing = MassingConfig()
+    fp = _oriented_footprint(
+        district,
+        district.exterior,
+        "row",
+        massing,
+        DEFAULT_METERS_PER_UNIT,
+        LotConfig(),
+    )
+    cap_units = massing.detached_width_max_m / DEFAULT_METERS_PER_UNIT
+    minx, _miny, maxx, _maxy = fp.bounds
+    assert (maxx - minx) > 2.0 * cap_units
+
+
+def test_oriented_footprint_width_cap_zero_disables() -> None:
+    # detached_width_max_m=0.0 restores the pre-S5.1 full-width slab.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    massing = MassingConfig(detached_width_max_m=0.0)
+    fp = _oriented_footprint(
+        district,
+        district.exterior,
+        "detached",
+        massing,
+        DEFAULT_METERS_PER_UNIT,
+        LotConfig(),
+    )
+    default_cap = MassingConfig().detached_width_max_m / DEFAULT_METERS_PER_UNIT
+    minx, _miny, maxx, _maxy = fp.bounds
+    assert (maxx - minx) > 2.0 * default_cap
+
+
+def test_oriented_footprint_landlocked_width_capped() -> None:
+    # No frontage edge (forced via an unreachable min_frontage) -> the OBB
+    # landlocked path; S5.1 caps half-width there too. Compare capped vs a
+    # width_max=0 (uncapped) build on the same lot: the cap must shrink it.
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    landlocked = LotConfig(min_frontage=1.0e9)
+    fp_capped = _oriented_footprint(
+        district,
+        district.exterior,
+        "detached",
+        MassingConfig(),
+        DEFAULT_METERS_PER_UNIT,
+        landlocked,
+    )
+    fp_uncapped = _oriented_footprint(
+        district,
+        district.exterior,
+        "detached",
+        MassingConfig(detached_width_max_m=0.0),
+        DEFAULT_METERS_PER_UNIT,
+        landlocked,
+    )
+    assert fp_capped.area < fp_uncapped.area
+    # the capped along-lot-long-axis extent stays within the cap
+    cap_units = MassingConfig().detached_width_max_m / DEFAULT_METERS_PER_UNIT
+    _c, _al, _as2, long_len, short_len = _obb_axes(fp_capped)
+    assert min(long_len, short_len) <= cap_units + 1e-6
 
 
 # ---------------------------------------------------------------------------

@@ -154,6 +154,16 @@ DEFAULT_ROW_DEPTH_MAX_M: float = 10.0
 DEFAULT_LANDMARK_YARD_FRONT_M: float = 3.0
 DEFAULT_LANDMARK_SIDE_M: float = 2.0
 DEFAULT_LANDMARK_DEPTH_MAX_M: float = 20.0
+# S5.1 footprint WIDTH cap (along-frontage extent, meters; 0.0 = uncapped).
+# The depth-max above bounds how far a building runs back from the street, but
+# NOT its width -- so a wide outskirts lot got a full-frontage slab that read
+# as a warehouse. Capping detached width to ~farmhouse scale keeps large lots
+# to a modest building centered with generous side yards (more inter-building
+# space). Row stays uncapped (0.0): its full-width footprint IS the continuous
+# terrace. Landmark stays uncapped: downtown landmarks should stay prominent.
+DEFAULT_DETACHED_WIDTH_MAX_M: float = 11.0
+DEFAULT_ROW_WIDTH_MAX_M: float = 0.0
+DEFAULT_LANDMARK_WIDTH_MAX_M: float = 0.0
 DEFAULT_REAR_MIN_M: float = 3.0
 # Matches mapgen.r1_mesh.DEFAULT_METERS_PER_UNIT -- duplicated here (rather
 # than importing r1_mesh) so this pure module keeps its own zero-dependency
@@ -316,6 +326,9 @@ class MassingConfig:
     landmark_yard_front_m: float = DEFAULT_LANDMARK_YARD_FRONT_M
     landmark_side_m: float = DEFAULT_LANDMARK_SIDE_M
     landmark_depth_max_m: float = DEFAULT_LANDMARK_DEPTH_MAX_M
+    detached_width_max_m: float = DEFAULT_DETACHED_WIDTH_MAX_M
+    row_width_max_m: float = DEFAULT_ROW_WIDTH_MAX_M
+    landmark_width_max_m: float = DEFAULT_LANDMARK_WIDTH_MAX_M
     rear_min_m: float = DEFAULT_REAR_MIN_M
 
 
@@ -519,6 +532,17 @@ def _setbacks_for_typology(
     if typology == "landmark":
         return cfg.landmark_yard_front_m, cfg.landmark_side_m, cfg.landmark_depth_max_m
     return cfg.detached_yard_front_m, cfg.detached_side_m, cfg.detached_depth_max_m
+
+
+def _width_max_for_typology(typology: str, cfg: MassingConfig) -> float:
+    """Max along-frontage footprint width in METERS for ``typology`` (S5.1);
+    ``0.0`` means uncapped. Unknown typologies use the detached cap (same
+    convention as :func:`_setbacks_for_typology`)."""
+    if typology == "row":
+        return cfg.row_width_max_m
+    if typology == "landmark":
+        return cfg.landmark_width_max_m
+    return cfg.detached_width_max_m
 
 
 def _stories_for_typology(
@@ -1286,6 +1310,17 @@ def _oriented_footprint(
         s_hi = cs_max - side_setback
         if s_hi <= s_lo:
             return _footprint_clamped(lot_poly, cfg.inset)
+        # S5.1: cap along-frontage width so a wide lot keeps a farmhouse-scale
+        # building centered in its frontage span (symmetric side yards), rather
+        # than a full-width warehouse slab. 0.0 = uncapped (row terraces,
+        # landmarks); detached caps to ~11 m.
+        width_max_m = _width_max_for_typology(typology, massing)
+        if width_max_m > 0.0:
+            width_max = width_max_m / meters_per_unit
+            if s_hi - s_lo > width_max:
+                s_mid = 0.5 * (s_lo + s_hi)
+                s_lo = s_mid - 0.5 * width_max
+                s_hi = s_mid + 0.5 * width_max
         side_strip = _strip_polygon(
             anchor, along, perp, s_lo, s_hi, d_lo - pad, d_hi + pad
         )
@@ -1294,6 +1329,11 @@ def _oriented_footprint(
         center, axis_long, axis_short, long_len, short_len = _obb_axes(lot_poly)
         d_yard_m, d_side_m, d_depth_max_m = _setbacks_for_typology("detached", massing)
         half_w = max(0.0, long_len / 2.0 - d_side_m / meters_per_unit)
+        # S5.1: same farmhouse width cap on the landlocked/interior path (uses
+        # the detached clearances, so cap with the detached width_max too).
+        d_width_max_m = _width_max_for_typology("detached", massing)
+        if d_width_max_m > 0.0:
+            half_w = min(half_w, 0.5 * d_width_max_m / meters_per_unit)
         half_d = max(
             0.0,
             min(
