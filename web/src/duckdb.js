@@ -74,6 +74,24 @@ function datasetFromParams(data, layout) {
       label: "Hybrid Island (Chen)",
     };
   }
+  // The two larger islands, each laid out + exported standalone (same pipeline as
+  // island-chen; self-consistent metric frame). idx0 ~22.5k worlds, idx12 ~90.5k
+  // (the largest, ~72% of the dataset). A single all-islands map needs metric
+  // reconciliation (per-island meters_per_app_unit) -- separate follow-up.
+  if (data === "island-chen-idx0" || layout === "chen-idx0") {
+    return {
+      key: "nolabs-localmap-island-chen-idx0",
+      dir: "full-nolabs-localmap-island-chen-idx0/",
+      label: "Hybrid Island 0 (Chen, 22k)",
+    };
+  }
+  if (data === "island-chen-idx12" || layout === "chen-idx12") {
+    return {
+      key: "nolabs-localmap-island-chen-idx12",
+      dir: "full-nolabs-localmap-island-chen-idx12/",
+      label: "Hybrid Island 12 (Chen, 90k)",
+    };
+  }
   if (
     data === "nolabs-city-mesh" ||
     data === "full-nolabs-localmap-island-toponymy-city-mesh" ||
