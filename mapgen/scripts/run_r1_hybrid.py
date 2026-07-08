@@ -88,9 +88,11 @@ from mapgen.r1_connect import (  # noqa: E402
 from mapgen.r1_lots import (  # noqa: E402
     DEFAULT_INSET,
     DEFAULT_MIN_LOT_AREA_FRAC,
+    FrontingRoadIndex,
     Lot,
     MassingConfig,
     assign_worlds_to_districts,
+    build_fronting_road_index,
     build_lots,
     classify_typology,
     count_sliver_reassignments,
@@ -108,7 +110,7 @@ from mapgen.r1_macro import (  # noqa: E402
     load_boundary,
     nucleus_specs_to_geojson,
 )
-from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT  # noqa: E402
+from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT, DEFAULT_STREET_WIDTHS  # noqa: E402
 from mapgen.r1_seam import (  # noqa: E402
     DEFAULT_RETRY_SEEDS,
     chen_in_block,
@@ -917,6 +919,33 @@ def _select_seam_block(
 _GREYBOX_TIER_NAME: dict[int, str] = {2: "highway", 1: "major", 0: "local"}
 
 
+def _fronting_road_segments(layer: MacroLayer) -> list[tuple[sg.LineString, str]]:
+    """Tiered arterial + ring centerlines as ``(line, tier_name)`` pairs for
+    the S7b :class:`~mapgen.r1_lots.FrontingRoadIndex`
+    (docs/macro-roads-nuclei-plan.md).
+
+    Clipped arterials carry functional tiers (highway/major/local via
+    ``_GREYBOX_TIER_NAME``); promoted ring arcs (slice B, ``tier`` 1/2)
+    contribute their major/highway tier; every whole core ring contributes the
+    ``"ring"`` tier. A promoted major/highway ring arc thus OVERLAPS its
+    whole-ring ``"ring"`` entry -- :meth:`FrontingRoadIndex.fronting_tier`
+    breaks that co-located tie toward the wider tier, so the arc wins where it
+    was promoted. Local-tier (0) ring arcs are omitted: they coincide with the
+    whole ring, which already contributes ``"ring"`` (matching the render
+    convention, which only draws promoted 1/2 arcs specially)."""
+    segments: list[tuple[sg.LineString, str]] = []
+    for line, rec in zip(layer.arterial_lines, layer.edges, strict=True):
+        if line.geom_type == "LineString":
+            segments.append((line, _GREYBOX_TIER_NAME.get(rec.tier, "street")))
+    for line, rec in zip(layer.ring_arc_lines, layer.ring_arc_edges, strict=True):
+        if line.geom_type == "LineString" and rec.tier in (1, 2):
+            segments.append((line, _GREYBOX_TIER_NAME[rec.tier]))
+    for line in layer.ring_lines:
+        if line.geom_type == "LineString":
+            segments.append((line, "ring"))
+    return segments
+
+
 def _feature_collection(
     records: list[tuple[int, Any, dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -1332,6 +1361,17 @@ def export_greybox(
     if massing is None:
         massing = MassingConfig()
 
+    # S7b (docs/macro-roads-nuclei-plan.md): one shared fronting-road index for
+    # every district's build_lots call -- denominates each lot's front setback
+    # from the WIDTH of the road its frontage fronts, using r1_mesh's
+    # DEFAULT_STREET_WIDTHS as the single source of truth for ribbon widths.
+    fronting_index: FrontingRoadIndex = build_fronting_road_index(
+        _fronting_road_segments(layer),
+        street_widths=DEFAULT_STREET_WIDTHS,
+        meters_per_unit=meters_per_unit,
+        pedestrian_clearance_m=massing.pedestrian_clearance_m,
+    )
+
     district_entries: list[tuple[int, sg.Polygon]] = []  # (block_id, polygon)
     for res in results:
         for poly in res.districts:
@@ -1417,6 +1457,7 @@ def export_greybox(
             landmark_ids=landmark_ids,
             fallback_stats=fallback_stats,
             zone=zone,
+            fronting_index=fronting_index,
         )
         all_lots.extend(district_lots)
         for lot in district_lots:
@@ -1615,6 +1656,25 @@ def export_greybox(
                 }
                 for z in ("core", "inner", "fringe")
             },
+            # S7b (docs/macro-roads-nuclei-plan.md): per-fronting-tier setback
+            # + near-highway displacement report. occupied-lot counts by
+            # fronting road tier; wide_setback = occupied lots on highway/major
+            # frontage (the ones the flat road_clear_m used to leave inside the
+            # ribbon); no_build_displaced = too-shallow highway/major lots
+            # excluded from assignment (turned to greenspace, their worlds
+            # re-displaced onto deeper lots in the same district);
+            # no_build_infeasible_districts = districts where too few buildable
+            # lots remained to exclude, so the shallow lots stayed assignable
+            # (no world lost -- degraded footprint instead).
+            "s7b_setback_by_tier": {
+                tier: fallback_stats.get("s7b_setback_by_tier", {}).get(tier, 0)
+                for tier in ("highway", "major", "ring", "local", "street")
+            },
+            "s7b_wide_setback_lots": fallback_stats.get("s7b_wide_setback_lots", 0),
+            "s7b_no_build_displaced": fallback_stats.get("s7b_no_build_displaced", 0),
+            "s7b_no_build_infeasible_districts": fallback_stats.get(
+                "s7b_no_build_infeasible_districts", 0
+            ),
         },
         "lot_config": {
             "inset": inset,
@@ -2064,6 +2124,16 @@ def run_hybrid(
         print(
             f"  S5 zones (districts): core={zc['core']} inner={zc['inner']} "
             f"fringe={zc['fringe']}",
+            flush=True,
+        )
+        s7b = counts["s7b_setback_by_tier"]
+        print(
+            "  S7b fronting setback (occupied lots): "
+            f"highway={s7b['highway']} major={s7b['major']} ring={s7b['ring']} "
+            f"local={s7b['local']} street={s7b['street']}; "
+            f"wide(hwy+major)={counts['s7b_wide_setback_lots']}, "
+            f"no-build displaced={counts['s7b_no_build_displaced']} "
+            f"(infeasible districts={counts['s7b_no_build_infeasible_districts']})",
             flush=True,
         )
         lot_config = greybox_manifest["lot_config"]

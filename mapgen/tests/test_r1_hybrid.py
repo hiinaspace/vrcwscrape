@@ -28,6 +28,7 @@ from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
     S6_GUIDANCE_STRENGTH_FLOOR,
     BlockResult,
     _block_mean_density,
+    _fronting_road_segments,
     _resolve_guidance_strength,
     _select_seam_block,
     _zone_for_district,
@@ -45,7 +46,12 @@ from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
 from mapgen.r1_arm_a import IslandFields  # noqa: E402
 from mapgen.r1_connect import SeamJunction  # noqa: E402
 from mapgen.r1_lots import MassingConfig, assign_worlds_to_districts  # noqa: E402
-from mapgen.r1_macro import MacroLayer, MacroParams, NucleusSpec  # noqa: E402
+from mapgen.r1_macro import (  # noqa: E402
+    MacroEdge,
+    MacroLayer,
+    MacroParams,
+    NucleusSpec,
+)
 from mapgen.r1_seam import ChenInBlockResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -827,3 +833,41 @@ def test_export_greybox_zone_and_landmark_quota_end_to_end(tmp_path) -> None:
     # The minor nucleus's equally-high-visits world is NEVER a landmark --
     # minor nuclei get no landmark tier by default (S5).
     assert by_world["minor_hi"]["typology"] != "landmark"
+
+
+# ---------------------------------------------------------------------------
+# S7b: fronting-road segment assembly (docs/macro-roads-nuclei-plan.md)
+# ---------------------------------------------------------------------------
+
+
+def _edge(tier: int) -> MacroEdge:
+    return MacroEdge(node_a=0, node_b=1, tau=tier, tier=tier, path_cost=1.0, length=1.0)
+
+
+def test_fronting_road_segments_maps_arterial_ring_and_promoted_arc_tiers() -> None:
+    hwy = sg.LineString([(0.0, 0.0), (10.0, 0.0)])
+    local = sg.LineString([(0.0, 5.0), (10.0, 5.0)])
+    whole_ring = sg.LineString([(0.0, 0.0), (0.0, 10.0)])
+    promoted_arc = sg.LineString([(0.0, 0.0), (0.0, 5.0)])  # tier 2 (highway)
+    local_arc = sg.LineString([(0.0, 5.0), (0.0, 10.0)])  # tier 0 -> omitted
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[whole_ring],
+        arterial_lines=[hwy, local],
+        edges=[_edge(2), _edge(0)],
+        blocks=[],
+        nuclei=[],
+        plaza_polys=[],
+        ring_arc_lines=[promoted_arc, local_arc],
+        ring_arc_edges=[_edge(2), _edge(0)],
+    )
+    segments = _fronting_road_segments(layer)
+    tiers = [tier for _line, tier in segments]
+    # highway + local arterials, the promoted (tier 2) arc, and the whole ring;
+    # the local-tier (0) arc is omitted (it coincides with the whole "ring").
+    assert tiers == ["highway", "local", "highway", "ring"]

@@ -17,18 +17,23 @@ from shapely.ops import unary_union
 import mapgen.r1_lots as r1_lots
 from mapgen.r1_lots import (
     DEFAULT_METERS_PER_UNIT,
+    DEFAULT_PEDESTRIAN_CLEARANCE_M,
+    FrontingRoadIndex,
     Lot,
     LotConfig,
     MassingConfig,
     _build_lots_voronoi,
     _footprint,
     _frontage_direction,
+    _frontage_edge,
+    _longest_frontage_segment,
     _massing_height,
     _obb_axes,
     _oriented_footprint,
     _stories_for_typology,
     _touches_ext_ring,
     assign_worlds_to_districts,
+    build_fronting_road_index,
     build_lots,
     classify_typology,
     count_sliver_reassignments,
@@ -37,6 +42,7 @@ from mapgen.r1_lots import (
     subdivide_district,
     top_landmark_ids,
 )
+from mapgen.r1_mesh import DEFAULT_STREET_WIDTHS
 
 # ---------------------------------------------------------------------------
 # assign_worlds_to_districts (UNCHANGED behavior -- not part of this wave)
@@ -1376,3 +1382,211 @@ def test_lot_is_frozen() -> None:
     )
     with pytest.raises(AttributeError):
         lot.height = 10.0  # ty: ignore[invalid-assignment]
+
+
+# ---------------------------------------------------------------------------
+# S7b: per-fronting-tier road setback + near-highway displacement
+# (docs/macro-roads-nuclei-plan.md slice S7b)
+# ---------------------------------------------------------------------------
+
+
+def _highway_index(
+    line: sg.LineString, tier: str = "highway", *, mpu: float = DEFAULT_METERS_PER_UNIT
+) -> FrontingRoadIndex:
+    return build_fronting_road_index(
+        [(line, tier)],
+        street_widths=DEFAULT_STREET_WIDTHS,
+        meters_per_unit=mpu,
+    )
+
+
+def test_fronting_road_index_lookup_highway_vs_interior() -> None:
+    # A road centerline along y=0; the SAME edge (distance ~0) resolves to its
+    # tier, while a far edge (interior frontage) resolves to None -> "street".
+    idx = _highway_index(sg.LineString([(0.0, 0.0), (20.0, 0.0)]))
+    on_road = sg.LineString([(0.0, 0.0), (20.0, 0.0)])
+    assert idx.fronting_tier(on_road) == "highway"
+    far = sg.LineString([(0.0, 7.9), (20.0, 7.9)])  # 7.9 units > 0.3 threshold
+    assert idx.fronting_tier(far) is None
+
+
+def test_fronting_road_index_road_clear_magnitudes_match_formula() -> None:
+    # road_clear_m(tier) = DEFAULT_STREET_WIDTHS[tier]*mpu/2 + pedestrian.
+    # Highway == 14.5 m EXACTLY (the contract's headline number); the other
+    # tiers follow the same single formula (contract's "~6 m / ~1 m"
+    # parentheticals omit the pedestrian term -- see this slice's report).
+    mpu = DEFAULT_METERS_PER_UNIT
+    ped = DEFAULT_PEDESTRIAN_CLEARANCE_M
+    idx = build_fronting_road_index(
+        [], street_widths=DEFAULT_STREET_WIDTHS, meters_per_unit=mpu
+    )
+    assert idx.road_clear_m("highway") == pytest.approx(1.0 * mpu / 2 + ped)
+    assert idx.road_clear_m("highway") == pytest.approx(14.5)
+    assert idx.road_clear_m("major") == pytest.approx(0.7 * mpu / 2 + ped)
+    assert idx.road_clear_m("ring") == pytest.approx(0.6 * mpu / 2 + ped)
+    assert idx.road_clear_m("local") == pytest.approx(0.5 * mpu / 2 + ped)
+    assert idx.road_clear_m("street") == pytest.approx(0.25 * mpu / 2 + ped)
+    # Strictly monotonic: highway widest, street narrowest.
+    ordered = [
+        idx.road_clear_m(t) for t in ("highway", "major", "ring", "local", "street")
+    ]
+    assert ordered == sorted(ordered, reverse=True)
+    assert all(a > b for a, b in zip(ordered, ordered[1:], strict=False))
+
+
+def test_fronting_road_index_tie_breaks_to_widest_tier() -> None:
+    # A promoted highway ring arc overlapping the whole "ring" it belongs to:
+    # co-located (distance 0) -> the wider (highway) tier must win, regardless
+    # of the order the segments were added.
+    line = sg.LineString([(0.0, 0.0), (20.0, 0.0)])
+    idx = build_fronting_road_index(
+        [(line, "ring"), (line, "highway")],
+        street_widths=DEFAULT_STREET_WIDTHS,
+        meters_per_unit=DEFAULT_METERS_PER_UNIT,
+    )
+    assert idx.fronting_tier(sg.LineString([(0.0, 0.0), (20.0, 0.0)])) == "highway"
+
+
+def test_longest_frontage_segment_matches_frontage_edge_anchor() -> None:
+    # _longest_frontage_segment mirrors _frontage_edge's SELECTION: the segment
+    # it returns starts at the same anchor _frontage_edge reports.
+    lot = sg.box(0.0, 0.0, 20.0, 8.0)
+    edge = _frontage_edge(lot, lot.exterior, min_frontage=0.0)
+    seg = _longest_frontage_segment(lot, lot.exterior, min_frontage=0.0)
+    assert edge is not None and seg is not None
+    anchor = edge[0]
+    p0 = seg.coords[0]
+    assert (p0[0], p0[1]) == pytest.approx((float(anchor[0]), float(anchor[1])))
+
+
+def test_oriented_footprint_road_clear_override_pushes_footprint_back() -> None:
+    # A pentagon whose UNIQUE longest edge is the bottom (y=0) -> deterministic
+    # frontage. A wide highway override sets the building back past the highway
+    # ribbon half-width (12.5 m = 0.5 island units), where the flat default
+    # (road_clear_m ~4.6 m) leaves it inside.
+    lot = sg.Polygon([(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (10.0, 14.0), (0.0, 10.0)])
+    mpu = DEFAULT_METERS_PER_UNIT
+    massing = MassingConfig()
+    ribbon = sg.LineString([(0.0, 0.0), (20.0, 0.0)]).buffer(1.0 * mpu / 2 / mpu)
+
+    flat = _oriented_footprint(lot, lot.exterior, "detached", massing, mpu, LotConfig())
+    wide = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        massing,
+        mpu,
+        LotConfig(),
+        road_clear_m_override=1.0 * mpu / 2 + DEFAULT_PEDESTRIAN_CLEARANCE_M,
+    )
+    assert not flat.is_empty and not wide.is_empty
+    assert flat.intersection(ribbon).area > 0.0  # bug: flat sits in the ribbon
+    assert wide.intersection(ribbon).area == pytest.approx(0.0, abs=1e-9)
+
+
+def test_build_lots_no_index_is_byte_identical_regression_guard() -> None:
+    # The regression guard: passing fronting_index=None reproduces the pre-S7b
+    # output exactly (same lot + footprint WKBs, same order).
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    world_ids = [f"w{i}" for i in range(6)]
+    xs = [1.0, 5.0, 9.0, 13.0, 17.0, 19.0]
+    ys = [1.0, 6.0, 2.0, 5.0, 3.0, 7.0]
+    member = _member_points(world_ids, xs, ys, [10] * 6)
+    a = build_lots(district, 0, member)
+    b = build_lots(district, 0, member, fronting_index=None)
+    assert [lot.lot.wkb for lot in a] == [lot.lot.wkb for lot in b]
+    assert [lot.footprint.wkb for lot in a] == [lot.footprint.wkb for lot in b]
+    assert [lot.world_id for lot in a] == [lot.world_id for lot in b]
+
+
+def test_build_lots_highway_frontage_clears_ribbon_where_flat_does_not() -> None:
+    # n=1 whole-district lot with a UNIQUE longest bottom edge -> the highway
+    # index widens its setback so the building clears the 12.5 m highway
+    # ribbon, where the flat default leaves it inside (the S7b fix).
+    district = sg.Polygon(
+        [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (10.0, 14.0), (0.0, 10.0)]
+    )
+    mpu = DEFAULT_METERS_PER_UNIT
+    member = _member_points(["solo"], [10.0], [4.0], [10])
+    idx = _highway_index(sg.LineString([(0.0, 0.0), (20.0, 0.0)]))
+    ribbon = sg.LineString([(0.0, 0.0), (20.0, 0.0)]).buffer(1.0 * mpu / 2 / mpu)
+
+    flat = build_lots(district, 0, member, meters_per_unit=mpu)
+    wide = build_lots(district, 0, member, meters_per_unit=mpu, fronting_index=idx)
+    assert flat[0].footprint.intersection(ribbon).area > 0.0
+    assert wide[0].footprint.intersection(ribbon).area == pytest.approx(0.0, abs=1e-9)
+
+
+def test_build_lots_shallow_highway_district_never_loses_a_world() -> None:
+    # A shallow strip fronting a highway: the highway setback leaves no
+    # buildable depth, so the no-build machinery engages -- but EVERY world is
+    # still placed (occupied lots carry the whole input world set; none lost),
+    # whether via lot exclusion (greenspace + re-displacement) or the
+    # feasibility fallback.
+    district = sg.box(0.0, 0.0, 40.0, 0.75)
+    world_ids = [f"w{i}" for i in range(4)]
+    xs = [4.0, 14.0, 24.0, 34.0]
+    ys = [0.4, 0.4, 0.4, 0.4]
+    member = _member_points(world_ids, xs, ys, [10] * 4)
+    idx = _highway_index(sg.LineString([(0.0, 0.0), (40.0, 0.0)]))
+    stats: dict[str, Any] = {}
+    lots = build_lots(district, 0, member, fronting_index=idx, fallback_stats=stats)
+    occupied = [lot for lot in lots if lot.kind == "lot"]
+    assert {lot.world_id for lot in occupied} == set(world_ids)  # no world lost
+    engaged = stats.get("s7b_no_build_displaced", 0) + stats.get(
+        "s7b_no_build_infeasible_districts", 0
+    )
+    assert engaged > 0  # the near-highway no-build path did fire
+
+
+def test_build_lots_fronting_index_is_deterministic() -> None:
+    district = sg.box(0.0, 0.0, 20.0, 8.0)
+    world_ids = [f"w{i}" for i in range(6)]
+    xs = [1.0, 5.0, 9.0, 13.0, 17.0, 19.0]
+    ys = [1.0, 6.0, 2.0, 5.0, 3.0, 7.0]
+    member = _member_points(world_ids, xs, ys, [10] * 6)
+    idx = _highway_index(sg.LineString([(0.0, 0.0), (20.0, 0.0)]))
+    a = build_lots(district, 3, member, fronting_index=idx)
+    b = build_lots(district, 3, member, fronting_index=idx)
+    assert [lot.footprint.wkb for lot in a] == [lot.footprint.wkb for lot in b]
+    assert [lot.lot.wkb for lot in a] == [lot.lot.wkb for lot in b]
+
+
+def test_oriented_footprint_rear_anchors_degenerate_highway_lot() -> None:
+    # A shallow lot fronting a highway (unique longest bottom edge): the wide
+    # highway setback can't fit, so the slab degenerates. rear_anchor_degenerate
+    # pushes the degraded building to the REAR (far from y=0) vs the lot-center
+    # clamped fallback -- strictly LESS footprint left inside the highway ribbon
+    # (it can't fully clear on a lot this shallow -- the accepted floor).
+    lot = sg.Polygon([(0.0, 0.0), (6.0, 0.0), (6.0, 0.7), (3.0, 0.8), (0.0, 0.7)])
+    mpu = DEFAULT_METERS_PER_UNIT
+    massing = MassingConfig()
+    hw_road_clear = 1.0 * mpu / 2 + DEFAULT_PEDESTRIAN_CLEARANCE_M  # 14.5 m
+    ribbon = sg.LineString([(0.0, 0.0), (6.0, 0.0)]).buffer(1.0 * mpu / 2 / mpu)
+
+    clamped = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        massing,
+        mpu,
+        LotConfig(),
+        road_clear_m_override=hw_road_clear,
+        rear_anchor_degenerate=False,
+    )
+    rear = _oriented_footprint(
+        lot,
+        lot.exterior,
+        "detached",
+        massing,
+        mpu,
+        LotConfig(),
+        road_clear_m_override=hw_road_clear,
+        rear_anchor_degenerate=True,
+    )
+    assert not clamped.is_empty and not rear.is_empty
+    assert lot.buffer(1e-9).covers(rear)  # never pokes outside the lot
+    # Rear-anchored building sits farther from the arterial and leaves less
+    # footprint inside the ribbon.
+    assert rear.centroid.y > clamped.centroid.y
+    assert rear.intersection(ribbon).area < clamped.intersection(ribbon).area

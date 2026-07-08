@@ -165,6 +165,20 @@ DEFAULT_DETACHED_WIDTH_MAX_M: float = 11.0
 DEFAULT_ROW_WIDTH_MAX_M: float = 0.0
 DEFAULT_LANDMARK_WIDTH_MAX_M: float = 0.0
 DEFAULT_REAR_MIN_M: float = 3.0
+# S7b (docs/macro-roads-nuclei-plan.md): pedestrian/sidewalk margin (METERS)
+# added to a fronting road's ribbon HALF-WIDTH to form that lot's front
+# clearance -- see FrontingRoadIndex. Only consumed on the S7b fronting-index
+# path; the flat pre-S7b road_clear_m default (DEFAULT_ROAD_CLEAR_M) is used
+# whenever no index is threaded in.
+DEFAULT_PEDESTRIAN_CLEARANCE_M: float = 2.0
+# S7b: max distance (island units) from a lot's frontage edge to a tiered road
+# for that road's tier to denominate the lot's front setback. A boundary
+# district's frontage edge lies ON the macro-block boundary == the arterial
+# centerline (distance ~0), while an INTERIOR district's nearest arterial is a
+# whole Chen district (~0.66 island units) away -- 0.3 (~7.5 m) cleanly
+# separates the two, so interior frontages resolve to the narrowest "street"
+# tier.
+DEFAULT_FRONTING_MATCH_THRESHOLD_UNITS: float = 0.3
 # Matches mapgen.r1_mesh.DEFAULT_METERS_PER_UNIT -- duplicated here (rather
 # than importing r1_mesh) so this pure module keeps its own zero-dependency
 # default; run_r1_hybrid.py wires the SAME value through --meters-per-unit.
@@ -299,6 +313,11 @@ class MassingConfig:
     - ``rear_min_m``: guard so a shallow lot always keeps at least this much
       UNBUILT depth behind the footprint, capping ``depth_max_m`` down when
       the lot itself is too shallow to fit the full setback + depth_max.
+    - ``pedestrian_clearance_m``: S7b (docs/macro-roads-nuclei-plan.md) --
+      pedestrian/sidewalk margin added to a fronting road's ribbon HALF-WIDTH
+      to form that lot's front clearance when a :class:`FrontingRoadIndex` is
+      threaded into :func:`build_lots`. Inert on the flat pre-S7b path (no
+      index): ``road_clear_m`` stays the flat clearance there.
     """
 
     a_detached_m2: float = DEFAULT_A_DETACHED_M2
@@ -330,6 +349,129 @@ class MassingConfig:
     row_width_max_m: float = DEFAULT_ROW_WIDTH_MAX_M
     landmark_width_max_m: float = DEFAULT_LANDMARK_WIDTH_MAX_M
     rear_min_m: float = DEFAULT_REAR_MIN_M
+    pedestrian_clearance_m: float = DEFAULT_PEDESTRIAN_CLEARANCE_M
+
+
+@dataclass(frozen=True, eq=False)
+class FrontingRoadIndex:
+    """Spatial index of tiered arterial/ring centerlines that denominates a
+    lot's FRONT setback from the WIDTH of the road its frontage actually fronts
+    (S7b, docs/macro-roads-nuclei-plan.md).
+
+    Road ribbon widths in the mesh are tier-differentiated (a highway ribbon
+    spans a full island unit -> +-12.5 m from its centerline at
+    ``meters_per_unit=25``), but the arterial CENTERLINE runs along the
+    macro-block boundary a boundary district's frontage edge sits on. A flat
+    ``MassingConfig.road_clear_m`` therefore set a highway-fronting building
+    only ~4.6 m back from a centerline whose ribbon reached 12.5 m -- the
+    building landed INSIDE the ribbon. This index maps each lot's frontage edge
+    to the tier of the nearest tiered road (within ``match_threshold`` island
+    units) so :func:`build_lots` can set ``road_clear_m`` from that tier's
+    half-width instead.
+
+    Built by :func:`build_fronting_road_index`, which owns the STRtree
+    construction and the per-tier ``road_clear_m`` precompute. ``street_widths``
+    (``mapgen.r1_mesh.DEFAULT_STREET_WIDTHS`` -- the SINGLE source of truth for
+    ribbon widths) is threaded IN by the caller rather than imported here,
+    keeping this module free of an r1_mesh dependency (same discipline as
+    ``DEFAULT_METERS_PER_UNIT``).
+
+    - ``road_clear_by_tier``: tier name -> front clearance (METERS) =
+      ``street_widths[tier] * meters_per_unit / 2 + pedestrian_clearance_m``
+      (ribbon half-width + pedestrian margin). Covers EVERY tier in
+      ``street_widths`` (incl. the interior ``"street"`` tier) so a lookup
+      resolves even for a tier not present among ``segments``.
+    - ``half_width_by_tier``: tier name -> ribbon half-width (METERS), used
+      only to break an exact nearest-distance TIE toward the WIDEST road
+      (deterministic + conservative -- keeps buildings off the widest nearby
+      ribbon, and lets a promoted highway ring arc win over the whole "ring"
+      it overlaps).
+
+    ``eq=False`` because the stored :class:`~shapely.strtree.STRtree` is not
+    meaningfully comparable/hashable and the index is only ever passed by
+    reference, never compared.
+    """
+
+    lines: tuple[sg.LineString, ...]
+    tiers: tuple[str, ...]
+    tree: STRtree
+    match_threshold: float
+    road_clear_by_tier: dict[str, float]
+    half_width_by_tier: dict[str, float]
+
+    def fronting_tier(self, edge: sg.LineString) -> str | None:
+        """Tier name of the nearest tiered road within ``match_threshold`` of
+        ``edge`` (an exact-distance tie broken toward the WIDEST tier, then by
+        tier name for full determinism), or ``None`` when no tiered road is
+        that close -- an interior frontage on a Chen local street, which
+        :func:`build_lots` maps to the narrowest ``"street"`` tier."""
+        if not self.lines:
+            return None
+        idx = self.tree.query_nearest(
+            edge, max_distance=self.match_threshold, all_matches=True
+        )
+        cands = [int(i) for i in idx]
+        if not cands:
+            return None
+        best_i = min(
+            cands,
+            key=lambda i: (
+                round(float(edge.distance(self.lines[i])), 9),
+                -self.half_width_by_tier.get(self.tiers[i], 0.0),
+                self.tiers[i],
+            ),
+        )
+        return self.tiers[best_i]
+
+    def road_clear_m(self, tier: str) -> float:
+        """Front clearance (METERS) for ``tier`` (ribbon half-width +
+        pedestrian margin); an unknown tier falls back to the narrowest
+        (``"street"``) clearance, else 0.0."""
+        if tier in self.road_clear_by_tier:
+            return self.road_clear_by_tier[tier]
+        return self.road_clear_by_tier.get("street", 0.0)
+
+
+def build_fronting_road_index(
+    segments: list[tuple[sg.LineString, str]],
+    *,
+    street_widths: dict[str, float],
+    meters_per_unit: float,
+    pedestrian_clearance_m: float = DEFAULT_PEDESTRIAN_CLEARANCE_M,
+    match_threshold: float = DEFAULT_FRONTING_MATCH_THRESHOLD_UNITS,
+) -> FrontingRoadIndex:
+    """Assemble a :class:`FrontingRoadIndex` from ``(line, tier_name)`` pairs
+    (empty/non-``LineString`` geometries skipped).
+
+    ``street_widths`` is ``mapgen.r1_mesh.DEFAULT_STREET_WIDTHS`` (ribbon width
+    in island units, per tier name) -- the SAME table drives both the mesh
+    ribbons and these setbacks, so there is a single source of truth for the
+    numbers. Every tier in ``street_widths`` gets a precomputed
+    ``road_clear_m`` and half-width, so a lookup for a tier not present among
+    ``segments`` (notably the interior ``"street"`` tier) still resolves.
+    """
+    lines: list[sg.LineString] = []
+    tiers: list[str] = []
+    for line, tier in segments:
+        if line is None or line.is_empty or line.geom_type != "LineString":
+            continue
+        lines.append(line)
+        tiers.append(tier)
+    road_clear_by_tier = {
+        tier: width * meters_per_unit / 2.0 + pedestrian_clearance_m
+        for tier, width in street_widths.items()
+    }
+    half_width_by_tier = {
+        tier: width * meters_per_unit / 2.0 for tier, width in street_widths.items()
+    }
+    return FrontingRoadIndex(
+        lines=tuple(lines),
+        tiers=tuple(tiers),
+        tree=STRtree(lines),
+        match_threshold=match_threshold,
+        road_clear_by_tier=road_clear_by_tier,
+        half_width_by_tier=half_width_by_tier,
+    )
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1310,59 @@ def _frontage_direction(
     return None if edge is None else edge[1]
 
 
+def _longest_frontage_segment(
+    lot_poly: sg.Polygon,
+    ext_ring: sg.LinearRing,
+    min_frontage: float,
+    ext_buffer: sg.base.BaseGeometry | None = None,
+) -> sg.LineString | None:
+    """The LONGEST boundary edge of ``lot_poly`` lying on ``ext_ring`` (the
+    district's street frontage), returned as a ``LineString`` -- or ``None``
+    when no edge qualifies.
+
+    Mirrors :func:`_frontage_edge`'s edge SELECTION exactly (same
+    longest-covered-segment rule / tie behavior) but yields the full segment
+    geometry (both endpoints) that :func:`FrontingRoadIndex.fronting_tier`
+    needs for its nearest-road lookup (S7b), where :func:`_frontage_edge`
+    yields only the anchor + direction its footprint frame needs. Kept as its
+    own helper rather than widening :func:`_frontage_edge`'s return so that
+    function -- and its byte-identical regression tests -- stays untouched."""
+    buffered = (
+        ext_ring.buffer(_FRONTAGE_TOUCH_TOL) if ext_buffer is None else ext_buffer
+    )
+    coords = list(lot_poly.exterior.coords)
+    best_len = max(min_frontage, 1e-9)
+    best: sg.LineString | None = None
+    for i in range(len(coords) - 1):
+        p0, p1 = coords[i], coords[i + 1]
+        seg = sg.LineString([p0, p1])
+        length = seg.length
+        if length <= best_len:
+            continue
+        if buffered.covers(seg):
+            best_len = length
+            best = seg
+    return best
+
+
+def _frontage_depth_units(
+    lot_poly: sg.Polygon, anchor: np.ndarray, along: np.ndarray
+) -> float:
+    """Perpendicular depth (island units) of ``lot_poly`` from its frontage
+    edge INTO the lot -- the max projection of the lot's vertices onto the
+    inward perpendicular of the ``(anchor, along)`` frontage frame. Mirrors
+    the ``total_depth`` :func:`_oriented_footprint` computes internally, used
+    by :func:`build_lots` to decide (S7b near-highway displacement) whether a
+    lot is too SHALLOW to fit any building behind a wide arterial setback."""
+    perp_candidate = np.array([-along[1], along[0]])
+    centroid = lot_poly.centroid
+    rel_c = np.array([centroid.x, centroid.y]) - anchor
+    perp = perp_candidate if float(rel_c @ perp_candidate) >= 0.0 else -perp_candidate
+    coords = np.asarray(lot_poly.exterior.coords[:-1], dtype=np.float64)
+    rel = coords - anchor
+    return float((rel @ perp).max())
+
+
 def _strip_polygon(
     anchor: np.ndarray,
     along: np.ndarray,
@@ -1223,6 +1418,8 @@ def _oriented_footprint(
     meters_per_unit: float,
     cfg: LotConfig,
     ext_buffer: sg.base.BaseGeometry | None = None,
+    road_clear_m_override: float | None = None,
+    rear_anchor_degenerate: bool = False,
 ) -> sg.Polygon:
     """Building footprint from REAL metric setbacks (``docs/wave2-plan.md``
     "The massing model"), replacing the old OBB-fill-ratio sizing.
@@ -1263,6 +1460,29 @@ def _oriented_footprint(
     a narrower reading of "the current OBB-long-axis behavor with the
     detached clearances" than a one-directional front setback (design
     decision; see this slice's report).
+
+    ``road_clear_m_override`` (S7b, docs/macro-roads-nuclei-plan.md), when not
+    ``None``, REPLACES ``massing.road_clear_m`` as the front clearance in the
+    frontage-frame branch -- :func:`build_lots` passes the per-lot value it
+    derived from the lot's fronting road tier (:class:`FrontingRoadIndex`) so a
+    highway-fronting lot sets its building back past the wide highway ribbon
+    while a local/interior lot keeps a narrow clearance. ``None`` (every
+    pre-S7b caller, and any lot with no fronting-tier info) keeps the flat
+    ``massing.road_clear_m``, so those footprints are byte-identical to before.
+    The landlocked/interior (no-frontage-edge) branch is unaffected: it never
+    used ``road_clear_m`` at all.
+
+    ``rear_anchor_degenerate`` (S7b near-highway follow-up), when ``True`` and
+    the frontage slab degenerates because the lot is too SHALLOW to fit the
+    front setback (``d_hi <= d_lo`` -- the case a highway/major-fronting lot
+    hits under its wide clearance), REPLACES the lot-center clamped fallback
+    with a slab anchored at the REAR of the frontage frame: a building of up to
+    ``depth_max`` hugging the lot's far (from-the-arterial) edge instead of its
+    center. This can only push the degraded building AWAY from the fronting
+    road (never toward it); a truly-shallow lot whose whole depth sits inside
+    the ribbon still cannot fully clear it (the accepted feasibility floor).
+    ``False`` (the default, every non-highway/major lot and every pre-S7b
+    caller) keeps the lot-center clamped fallback byte-identically.
     """
     if lot_poly.is_empty or lot_poly.area <= 0.0:
         return _footprint_clamped(lot_poly, cfg.inset)
@@ -1285,13 +1505,30 @@ def _oriented_footprint(
         proj_perp = rel @ perp
         total_depth = float(proj_perp.max())
 
-        front_setback = (massing.road_clear_m + yard_front_m) / meters_per_unit
+        road_clear_m = (
+            massing.road_clear_m
+            if road_clear_m_override is None
+            else road_clear_m_override
+        )
+        front_setback = (road_clear_m + yard_front_m) / meters_per_unit
         depth_max = depth_max_m / meters_per_unit
         rear_min = massing.rear_min_m / meters_per_unit
         d_lo = front_setback
         d_hi = min(front_setback + depth_max, total_depth - rear_min)
         if d_hi <= d_lo:
-            return _footprint_clamped(lot_poly, cfg.inset)
+            if not rear_anchor_degenerate:
+                return _footprint_clamped(lot_poly, cfg.inset)
+            # S7b near-highway follow-up: the lot is too shallow for the wide
+            # front setback, so anchor the building at the REAR of the frontage
+            # frame (far edge from the arterial) instead of the lot-center
+            # clamped fallback -- a slab of up to depth_max hugging total_depth.
+            # Runs through the SAME depth/side-strip machinery below, just with
+            # a rear-anchored band; falls back to the clamped footprint only if
+            # even that band is degenerate (a zero-depth lot).
+            d_hi = total_depth
+            d_lo = max(0.0, total_depth - depth_max)
+            if d_hi <= d_lo:
+                return _footprint_clamped(lot_poly, cfg.inset)
 
         s_min, s_max = float(proj_along.min()), float(proj_along.max())
         pad = max(s_max - s_min, total_depth, 1.0) * 2.0 + 1.0
@@ -1685,6 +1922,19 @@ def _relaxed_lot_configs(cfg: LotConfig) -> list[LotConfig]:
     return ladder
 
 
+def _record_s7b_tier(stats: dict[str, Any] | None, tier: str | None) -> None:
+    """Tally one OCCUPIED lot's fronting-road tier into ``stats`` (S7b report
+    counters). No-op when ``stats``/``tier`` is ``None`` (no index threaded /
+    landlocked lot), so the flat pre-S7b path leaves ``fallback_stats``
+    byte-identical (no ``s7b_*`` keys)."""
+    if stats is None or tier is None:
+        return
+    by_tier = stats.setdefault("s7b_setback_by_tier", {})
+    by_tier[tier] = by_tier.get(tier, 0) + 1
+    if tier in ("highway", "major"):
+        stats["s7b_wide_setback_lots"] = stats.get("s7b_wide_setback_lots", 0) + 1
+
+
 def build_lots(
     district: sg.Polygon,
     district_id: int,
@@ -1699,6 +1949,7 @@ def build_lots(
     landmark_ids: frozenset[str] = frozenset(),
     fallback_stats: dict[str, Any] | None = None,
     zone: str = "fringe",
+    fronting_index: FrontingRoadIndex | None = None,
 ) -> list[Lot]:
     """Tessellate ``district`` into street-fronting lots, assign its member
     worlds onto them (Hungarian, exact), and give each a massing-model
@@ -1740,6 +1991,22 @@ def build_lots(
     were needed) whenever this district
     needed ANY relaxation to reach ``n`` lots -- a district that reaches ``n``
     under ``cfg``'s own strict floor records neither.
+
+    ``fronting_index`` (S7b, docs/macro-roads-nuclei-plan.md), when given,
+    denominates each lot's FRONT setback from the WIDTH of the road its
+    frontage edge actually fronts (highway -> widest) instead of the flat
+    ``massing.road_clear_m``, and makes a lot too SHALLOW to fit any building
+    behind a highway/major setback NO-BUILD: such lots are EXCLUDED from the
+    Hungarian assignable set (so their worlds re-displace onto deeper lots in
+    the SAME district and the shallow lots become ``kind="greenspace"``),
+    provided enough buildable lots remain (``>= n``); if too few do, the
+    exclusion is skipped (feasibility) so no world is ever lost -- those worlds
+    keep their shallow lot and degrade to the existing shallow-lot footprint
+    fallback. ``None`` (the default, every pre-S7b caller) keeps the flat
+    ``road_clear_m`` and never excludes a lot, so output is byte-identical to
+    before S7b (regression guard). When ``fallback_stats`` is given, S7b tallies
+    are recorded under ``s7b_setback_by_tier`` / ``s7b_wide_setback_lots`` /
+    ``s7b_no_build_displaced`` / ``s7b_no_build_infeasible_districts``.
 
     Typology/height are computed PER WORLD from the district-level
     ``(district.area, len(member_points))`` pair (:func:`classify_typology`)
@@ -1811,6 +2078,23 @@ def build_lots(
 
     if n == 1:
         lot_poly = district
+        # S7b: a single-world district still sets its building back from the
+        # tier of the road it fronts (no exclusion possible -- one world, one
+        # lot -- so a shallow highway-fronting solo lot just degrades to the
+        # existing shallow-lot footprint fallback rather than becoming a lost
+        # greenspace). rc stays None (flat road_clear_m) when no index / no
+        # frontage edge -- byte-identical to pre-S7b.
+        rc0: float | None = None
+        rear0 = False
+        if fronting_index is not None:
+            seg0 = _longest_frontage_segment(
+                lot_poly, ext_ring, cfg.min_frontage, ext_buffer
+            )
+            if seg0 is not None:
+                tier0 = fronting_index.fronting_tier(seg0) or "street"
+                rc0 = fronting_index.road_clear_m(tier0)
+                rear0 = tier0 in ("highway", "major")
+                _record_s7b_tier(fallback_stats, tier0)
         return [
             Lot(
                 world_id=world_ids[0],
@@ -1823,6 +2107,8 @@ def build_lots(
                     meters_per_unit,
                     cfg,
                     ext_buffer,
+                    road_clear_m_override=rc0,
+                    rear_anchor_degenerate=rear0,
                 ),
                 lot=lot_poly,
                 height=heights[0],
@@ -1904,14 +2190,77 @@ def build_lots(
         anchor = centroid if poly.contains(centroid) else poly.representative_point()
         anchors.append((anchor.x, anchor.y))
 
+    # S7b (docs/macro-roads-nuclei-plan.md): per-lot fronting tier -> front
+    # clearance override + near-highway no-build. INERT unless a
+    # FrontingRoadIndex is threaded in: with fronting_index=None every
+    # lot_road_clear stays None (flat massing.road_clear_m) and lot_no_build
+    # stays all-False, so the assignment + footprints below are byte-identical
+    # to pre-S7b (regression guard). The no-build depth test uses the
+    # district's AREA-ONLY base typology's front yard (a lot's world -- and so
+    # its true typology -- isn't known until AFTER assignment; the highway
+    # half-width dominates the ~2 m yard difference, so the base tier is a fine
+    # proxy for "fundamentally too shallow for a highway building").
+    lot_road_clear: list[float | None] = [None] * len(lot_polys)
+    lot_tier: list[str | None] = [None] * len(lot_polys)
+    lot_no_build: list[bool] = [False] * len(lot_polys)
+    if fronting_index is not None:
+        base_typology = classify_typology(
+            district.area, n, "", frozenset(), massing, meters_per_unit
+        )
+        base_yard_m, _base_side_m, _base_depth_m = _setbacks_for_typology(
+            base_typology, massing
+        )
+        rear_min = massing.rear_min_m / meters_per_unit
+        for j, poly in enumerate(lot_polys):
+            seg = _longest_frontage_segment(
+                poly, ext_ring, cfg.min_frontage, ext_buffer
+            )
+            if seg is None:
+                continue
+            tier = fronting_index.fronting_tier(seg) or "street"
+            lot_tier[j] = tier
+            rc = fronting_index.road_clear_m(tier)
+            lot_road_clear[j] = rc
+            if tier in ("highway", "major"):
+                edge = _frontage_edge(poly, ext_ring, cfg.min_frontage, ext_buffer)
+                if edge is not None:
+                    total_depth = _frontage_depth_units(poly, edge[0], edge[1])
+                    front_setback = (rc + base_yard_m) / meters_per_unit
+                    if total_depth - rear_min - front_setback <= 0.0:
+                        lot_no_build[j] = True
+
+    # Exclude no-build (too-shallow highway/major) lots from the Hungarian
+    # assignable columns so their worlds re-displace onto deeper lots in this
+    # SAME district and the shallow lots fall through to greenspace -- but only
+    # while enough buildable lots remain (>= n); otherwise keep every lot
+    # assignable so no world is ever lost (feasibility). cols==range(M) is the
+    # pre-S7b behavior (byte-identical when nothing is excluded).
+    buildable_cols = [j for j in range(len(lot_polys)) if not lot_no_build[j]]
+    n_excluded = len(lot_polys) - len(buildable_cols)
+    if n_excluded > 0 and len(buildable_cols) >= n:
+        cols = buildable_cols
+        if fallback_stats is not None:
+            fallback_stats["s7b_no_build_displaced"] = (
+                fallback_stats.get("s7b_no_build_displaced", 0) + n_excluded
+            )
+    else:
+        cols = list(range(len(lot_polys)))
+        if n_excluded > 0 and fallback_stats is not None:
+            fallback_stats["s7b_no_build_infeasible_districts"] = (
+                fallback_stats.get("s7b_no_build_infeasible_districts", 0) + 1
+            )
+
     xs_arr = np.asarray(xs, dtype=np.float64)
     ys_arr = np.asarray(ys, dtype=np.float64)
     anchor_arr = np.asarray(anchors, dtype=np.float64)
-    cost = (xs_arr[:, None] - anchor_arr[None, :, 0]) ** 2 + (
-        ys_arr[:, None] - anchor_arr[None, :, 1]
+    anchor_cols = anchor_arr[cols]
+    cost = (xs_arr[:, None] - anchor_cols[None, :, 0]) ** 2 + (
+        ys_arr[:, None] - anchor_cols[None, :, 1]
     ) ** 2
     row_ind, col_ind = linear_sum_assignment(cost)
-    lot_for_world = {int(r): int(c) for r, c in zip(row_ind, col_ind, strict=True)}
+    lot_for_world = {
+        int(r): cols[int(c)] for r, c in zip(row_ind, col_ind, strict=True)
+    }
 
     lots: list[Lot] = []
     used_lot_idx = set(lot_for_world.values())
@@ -1919,6 +2268,7 @@ def build_lots(
         lot_idx = lot_for_world[i]
         lot_poly = lot_polys[lot_idx]
         ax, ay = anchors[lot_idx]
+        _record_s7b_tier(fallback_stats, lot_tier[lot_idx])
         lots.append(
             Lot(
                 world_id=world_ids[i],
@@ -1931,6 +2281,8 @@ def build_lots(
                     meters_per_unit,
                     cfg,
                     ext_buffer,
+                    road_clear_m_override=lot_road_clear[lot_idx],
+                    rear_anchor_degenerate=lot_tier[lot_idx] in ("highway", "major"),
                 ),
                 lot=lot_poly,
                 height=heights[i],
