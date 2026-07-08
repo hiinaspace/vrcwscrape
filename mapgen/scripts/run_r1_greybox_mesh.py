@@ -97,6 +97,13 @@ def _read_arterials(in_dir: Path) -> list[RoadSegment]:
     features = _read_geojson(in_dir / "arterials.geojson")
     segments = []
     for feat in features:
+        # Skip promoted ring-arc records (slice B/R tier-metadata): they are
+        # subsegments of the whole "ring" records, read the same "ring" tier/
+        # width here, and sit ~1 m off after the S7c fillet -- so meshing both
+        # lays a redundant coplanar ribbon over every ring. The whole "ring"
+        # record already covers the full ring.
+        if "ring_tier" in feat["properties"]:
+            continue
         geom = sg.shape(feat["geometry"])
         if geom.geom_type != "LineString":
             continue

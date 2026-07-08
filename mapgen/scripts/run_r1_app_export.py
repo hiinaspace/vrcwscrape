@@ -367,6 +367,15 @@ def main(argv: list[str] | None = None) -> None:
     arterials_fc = _load_geojson(greybox_dir / "arterials.geojson")
     arterial_features = []
     for feat in arterials_fc["features"]:
+        # Skip promoted ring-arc records: they are tier-metadata subsegments of
+        # the whole "ring" records (slice B/R), sit ~1 m off the ring after the
+        # S7c fillet, and are styled identically to the whole ring here -- so
+        # drawing both double-strokes every ring (the reported "braiding"). The
+        # whole "ring" record already covers the full ring geometry. (Promoting
+        # ring arcs to their own width/style would instead require drawing the
+        # arcs and NOT the whole ring; deferred -- see docs/post-s7 review.)
+        if "ring_tier" in feat["properties"]:
+            continue
         tier = feat["properties"]["tier"]
         geom_app = invert_geom(shapely.geometry.shape(feat["geometry"]), affine)
         width = island_length_to_app(road_width_island_units(tier), affine)
