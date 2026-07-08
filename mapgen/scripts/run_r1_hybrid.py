@@ -49,7 +49,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -64,6 +64,7 @@ import polars as pl  # noqa: E402
 import shapely  # noqa: E402
 import shapely.geometry as sg  # noqa: E402
 from shapely.ops import unary_union  # noqa: E402
+from shapely.strtree import STRtree  # noqa: E402
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO / "src") not in sys.path:
@@ -110,7 +111,12 @@ from mapgen.r1_macro import (  # noqa: E402
     load_boundary,
     nucleus_specs_to_geojson,
 )
-from mapgen.r1_mesh import DEFAULT_METERS_PER_UNIT, DEFAULT_STREET_WIDTHS  # noqa: E402
+from mapgen.r1_mesh import (  # noqa: E402
+    DEFAULT_METERS_PER_UNIT,
+    DEFAULT_STREET_WIDTHS,
+    buffer_ribbon,
+    fillet_centerline,
+)
 from mapgen.r1_seam import (  # noqa: E402
     DEFAULT_RETRY_SEEDS,
     chen_in_block,
@@ -946,6 +952,157 @@ def _fronting_road_segments(layer: MacroLayer) -> list[tuple[sg.LineString, str]
     return segments
 
 
+# ---------------------------------------------------------------------------
+# S7c: mesh-layer highway/ring fillet + building-footprint ribbon clip
+# (docs/macro-roads-nuclei-plan.md). Both land at EXPORT time so
+# arterials.geojson + lots.parquet carry the cleaned geometry for every
+# downstream consumer (deck.gl web view, G1 OBJ bake) at once.
+# ---------------------------------------------------------------------------
+
+# "Small" per Fix 2's "tiny sliver" carve-out: a clip surviving below this
+# fraction of the original footprint is a lot almost entirely inside the
+# ribbon (rare -- Chen fabric abutting the arterial centerline), where a
+# building slightly on the road beats losing the world entirely.
+_RIBBON_CLIP_MIN_AREA_FRAC: float = 0.05
+
+
+def _fillet_highway_and_ring_lines(
+    layer: MacroLayer,
+) -> tuple[list[sg.LineString], list[sg.LineString], list[sg.LineString]]:
+    """S7c Fix 1: mesh-LAYER Chaikin fillet on the EXPORTED copy of the
+    promoted-highway arterial tier + every ring-tier centerline (whole rings
+    and ring arcs alike -- both always export ``"tier": "ring"``, see
+    :func:`_greybox_arterials_geojson`). Major/local arterials pass through
+    UNCHANGED (they read fine per the visual gate). Returns
+    ``(arterial_lines, ring_lines, ring_arc_lines)`` aligned 1:1 with
+    ``layer.edges`` / ``layer.ring_lines`` / ``layer.ring_arc_edges`` -- a
+    smoothed COPY only; ``layer`` itself (and the macro-blocks already
+    polygonized from its pre-fillet geometry) is untouched."""
+    arterial_lines = [
+        fillet_centerline(line) if rec.tier == 2 else line
+        for line, rec in zip(layer.arterial_lines, layer.edges, strict=True)
+    ]
+    ring_lines = [fillet_centerline(line) for line in layer.ring_lines]
+    ring_arc_lines = [fillet_centerline(line) for line in layer.ring_arc_lines]
+    return arterial_lines, ring_lines, ring_arc_lines
+
+
+def _s7c_road_ribbons(
+    filleted_arterial_lines: list[sg.LineString],
+    filleted_ring_lines: list[sg.LineString],
+    filleted_ring_arc_lines: list[sg.LineString],
+    layer: MacroLayer,
+    results: list[BlockResult],
+    street_widths: dict[str, float],
+) -> list[sg.Polygon]:
+    """Every road ribbon (buffered centerline), at the S7c-filleted
+    highway/ring geometry (Fix 1) -- arterial (tier-differentiated width) +
+    ring/ring-arc (``"ring"`` width) + per-block Chen local streets
+    (``"street"`` width, unfilleted -- local streets weren't flagged as
+    visually rigid). This is the flat (pre-union) list :func:`buffer_ribbon`
+    produces; :func:`_clip_footprints_to_ribbon` spatially indexes it and
+    only unions the FEW candidates near each footprint, so the clip stays
+    cheap across ~12k buildings instead of unioning the whole island's roads
+    once up front."""
+    ribbons: list[sg.Polygon] = []
+    for line, rec in zip(filleted_arterial_lines, layer.edges, strict=True):
+        width = street_widths.get(_GREYBOX_TIER_NAME.get(rec.tier, "street"))
+        if width and width > 0.0:
+            ribbon = buffer_ribbon(line, width)
+            if ribbon is not None:
+                ribbons.append(ribbon)
+    ring_width = street_widths.get("ring")
+    if ring_width and ring_width > 0.0:
+        for line in (*filleted_ring_lines, *filleted_ring_arc_lines):
+            ribbon = buffer_ribbon(line, ring_width)
+            if ribbon is not None:
+                ribbons.append(ribbon)
+    street_width = street_widths.get("street")
+    if street_width and street_width > 0.0:
+        for res in results:
+            flags = res.street_perimeter_flags or [False] * len(res.streets)
+            for line, is_perimeter in zip(res.streets, flags, strict=True):
+                if is_perimeter or line.geom_type != "LineString":
+                    continue
+                ribbon = buffer_ribbon(line, street_width)
+                if ribbon is not None:
+                    ribbons.append(ribbon)
+    return ribbons
+
+
+def _largest_polygon_part(geom: sg.base.BaseGeometry) -> sg.Polygon | None:
+    """Largest ``Polygon`` part of ``geom`` (mirrors
+    ``mapgen.r1_mesh._largest_polygon`` -- duplicated locally since that
+    helper is a private module internal of a different module, not part of
+    r1_mesh's public surface)."""
+    if geom.is_empty:
+        return None
+    if geom.geom_type == "Polygon":
+        return geom
+    if geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        parts = [g for g in geom.geoms if g.geom_type == "Polygon" and not g.is_empty]
+        if parts:
+            return max(parts, key=lambda p: p.area)
+    return None
+
+
+def _clip_footprints_to_ribbon(
+    lots: list[Lot],
+    ribbons: list[sg.Polygon],
+    *,
+    min_area_frac: float = _RIBBON_CLIP_MIN_AREA_FRAC,
+) -> tuple[list[Lot], int, int]:
+    """S7c Fix 2: clip every OCCUPIED footprint against the road-ribbon union
+    so a first-row building can't sit inside the wide arterial/ring ribbon
+    its own macro-block boundary follows (S7b's per-tier setback pushed the
+    build ANCHOR back, but a lot whose whole depth sits inside a wide ribbon
+    still overlapped it).
+
+    A footprint that overlaps ``ribbons`` and clips down to >= ``
+    min_area_frac`` of its original area is REPLACED by the clipped
+    (flush-to-road-edge) polygon; one that clips to nothing or a tiny sliver
+    (a lot almost entirely inside the ribbon -- rare) keeps its ORIGINAL
+    footprint, per Fix 2: a building slightly on the road beats a missing
+    world. A footprint with no ribbon overlap at all is untouched and counted
+    in neither bucket. Returns ``(lots, n_clipped, n_kept_original)`` --
+    ``lots``' order/length/identity-for-everything-but-footprint is
+    preserved (``dataclasses.replace`` only touches ``footprint``), so
+    ``lot_id`` build-order assignment downstream is unaffected.
+    """
+    if not ribbons:
+        return lots, 0, 0
+    tree = STRtree(ribbons)
+    out: list[Lot] = []
+    n_clipped = 0
+    n_kept_original = 0
+    for lot in lots:
+        if lot.kind != "lot" or lot.footprint.is_empty:
+            out.append(lot)
+            continue
+        cand_idx = tree.query(lot.footprint)
+        if len(cand_idx) == 0:
+            out.append(lot)
+            continue
+        nearby = unary_union([ribbons[int(i)] for i in cand_idx])
+        if not lot.footprint.intersects(nearby):
+            out.append(lot)
+            continue
+        original_area = lot.footprint.area
+        clipped_geom = lot.footprint.difference(nearby)
+        clipped_poly = _largest_polygon_part(clipped_geom)
+        if (
+            clipped_poly is not None
+            and original_area > 0.0
+            and clipped_poly.area >= min_area_frac * original_area
+        ):
+            out.append(replace(lot, footprint=clipped_poly))
+            n_clipped += 1
+        else:
+            out.append(lot)
+            n_kept_original += 1
+    return out, n_clipped, n_kept_original
+
+
 def _feature_collection(
     records: list[tuple[int, Any, dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -1372,6 +1529,19 @@ def export_greybox(
         pedestrian_clearance_m=massing.pedestrian_clearance_m,
     )
 
+    # S7c Fix 1 (docs/macro-roads-nuclei-plan.md): mesh-LAYER fillet on the
+    # EXPORTED copy of the highway/ring-tier centerlines only -- computed
+    # once here and reused both for arterials.geojson (below) and for the
+    # Fix 2 ribbon union (after all_lots is built), so the exported road
+    # network and the ribbon buildings get clipped against always agree.
+    # S7b's fronting_index above deliberately keeps reading the UNFILLETED
+    # layer geometry -- that setback model already landed/baked and a
+    # filleted-vs-not nearest-line lookup would only add noise, not fix
+    # anything it's responsible for.
+    filleted_arterial_lines, filleted_ring_lines, filleted_ring_arc_lines = (
+        _fillet_highway_and_ring_lines(layer)
+    )
+
     district_entries: list[tuple[int, sg.Polygon]] = []  # (block_id, polygon)
     for res in results:
         for poly in res.districts:
@@ -1468,6 +1638,23 @@ def export_greybox(
     n_sliver = count_sliver_reassignments(all_lots)
     n_greenspace = sum(1 for lot in all_lots if lot.kind == "greenspace")
 
+    # S7c Fix 2 (docs/macro-roads-nuclei-plan.md): clip every occupied
+    # footprint against the road-ribbon union, built from the SAME filleted
+    # highway/ring geometry Fix 1 just exported (plus unfilleted major/local
+    # arterials and per-block Chen streets) -- so the ribbon a footprint gets
+    # clipped against always agrees with the road actually drawn/baked.
+    s7c_ribbons = _s7c_road_ribbons(
+        filleted_arterial_lines,
+        filleted_ring_lines,
+        filleted_ring_arc_lines,
+        layer,
+        results,
+        DEFAULT_STREET_WIDTHS,
+    )
+    all_lots, n_footprint_clipped, n_footprint_kept_original = (
+        _clip_footprints_to_ribbon(all_lots, s7c_ribbons)
+    )
+
     # Fallback-rate acceptance check (docs/lots-wave-plan.md): the street-
     # fronting subdivision path is meant to be the norm, with the Voronoi
     # fallback (:func:`build_lots`) absorbing rare geometry pathologies --
@@ -1491,11 +1678,13 @@ def export_greybox(
         json.dump(_greybox_island_geojson(boundary), f, indent=2, sort_keys=True)
     with (out_dir / "arterials.geojson").open("w") as f:
         json.dump(
+            # S7c Fix 1: filleted highway/ring copies, not layer.* raw --
+            # see the filleted_*_lines computation above.
             _greybox_arterials_geojson(
-                layer.arterial_lines,
+                filleted_arterial_lines,
                 layer.edges,
-                layer.ring_lines,
-                layer.ring_arc_lines,
+                filleted_ring_lines,
+                filleted_ring_arc_lines,
                 layer.ring_arc_edges,
             ),
             f,
@@ -1675,6 +1864,14 @@ def export_greybox(
             "s7b_no_build_infeasible_districts": fallback_stats.get(
                 "s7b_no_build_infeasible_districts", 0
             ),
+            # S7c Fix 2: occupied footprints clipped flush to a road-ribbon
+            # edge (used the clipped, smaller polygon) vs kept their
+            # ORIGINAL footprint because the clip was empty/a tiny sliver
+            # (lot almost entirely inside the ribbon -- world kept, not
+            # lost). A footprint with no ribbon overlap at all counts in
+            # neither bucket. See _clip_footprints_to_ribbon.
+            "s7c_footprint_ribbon_clipped": n_footprint_clipped,
+            "s7c_footprint_ribbon_kept_original": n_footprint_kept_original,
         },
         "lot_config": {
             "inset": inset,

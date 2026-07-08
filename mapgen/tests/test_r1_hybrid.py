@@ -28,8 +28,11 @@ from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
     S6_GUIDANCE_STRENGTH_FLOOR,
     BlockResult,
     _block_mean_density,
+    _clip_footprints_to_ribbon,
+    _fillet_highway_and_ring_lines,
     _fronting_road_segments,
     _resolve_guidance_strength,
+    _s7c_road_ribbons,
     _select_seam_block,
     _zone_for_district,
     assign_worlds_excluding,
@@ -45,12 +48,17 @@ from run_r1_hybrid import (  # ty: ignore[unresolved-import]  # noqa: E402
 
 from mapgen.r1_arm_a import IslandFields  # noqa: E402
 from mapgen.r1_connect import SeamJunction  # noqa: E402
-from mapgen.r1_lots import MassingConfig, assign_worlds_to_districts  # noqa: E402
+from mapgen.r1_lots import Lot, MassingConfig, assign_worlds_to_districts  # noqa: E402
 from mapgen.r1_macro import (  # noqa: E402
     MacroEdge,
     MacroLayer,
     MacroParams,
     NucleusSpec,
+)
+from mapgen.r1_mesh import (  # noqa: E402
+    DEFAULT_STREET_WIDTHS,
+    buffer_ribbon,
+    fillet_centerline,
 )
 from mapgen.r1_seam import ChenInBlockResult  # noqa: E402
 
@@ -871,3 +879,257 @@ def test_fronting_road_segments_maps_arterial_ring_and_promoted_arc_tiers() -> N
     # highway + local arterials, the promoted (tier 2) arc, and the whole ring;
     # the local-tier (0) arc is omitted (it coincides with the whole "ring").
     assert tiers == ["highway", "local", "highway", "ring"]
+
+
+# ---------------------------------------------------------------------------
+# S7c: highway/ring mesh-layer fillet + building-footprint ribbon clip
+# (docs/macro-roads-nuclei-plan.md)
+# ---------------------------------------------------------------------------
+
+
+def test_fillet_highway_and_ring_lines_only_highway_and_ring() -> None:
+    hwy = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)])
+    major = sg.LineString([(0.0, 5.0), (10.0, 5.0), (10.0, 15.0)])
+    ring = sg.LineString(
+        [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+    )
+    arc = sg.LineString([(0.0, 0.0), (5.0, 0.0), (5.0, 5.0)])
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[ring],
+        arterial_lines=[hwy, major],
+        edges=[_edge(2), _edge(1)],
+        blocks=[],
+        nuclei=[],
+        plaza_polys=[],
+        ring_arc_lines=[arc],
+        ring_arc_edges=[_edge(2)],
+    )
+    arterial_lines, ring_lines, ring_arc_lines = _fillet_highway_and_ring_lines(layer)
+    # Highway (tier 2) is filleted -- more vertices, endpoints preserved.
+    assert len(list(arterial_lines[0].coords)) > len(list(hwy.coords))
+    assert list(arterial_lines[0].coords)[0] == list(hwy.coords)[0]
+    assert list(arterial_lines[0].coords)[-1] == list(hwy.coords)[-1]
+    # Major (tier 1) passes through UNCHANGED (same object -- leave-as-is
+    # tiers, per the fix's scope).
+    assert arterial_lines[1] is major
+    # Every ring / ring-arc line is filleted regardless of its promoted tier
+    # -- both always export "tier": "ring" (see _greybox_arterials_geojson).
+    assert ring_lines[0] is not ring
+    assert len(list(ring_lines[0].coords)) > len(list(ring.coords))
+    assert ring_arc_lines[0] is not arc
+    assert len(list(ring_arc_lines[0].coords)) > len(list(arc.coords))
+
+
+def test_fillet_highway_and_ring_lines_deterministic() -> None:
+    hwy = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)])
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[],
+        arterial_lines=[hwy],
+        edges=[_edge(2)],
+        blocks=[],
+        nuclei=[],
+        plaza_polys=[],
+    )
+    first = _fillet_highway_and_ring_lines(layer)
+    second = _fillet_highway_and_ring_lines(layer)
+    assert [list(line.coords) for line in first[0]] == [
+        list(line.coords) for line in second[0]
+    ]
+
+
+def _s7c_lot(
+    *,
+    world_id: str = "w",
+    footprint: sg.Polygon,
+    kind: str = "lot",
+) -> Lot:
+    return Lot(
+        world_id=world_id,
+        district_id=0,
+        footprint=footprint,
+        lot=footprint,
+        height=6.0,
+        name=None,
+        visits=1,
+        x=0.0,
+        y=0.0,
+        assigned="direct",
+        lot_x=0.0,
+        lot_y=0.0,
+        kind=kind,
+        displacement=0.0,
+        typology="detached",
+    )
+
+
+def test_clip_footprints_to_ribbon_overlapping_lot_clips_flush() -> None:
+    """A first-row footprint whose left half sits inside the ribbon clips
+    down to the surviving (non-overlapping, smaller) piece."""
+    footprint = sg.box(0.0, 0.0, 10.0, 10.0)
+    ribbon = sg.box(-5.0, -5.0, 5.0, 15.0)
+    lots, n_clipped, n_kept = _clip_footprints_to_ribbon(
+        [_s7c_lot(footprint=footprint)], [ribbon]
+    )
+    assert (n_clipped, n_kept) == (1, 0)
+    clipped = lots[0].footprint
+    assert clipped.area < footprint.area
+    # No remaining OVERLAP with the ribbon (a shared boundary edge still
+    # counts as "intersects", so compare intersection area instead).
+    assert clipped.intersection(ribbon).area < 1e-9
+
+
+def test_clip_footprints_to_ribbon_wholly_inside_keeps_original() -> None:
+    """A lot almost entirely inside a wide ribbon keeps its ORIGINAL
+    footprint (a building slightly on the road beats a missing world)."""
+    footprint = sg.box(0.0, 0.0, 1.0, 1.0)
+    ribbon = sg.box(-10.0, -10.0, 10.0, 10.0)  # engulfs the tiny footprint
+    lots, n_clipped, n_kept = _clip_footprints_to_ribbon(
+        [_s7c_lot(footprint=footprint)], [ribbon]
+    )
+    assert (n_clipped, n_kept) == (0, 1)
+    assert lots[0].footprint.equals(footprint)
+
+
+def test_clip_footprints_to_ribbon_no_overlap_uncounted() -> None:
+    footprint = sg.box(100.0, 100.0, 101.0, 101.0)
+    ribbon = sg.box(-5.0, -5.0, 5.0, 5.0)
+    lots, n_clipped, n_kept = _clip_footprints_to_ribbon(
+        [_s7c_lot(footprint=footprint)], [ribbon]
+    )
+    assert (n_clipped, n_kept) == (0, 0)
+    assert lots[0].footprint.equals(footprint)
+
+
+def test_clip_footprints_to_ribbon_skips_greenspace_and_empty_footprint() -> None:
+    greenspace = _s7c_lot(footprint=sg.Polygon(), kind="greenspace")
+    ribbon = sg.box(-100.0, -100.0, 100.0, 100.0)
+    lots, n_clipped, n_kept = _clip_footprints_to_ribbon([greenspace], [ribbon])
+    assert (n_clipped, n_kept) == (0, 0)
+    assert lots[0] is greenspace
+
+
+def test_clip_footprints_to_ribbon_no_ribbons_is_noop() -> None:
+    lot = _s7c_lot(footprint=sg.box(0.0, 0.0, 1.0, 1.0))
+    lots, n_clipped, n_kept = _clip_footprints_to_ribbon([lot], [])
+    assert (lots, n_clipped, n_kept) == ([lot], 0, 0)
+
+
+def test_clip_footprints_to_ribbon_deterministic() -> None:
+    footprint = sg.box(0.0, 0.0, 10.0, 10.0)
+    ribbon = sg.box(-5.0, -5.0, 5.0, 15.0)
+    lots1, *_rest1 = _clip_footprints_to_ribbon(
+        [_s7c_lot(footprint=footprint)], [ribbon]
+    )
+    lots2, *_rest2 = _clip_footprints_to_ribbon(
+        [_s7c_lot(footprint=footprint)], [ribbon]
+    )
+    assert lots1[0].footprint.equals(lots2[0].footprint)
+
+
+def test_s7c_road_ribbons_uses_the_passed_in_filleted_lines() -> None:
+    """The ribbon list must be built from whatever line the caller passes in
+    (the FILLETED copy, per Fix 1) -- not re-derived from raw layer
+    geometry -- so ribbon and exported/baked road always agree."""
+    ring = sg.LineString(
+        [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+    )
+    filleted_ring = fillet_centerline(ring)
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[ring],  # raw -- must NOT be what actually gets buffered
+        arterial_lines=[],
+        edges=[],
+        blocks=[],
+        nuclei=[],
+        plaza_polys=[],
+    )
+    ribbons = _s7c_road_ribbons(
+        [], [filleted_ring], [], layer, [], DEFAULT_STREET_WIDTHS
+    )
+    assert len(ribbons) == 1
+    expected = buffer_ribbon(filleted_ring, DEFAULT_STREET_WIDTHS["ring"])
+    assert ribbons[0].equals(expected)
+    # Sanity: the filleted ring's ribbon really does differ from the raw
+    # ring's ribbon -- otherwise this test wouldn't exercise anything.
+    assert not ribbons[0].equals(buffer_ribbon(ring, DEFAULT_STREET_WIDTHS["ring"]))
+
+
+def test_export_greybox_filets_highway_not_major_arterials(tmp_path) -> None:
+    """End-to-end Fix 1: arterials.geojson carries the FILLETED highway
+    centerline (more vertices, endpoints pinned) but the UNCHANGED major
+    one -- the fix lands at export, per docs/macro-roads-nuclei-plan.md."""
+    import json
+
+    boundary = sg.box(-20.0, -20.0, 20.0, 20.0)
+    district = sg.box(-10.0, -10.0, 10.0, 10.0)
+    hwy = sg.LineString([(-15.0, 0.0), (0.0, 0.0), (0.0, 15.0)])
+    major = sg.LineString([(-15.0, 5.0), (0.0, 5.0), (0.0, 20.0)])
+    layer = MacroLayer(
+        params=MacroParams(),
+        nodes=[],
+        cost=np.zeros((2, 2)),
+        raw_arterial_lines=[],
+        raw_edges=[],
+        core_polys=[],
+        ring_lines=[],
+        arterial_lines=[hwy, major],
+        edges=[_edge(2), _edge(1)],
+        blocks=[boundary],
+        nuclei=[],
+        plaza_polys=[],
+    )
+    result = BlockResult(
+        block_id=0,
+        districts=[district],
+        streets=[],
+        failed=False,
+        seed_used=0,
+        district_count=1,
+        geometry_valid_pass=True,
+        paper_invariant_pass=True,
+        seconds=0.0,
+        gates=[],
+        street_perimeter_flags=[],
+        n_connectors=0,
+    )
+    points = pl.DataFrame({"world_id": ["w1"], "x": [0.0], "y": [0.0], "visits": [10]})
+    out_dir = tmp_path / "greybox"
+    export_greybox(
+        out_dir,
+        tmp_path,
+        boundary=boundary,
+        layer=layer,
+        results=[result],
+        points=points,
+    )
+    with (out_dir / "arterials.geojson").open() as f:
+        arterials_gj = json.load(f)
+    by_tier: dict[str, list] = {}
+    for feat in arterials_gj["features"]:
+        by_tier.setdefault(feat["properties"]["tier"], []).append(feat)
+    [hwy_feat] = by_tier["highway"]
+    [major_feat] = by_tier["major"]
+    hwy_coords = hwy_feat["geometry"]["coordinates"]
+    major_coords = major_feat["geometry"]["coordinates"]
+    assert len(hwy_coords) > len(list(hwy.coords))  # filleted: more vertices
+    assert [tuple(c) for c in major_coords] == list(major.coords)  # unfilleted
+    # Endpoints of the filleted highway stay pinned to the raw source.
+    assert tuple(hwy_coords[0]) == hwy.coords[0]
+    assert tuple(hwy_coords[-1]) == hwy.coords[-1]

@@ -442,6 +442,129 @@ def buffer_ribbon(line: sg.LineString, width_units: float) -> sg.Polygon | None:
 
 
 # ---------------------------------------------------------------------------
+# Centerline fillet (S7c mesh-layer corner rounding,
+# docs/macro-roads-nuclei-plan.md)
+#
+# The promoted-highway/ring-tier road network reads rigid at ring<->arterial
+# junctions -- long DP-simplified chords meeting at abrupt kinks, the same
+# jaggedness S1 fixed at the SOURCE for arterials/rings inside
+# ``r1_macro.build_macro_layer``. This is a separate, mesh/export-LAYER-only
+# fillet: it smooths the EXPORTED copy of a road centerline (feeding
+# ``arterials.geojson`` and, through it, the OBJ road ribbons and the
+# building-clip ribbon union) without touching ``r1_macro``'s source
+# geometry -- the macro-blocks are already polygonized from the pre-fillet
+# centerlines, so re-deriving them here would desync roads from blocks (the
+# same lesson S1's docstring states, just applied in the opposite direction:
+# fillet the export copy, never re-derive from it).
+#
+# Mirrors ``r1_macro.smooth_polyline``'s endpoint-preserving open-chain
+# Chaikin pass (``_chaikin_pass_open``) plus a closed-loop variant for whole
+# rings (``_chaikin_pass_closed``) -- duplicated rather than imported to keep
+# this module's dependency footprint minimal (numpy/shapely/trimesh only, no
+# r1_macro/networkx/scipy/skimage), matching this module's "pure geometry,
+# decoupled from the macro pipeline" contract (see the module docstring).
+# ---------------------------------------------------------------------------
+
+DEFAULT_FILLET_ITERATIONS: int = 2
+# Island units; matches r1_macro.DEFAULT_SMOOTH_POST_TOL (same rationale:
+# bound the ~2x-per-pass vertex growth Chaikin adds back down).
+DEFAULT_FILLET_POST_TOL: float = 0.15
+
+
+def _fillet_pass_open(
+    coords: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """One Chaikin corner-cutting pass over an OPEN coordinate chain.
+
+    Preserves the first and last coordinate EXACTLY (only interior corners
+    are cut) -- mirrors ``mapgen.r1_macro._chaikin_pass_open``.
+    """
+    n = len(coords)
+    if n < 3:
+        return list(coords)
+    out: list[tuple[float, float]] = [coords[0]]
+    last_edge = n - 2
+    for i in range(n - 1):
+        (x0, y0), (x1, y1) = coords[i], coords[i + 1]
+        q = (0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1)
+        r = (0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1)
+        if i == 0:
+            out.append(r)
+        elif i == last_edge:
+            out.append(q)
+        else:
+            out.append(q)
+            out.append(r)
+    out.append(coords[-1])
+    return out
+
+
+def _fillet_pass_closed(
+    coords: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """One Chaikin corner-cutting pass over a CLOSED ring coordinate chain.
+
+    ``coords`` is a closed ring (``coords[0] == coords[-1]``). Mirrors
+    ``mapgen.r1_macro._chaikin_pass_closed``.
+    """
+    ring = coords[:-1] if coords[0] == coords[-1] else list(coords)
+    n = len(ring)
+    if n < 3:
+        return list(coords)
+    out: list[tuple[float, float]] = []
+    for i in range(n):
+        (x0, y0), (x1, y1) = ring[i], ring[(i + 1) % n]
+        out.append((0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1))
+        out.append((0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1))
+    out.append(out[0])
+    return out
+
+
+def fillet_centerline(
+    line: sg.LineString,
+    *,
+    iterations: int = DEFAULT_FILLET_ITERATIONS,
+    post_tol: float = DEFAULT_FILLET_POST_TOL,
+) -> sg.LineString:
+    """Chaikin-smooth one road centerline for mesh/export emission (S7c).
+
+    Auto-detects OPEN vs CLOSED: a ring (``line.coords[0] ==
+    line.coords[-1]``, e.g. a whole core ring) is smoothed with the
+    endpoint-free closed pass (:func:`_fillet_pass_closed`); an open chain
+    (an arterial, or a ring-arc segment cut at T-junction stations) is
+    smoothed with the endpoint-PRESERVED open pass (:func:`_fillet_pass_open`)
+    so shared junction points -- where a ring arc meets an arterial, or two
+    arterial segments meet at a macro-node -- stay bit-for-bit coincident.
+    Callers that buffer these lines into a ribbon union (the S7c building
+    clip) rely on that coincidence never opening a gap. Degenerate lines
+    (fewer than 3 coordinates) or ``iterations <= 0`` pass through UNCHANGED.
+    """
+    coords = list(line.coords)
+    if len(coords) < 3 or iterations <= 0:
+        return line
+    closed = coords[0] == coords[-1]
+    pts = coords
+    for _ in range(iterations):
+        pts = _fillet_pass_closed(pts) if closed else _fillet_pass_open(pts)
+    smoothed = sg.LineString(pts)
+    if post_tol > 0:
+        smoothed = smoothed.simplify(post_tol, preserve_topology=False)
+    out_coords = list(smoothed.coords)
+    if closed:
+        # simplify() always keeps a chain's first/last vertex, but pin
+        # defensively (mirrors smooth_polyline's open-line pin) in case of
+        # any floating-point drift.
+        if out_coords[0] != out_coords[-1]:
+            out_coords[-1] = out_coords[0]
+            smoothed = sg.LineString(out_coords)
+    elif out_coords[0] != coords[0] or out_coords[-1] != coords[-1]:
+        out_coords[0] = coords[0]
+        out_coords[-1] = coords[-1]
+        smoothed = sg.LineString(out_coords)
+    return smoothed
+
+
+# ---------------------------------------------------------------------------
 # Group builders
 # ---------------------------------------------------------------------------
 

@@ -25,6 +25,7 @@ from mapgen.r1_mesh import (
     build_road_groups,
     build_water_group,
     extrude_solid,
+    fillet_centerline,
     flat_cap,
     materials_to_mtl,
     mesh_materials,
@@ -160,6 +161,75 @@ def test_buffer_ribbon_rejects_degenerate() -> None:
     assert buffer_ribbon(sg.LineString(), width_units=1.0) is None
     assert buffer_ribbon(sg.LineString([(0, 0), (1, 0)]), width_units=0.0) is None
     assert buffer_ribbon(sg.LineString([(0, 0), (1, 0)]), width_units=-1.0) is None
+
+
+# ---------------------------------------------------------------------------
+# Centerline fillet (S7c mesh-layer corner rounding)
+# ---------------------------------------------------------------------------
+
+
+def _corner_angle_deg(a, b, c) -> float:
+    """Interior angle (degrees) at vertex ``b`` of the polyline ``a-b-c``."""
+    v1 = (a[0] - b[0], a[1] - b[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    n1 = math.hypot(*v1)
+    n2 = math.hypot(*v2)
+    cos_theta = max(-1.0, min(1.0, dot / (n1 * n2)))
+    return math.degrees(math.acos(cos_theta))
+
+
+def test_fillet_centerline_preserves_endpoints_open_line() -> None:
+    line = sg.LineString([(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (10.0, 5.0)])
+    filleted = fillet_centerline(line)
+    coords = list(filleted.coords)
+    assert coords[0] == (0.0, 0.0)
+    assert coords[-1] == (10.0, 5.0)
+
+
+def test_fillet_centerline_rounds_sharp_corner() -> None:
+    """A 90-degree right-angle kink should read LESS sharp (angle closer to
+    180 degrees straight) after filleting -- the user's sharp-corner
+    complaint this fix addresses."""
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)])
+    filleted = fillet_centerline(line, post_tol=0.0)
+    coords = list(filleted.coords)
+    assert len(coords) > 3  # corner-cutting adds interior vertices
+    # The sharpest surviving interior vertex should be less acute than the
+    # original 90-degree kink.
+    angles = [
+        _corner_angle_deg(coords[i - 1], coords[i], coords[i + 1])
+        for i in range(1, len(coords) - 1)
+    ]
+    assert min(angles) > 90.0
+
+
+def test_fillet_centerline_closed_ring_stays_closed() -> None:
+    ring = sg.LineString(
+        [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+    )
+    filleted = fillet_centerline(ring)
+    coords = list(filleted.coords)
+    assert coords[0] == coords[-1]
+    # Every original corner should read less sharp, same as the open case.
+    assert len(coords) > len(list(ring.coords))
+
+
+def test_fillet_centerline_degenerate_line_passthrough() -> None:
+    short = sg.LineString([(0.0, 0.0), (1.0, 1.0)])
+    assert list(fillet_centerline(short).coords) == list(short.coords)
+
+
+def test_fillet_centerline_zero_iterations_is_noop() -> None:
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)])
+    assert fillet_centerline(line, iterations=0) is line
+
+
+def test_fillet_centerline_deterministic() -> None:
+    line = sg.LineString([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (20.0, 10.0)])
+    first = list(fillet_centerline(line).coords)
+    second = list(fillet_centerline(line).coords)
+    assert first == second
 
 
 # ---------------------------------------------------------------------------
