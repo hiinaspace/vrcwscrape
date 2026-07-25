@@ -72,6 +72,7 @@ dev = [
     "ty",
     "pre-commit>=3.8",
     "pytest>=9.0.3",
+    "pytest-xdist>=3.6",
 ]
 
 [build-system]
