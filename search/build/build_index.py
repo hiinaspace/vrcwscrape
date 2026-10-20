@@ -33,8 +33,6 @@ N_FLAG_TAGS = 8
 DESC_INDEX_CHARS = 1000
 DESC_STORE_CHARS = 700
 
-THUMB_COLS = ["thumbnail_url", "thumbnailImageUrl", "thumbnail_image_url", "image_url", "imageUrl"]
-
 
 class Out:
     def __init__(self, root: Path):
@@ -128,11 +126,17 @@ def load(path: str) -> dict:
         else:
             d[k] = np.zeros(n, dtype=np.int64)
     d["tags"] = [list(x) if x else [] for x in col("tags", [])]
+    # thumbnails are self-hosted (build/pack_thumbs.py); the VRChat CDN URLs in the parquet are never emitted
     d["thumb"] = None
-    for c in THUMB_COLS:
-        if c in cols:
-            d["thumb"] = [x or "" for x in t[c].to_pylist()]
-            break
+    d["recent"] = None
+    if "recent_visits_per_day" in cols:  # v2 parquet: recent visits/day (null = unknown), basis metrics|popularity_fallback
+        rv = t["recent_visits_per_day"].to_pylist()
+        d["recent"] = np.array([np.nan if x is None else x for x in rv], dtype=np.float64)
+        d["recent_metrics"] = np.array(
+            [b == "metrics" and x is not None for b, x in zip(col("recent_basis", "metrics"), rv)], dtype=bool
+        )
+        wd = [x for x in col("recent_window_days") if x is not None]
+        d["recent_window"] = float(np.median(wd)) if wd else None
     if "platforms" in cols:  # fresh export: list of platform strings
         pl = t["platforms"].to_pylist()
         hasq = np.array([any("android" in str(p).lower() or "quest" in str(p).lower() for p in (x or [])) for x in pl])
@@ -161,6 +165,41 @@ def canon_tag(raw: str) -> str:
     if raw.startswith("author_tag_"):
         return raw[len("author_tag_") :]
     return raw
+
+
+TREND_SCALE = 1024  # u16 steps per decade of (1 + recent visits/day)
+
+
+def trend_column(d: dict) -> tuple[np.ndarray, dict]:
+    """u16 trending key per world (already in popularity order) + manifest info.
+
+    v2 parquet: round(1024 * log10(1 + recent_visits_per_day)); rows without a measurement (basis popularity_fallback)
+    get the median recent rate of measured worlds with the same VRChat `popularity` value (so they interleave sensibly).
+    Without recent columns (old parquet): popularity-only key, documented as popularity_fallback.
+    """
+    pop = d["pop"].astype(np.int64)
+    n = len(pop)
+    if d.get("recent") is None:
+        key = np.clip(pop * 5000 + d["heat"].astype(np.int64) * 500, 0, 65535)
+        return key.astype(np.uint16), {"basis": "popularity_fallback", "windowDays": None, "scale": 0, "measured": 0}
+    rec = d["recent"].copy()
+    meas = d["recent_metrics"] & ~np.isnan(rec)
+    med = {}
+    for pv in np.unique(pop):
+        sel = meas & (pop == pv)
+        if sel.sum() >= 20:
+            med[int(pv)] = float(np.median(rec[sel]))
+    overall = float(np.median(rec[meas])) if meas.any() else 0.0
+    fill = np.array([med.get(int(pv), overall) for pv in pop])
+    v = np.where(meas, rec, fill)
+    key = np.clip(np.round(TREND_SCALE * np.log10(1.0 + np.maximum(v, 0))), 0, 65535)
+    return key.astype(np.uint16), {
+        "basis": "recent_visits_per_day",
+        "windowDays": d.get("recent_window"),
+        "scale": TREND_SCALE,
+        "measured": int(meas.sum()),
+        "fallbackRows": int(n - meas.sum()),
+    }
 
 
 def main() -> None:
@@ -258,6 +297,8 @@ def main() -> None:
     dv = np.concatenate([[vis[0]], vis[:-1] - vis[1:]]) if n else vis
     add("visits_delta", dv, np.uint32, "delta_desc")
     add("fav", np.minimum(d["fav"], 0xFFFFFFFF), np.uint32)
+    trend_key, trend_info = trend_column(d)
+    add("trend", trend_key, np.uint16)
     add("plat", d["has_pc"].astype(np.uint8) | (d["has_quest"].astype(np.uint8) << 1), np.uint8)
     add("flags", flags, np.uint8)
     add("tagcnt", tagcnt, np.uint8)
@@ -366,16 +407,7 @@ def main() -> None:
     print(f"fts built in {time.time()-t1:.1f}s")
 
     # ---- meta + card chunks
-    thumb = None
-    if d["thumb"] is not None:
-        urls = [u for u in d["thumb"] if u]
-        if urls:
-            import os
-
-            pre = os.path.commonprefix(urls)
-            suf = os.path.commonprefix([u[::-1] for u in urls])[::-1]
-            suf = suf[: max(0, min(len(u) for u in urls) - len(pre))]
-            thumb = {"prefix": pre, "suffix": suf}
+    # no hotlinking: thumbnails come from pack_thumbs.py (manifest.thumbs)
 
     def strip(s, p):
         return s[len(p) :] if s.startswith(p) else s
@@ -388,8 +420,6 @@ def main() -> None:
             "an": [d["author_name"][i] for i in r],
             "au": [strip(d["author_id"][i], "usr_") for i in r],
         }
-        if thumb:
-            m["th"] = [d["thumb"][i][len(thumb["prefix"]) : len(d["thumb"][i]) - len(thumb["suffix"])] if d["thumb"][i] else "" for i in r]
         out.json(f"meta/{k // META_CHUNK}.bin", m)
     for k in range(0, n, CARD_CHUNK):
         r = range(k, min(n, k + CARD_CHUNK))
@@ -424,8 +454,10 @@ def main() -> None:
         "minCoreTag": min_core,
         "flagTags": N_FLAG_TAGS,
         "sizeUnit": 1024,
-        "thumb": thumb,
-        "hasThumb": bool(thumb),
+        "thumb": None,
+        "hasThumb": False,
+        "thumbs": None,  # filled in by pack_thumbs.py
+        "trend": trend_info,
         "tagGroups": tag_groups,
         "cw": [[k, c] for k, c in all_tags if tag_class(k) == "cw"],
         "date_max": int(max(d["updated"].max(), d["created"].max())) if n else 0,
