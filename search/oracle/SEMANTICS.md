@@ -59,4 +59,4 @@ Assumed shape (DESIGN.md does not define it yet; harness adapts to either): an o
 and `query(q, k) -> Promise<string[] | {ids}>`, or a plain function `(q, k)` whose first call loads. If absent, the check is skipped.
 Set: the 400 `cjk2en` rows of `/work/projects/vrcwscrape-data/emb/queries.parquet` (set, world_id, query); a hit is the source world_id in
 the top 10 (offline static-model number: 20.2% recall@10, MRR 12.7). Reported: download bytes (CDP delta around `load()`), load time,
-per-query latency p50/p95, recall@10 vs 20.2%. PASS if recall@10 >= 0.17 (within ~1 s.e. of offline).
+per-query latency p50/p95, recall@10 vs 20.2%. Recall is report-only: the queries derive from the indexed docs' own description text, so in-page recall is contaminated; the leak-free offline estimate is ~0.20. Graded: download <= 40 MiB, per-query p95 <= 100 ms, no errors.
