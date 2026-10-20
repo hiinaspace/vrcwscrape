@@ -1,23 +1,142 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FAKE vrcw search (oracle harness self-test)</title>
-<style>body{font:14px sans-serif;margin:1em}.item{border-bottom:1px solid #ccc;padding:4px;cursor:pointer}
-#banner{background:#fc0;padding:4px;font-weight:bold}</style>
+<style>
+body{font:14px sans-serif;margin:1em}.item{border-bottom:1px solid #ccc;padding:4px;cursor:pointer;display:flex;gap:8px}
+.item img{width:64px;height:48px;background:#ddd}.chip{background:#eef;border-radius:3px;margin:1px;padding:0 3px;font-size:11px}
+#banner{background:#fc0;padding:4px;font-weight:bold}.pill{background:#cfe;border-radius:8px;padding:1px 8px;margin:2px;display:inline-block}
+#hist{height:60px;border:1px solid #888;display:flex;align-items:flex-end;width:100%;max-width:520px;user-select:none}
+#hist div{flex:1;background:#69c;margin:0 1px}#card{position:fixed;right:0;top:0;width:340px;height:100%;background:#fff;border-left:2px solid #333;padding:8px;overflow:auto}
+@media (max-width:760px){#card{width:100%}}
+</style>
 <div id="banner">FAKE SITE - oracle self-test, not the real search</div>
 <input data-testid="search-input" id="q" placeholder="search" size="40">
+<label><input type="checkbox" id="semtoggle" data-testid="sem-toggle"> semantic search (downloads ~2 MB)</label>
+<span id="sempop" hidden><button id="semenable" data-testid="sem-enable">Download and enable</button></span>
+<span id="semstate" data-testid="sem-state"></span>
+<div id="pills"></div>
 <div><span data-testid="facet-platform" id="fp"></span> | <span data-testid="facet-capacity" id="fc"></span></div>
 <div data-testid="facet-tags" id="ft"></div>
+<div id="hist" data-testid="date-hist" title="uploads over time (drag to brush)"></div>
 <div>total: <b id="total">-</b></div>
-<div data-testid="results" id="results"></div>
+<ol data-testid="semantic-results" id="semlist" hidden></ol>
+<ol data-testid="results" id="results" style="padding:0;list-style:none"></ol>
+<button data-testid="load-more" id="more" hidden>load more</button>
 <div data-testid="world-card" id="card" hidden></div>
 <script>
-let W = [];
-const stripTag = t => t.replace(/^author_tag_/, "");
-function prep(w) {
-  w.tagset = [...new Set((w.tags || []).map(stripTag))].sort();
-  w.hay = (w.name + " " + (w.author || "") + " " + w.tagset.join(" ") + " " + (w.desc || "")).toLowerCase();
-  w.hasPc = w.pc != null; w.hasQuest = w.quest != null;
+let W = [], shown = 50, semOn = false;
+const HIDDEN = ["admin_", "adm_", "feature_", "debug_", "system_"];
+const CJK = /([々-〇぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿가-힯]+)/gu;
+function norm(s) {
+  s = (s || "").normalize("NFKC").toLowerCase().replace(CJK, " $1 ");
+  return (s.match(/[\p{L}\p{N}\p{M}]+/gu) || []).join(" ");
 }
+function prep(w) {
+  w.tagset = [...new Set((w.tags || []).map(t => t.replace(/^author_tag_/, "")))].sort();
+  w.low = new Set(w.tagset.map(t => t.toLowerCase()));
+  const tt = w.tagset.filter(t => !HIDDEN.some(h => t.startsWith(h)));
+  w.title_n = " " + norm(w.name) + " ";
+  w.blob = " " + [norm(w.name), norm(w.author), tt.map(norm).join(" # "), norm((w.desc || "").slice(0, 1000))].join(" # ") + " ";
+  w.hasPc = (w.platforms || []).includes("pc"); w.hasQuest = (w.platforms || []).includes("quest");
+  w.desc_n = " " + norm((w.desc || "").slice(0, 1000)) + " ";
+  w.u = w.updated.slice(0, 10); w.c = w.created.slice(0, 10);
+}
+// ---- query language
+function tokenize(q) {
+  return q.match(/"[^"]*"?|[()]|\||-(?=\()|[^\s()|"]+/g) || [];
+}
+const FIELDS = ["tag", "cw", "title", "author", "platform", "cap", "size", "visits", "updated", "published"];
+function parse(q) {
+  const t = tokenize(q); let p = 0;
+  const peek = () => t[p];
+  const isOr = x => x === "OR" || x === "|";
+  function parseOr() { return parseAnd(); }
+  function parseAnd() { // OR binds tighter than the space-AND: `a b | c` = a AND (b OR c)
+    const c = [];
+    while (p < t.length && peek() !== ")") {
+      if (isOr(peek())) { p++; continue; }
+      const u = parseUnary(); if (!u) continue;
+      const alts = [u];
+      while (p < t.length && isOr(peek())) { p++; const v = parseUnary(); if (v) alts.push(v); }
+      c.push(alts.length > 1 ? { t: "or", c: alts } : u);
+    }
+    return c.length === 1 ? c[0] : { t: "and", c };
+  }
+  function parseUnary() {
+    const x = peek();
+    if (x === "NOT" || x === "-") { p++; const u = parseUnary(); return u && { t: "not", c: u }; }
+    if (x === "(") { p++; const e = parseOr(); if (peek() === ")") p++; return e; }
+    p++;
+    if (x === ")") return null;
+    if (x.startsWith("-") && x.length > 1) return { t: "not", c: atom(x.slice(1)) };
+    return atom(x);
+  }
+  return parseOr();
+}
+function atom(x) {
+  if (x[0] === '"') return { t: "phrase", v: norm(x.replace(/"/g, "")) };
+  const m = x.match(/^([a-z]+):(.+)$/);
+  if (m && FIELDS.includes(m[1])) return { t: "field", f: m[1], v: m[2] };
+  return { t: "word", v: norm(x) };
+}
+function lastWord(n) { // the last plain word (positive or negated) gets prefix expansion (DESIGN.md)
+  let last = null;
+  (function walk(n) {
+    if (!n) return;
+    if (n.t === "not") return walk(n.c);
+    if (n.c && Array.isArray(n.c)) return n.c.forEach(walk);
+    if (n.t === "word") last = n;
+  })(n);
+  return last;
+}
+function num(v, spec) {
+  let m = spec.match(/^(>=|<=|>|<|=)?(\d+(?:\.\d+)?)$/);
+  if (m) { const x = +m[2]; return v != null && ({ ">=": v >= x, "<=": v <= x, ">": v > x, "<": v < x, "=": v == x, "undefined": v == x })[m[1]]; }
+  m = spec.match(/^(\d+(?:\.\d+)?)\.\.(\d+(?:\.\d+)?)$/);
+  return !!m && v != null && v >= +m[1] && v <= +m[2];
+}
+function ev(n, w, ctx) {
+  switch (n.t) {
+    case "and": return n.c.every(c => ev(c, w, ctx));
+    case "or": return n.c.some(c => ev(c, w, ctx));
+    case "not": return !ev(n.c, w, ctx);
+    case "word": {
+      if (!n.v) return true;
+      if (/[々-〇぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿가-힯]/u.test(n.v)) return w.blob.includes(n.v);
+      return w.blob.includes(" " + n.v + (n === ctx.last ? "" : " "));
+    }
+    case "phrase": return !n.v || w.blob.includes(" " + n.v + " ") || n.v.split(" ").every(t => w.desc_n.includes(" " + t + " "));
+    case "field": {
+      const v = n.v.toLowerCase();
+      switch (n.f) {
+        case "tag": return w.low.has(v);
+        case "cw": return w.tagset.includes("content_" + v);
+        case "title": return w.title_n.includes(" " + norm(n.v) + " ");
+        case "author": return (" " + norm(w.author) + " ").includes(" " + norm(n.v) + " ");
+        case "platform": return v === "quest" ? w.hasQuest : v === "pc" ? w.hasPc : false;
+        case "cap": return num(w.cap, n.v);
+        case "visits": return num(w.visits, n.v);
+        case "size": return num(Math.min(w.pc ?? Infinity, w.quest ?? Infinity), n.v) && isFinite(Math.min(w.pc ?? Infinity, w.quest ?? Infinity));
+        case "updated": case "published": {
+          const d = n.f === "updated" ? w.u : w.c, m = n.v.match(/^(>=|<=|>|<)?(\d{4})(?:-(\d\d))?$/);
+          if (!m) return false;
+          const key = m[2] + (m[3] ? "-" + m[3] : ""), dd = d.slice(0, key.length), op = m[1];
+          return !op ? dd === key : op === ">=" ? dd >= key : op === ">" ? dd > key : op === "<=" ? dd <= key : dd < key;
+        }
+      }
+    }
+  }
+  return true;
+}
+function posWords(n, out = [], neg = false) {
+  if (!n) return out;
+  if (n.t === "not") return posWords(n.c, out, !neg);
+  if (n.c && Array.isArray(n.c)) { n.c.forEach(c => posWords(c, out, neg)); return out; }
+  if (!neg && n.t === "word" && n.v) out.push(n.v);
+  return out;
+}
+// ---- filters (contract in SEMANTICS.md)
 function matchF(w, f) {
   if (f.cap_min != null && f.cap_min !== "" && !(w.cap >= +f.cap_min)) return false;
   if (f.cap_max != null && f.cap_max !== "" && !(w.cap <= +f.cap_max)) return false;
@@ -26,25 +145,36 @@ function matchF(w, f) {
   if (p === "quest" && !w.hasQuest) return false;
   if (p === "both" && !(w.hasPc && w.hasQuest)) return false;
   if (f.size_max_mb != null && f.size_max_mb !== "") {
-    const x = +f.size_max_mb, pc = w.hasPc ? w.pc : Infinity, qu = w.hasQuest ? w.quest : Infinity;
+    const x = +f.size_max_mb, pc = w.hasPc && w.pc != null ? w.pc : Infinity, qu = w.hasQuest && w.quest != null ? w.quest : Infinity;
     if (p === "pc") { if (!(pc <= x)) return false; }
     else if (p === "quest") { if (!(qu <= x)) return false; }
     else if (p === "both") { if (!(pc <= x && qu <= x)) return false; }
     else if (!(Math.min(pc, qu) <= x)) return false;
   }
-  if (f.after && !(w.updated.slice(0, 10) >= f.after)) return false;
-  if (f.before && !(w.updated.slice(0, 10) <= f.before)) return false;
+  if (f.platform_ex === "pc" && w.hasPc) return false;
+  if (f.platform_ex === "quest" && w.hasQuest) return false;
+  if (f.pub_after && !(w.c >= f.pub_after)) return false;
+  if (f.pub_before && !(w.c <= f.pub_before)) return false;
+  if (f.after && !(w.u >= f.after)) return false;
+  if (f.before && !(w.u <= f.before)) return false;
   for (const t of f.tags || []) if (!w.tagset.includes(t)) return false;
+  for (const t of f.tags_ex || []) if (w.tagset.includes(t)) return false;
+  for (const s of f.status || []) if (!w.tagset.includes("system_" + s)) return false;
+  for (const s of f.status_ex || []) if (w.tagset.includes("system_" + s)) return false;
+  for (const c of f.cw || []) if (!w.tagset.includes("content_" + c)) return false;
+  for (const c of (f.cw_ex || []).concat(f.cw_exclude || [])) if (w.tagset.includes("content_" + c)) return false;
   if (f.author && w.author_id !== f.author) return false;
   return true;
 }
-function runQuery({ q = "", filters = {}, sort = "relevance", limit = 20 } = {}) {
+function runQuery({ q = "", filters = {}, sort, limit = 20 } = {}) {
   const t0 = performance.now();
-  const toks = q.toLowerCase().split(/\s+/).filter(Boolean);
-  let hits = W.filter(w => matchF(w, filters) && toks.every(t => w.hay.includes(t)));
+  const ast = q.trim() ? parse(q) : null;
+  const ctx = { last: lastWord(ast) }, words = posWords(ast);
+  let hits = W.filter(w => matchF(w, filters) && (!ast || ev(ast, w, ctx)));
   const total = hits.length;
-  const score = w => toks.reduce((s, t) => s + (w.name.toLowerCase().includes(t) ? 10 : 0), 0) + Math.log1p(w.visits || 0) / 100;
-  const key = { relevance: score, visits: w => w.visits || 0, favorites: w => w.fav || 0,
+  sort = sort || (q.trim() ? "relevance" : "trending");
+  const score = w => words.reduce((s, t) => s + (w.title_n.includes(" " + t) ? 10 : 0), 0) + Math.log1p(w.visits || 0) / 100;
+  const key = { relevance: score, trending: w => w.rv ?? -1, visits: w => w.visits || 0, favorites: w => w.fav || 0,
     updated: w => w.updated, published: w => w.created }[sort] || score;
   hits = hits.slice().sort((a, b) => (key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0));
   const pc = hits.filter(w => w.hasPc).length, qu = hits.filter(w => w.hasQuest).length;
@@ -53,10 +183,17 @@ function runQuery({ q = "", filters = {}, sort = "relevance", limit = 20 } = {})
     for (const t of w.tagset) tags[t] = (tags[t] || 0) + 1;
     if (w.cap != null) { const b = w.cap <= 8 ? "1-8" : w.cap <= 16 ? "9-16" : w.cap <= 32 ? "17-32" : w.cap <= 64 ? "33-64" : "65+"; capacity[b] = (capacity[b] || 0) + 1; }
   }
+  const mon = (col, ign) => { const g = { ...filters }; ign.forEach(k => delete g[k]);
+    const cs = new Array(20 * 12).fill(0); // months since 2010-01
+    W.forEach(w => { if (!matchF(w, g) || !(!ast || ev(ast, w, ctx))) return; const d = w[col]; cs[(+d.slice(0, 4) - 2010) * 12 + +d.slice(5, 7) - 1]++; });
+    return { m0: 0, counts: cs }; };
+  const capH = (() => { const g = { ...filters }; delete g.cap_min; delete g.cap_max; const a = new Array(257).fill(0);
+    W.forEach(w => { if (w.cap != null && w.cap < 257 && matchF(w, g) && (!ast || ev(ast, w, ctx))) a[w.cap]++; }); return a; })();
   const top = Object.entries(tags).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 30);
   return { ids: hits.slice(0, limit).map(w => w.id), total,
-    facetCounts: { platform: { pc, quest: qu, both: hits.filter(w => w.hasPc && w.hasQuest).length }, tags: Object.fromEntries(top), capacity },
-    ms: performance.now() - t0, _hits: hits.slice(0, limit) };
+    facetCounts: { platform: { pc, quest: qu, both: hits.filter(w => w.hasPc && w.hasQuest).length }, tags: Object.fromEntries(top), capacity,
+      months: mon("created", ["pub_after", "pub_before"]), updatedMonths: mon("updated", ["after", "before"]), capacityHist: capH },
+    ms: performance.now() - t0, _hits: hits.slice(0, limit), _ast: ast };
 }
 function similar(id, k = 10) {
   const me = W.find(w => w.id === id); if (!me) return [];
@@ -65,41 +202,107 @@ function similar(id, k = 10) {
     const i = w.tagset.filter(t => s.has(t)).length, u = new Set([...w.tagset, ...me.tagset]).size || 1;
     return [i / u + (w.author_id === me.author_id ? 0.5 : 0), w.id]; }).sort((a, b) => b[0] - a[0]).slice(0, k).map(x => x[1]);
 }
+// ---- UI
+let thumb = null;
+function thumbUrl() { // self-hosted-style thumbnail: a generated blob (never a VRChat host)
+  if (thumb) return thumb;
+  const c = document.createElement("canvas"); c.width = 64; c.height = 48;
+  const g = c.getContext("2d"); g.fillStyle = "#59c"; g.fillRect(0, 0, 64, 48);
+  thumb = new Promise(r => c.toBlob(b => r(URL.createObjectURL(b))));
+  return thumb;
+}
 function readUrl() {
   const p = new URLSearchParams(location.search), f = {};
-  for (const k of ["cap_min", "cap_max", "size_max_mb", "platform", "after", "before", "author"]) if (p.get(k)) f[k] = p.get(k);
-  if (p.get("tags")) f.tags = p.get("tags").split(",");
-  return { q: p.get("q") || "", filters: f, sort: p.get("sort") || "relevance", world: p.get("world") };
+  for (const k of ["cap_min", "cap_max", "size_max_mb", "platform", "platform_ex", "after", "before", "pub_after", "pub_before", "author"]) if (p.get(k)) f[k] = p.get(k);
+  for (const k of ["tags", "tags_ex", "status", "status_ex", "cw", "cw_exclude"]) if (p.get(k)) f[k] = p.get(k).split(",");
+  return { q: p.get("q") || "", filters: f, sort: p.get("sort") || undefined, world: p.get("world") };
 }
-function render() {
+function setParams(obj) {
+  const u = new URL(location);
+  for (const [k, v] of Object.entries(obj)) v ? u.searchParams.set(k, v) : u.searchParams.delete(k);
+  history.replaceState({}, "", u); render();
+}
+function label(n) {
+  if (!n) return "";
+  if (n.t === "not") return "NOT " + label(n.c);
+  if (n.t === "field") return n.f + ":" + n.v;
+  if (n.t === "phrase") return '"' + n.v + '"';
+  if (n.t === "word") return n.v;
+  return (n.t === "or" ? "(" : "") + n.c.map(label).join(n.t === "or" ? " OR " : " ") + (n.t === "or" ? ")" : "");
+}
+function semHits(q) {
+  const toks = norm(q).split(" ").filter(Boolean);
+  return W.map(w => [toks.filter(t => w.blob.includes(t)).length + Math.log1p(w.visits || 0) / 100, w])
+    .sort((a, b) => b[0] - a[0]).slice(0, 12).map(x => x[1]);
+}
+async function render() {
   const s = readUrl(); document.getElementById("q").value = s.q;
-  const r = runQuery({ ...s, limit: 30 });
+  const r = runQuery({ ...s, limit: 400 });
   document.getElementById("total").textContent = r.total;
   document.getElementById("fp").textContent = "platform pc " + r.facetCounts.platform.pc + " quest " + r.facetCounts.platform.quest;
   document.getElementById("fc").textContent = "capacity " + JSON.stringify(r.facetCounts.capacity);
   document.getElementById("ft").textContent = "tags " + Object.entries(r.facetCounts.tags).slice(0, 12).map(e => e.join(":")).join(" ");
+  const top = r._ast ? (r._ast.t === "and" ? r._ast.c : [r._ast]) : [];
+  document.getElementById("pills").innerHTML = top.map(n => `<span class="pill" data-testid="pill"></span>`).join("");
+  document.querySelectorAll("#pills .pill").forEach((e, i) => e.textContent = label(top[i]));
+  document.getElementById("semstate").textContent = semOn ? "semantic: on" : "";
+  const sl = document.getElementById("semlist"); sl.hidden = !(semOn && s.q); sl.innerHTML = "";
+  if (semOn && s.q) for (const w of semHits(s.q)) { const li = document.createElement("li"); li.dataset.testid = "semantic-item"; li.dataset.id = w.id; li.textContent = w.name; sl.appendChild(li); }
   const el = document.getElementById("results"); el.innerHTML = "";
-  for (const w of r._hits) {
-    const d = document.createElement("div"); d.className = "item"; d.dataset.testid = "result-item";
-    d.textContent = w.name + " - " + w.author + " (cap " + w.cap + ")";
-    d.onclick = () => { const u = new URL(location); u.searchParams.set("world", w.id); history.pushState({}, "", u); render(); };
+  const url = await thumbUrl();
+  for (const w of r._hits.slice(0, shown)) {
+    const d = document.createElement("li"); d.className = "item"; d.dataset.testid = "result-item"; d.dataset.id = w.id;
+    d.innerHTML = `<img alt=""><div><b></b> <small></small><div class="t"></div><div class="d"></div></div>`;
+    d.querySelector("img").src = url;
+    d.querySelector("b").textContent = w.name; d.querySelector("small").textContent = w.author + " (cap " + w.cap + ")";
+    d.querySelector(".t").innerHTML = w.tagset.filter(t => !HIDDEN.some(h => t.startsWith(h))).map(t => `<span class="chip">${t.replace(/</g, "")}</span>`).join("");
+    d.querySelector(".d").textContent = (w.desc || "").slice(0, 120);
+    d.onclick = () => setParams({ world: w.id });
     el.appendChild(d);
   }
+  document.getElementById("more").hidden = shown >= r._hits.length;
   const card = document.getElementById("card");
   if (s.world) {
     const w = W.find(x => x.id === s.world); card.hidden = !w;
-    if (w) card.innerHTML = "<h2></h2><p></p><div data-testid='similar-list'></div>",
-      card.querySelector("h2").textContent = w.name, card.querySelector("p").textContent = w.author + " | cap " + w.cap + " | " + w.updated,
+    if (w) {
+      card.innerHTML = `<button data-testid="detail-close" id="x">x</button><div data-testid="detail-panel"><h2></h2><p></p><a href="https://vrchat.com/home/world/${w.id}">official page</a><div data-testid="similar-list"></div></div>`;
+      card.querySelector("h2").textContent = w.name;
+      card.querySelector("p").textContent = w.author + " | cap " + w.cap + " | " + w.updated;
       card.querySelector("[data-testid=similar-list]").textContent = "similar: " + similar(w.id, 8).map(i => W.find(x => x.id === i).name).join(" / ");
+      card.querySelector("#x").onclick = () => setParams({ world: "" });
+    }
   } else card.hidden = true;
+  drawHist();
 }
-document.getElementById("q").addEventListener("input", e => {
-  const u = new URL(location); e.target.value ? u.searchParams.set("q", e.target.value) : u.searchParams.delete("q");
-  history.replaceState({}, "", u); render();
+function drawHist() {
+  const h = document.getElementById("hist"), years = [];
+  for (let y = 2017; y <= 2026; y++) years.push(y);
+  const cnt = years.map(y => W.filter(w => w.c.startsWith(y)).length), mx = Math.max(...cnt, 1);
+  h.innerHTML = cnt.map(c => `<div style="height:${Math.round((c / mx) * 100)}%"></div>`).join("");
+}
+(function brush() {
+  const h = document.getElementById("hist"); let x0 = null;
+  const yearAt = ev => { const r = h.getBoundingClientRect(); return 2017 + Math.max(0, Math.min(9, Math.floor(((ev.clientX - r.left) / r.width) * 10))); };
+  h.addEventListener("mousedown", ev => { x0 = yearAt(ev); });
+  window.addEventListener("mouseup", ev => {
+    if (x0 == null) return; const x1 = yearAt(ev), a = Math.min(x0, x1), b = Math.max(x0, x1); x0 = null;
+    setParams({ pub_after: a + "-01-01", pub_before: b + "-12-31" });
+  });
+})();
+document.getElementById("q").addEventListener("input", e => { shown = 50; setParams({ q: e.target.value }); });
+document.getElementById("more").onclick = () => { shown += 50; render(); };
+document.getElementById("semtoggle").addEventListener("click", ev => {
+  if (semOn) { semOn = false; render(); return; }
+  ev.preventDefault();
+  document.getElementById("sempop").hidden = false;
 });
+document.getElementById("semenable").onclick = async () => {
+  await (await fetch("sem.bin")).arrayBuffer();
+  semOn = true; document.getElementById("semtoggle").checked = true; document.getElementById("sempop").hidden = true; render();
+};
 window.vrcwSearchReady = fetch("data.json").then(r => r.json()).then(d => {
   W = d; W.forEach(prep);
-  window.vrcwSearch = { query: async o => { const r = runQuery(o); delete r._hits; return r; }, similar: async (id, k) => similar(id, k) };
-  render();
+  window.vrcwSearch = { query: async o => { const r = runQuery(o); delete r._hits; delete r._ast; return r; }, similar: async (id, k) => similar(id, k) };
+  return render();
 });
 </script>

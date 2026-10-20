@@ -3,3 +3,5 @@ runs/
 gold/*
 !gold/queries.sample.jsonl
 __pycache__/
+fake_site/data.json
+fake_site/sem.bin

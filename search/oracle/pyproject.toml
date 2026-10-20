@@ -3,7 +3,13 @@ name = "vrcw-search-oracle"
 version = "0.1.0"
 description = "Independent measurement harness for the vrcwscrape static search site"
 requires-python = ">=3.11"
-dependencies = ["duckdb>=1.1", "playwright>=1.48", "numpy"]
+dependencies = [
+    "duckdb>=1.1",
+    "playwright>=1.48",
+    "numpy",
+    "regex>=2026.9.29",
+    "pyarrow>=26.0.0",
+]
 
 [tool.ruff]
 line-length = 100

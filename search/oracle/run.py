@@ -8,23 +8,34 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
-import re
 import json
-import os
+import math
 import random
 import statistics
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 import numpy as np
 from playwright.sync_api import sync_playwright
 
-from common import DEFAULT_PARQUET, HERE, connect, script_of, tag_class
+import r5
+from common import (
+    DEFAULT_PARQUET,
+    HERE,
+    QUERY_JS,
+    MiB,
+    connect,
+    facet_eval,
+    launch,
+    load_jsonl,
+    pct,
+    script_of,
+    site_url,
+    tag_class,
+)
 
-MiB = 1024 * 1024
 TARGETS = {
     "cold_first_results_s": 1.5,
     "first_view_bytes": 3 * MiB,
@@ -35,27 +46,7 @@ TARGETS = {
     "total_bytes": 200 * 1000 * 1000,
     "max_files": 20000,
 }
-LIB_DIR = Path.home() / ".cache/chromium-libs/usr/lib/x86_64-linux-gnu"
 SHOT_VIEWPORTS = {"desktop": (1440, 900), "mobile": (390, 844)}
-
-
-def launch(p):
-    env = dict(os.environ)
-    if LIB_DIR.exists():  # user-space copies of Chromium's shared libs (no root on cc-0)
-        env["LD_LIBRARY_PATH"] = f"{LIB_DIR}:{env.get('LD_LIBRARY_PATH', '')}"
-    return p.chromium.launch(env=env)
-
-
-def site_url(base: str, **params) -> str:
-    params = {k: v for k, v in params.items() if v not in (None, "")}
-    return base.rstrip("/") + "/" + (("?" + urlencode(params)) if params else "")
-
-
-def pct(xs, q):
-    if not xs:
-        return None
-    xs = sorted(xs)
-    return xs[min(len(xs) - 1, int(round(q * (len(xs) - 1))))]
 
 
 # ---------------------------------------------------------------- cold start
@@ -127,20 +118,6 @@ def cold_metrics(browser, base: str, q: str, reps: int = 3) -> dict:
 
 
 # ---------------------------------------------------------------- in-page batch
-QUERY_JS = """
-async (items) => {
-  await window.vrcwSearchReady;
-  const out = [];
-  for (const it of items) {
-    const t0 = performance.now();
-    let r = null, err = null;
-    try { r = await window.vrcwSearch.query(it); } catch (e) { err = String(e); }
-    out.push({wall: performance.now() - t0, ms: r && r.ms, ids: r && r.ids, total: r && r.total,
-              facetCounts: r && r.facetCounts, err});
-  }
-  return out;
-}
-"""
 SIMILAR_JS = """
 async (items) => {
   await window.vrcwSearchReady;
@@ -158,10 +135,6 @@ def chunked(page, js, items, n=200):
     for i in range(0, len(items), n):
         res += page.evaluate(js, items[i : i + n])
     return res
-
-
-def load_jsonl(p: Path) -> list[dict]:
-    return [json.loads(line) for line in open(p) if line.strip()]
 
 
 def warm_and_recall(page, gold: list[dict], facets: list[dict], parquet: str) -> dict:
@@ -214,49 +187,6 @@ def warm_and_recall(page, gold: list[dict], facets: list[dict], parquet: str) ->
         },
         "recall": {"overall": overall, "by_category": cats, "n": n, "sample_misses": misses},
         "fres": fres,
-    }
-
-
-def facet_eval(facets: list[dict], fres: list[dict]) -> dict:
-    exact = 0
-    bad = []
-    cap_present = 0
-    for f, r in zip(facets, fres):
-        t = f["truth"]
-        fc = r.get("facetCounts") or {}
-        reasons = []
-        if r["err"] or r["total"] is None:
-            reasons.append(f"error {r['err']}")
-        else:
-            if r["total"] != t["total"]:
-                reasons.append(f"total {r['total']} != {t['total']}")
-            plat = fc.get("platform")
-            if not isinstance(plat, dict):
-                reasons.append("facetCounts.platform missing")
-            else:
-                for k, v in t["platform"].items():
-                    if plat.get(k) != v:
-                        reasons.append(f"platform.{k} {plat.get(k)} != {v}")
-            tg = fc.get("tags")
-            if not isinstance(tg, dict):
-                reasons.append("facetCounts.tags missing")
-            else:
-                for k, v in t["tags"].items():
-                    if tg.get(k) != v:
-                        reasons.append(f"tag {k} {tg.get(k)} != {v}")
-            cap = fc.get("capacity")
-            if isinstance(cap, dict):
-                cap_present += 1
-        if not reasons:
-            exact += 1
-        elif len(bad) < 8:
-            bad.append({"filters": f["filters"], "reasons": reasons[:4]})
-    return {
-        "n": len(facets),
-        "exact": exact,
-        "exact_rate": exact / max(1, len(facets)),
-        "capacity_facet_present": cap_present,
-        "sample_failures": bad,
     }
 
 
@@ -393,10 +323,38 @@ def duckdb_rows(path: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------- popularity / author / content-default
-POP_QUERIES = (
-    "horror club avatar chill pool game shrine japan sleep dance music anime quest pvp puzzle "
-    "cafe forest space city beach cozy fantasy escape maze parkour movie bar home night castle"
-).split()
+POP_QUERIES = [
+    "horror",
+    "club",
+    "avatar",
+    "chill",
+    "pool",
+    "game",
+    "shrine",
+    "japan",
+    "sleep",
+    "dance",
+    "music",
+    "anime",
+    "quest",
+    "pvp",
+    "puzzle",
+    "cafe",
+    "forest",
+    "space",
+    "city",
+    "beach",
+    "cozy",
+    "fantasy",
+    "escape",
+    "maze",
+    "parkour",
+    "movie",
+    "bar",
+    "home",
+    "night",
+    "castle",
+]
 
 
 def _top_ids(page, items):
@@ -474,60 +432,6 @@ def author_eval(page, parquet: str, n: int = 30, seed: int = 11) -> dict:
     }
 
 
-DESIGN_MD = HERE.parent / "DESIGN.md"
-CONTENT_DOC_RE = re.compile(
-    r"show_?(adult|nsfw|content|all)|nsfw|hidden by default|hide_?adult", re.I
-)
-
-
-DOM_IDS_JS = """
-() => [...document.querySelectorAll('[data-testid="result-item"]')].slice(0, 50).map(e => {
-  const m = e.outerHTML.match(/wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/);
-  return m ? m[0] : null;
-})
-"""
-
-
-def content_default_eval(page, parquet: str, mode: str, base: str, browser) -> dict:
-    """UI-only default (DESIGN.md round 4): `?sort=published` renders no content_sex/adult worlds; `&adult=1` shows some."""
-    if mode == "off":
-        return {"skipped": "--content-default off"}
-    con = connect(parquet)
-    bad_ids = {
-        r[0]
-        for r in con.execute(
-            "select world_id from w where list_contains(tagset,'content_sex') or list_contains(tagset,'content_adult')"
-        ).fetchall()
-    }
-
-    def rendered(params: dict) -> list[str | None]:
-        ctx = browser.new_context(
-            viewport={"width": 1440, "height": 900}
-        )  # fresh: no stored adult toggle
-        pg = ctx.new_page()
-        try:
-            pg.goto(site_url(base, **params), wait_until="load")
-            pg.wait_for_selector('[data-testid="result-item"]', timeout=20000)
-            pg.wait_for_timeout(500)
-            return pg.evaluate(DOM_IDS_JS)
-        finally:
-            ctx.close()
-
-    default = rendered({"sort": "published"})
-    adult = rendered({"sort": "published", "adult": "1"})
-    unparsed = sum(1 for i in default if i is None)
-    d_flag = [i for i in default if i in bad_ids]
-    a_flag = [i for i in adult if i in bad_ids]
-    return {
-        "n_default": len(default),
-        "flagged_default": len(d_flag),
-        "flagged_default_ids": d_flag[:5],
-        "n_adult": len(adult),
-        "flagged_adult": len(a_flag),
-        "unparsed_ids": unparsed,
-    }
-
-
 # ---------------------------------------------------------------- dist audit
 def dist_audit(dist: Path) -> dict:
     files = [(p, p.stat().st_size) for p in dist.rglob("*") if p.is_file()]
@@ -591,6 +495,8 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     def add(name, value, target, ok):
         rows.append((name, value, target, ok))
 
+    if m.get("r5_only"):
+        return r5.verdict_rows(m)
     for key, label in [
         ("cold_empty", "cold first results, empty query"),
         ("cold_query", "cold first results, query"),
@@ -705,24 +611,7 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
         )
     elif au:
         add("author-name query", au.get("error", "?"), "mean >= 0.70", False)
-    cd = m.get("content_default", {})
-    if "flagged_default" in cd:
-        add(
-            "adult default hidden in UI (?sort=published, rendered items)",
-            f"{cd['flagged_default']} flagged of {cd['n_default']}; world ids unparsed from DOM: {cd['unparsed_ids']}",
-            "0 flagged, ids readable",
-            cd["flagged_default"] == 0 and cd["n_default"] > 0 and cd["unparsed_ids"] == 0,
-        )
-        add(
-            "adult=1 reveals flagged worlds",
-            f"{cd['flagged_adult']} flagged of {cd['n_adult']}",
-            ">= 1",
-            cd["flagged_adult"] >= 1,
-        )
-    elif "error" in cd:
-        add("content default check", cd["error"], "0 flagged", False)
-    elif cd:
-        add("content default check", "skipped: " + cd["skipped"], "optional", None)
+    rows += r5.verdict_rows(m)
     sm = m.get("semantic", {})
     if "recall_at_10" in sm:
         add(
@@ -776,7 +665,8 @@ def write_summary(m: dict, rows, path: Path) -> None:
         "",
         f"- site: {m['url']}",
         f"- parquet: {m['parquet']}",
-        f"- gold: {m['gold_dir']} ({m['n_gold']} queries, {m['n_facet_combos']} facet combos)",
+        f"- gold: {m['gold_dir']} ({m['n_gold']} queries, {m['n_facet_combos']} facet combos)"
+        + (" [round-5 checks only]" if m.get("r5_only") else ""),
         "- network: loopback/LAN as seen from the harness host (not a throttled link)",
         "",
         "| metric | value | target | verdict |",
@@ -792,21 +682,25 @@ def write_summary(m: dict, rows, path: Path) -> None:
         f"**Overall: {'PASS' if all(graded) else 'FAIL'}** ({sum(graded)}/{len(graded)} checks)",
         "",
     ]
-    sh = m.get("screenshots")
+    sh = {**(m.get("screenshots") or {}), **(m.get("screenshots_r5") or {})}
     if sh:
-        bad = {k: v for k, v in sh.items() if v != "ok"}
+        bad = {k: v for k, v in sh.items() if v != "ok" and ".png:" not in k}
         lines += [
             f"Screenshots: {len(sh) - len(bad)}/{len(sh)} ok" + (f"; failed: {bad}" if bad else "")
         ]
-    if m["recall"]["sample_misses"]:
+    if m.get("recall", {}).get("sample_misses"):
         lines += ["", "Sample recall misses:"] + [
             f"- {x}" for x in m["recall"]["sample_misses"][:8]
         ]
-    if m["facets"]["sample_failures"]:
+    if m.get("facets", {}).get("sample_failures"):
         lines += ["", "Sample facet mismatches:"] + [
             f"- {x}" for x in m["facets"]["sample_failures"][:5]
         ]
     path.write_text("\n".join(lines) + "\n")
+
+
+class _Done(Exception):
+    pass
 
 
 def main() -> None:
@@ -817,12 +711,21 @@ def main() -> None:
     ap.add_argument("--dist")
     ap.add_argument("--label", default="")
     ap.add_argument("--build-time-s", type=float)
-    ap.add_argument("--content-default", choices=["auto", "on", "off"], default="auto")
+    ap.add_argument(
+        "--r5-parquet", help="parquet for the round-5 checks (v2: recent_visits_per_day)"
+    )
+    ap.add_argument("--no-r5", action="store_true", help="skip the round-5 checks")
+    ap.add_argument(
+        "--no-semantic-ui", action="store_true", help="skip the real-UI semantic toggle check"
+    )
+    ap.add_argument(
+        "--r5-only", action="store_true", help="only the round-5 checks (fast iteration)"
+    )
     ap.add_argument("--no-shots", action="store_true")
     ap.add_argument("--runs-dir", default=str(HERE / "runs"))
     a = ap.parse_args()
-    gold = load_jsonl(Path(a.gold) / "queries.jsonl")
-    facets = load_jsonl(Path(a.gold) / "facets.jsonl")
+    gold = [] if a.r5_only else load_jsonl(Path(a.gold) / "queries.jsonl")
+    facets = [] if a.r5_only else load_jsonl(Path(a.gold) / "facets.jsonl")
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     outdir = Path(a.runs_dir) / ts
     outdir.mkdir(parents=True, exist_ok=True)
@@ -835,10 +738,20 @@ def main() -> None:
         "n_gold": len(gold),
         "n_facet_combos": len(facets),
         "build_time_s": a.build_time_s,
+        "r5_only": a.r5_only,
     }
     with sync_playwright() as p:
         browser = launch(p)
         try:
+            if a.r5_only:
+                ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+                page = ctx.new_page()
+                page.goto(site_url(a.url), wait_until="load")
+                page.wait_for_function("window.vrcwSearchReady !== undefined", timeout=30000)
+                page.evaluate("window.vrcwSearchReady")
+                m.update(r5.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, page, a))
+                ctx.close()
+                raise _Done
             m["cold_empty"] = cold_metrics(browser, a.url, "")
             m["cold_query"] = cold_metrics(browser, a.url, "horror")
             ctx = browser.new_context(viewport={"width": 1440, "height": 900})
@@ -857,17 +770,13 @@ def main() -> None:
             for key, fn in (
                 ("popularity", lambda: popularity_eval(page, a.parquet)),
                 ("authors", lambda: author_eval(page, a.parquet)),
-                (
-                    "content_default",
-                    lambda: content_default_eval(
-                        page, a.parquet, a.content_default, a.url, browser
-                    ),
-                ),
             ):
                 try:
                     m[key] = fn()
                 except Exception as e:  # noqa: BLE001
                     m[key] = {"error": f"harness error: {e}"[:300]}
+            if not a.no_r5:
+                m.update(r5.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, page, a))
             ctx.close()
             try:
                 m["semantic"] = semantic_eval(browser, a.url)
@@ -875,6 +784,8 @@ def main() -> None:
                 m["semantic"] = {"error": f"harness error: {e}"[:300]}
             if not a.no_shots:
                 m["screenshots"] = screenshots(browser, a.url, a.parquet, outdir)
+        except _Done:
+            pass
         finally:
             browser.close()
     if a.dist:

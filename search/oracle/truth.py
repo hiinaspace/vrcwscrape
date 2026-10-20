@@ -23,6 +23,7 @@ def main() -> None:
     a = ap.parse_args()
     rnd = random.Random(a.seed)
     con = connect(a.parquet)
+    n_rows = con.execute("select count(*) from w").fetchone()[0]
     lo, hi = con.execute("select min(updated_at), max(updated_at) from w").fetchone()
     sizes = con.execute(
         "select quantile_cont(x, [0.1,0.25,0.5,0.75,0.9]) from "
@@ -76,7 +77,9 @@ def main() -> None:
         r[0][len("content_") :]
         for r in con.execute(
             "select t from (select unnest(tagset) t from w) where t like 'content\\_%' escape '\\' "
-            "group by t having count(*) >= 100 order by count(*) desc"
+            "group by t having count(*) >= "
+            + str(min(100, max(10, n_rows // 2000)))
+            + " order by count(*) desc"
         ).fetchall()
     ]
     hidden = [
@@ -84,7 +87,9 @@ def main() -> None:
         for r in con.execute(
             "select t from (select unnest(tagset) t from w) where regexp_matches(t, "
             "'^(admin_|adm_|feature_|debug_|system_)') and t not in ('system_approved','system_labs') "
-            "group by t having count(*) >= 50 order by count(*) desc, t limit 20"
+            "group by t having count(*) >= "
+            + str(min(50, max(5, n_rows // 4000)))
+            + " order by count(*) desc, t limit 20"
         ).fetchall()
     ]
     for i in range(a.n_extra):
@@ -93,9 +98,11 @@ def main() -> None:
         if "status" in kinds:
             f["status"] = rnd.choice([["approved"], ["labs"], ["approved", "labs"]])
         if "cw" in kinds and cw_names:
-            f["cw"] = rnd.sample(cw_names[:6], rnd.choice([1, 1, 2]))
+            f["cw"] = rnd.sample(cw_names[:6], min(len(cw_names[:6]), rnd.choice([1, 1, 2])))
         if "cw_exclude" in kinds and cw_names:
-            f["cw_exclude"] = rnd.sample(cw_names[:6], rnd.choice([1, 2, 3]))
+            f["cw_exclude"] = rnd.sample(
+                cw_names[:6], min(len(cw_names[:6]), rnd.choice([1, 2, 3]))
+            )
         if "hidden" in kinds and hidden:
             f["tags"] = rnd.sample(hidden, 1)
         if "base" in kinds:
