@@ -1,6 +1,6 @@
 import {
   Core, Manifest, TITLE_MARK, authorWorlds, fetchJson, forEachPosting, getShard, idToIdx, loadCore,
-  loadManifest, lowerBound, loadRare, Rare, worldInfo, similarIdx, cached,
+  loadManifest, lowerBound, loadRare, loadSizeLo, Rare, worldInfo, similarIdx, cached,
 } from "./data";
 import { PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
 
@@ -49,6 +49,7 @@ export class Engine {
   private tw!: Float32Array;
   private mask!: Uint8Array;
   allTags: Promise<[string, number][]> | null = null;
+  sizeLo: Promise<{ pc: Uint16Array; quest: Uint16Array }> | null = null;
   rare: Promise<{ r: Rare; keys: string[]; id: Map<string, number> }> | null = null;
   defaultFacets!: FacetCounts;
 
@@ -91,7 +92,16 @@ export class Engine {
     const c = this.c, n = c.n, mask = this.mask;
     const capLo = f.cap_min ?? -1, capHi = f.cap_max ?? 1e9;
     const useCap = f.cap_min !== undefined || f.cap_max !== undefined;
-    const lim = f.size_max_mb !== undefined ? Math.floor(f.size_max_mb * (1048576 / this.m.sizeUnit) + 1e-6) : -1;
+    // size_max_mb is compared exactly: bytes <= floor(x * 2^20). K = ceil(bytes/1024) is in core; the low bits are lazy.
+    let lim = -1, rem = 0;
+    if (f.size_max_mb !== undefined) {
+      const T = Math.floor(f.size_max_mb * 1048576);
+      lim = Math.floor(T / 1024);
+      rem = T - lim * 1024;
+    }
+    if (rem > 0) this.sizeLo ??= loadSizeLo(n);
+    const lo = rem > 0 ? await this.sizeLo! : null;
+    const loPc = lo?.pc, loQ = lo?.quest;
     const plat = f.platform || "";
     const dLo = f.after ? dayOf(f.after) : -1, dHi = f.before ? dayOf(f.before) : 1e9;
     const useDate = !!(f.after || f.before);
@@ -131,10 +141,12 @@ export class Engine {
         if (plat === "pc" ? !(p & 1) : plat === "quest" ? !(p & 2) : p !== 3) ok = false;
       }
       if (ok && lim >= 0) {
-        if (plat === "pc") ok = pc[i] <= lim;
-        else if (plat === "quest") ok = quest[i] <= lim;
-        else if (plat === "both") ok = pc[i] <= lim && quest[i] <= lim;
-        else ok = pc[i] <= lim || quest[i] <= lim;
+        const okPc = pc[i] <= lim || (rem > 0 && pc[i] === lim + 1 && loPc![i] < rem);
+        const okQ = quest[i] <= lim || (rem > 0 && quest[i] === lim + 1 && loQ![i] < rem);
+        if (plat === "pc") ok = okPc;
+        else if (plat === "quest") ok = okQ;
+        else if (plat === "both") ok = okPc && okQ;
+        else ok = okPc || okQ;
       }
       if (ok && useDate && (updated[i] < dLo || updated[i] > dHi)) ok = false;
       if (ok && flagReq && (flags[i] & flagReq) !== flagReq) ok = false;

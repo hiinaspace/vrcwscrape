@@ -118,6 +118,7 @@ def load(path: str) -> dict:
         else:
             vals = [None] * n
         d[k] = np.array([0xFFFFFFFF if (x is None or x <= 0) else min(-(-x // 1024), 0xFFFFFFFE) for x in vals], dtype=np.int64)
+        d[k + "_lo"] = np.array([0 if (x is None or x <= 0) else (x - 1) % 1024 for x in vals], dtype=np.int64)
     for k, c in (("created", "created_at"), ("updated", "updated_at")):
         if c in cols:
             arr = t[c].cast(pa.timestamp("s"), safe=False).to_numpy(zero_copy_only=False)
@@ -234,6 +235,8 @@ def main() -> None:
         sections.append({"name": name, "dtype": np.dtype(dtype).name, "len": len(arr), "off": len(blob), "bytes": len(raw), "kind": kind})
         blob += raw
 
+    # exact byte sizes for fractional size_max_mb: bytes = (K-1)*1024 + lo + 1 where K = stored KiB (ceil); lazy file
+    out.write("sizelo.bin", planes(d["pc_lo"].astype(np.uint16)) + planes(d["quest_lo"].astype(np.uint16)))
     add("cap", d["capacity"], np.uint8)
     add("pc", d["pc"], np.uint32)
     add("quest", d["quest"], np.uint32)

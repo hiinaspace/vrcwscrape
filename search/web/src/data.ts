@@ -241,3 +241,8 @@ export async function similarIdx(idx: number, k: number): Promise<number[]> {
   }
   return out;
 }
+
+export async function loadSizeLo(n: number): Promise<{ pc: Uint16Array; quest: Uint16Array }> {
+  const raw = await fetchBin("sizelo.bin");
+  return { pc: unplane(raw, 0, n, 2, Uint16Array), quest: unplane(raw, 2 * n, n, 2, Uint16Array) };
+}
