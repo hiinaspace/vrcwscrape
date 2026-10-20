@@ -8,5 +8,6 @@ export interface Ctx {
   state: State;
   meters: Meters;
   /** state changed: update URL and re-run the query after `debounceMs` */
-  change(debounceMs?: number): void;
+  /** mode "push" (default) = new history entry; "type" = continuous input (typing, slider drag): one entry per burst, then replaceState */
+  change(debounceMs?: number, mode?: "push" | "type"): void;
 }

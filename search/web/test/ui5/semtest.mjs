@@ -28,6 +28,8 @@ await p.waitForFunction(() => document.querySelectorAll("[data-testid=semantic-i
 out.semItems = await T("semantic-item").count();
 out.firstSem = (await T("semantic-item").first().locator(".title").textContent());
 await p.screenshot({ path: "/work/tmp-ui5/ui5shots/" + kind + "-sem-on-query.png" });
+await p.reload(); await p.waitForFunction(() => document.querySelector("[data-testid=sem-toggle]")?.getAttribute("aria-checked") === "true", null, { timeout: 60000 });
+out.rememberedAfterReload = true;
 await T("sem-toggle").click();
 out.offAfter = await T("sem-toggle").getAttribute("aria-checked");
 out.sectionAfterOff = await p.locator("#semantic").isVisible();

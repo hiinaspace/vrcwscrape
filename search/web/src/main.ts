@@ -100,7 +100,7 @@ async function boot() {
   });
   const q = $<HTMLInputElement>("#q");
   q.value = ctx.state.q;
-  q.addEventListener("input", () => { ctx.state.q = q.value; change(90); });
+  q.addEventListener("input", () => { ctx.state.q = q.value; change(90, "type"); });
   createSyntaxHelp($("#syntax-btn"), $("#syntax-pop"), (ex) => { ctx.state.q = ctx.state.q.trim() ? ctx.state.q.trim() + " " + ex : ex; q.value = ctx.state.q; q.focus(); change(); });
   semCtl = semUi($("#sem-host"), $("#sem-panel"), {
     load: async (progress) => { await ensureSem(progress); },
@@ -116,8 +116,11 @@ async function boot() {
     s.sort = v;
     change();
   });
+  $("#sorts").addEventListener("scroll", sortFade, { passive: true });
+  window.addEventListener("resize", sortFade);
   for (const id of ["#results", "#sem-list"]) { $(id).addEventListener("click", onListClick); $(id).addEventListener("keydown", onListKey as EventListener); }
   window.addEventListener("popstate", () => {
+    typingPushed = false;
     ctx.state = readUrl();
     $<HTMLInputElement>("#q").value = ctx.state.q;
     facets.sync();
@@ -140,13 +143,23 @@ function commit(push = false) {
   const u = toUrl(ctx.state);
   if (u !== location.pathname + location.search) (push ? history.pushState : history.replaceState).call(history, null, "", u);
 }
-let timer: any;
-function change(debounce = 0) {
+let timer: any, typingTimer: any, typingPushed = false;
+/** discrete actions push a history entry; continuous input (typing, slider drags) pushes one entry per burst (1 s idle) and replaces after that */
+function change(debounce = 0, mode: "push" | "type" = "push") {
   pills?.render();
   renderSorts();
   ($("#fbtn") as HTMLElement).textContent = facetCount(ctx.state) ? `Filters (${facetCount(ctx.state)})` : "Filters";
   clearTimeout(timer);
-  timer = setTimeout(() => { shown = PAGE; commit(); void refresh(); }, debounce);
+  timer = setTimeout(() => {
+    shown = PAGE;
+    if (mode === "type") {
+      commit(!typingPushed);
+      typingPushed = true;
+      clearTimeout(typingTimer);
+      typingTimer = setTimeout(() => (typingPushed = false), 1000);
+    } else { commit(true); typingPushed = false; }
+    void refresh();
+  }, debounce);
 }
 
 function renderSorts() {
@@ -157,6 +170,12 @@ function renderSorts() {
     const tip = x === "trending" && eng.trend?.basis === "popularity_fallback" ? "recent visits per day (estimated from popularity; no recent-visit data in this build)" : SORT_TIP[x];
     return `<button type="button" data-sort="${x}" data-testid="sort-${x}" class="${on ? "on" : ""}" aria-pressed="${on}" title="${tip}">${SORT_LABEL[x]}${arrow}</button>`;
   }).join("");
+  sortFade();
+}
+function sortFade() {
+  const el = $("#sorts");
+  el.classList.toggle("fade-r", el.scrollLeft + el.clientWidth < el.scrollWidth - 4);
+  el.classList.toggle("fade-l", el.scrollLeft > 4);
 }
 
 async function refresh() {
@@ -172,10 +191,11 @@ async function refresh() {
     : `<li class="empty-state" data-testid="no-results"><div><b>No worlds match.</b><br>Remove a pill above, or relax a filter.</div></li>`;
   lazyThumbs($("#results"));
   ($("#more") as HTMLButtonElement).hidden = r.idx.length >= r.total;
+  setAuthorName(s.author ? await authorLabel(s.author) : "");
+  if (my !== seq) return;
   pills.render();
   renderSorts();
   await facets.render(r.facetCounts as FacetCounts, r.total);
-  if (s.author) setAuthorName(await authorLabel(s.author));
   if (my !== seq) return;
   void renderSemantic(my, new Set(r.idx));
 }
@@ -254,7 +274,7 @@ async function renderSemantic(my: number, shownIds: Set<number>) {
   const ms = performance.now() - t0;
   const infos = await eng.info(hits);
   if (my !== seq) return;
-  list.innerHTML = hits.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], "semantic-item", infos[j].id === ctx.state.world, true)).join("")
+  list.innerHTML = hits.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], "semantic-item", infos[j].id === ctx.state.world)).join("")
     || `<li class="dim empty">nothing new beyond the results above</li>`;
   lazyThumbs(list);
   $("#sem-ms").textContent = `${ms.toFixed(0)} ms`;

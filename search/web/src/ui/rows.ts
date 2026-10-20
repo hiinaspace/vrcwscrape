@@ -27,8 +27,10 @@ export function meterBlock(eng: Engine, meters: Meters, i: number): string {
 export function rowExtraHtml(card: RowCard | undefined): string {
   if (!card) return "";
   const tags = card.tags.filter((t) => tagClass(t) === "user");
-  const desc = card.desc.replace(/\s+/g, " ").trim();
-  const d160 = desc.length > 160 ? desc.slice(0, 160).trimEnd() + "…" : desc;
+  let desc = card.desc.replace(/\s+/g, " ").trim();
+  // the meta chunk cuts at 160 chars (mid-word): back up to a word boundary and mark the cut
+  if (desc.length >= 155) desc = desc.replace(/\s+\S*$/, "") + "…";
+  const d160 = desc;
   return `<div class="tg">${tags.map((t) => `<span class="tag" data-t="${esc(t)}">${esc(label(t))}</span>`).join("")}</div>${d160 ? `<p class="rdesc">${esc(d160)}</p>` : ""}`;
 }
 export function rowBadges(card: RowCard | undefined): string {

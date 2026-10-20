@@ -5,6 +5,7 @@ import { authorWorlds } from "../data";
 import type { Ctx } from "./ctx";
 import { dualRange, DualRange } from "./dualrange";
 import { histogram, Hist, ymLabel } from "./histogram";
+import { parseQuery, flipPill, removePill } from "../query";
 import { facetCount } from "./state";
 import { $, esc, fmt, label } from "./util";
 
@@ -80,7 +81,7 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     hist = histogram({ testid: "date-hist", onBrush });
     $("#f-hist").appendChild(hist.el);
     const ysl = Array.from({ length: y1 - y0 + 1 }, (_, i) => "’" + String(y0 + i).slice(2));
-    years = dualRange({ stops: ysl, tickEvery: ysl.length > 9 ? 2 : 1, testid: "date-years", onInput: onYears, onChange: () => ctx.change() });
+    years = dualRange({ stops: ysl, tickEvery: ysl.length > 9 ? 2 : 1, testid: "date-years", onInput: onYears, onChange: () => ctx.change(0, "type") });
     $("#f-years").appendChild(years.el);
     cap = dualRange({ stops: CAP_STOPS.map((v, i) => (i === CAP_STOPS.length - 1 ? v + "+" : String(v))), tickEvery: 1, testid: "cap-range", onInput: onCap });
     $("#f-cap").appendChild(cap.el);
@@ -92,14 +93,20 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     host.addEventListener("click", onClick);
     $("#f-datef").addEventListener("click", (e) => {
       const b = (e.target as HTMLElement).closest("button"); if (!b) return;
-      S().datef = b.dataset.f as "updated" | "published"; ctx.change(); // histogram re-renders from the cached counts
-      sync(); if (lastFc) paintHist(lastFc);
+      const to = b.dataset.f as "updated" | "published", s = S() as any;
+      if (to !== s.datef) { // carry the active range over to the other field and clear the old one: no orphan hidden range
+        const [fa, fb] = s.datef === "published" ? ["pub_after", "pub_before"] : ["after", "before"];
+        const [ta, tb] = to === "published" ? ["pub_after", "pub_before"] : ["after", "before"];
+        if (s[fa] || s[fb]) { s[ta] = s[fa]; s[tb] = s[fb]; s[fa] = ""; s[fb] = ""; }
+        s.datef = to;
+      }
+      sync(); if (lastFc) paintHist(lastFc); ctx.change();
     });
     $("#f-presets").addEventListener("click", (e) => {
       const b = (e.target as HTMLElement).closest("button"); if (!b) return;
       preset(b.dataset.p!); sync(); ctx.change();
     });
-    $("#f-size").addEventListener("input", (e) => { S().size_max_mb = (e.target as HTMLInputElement).value === "" ? undefined : Math.max(0, +(e.target as HTMLInputElement).value); sync(false); ctx.change(150); });
+    $("#f-size").addEventListener("input", (e) => { S().size_max_mb = (e.target as HTMLInputElement).value === "" ? undefined : Math.max(0, +(e.target as HTMLInputElement).value); sync(false); ctx.change(150, "type"); });
     $("#f-reset").addEventListener("click", () => {
       const s = S();
       Object.assign(s, { cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", platform_ex: "", after: "", before: "", pub_after: "", pub_before: "", tags: [], tags_ex: [], author: "", status: [], status_ex: [], cw: [], cwx: [] });
@@ -128,12 +135,12 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     const [ka, kb2] = dfield(), s = S() as any, n = y1 - y0;
     s[ka] = a <= 0 ? "" : `${y0 + a}-01-01`;
     s[kb2] = b >= n ? "" : `${y0 + b}-12-31`;
-    sync(true, false, true); ctx.change(150);
+    sync(true, false, true); ctx.change(150, "type");
   }
   function preset(p: string) {
     const [ka, kb2] = dfield(), s = S() as any;
     s[kb2] = "";
-    if (p === "any") { s[ka] = ""; return; }
+    if (p === "any") { s.after = ""; s.before = ""; s.pub_after = ""; s.pub_before = ""; return; }
     const days = p === "week" ? 6 : p === "month" ? 29 : 364;
     s[ka] = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - days * 86400000));
   }
@@ -161,13 +168,14 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     const [ka, kb2] = dfield(), a: string = (s as any)[ka], b: string = (s as any)[kb2];
     if (!skipYears) years.set(a ? Math.max(0, Math.min(y1 - y0, +a.slice(0, 4) - y0)) : 0, b ? Math.max(0, Math.min(y1 - y0, +b.slice(0, 4) - y0)) : y1 - y0);
     if (withHist && !skipHist) syncBrush();
-    $("#f-datelabel").textContent = !a && !b ? "any time" : `${s.datef}: ${a || "…"} → ${b || "now"}`;
+    const rng = (n: string, x: string, y: string) => (x || y ? `${n}: ${x || "…"} → ${y || "now"}` : "");
+    $("#f-datelabel").textContent = [rng("updated", s.after, s.before), rng("published", s.pub_after, s.pub_before)].filter(Boolean).join(" · ") || "any time";
     const wk = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 6 * 86400000));
     const mo = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 29 * 86400000));
     const yr = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 364 * 86400000));
     $("#f-presets").querySelectorAll("button").forEach((x) => {
       const p = (x as HTMLElement).dataset.p;
-      const on = p === "any" ? !a && !b : !b && a === (p === "week" ? wk : p === "month" ? mo : yr);
+      const on = p === "any" ? !s.after && !s.before && !s.pub_after && !s.pub_before : !b && a === (p === "week" ? wk : p === "month" ? mo : yr);
       x.classList.toggle("on", on);
     });
     // capacity
@@ -194,20 +202,45 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     s.cap_max = b >= CAP_STOPS.length - 1 ? undefined : CAP_STOPS[b];
     $("#f-caplabel").textContent = capLabel();
     ($("#fbtn") as HTMLElement).textContent = facetCount(s) ? `Filters (${facetCount(s)})` : "Filters";
-    ctx.change(120);
+    ctx.change(120, "type");
   }
   function onSize(_a: number, b: number) {
     const s = S();
     s.size_max_mb = b >= SIZE_STOPS.length ? undefined : SIZE_STOPS[b];
     $("#f-sizelabel").textContent = s.size_max_mb === undefined ? "any" : `≤ ${s.size_max_mb} MB`;
     const si = $<HTMLInputElement>("#f-size"); si.value = s.size_max_mb === undefined ? "" : String(s.size_max_mb);
-    ctx.change(120);
+    ctx.change(120, "type");
   }
 
   // ------------------------------------------------------------------ +/- toggling
   const flip = (arr: string[], k: string) => { const i = arr.indexOf(k); if (i >= 0) arr.splice(i, 1); else arr.push(k); };
   const drop = (arr: string[], k: string) => { const i = arr.indexOf(k); if (i >= 0) arr.splice(i, 1); };
+  /** conditions typed in the search box (tag:x, cw:x, status:x, platform:x) as facet states, with the pill that makes them */
+  const qkey = (v: string) => v.trim().toLowerCase().replace(/\s+/g, "_");
+  function typed(kind: Kind, k: string) {
+    const f = kind === "tag" ? "tag" : kind === "cw" ? "cw" : kind === "status" ? "status" : "platform";
+    const want = qkey(kind === "tag" ? label(k) : k);
+    const q = S().q;
+    for (const p of parseQuery(q).pills) {
+      if (p.kind !== "field" || p.field !== f) continue;
+      const v = qkey(p.value);
+      const hit = kind === "platform" ? v === want || v === "both" : kind === "cw" ? v.replace(/^content_/, "") === want : v === want;
+      if (hit) return { pill: p, st: (p.negated ? "exc" : "inc") as St, q };
+    }
+    return null;
+  }
+  /** a + / - click on a row whose state comes from the typed query edits the query instead of adding a second, hidden condition */
+  function toggleTyped(kind: Kind, k: string, act: "inc" | "exc"): boolean {
+    const t = typed(kind, k);
+    if (!t) return false;
+    const s = S();
+    if (t.pill.value.toLowerCase() === "both" && kind === "platform") return false;
+    s.q = act === t.st ? removePill(t.q, t.pill) : flipPill(t.q, t.pill);
+    $<HTMLInputElement>("#q").value = s.q;
+    return true;
+  }
   function toggle(kind: Kind, k: string, act: "inc" | "exc") {
+    if (toggleTyped(kind, k, act)) return;
     const s = S();
     if (kind === "tag") { if (act === "inc") { drop(s.tags_ex, k); flip(s.tags, k); } else { drop(s.tags, k); flip(s.tags_ex, k); } }
     else if (kind === "status") { if (act === "inc") { drop(s.status_ex, k); flip(s.status, k); } else { drop(s.status, k); flip(s.status_ex, k); } }
@@ -238,6 +271,8 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
   // ------------------------------------------------------------------ render (data -> DOM)
   function stOf(kind: Kind, k: string): St {
     const s = S();
+    const ty = typed(kind, k);
+    if (ty) return ty.st;
     if (kind === "tag") return s.tags.includes(k) ? "inc" : s.tags_ex.includes(k) ? "exc" : "";
     if (kind === "status") return s.status.includes(k) ? "inc" : s.status_ex.includes(k) ? "exc" : "";
     if (kind === "cw") return s.cw.includes(k) ? "inc" : s.cwx.includes(k) ? "exc" : "";
@@ -248,6 +283,9 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     const list = fc.userTagList ?? Object.entries(fc.userTags);
     const counts = new Map(list);
     const sel = [...S().tags, ...S().tags_ex];
+    // tags typed in the box (tag:x / -tag:x) that are not in the top list still get a row so the + / - state is visible
+    const known = new Set([...sel, ...list.map(([k]) => k)].map((k) => qkey(label(k))));
+    for (const p of parseQuery(S().q).pills) if (p.kind === "field" && p.field === "tag" && !known.has(qkey(p.value))) { sel.push(p.value); known.add(qkey(p.value)); }
     const rest = list.filter(([k]) => !sel.includes(k));
     const shown = rest.slice(0, tagsMore ? 40 : 14);
     const mx = Math.max(1, ...list.map((x) => x[1]));

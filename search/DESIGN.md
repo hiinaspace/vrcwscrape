@@ -248,6 +248,11 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   facet-<name> world-card similar-list semantic-results`. Removed: `adult-toggle`, `semantic-toggle` (checkbox). `window.vrcwSearch` is unchanged (query forwards `q` verbatim).
 * **Checks**: `web/test/ui5/{launch,interact,semtest,shots,bytes}.mjs` (Playwright; Firefox 157 is installed under `/work/.tools/pw-browsers` because `~` is full, its GTK libs under
   `/work/.tools/ffdeps/root`). `interact.mjs` = 36 real-click/drag assertions, green in Chromium and Firefox; `semtest.mjs` = toggle flow incl. dialogs recorded (none are opened).
+* **Round 5e**: history = pushState for discrete actions (facet +/-, pills, presets, sort chips, brush end, opening the detail panel); typing and slider drags push one entry per burst
+  (1 s idle) and replaceState after that; back/forward restore the whole state incl. pills. The Updated/Published switch moves the active range to the other field (no hidden orphan range);
+  `any` clears all four date params; the facet label lists every active date range. `tag:x` / `cw:x` / `status:x` / `platform:x` typed in the box light the matching facet +/- (and clicking
+  a lit button edits the query text instead of adding a second condition); typed tags missing from the top list get their own row. Author pill shows the name. Descriptions: word-boundary cut +
+  2-line clamp. Mobile: +/- 32 px, sort chips scroll with an edge fade. Semantic strip uses the normal row renderer (two-column grid); consent is remembered and re-enables on reload.
 * **First-view bytes** (headless Chromium, localhost, same-origin, incl. 1.5 s idle): empty 2.30 MB (15 requests), `?q=lake -hangout` 2.61 MB (32), `?q=cozy hangout` 2.50 MB (28).
 
 ## Round 5 (engine): implementation notes and measurements
