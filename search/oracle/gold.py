@@ -10,7 +10,7 @@ import json
 import random
 from pathlib import Path
 
-from common import CJK_RE, CJK_RUN_RE, HAN_RE, HANGUL_RE, KANA_RE, connect
+from common import CJK_RE, CJK_RUN_RE, HAN_RE, HANGUL_RE, KANA_RE, connect, tag_class
 
 
 STOP = {
@@ -166,7 +166,7 @@ def main() -> None:
         and t not in STOP
         and t.isascii()
         and t.replace("_", "").isalnum()
-        and not t.startswith("system_")
+        and tag_class(t) == "user"
     )
     rnd.shuffle(cand_tags)
     for t in cand_tags:

@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 
-from common import DEFAULT_PARQUET, HERE, connect, script_of
+from common import DEFAULT_PARQUET, HERE, connect, script_of, tag_class
 
 MiB = 1024 * 1024
 TARGETS = {
@@ -233,9 +233,9 @@ def facet_eval(facets: list[dict], fres: list[dict]) -> dict:
 def similar_eval(page, parquet: str, k: int = 10, want: int = 200, seed: int = 3) -> dict:
     con = connect(parquet)
     rows = con.execute(
-        "select world_id, name, author_id, [t for t in tagset if not starts_with(t, 'system_')], "
-        "coalesce(visits,0) from w order by world_id"
+        "select world_id, name, author_id, tagset, coalesce(visits,0) from w order by world_id"
     ).fetchall()
+    rows = [(a, b, c, [t for t in d if tag_class(t) == "user"], e) for a, b, c, d, e in rows]
     info = {r[0]: r for r in rows}
     rnd = random.Random(seed)
     cand = sorted(rows, key=lambda r: -r[4])[:30000]
@@ -277,6 +277,88 @@ def similar_eval(page, parquet: str, k: int = 10, want: int = 200, seed: int = 3
         and out["same_script"]["neighbors"] > out["same_script"]["random"]
     )
     return out
+
+
+# ---------------------------------------------------------------- semantic (optional)
+SEM_LOAD_JS = """
+async () => {
+  await window.vrcwSearchReady;
+  const s = window.vrcwSearch.semantic;
+  if (!s) return {present: false};
+  const t0 = performance.now();
+  if (typeof s.load === "function") await s.load();
+  else if (typeof s === "function") await s("warmup", 1);
+  return {present: true, load_ms: performance.now() - t0};
+}
+"""
+SEM_Q_JS = """
+async (items) => {
+  const s = window.vrcwSearch.semantic;
+  const f = typeof s === "function" ? s : (q, k) => s.query(q, k);
+  const out = [];
+  for (const q of items) {
+    const t0 = performance.now();
+    let ids = null, err = null;
+    try { const r = await f(q, 10); ids = Array.isArray(r) ? r : (r && r.ids) || null; }
+    catch (e) { err = String(e); }
+    out.push({ms: performance.now() - t0, ids, err});
+  }
+  return out;
+}
+"""
+SEM_QUERIES = "/work/projects/vrcwscrape-data/emb/queries.parquet"
+SEM_OFFLINE_RECALL = 0.202
+
+
+def semantic_eval(browser, base: str) -> dict:
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = ctx.new_page()
+    cdp = ctx.new_cdp_session(page)
+    cdp.send("Network.enable")
+    page.goto(site_url(base), wait_until="load")
+    page.wait_for_function("window.vrcwSearchReady !== undefined", timeout=30000)
+    present = page.evaluate(
+        "(async () => { await window.vrcwSearchReady; return !!window.vrcwSearch.semantic; })()"
+    )
+    if not present:
+        ctx.close()
+        return {"skipped": "window.vrcwSearch.semantic not present"}
+    state = {"bytes": 0}
+    cdp.on(
+        "Network.loadingFinished",
+        lambda e: state.__setitem__("bytes", state["bytes"] + e.get("encodedDataLength", 0)),
+    )
+    page.set_default_timeout(600000)
+    ld = page.evaluate(SEM_LOAD_JS)
+    dl = state["bytes"]
+    rows = duckdb_rows(SEM_QUERIES)
+    res = chunked(page, SEM_Q_JS, [q for _, q in rows], n=50)
+    lat = [r["ms"] for r in res if r["err"] is None]
+    hits = sum(1 for (wid, _), r in zip(rows, res) if r["ids"] and wid in r["ids"][:10])
+    ctx.close()
+    return {
+        "n": len(rows),
+        "download_bytes": dl,
+        "load_s": ld["load_ms"] / 1000,
+        "p50_ms": pct(lat, 0.5),
+        "p95_ms": pct(lat, 0.95),
+        "errors": sum(1 for r in res if r["err"]),
+        "recall_at_10": hits / max(1, len(rows)),
+        "offline_recall_at_10": SEM_OFFLINE_RECALL,
+    }
+
+
+def duckdb_rows(path: str) -> list[tuple[str, str]]:
+    import duckdb
+
+    return (
+        duckdb.connect()
+        .execute(
+            "select world_id, query from read_parquet(?) where set = 'cjk2en' order by world_id",
+            [path],
+        )
+        .fetchall()
+    )
 
 
 # ---------------------------------------------------------------- dist audit
@@ -426,6 +508,19 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
             "jaccard >1.5x, author >=, script > random",
             s["verdict_pass"],
         )
+    sm = m.get("semantic", {})
+    if "recall_at_10" in sm:
+        add(
+            "semantic cjk2en recall@10 (in-page model)",
+            f"{sm['recall_at_10']:.3f} vs offline {sm['offline_recall_at_10']:.3f}; download {sm['download_bytes'] / MiB:.1f} MiB in "
+            f"{sm['load_s']:.1f} s; query p50/p95 {sm['p50_ms']:.0f}/{sm['p95_ms']:.0f} ms (n={sm['n']}, errors={sm['errors']})",
+            ">= 0.17",
+            sm["recall_at_10"] >= 0.17 and sm["errors"] == 0,
+        )
+    elif "error" in sm:
+        add("semantic cjk2en", sm["error"], ">= 0.17", False)
+    elif sm:
+        add("semantic cjk2en", "skipped: " + sm["skipped"], "optional", None)
     d = m.get("dist")
     if d:
         add(
@@ -532,6 +627,10 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 m["similar"] = {"error": f"harness error: {e}"[:300]}
             ctx.close()
+            try:
+                m["semantic"] = semantic_eval(browser, a.url)
+            except Exception as e:  # noqa: BLE001
+                m["semantic"] = {"error": f"harness error: {e}"[:300]}
             if not a.no_shots:
                 m["screenshots"] = screenshots(browser, a.url, a.parquet, outdir)
         finally:

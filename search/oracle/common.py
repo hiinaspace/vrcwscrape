@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 
 HERE = Path(__file__).parent
-DEFAULT_PARQUET = "/work/projects/vrcwscrape/mapgen/data/worlds_search.parquet"
+DEFAULT_PARQUET = "/work/projects/vrcwscrape-data/worlds-2026-10-20-public.parquet"
 CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 KANA_RE = re.compile(r"[぀-ヿ]")
 HANGUL_RE = re.compile(r"[가-힯]")
@@ -19,11 +19,19 @@ CJK_RUN_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]+")
 def connect(parquet: str) -> duckdb.DuckDBPyConnection:
     """DuckDB with view `w` holding the parquet plus derived columns (see SEMANTICS.md)."""
     con = duckdb.connect()
+    cols = {
+        r[0] for r in con.execute(f"describe select * from read_parquet('{parquet}')").fetchall()
+    }
+    # platform membership: the export's `platforms` list when present, else non-NULL package size
+    has_pc = "list_contains(platforms, 'pc')" if "platforms" in cols else "pc_size_mb is not null"
+    has_q = (
+        "list_contains(platforms, 'quest')" if "platforms" in cols else "quest_size_mb is not null"
+    )
     con.execute(
         f"""
         create view w as select *,
-          pc_size_mb is not null as has_pc,
-          quest_size_mb is not null as has_quest,
+          coalesce({has_pc}, false) as has_pc,
+          coalesce({has_q}, false) as has_quest,
           list_sort(list_distinct(list_transform(coalesce(tags, []),
               t -> regexp_replace(t, '^author_tag_', '')))) as tagset
         from read_parquet('{parquet}')
@@ -64,6 +72,12 @@ def where_sql(f: dict) -> str:
         c.append(f"updated_at >= timestamp {sql_str(f['after'] + ' 00:00:00')}")
     if f.get("before"):
         c.append(f"updated_at < timestamp {sql_str(f['before'] + ' 00:00:00')} + interval 1 day")
+    for st in f.get("status") or []:
+        c.append(f"list_contains(tagset, {sql_str('system_' + st)})")
+    for cw in f.get("cw") or []:
+        c.append(f"list_contains(tagset, {sql_str('content_' + cw)})")
+    for cw in f.get("cw_exclude") or []:
+        c.append(f"not list_contains(tagset, {sql_str('content_' + cw)})")
     for t in f.get("tags") or []:
         c.append(f"list_contains(tagset, {sql_str(t)})")
     if f.get("author"):
@@ -97,3 +111,17 @@ def facet_truth(con, f: dict, top_tags: int = 20) -> dict:
 def script_of(name: str) -> str:
     """'cjk' if the name contains any kana/han/hangul, else 'latin'."""
     return "cjk" if CJK_RE.search(name or "") else "latin"
+
+
+HIDDEN_PREFIXES = ("admin_", "adm_", "feature_", "debug_", "system_")
+
+
+def tag_class(t: str) -> str:
+    """Mirror of the site's tag classes (DESIGN.md): hidden | status | cw | user."""
+    if t in ("system_approved", "system_labs"):
+        return "status"
+    if t.startswith(HIDDEN_PREFIXES):
+        return "hidden"
+    if t.startswith("content_"):
+        return "cw"
+    return "user"

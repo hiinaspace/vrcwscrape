@@ -12,7 +12,7 @@ Write to the oracle author if a choice is unworkable; do not silently diverge.
 
 ## Filters (all ANDed)
 - **capacity**: `cap_min <= capacity <= cap_max`, inclusive. A world with NULL capacity fails if either bound is set.
-- **platform**: a world "has PC" iff `pc_size_*` is non-NULL, "has Quest" iff `quest_size_*` is non-NULL.
+- **platform**: a world "has PC" iff `platforms` contains `pc` ("has Quest" iff it contains `quest`); if the parquet has no `platforms` column, fall back to a non-NULL `pc_size_*` / `quest_size_*`.
   `pc` = has PC; `quest` = has Quest; `both` = has both. (The fresh export's platform list, if it
   disagrees, wins; then the oracle changes, tell the orchestrator.)
 - **size_max_mb**: size in MB = bytes / 1048576 (the parquet's `pc_size_mb`, `quest_size_mb`). Which package:
@@ -25,6 +25,11 @@ Write to the oracle author if a choice is unworkable; do not silently diverge.
   Published date (`created_at`) is only a sort key (`sort=published`), not a filter.
 - **tags**: AND of all listed tags. Tag key = raw tag with the `author_tag_` prefix stripped (`author_tag_chill` -> `chill`);
   other prefixes (`system_approved`, `admin_...`) are kept verbatim. A world's tag set is deduplicated after stripping.
+- **status** (`status=approved,labs`, array of `approved`/`labs`): AND; requires tags `system_approved` / `system_labs`.
+- **cw** (`cw=horror,gore`): AND; requires `content_<name>` tags. **cw_exclude** (`cw_exclude=adult,sex`): world must carry none of them.
+- Tag classes (DESIGN.md): hidden = `admin_ adm_ feature_ debug_ system_*` except status; status = `system_approved|system_labs`;
+  cw = `content_*`; user = the rest. Hidden tags stay filterable via `tags=` and (unchanged contract) count in `facetCounts.tags`.
+  Gold tag-word queries and similar-worlds Jaccard only use user-class tags.
 - **author**: exact `author_id` match.
 
 ## `total` and `facetCounts` (conjunctive: counted over the filtered set, no "exclude own dimension" rule)
@@ -48,3 +53,10 @@ chosen so the title-match set has <= 20-30 worlds (not trivially common). The si
 Graded on up to 200 popular worlds that return a non-empty list (coverage reported): neighbors vs 10 random worlds on
 tag Jaccard (system_ tags excluded), same author_id rate, same-script rate (name contains any kana/han/hangul = "cjk").
 PASS = Jaccard > 1.5x random, same-author >= random, same-script > random.
+
+## Semantic search (optional, `window.vrcwSearch.semantic`)
+Assumed shape (DESIGN.md does not define it yet; harness adapts to either): an object with `load()` (triggers the model download)
+and `query(q, k) -> Promise<string[] | {ids}>`, or a plain function `(q, k)` whose first call loads. If absent, the check is skipped.
+Set: the 400 `cjk2en` rows of `/work/projects/vrcwscrape-data/emb/queries.parquet` (set, world_id, query); a hit is the source world_id in
+the top 10 (offline static-model number: 20.2% recall@10, MRR 12.7). Reported: download bytes (CDP delta around `load()`), load time,
+per-query latency p50/p95, recall@10 vs 20.2%. PASS if recall@10 >= 0.17 (within ~1 s.e. of offline).

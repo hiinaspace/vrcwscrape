@@ -18,6 +18,7 @@ def main() -> None:
     ap.add_argument("parquet")
     ap.add_argument("--out", default="gold/facets.jsonl")
     ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--n-extra", type=int, default=40)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
     rnd = random.Random(a.seed)
@@ -69,6 +70,37 @@ def main() -> None:
             f["tags"] = rnd.sample(top_tags[:30], rnd.choice([1, 1, 2]))
         if "author" in dims and authors:
             f["author"] = rnd.choice(authors)
+        out.append({"filters": f, "truth": facet_truth(con, f)})
+    # extra combos exercising status / cw / cw_exclude / hidden-tag filters (DESIGN.md tag classes)
+    cw_names = [
+        r[0][len("content_") :]
+        for r in con.execute(
+            "select t from (select unnest(tagset) t from w) where t like 'content\\_%' escape '\\' "
+            "group by t having count(*) >= 100 order by count(*) desc"
+        ).fetchall()
+    ]
+    hidden = [
+        r[0]
+        for r in con.execute(
+            "select t from (select unnest(tagset) t from w) where regexp_matches(t, "
+            "'^(admin_|adm_|feature_|debug_|system_)') and t not in ('system_approved','system_labs') "
+            "group by t having count(*) >= 50 order by count(*) desc, t limit 20"
+        ).fetchall()
+    ]
+    for i in range(a.n_extra):
+        f = {}
+        kinds = rnd.sample(["status", "cw", "cw_exclude", "hidden", "base"], rnd.randint(1, 3))
+        if "status" in kinds:
+            f["status"] = rnd.choice([["approved"], ["labs"], ["approved", "labs"]])
+        if "cw" in kinds and cw_names:
+            f["cw"] = rnd.sample(cw_names[:6], rnd.choice([1, 1, 2]))
+        if "cw_exclude" in kinds and cw_names:
+            f["cw_exclude"] = rnd.sample(cw_names[:6], rnd.choice([1, 2, 3]))
+        if "hidden" in kinds and hidden:
+            f["tags"] = rnd.sample(hidden, 1)
+        if "base" in kinds:
+            f["platform"] = rnd.choice(["pc", "quest", "both"])
+            f["cap_min"] = rnd.choice(caps)
         out.append({"filters": f, "truth": facet_truth(con, f)})
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     with open(a.out, "w") as fh:
