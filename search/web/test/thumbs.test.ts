@@ -2,6 +2,9 @@
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import "./shim.mjs";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { resolveObjectURL } from "node:buffer";
 import { Engine } from "../src/engine";
 
 let e: Engine;
@@ -31,4 +34,21 @@ test("same image is deduplicated across worlds and requests coalesce", async () 
   if (skip()) return;
   const a = await e.thumbUrl(0), b = await e.thumbUrl(0);
   assert.equal(a, b);
+});
+
+// integrity: every fetched blob equals the AVIF the fixture assigned to that world (VRCW_EXPECT = json {ordinal: sha1}); exercises shard + pack boundaries
+test("blob bytes match the fixture for worlds across shards and packs", async () => {
+  if (skip() || !process.env.VRCW_EXPECT) return;
+  const exp: Record<string, string | null> = JSON.parse(fs.readFileSync(process.env.VRCW_EXPECT, "utf8"));
+  let checked = 0;
+  for (const [k, sha] of Object.entries(exp)) {
+    const u = await e.thumbUrl(+k);
+    if (sha === null) { assert.equal(u, null, k); continue; }
+    assert.ok(u, k);
+    const b = resolveObjectURL(u!);
+    const bytes = Buffer.from(await b!.arrayBuffer());
+    assert.equal(crypto.createHash("sha1").update(bytes).digest("hex"), sha, `world ${k}`);
+    checked++;
+  }
+  assert.ok(checked > 500, `checked ${checked}`);
 });

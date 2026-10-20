@@ -10,11 +10,15 @@ Writes   <out_dir>/p-000.bin, p-001.bin ...   concatenated AVIFs, unique images 
 and sets manifest["thumbs"] = {base, packs, count, blobs, bytes, index}. `base` is resolved by the browser relative to data/ unless absolute
 (set it to e.g. https://thumbs.example.com/v1/ when the packs are hosted elsewhere; that host must allow CORS + Range).
 
-Index layout (little endian, then gzip):
-  "THM1" u32 nWorlds u32 nBlobs u32 nPacks ; nPacks x (u32 firstBlob, u32 bytes)
-  worldCode: nWorlds x u32 as 4 byte planes: 0 = next fresh blob, 1 = no thumbnail, k>=2 = existing blob (maxSeen - (k-2))
-  blobLen:   nBlobs x u16 as 2 byte planes
-Offsets inside a pack are the prefix sum of blobLen from the pack's first blob (blobs are stored back to back).
+Index (all little endian; every file gzip'd and magic-sniffed like the other payloads):
+  <index-dir>/thumbs_index.bin  "THM2" u32 nWorlds u32 nBlobs u32 nPacks u32 WS u32 BS ; nPacks x (u32 firstBlob, u32 bytes);
+                                ceil(nWorlds/WS) x u32 maxBlobBefore (-1 as 0xFFFFFFFF); ceil(nBlobs/BS) x u32 offsetOfFirstBlobInItsPack
+  <index-dir>/th/w<k>.bin       world shard k (WS worlds): u32 codes as 4 byte planes. 0 = next fresh blob, 1 = no thumbnail,
+                                c >= 2 = an already-used blob: (maxSeen - (c - 2))
+  <index-dir>/th/b<k>.bin       blob shard k (BS blobs): u16 lengths as 2 byte planes
+Blobs are stored back to back inside a pack in blob-id order; a blob's offset is the prefix sum of lengths from the pack's first blob
+(reset to 0 at each pack boundary). Blob ids are assigned in order of first use by world ordinal (= popularity), so the popular worlds
+live in the first shards/packs and a result page touches only a handful of tiny shards.
 """
 
 from __future__ import annotations
@@ -34,6 +38,10 @@ def planes(a: np.ndarray) -> bytes:
     return a.view(np.uint8).reshape(len(a), a.dtype.itemsize).T.tobytes()
 
 
+WS = 4096  # worlds per world shard (default; --ws)
+BS = 2048  # blobs per blob shard (default; --bs)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("thumbs")
@@ -43,7 +51,10 @@ def main() -> None:
     ap.add_argument("--pack-mib", type=float, default=24.0)
     ap.add_argument("--base", default="../thumbs/")
     ap.add_argument("--index-dir", default=None)
+    ap.add_argument("--ws", type=int, default=WS)
+    ap.add_argument("--bs", type=int, default=BS)
     a = ap.parse_args()
+    WS_, BS_ = a.ws, a.bs
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     idx_dir = Path(a.index_dir) if a.index_dir else out
@@ -106,10 +117,36 @@ def main() -> None:
             code[i] = 2 + (maxseen - b)
     flush()
 
-    hdr = b"THM1" + struct.pack("<III", n, len(lens), len(packs)) + b"".join(struct.pack("<II", f, nb) for f, nb in packs)
-    body = hdr + planes(code) + planes(np.array(lens, dtype=np.uint16))
+    nb_ = len(lens)
+    pack_first = [f for f, _ in packs]
+    # offset of each blob inside its pack
+    off = np.zeros(nb_, dtype=np.int64)
+    for k, (f, _) in enumerate(packs):
+        end = packs[k + 1][0] if k + 1 < len(packs) else nb_
+        if end > f:
+            off[f:end] = np.concatenate([[0], np.cumsum(lens[f : end - 1])]) if end - f > 1 else 0
+    nws = -(-n // WS_)
+    nbs = -(-nb_ // BS_)
+    max_before = np.zeros(nws, dtype=np.uint32)
+    fresh = (code == 0).astype(np.int64)
+    cum = np.cumsum(fresh)  # cum[i] = fresh blobs up to and including i
+    for k in range(nws):
+        j = k * WS_
+        max_before[k] = (int(cum[j - 1]) - 1) & 0xFFFFFFFF if j > 0 else 0xFFFFFFFF
+    hdr = b"THM2" + struct.pack("<IIIII", n, nb_, len(packs), WS_, BS_) + b"".join(struct.pack("<II", f, nb) for f, nb in packs)
+    hdr += max_before.astype("<u4").tobytes() + np.array([off[k * BS_] for k in range(nbs)], dtype="<u4").tobytes()
     idx_dir.mkdir(parents=True, exist_ok=True)
-    (idx_dir / "thumbs_index.bin").write_bytes(gzip.compress(body, 9, mtime=0))
+    (idx_dir / "th").mkdir(exist_ok=True)
+    (idx_dir / "thumbs_index.bin").write_bytes(gzip.compress(hdr, 9, mtime=0))
+    shard_bytes = (idx_dir / "thumbs_index.bin").stat().st_size
+    for k in range(nws):
+        d = gzip.compress(planes(code[k * WS_ : (k + 1) * WS_]), 9, mtime=0)
+        (idx_dir / "th" / f"w{k}.bin").write_bytes(d)
+        shard_bytes += len(d)
+    for k in range(nbs):
+        d = gzip.compress(planes(np.array(lens[k * BS_ : (k + 1) * BS_], dtype=np.uint16)), 9, mtime=0)
+        (idx_dir / "th" / f"b{k}.bin").write_bytes(d)
+        shard_bytes += len(d)
     total = sum(nb for _, nb in packs)
     info = {
         "base": a.base, "packs": len(packs), "count": int((code != 1).sum()), "blobs": len(lens), "bytes": total,
@@ -121,8 +158,8 @@ def main() -> None:
         m["thumbs"] = info
         m["hasThumb"] = True
         mp.write_text(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
-    gz = (idx_dir / "thumbs_index.bin").stat().st_size
-    print(json.dumps({**info, "avg_bytes": round(total / max(1, len(lens))), "index_gz_bytes": gz, "max_pack": max(nb for _, nb in packs) if packs else 0}))
+    print(json.dumps({**info, "avg_bytes": round(total / max(1, len(lens))), "index_gz_bytes_total": shard_bytes, "index_files": 1 + nws + nbs,
+                      "max_pack": max(nb for _, nb in packs) if packs else 0}))
 
 
 if __name__ == "__main__":
