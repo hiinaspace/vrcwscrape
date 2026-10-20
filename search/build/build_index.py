@@ -200,6 +200,18 @@ def main() -> None:
     min_core = max(MIN_CORE_TAG, n // 5000)
     core = [(k, c) for k, c in all_tags if c >= min_core][:65000]
     core_id = {k: i for i, (k, _) in enumerate(core)}
+    # UI-only tag groups: case-fold + simple plural merge (facetCounts.tags / tag filters stay raw for the oracle contract)
+    lower_set = {k.lower() for k, _ in all_tags}
+
+    def gkey(k: str) -> str:
+        lo = k.lower()
+        return lo[:-1] if len(lo) >= 4 and lo.endswith("s") and lo[:-1] in lower_set else lo
+
+    grp = defaultdict(list)
+    for k, _ in core:
+        if tag_class(k) == "user":
+            grp[gkey(k)].append(k)
+    tag_groups = {g: v for g, v in grp.items() if len(v) > 1}
     tagcnt = np.zeros(n, dtype=np.uint8)
     tagids = array("H")
     flags = np.zeros(n, dtype=np.uint8)
@@ -273,6 +285,9 @@ def main() -> None:
             emit(tok.TITLE_MARK + tk, i, tok.F_TITLE)
         for tm in tok.tokens(d["author_name"][i], True):
             emit(tm, i, tok.F_AUTHOR)
+        ak = tok.title_key(d["author_name"][i])
+        if ak:
+            emit(tok.AUTHOR_MARK + ak, i, tok.F_AUTHOR)
         pcs = tok.pieces(d["name"][i])
         for a_, b_ in zip(pcs, pcs[1:]):
             emit(tok.PAIR_MARK + a_ + " " + b_, i, tok.F_TITLE)
@@ -411,6 +426,7 @@ def main() -> None:
         "sizeUnit": 1024,
         "thumb": thumb,
         "hasThumb": bool(thumb),
+        "tagGroups": tag_groups,
         "cw": [[k, c] for k, c in all_tags if tag_class(k) == "cw"],
         "date_max": int(max(d["updated"].max(), d["created"].max())) if n else 0,
     }

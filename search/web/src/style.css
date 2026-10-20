@@ -51,3 +51,9 @@ a{color:inherit}
 
 .sem{font-size:12px;color:var(--dim);flex-basis:100%;order:5}.sem input{margin-right:4px}
 #semantic{margin-top:18px}#semantic h3{font-size:13px;margin:0 0 8px;color:var(--dim)}
+
+[hidden]{display:none!important}
+.adult,.sem{font-size:12px;color:var(--dim)}.adult{order:4}.adult input,.sem input{margin-right:4px}
+.plats{display:flex;gap:4px;margin-top:4px}.pb{font-size:11px;padding:1px 6px;border-radius:4px;background:#8883}.pb.pc{background:#4a8af433}.pb.quest{background:#3ab07033}
+#semantic{margin:0 0 14px}#semantic .results{display:flex;overflow-x:auto;gap:8px;padding-bottom:6px}
+#semantic .results li{flex:0 0 250px}#semantic .thumb{width:84px;height:63px}#semantic .facts,#semantic .plats{display:none}

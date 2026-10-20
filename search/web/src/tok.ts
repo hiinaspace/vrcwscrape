@@ -7,6 +7,7 @@ const NONWORD = /[^\p{L}\p{N}\p{M}]+/gu;
 export const TITLE_MARK = "\u0001";
 export const TAG_MARK = "\u0002";
 export const PAIR_MARK = "\u0003";
+export const AUTHOR_MARK = "\u0004";
 const MAX_WORD = 32;
 const MAX_TITLE = 48;
 
@@ -39,7 +40,7 @@ export function tokens(text: string): Tok[] {
 }
 
 export function shardKey(term: string): string {
-  if (term[0] === TITLE_MARK || term[0] === TAG_MARK || term[0] === PAIR_MARK) term = term.slice(1);
+  if (term[0] === TITLE_MARK || term[0] === TAG_MARK || term[0] === PAIR_MARK || term[0] === AUTHOR_MARK) term = term.slice(1);
   return Array.from(term).slice(0, 2).join("");
 }
 

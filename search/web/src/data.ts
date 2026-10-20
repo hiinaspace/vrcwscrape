@@ -10,6 +10,7 @@ export interface Manifest {
   cardChunk: number;
   nCoreTags: number;
   cw: [string, number][];
+  tagGroups: Record<string, string[]>;
   minCoreTag: number;
   flagTags: number;
   sizeUnit: number;

@@ -2,7 +2,7 @@ import {
   Core, Manifest, TITLE_MARK, authorWorlds, fetchJson, forEachPosting, getShard, idToIdx, loadCore,
   loadManifest, lowerBound, loadRare, loadSizeLo, Rare, worldInfo, similarIdx, cached,
 } from "./data";
-import { PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
+import { AUTHOR_MARK, PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
 
 export interface Filters {
   cap_min?: number; cap_max?: number; size_max_mb?: number;
@@ -10,8 +10,8 @@ export interface Filters {
   after?: string; before?: string; tags?: string[]; author?: string;
   status?: string[]; cw?: string[]; cw_exclude?: string[];
 }
-export type Sort = "relevance" | "visits" | "favorites" | "updated" | "published";
-export interface QueryIn { q?: string; filters?: Filters; sort?: Sort; limit?: number; exactTail?: boolean }
+export type Sort = "relevance" | "text" | "visits" | "favorites" | "updated" | "published";
+export interface QueryIn { whatIf?: boolean; q?: string; filters?: Filters; sort?: Sort; limit?: number; exactTail?: boolean }
 export interface QueryOut { idx: number[]; total: number; facetCounts: FacetCounts; ms: number }
 export interface FacetCounts {
   platform: { pc: number; quest: number; both: number };
@@ -21,6 +21,8 @@ export interface FacetCounts {
   status: Record<string, number>;
   cw: Record<string, number>;
   userTags: Record<string, number>;
+  /** what-if platform counts (UI): total if that platform option were selected, other filters kept */
+  platformIf?: { any: number; pc: number; quest: number; both: number };
 }
 
 const HIDDEN = ["admin_", "adm_", "feature_", "debug_"];
@@ -34,7 +36,7 @@ const EPOCH = Date.UTC(2010, 0, 1);
 const dayOf = (iso: string) => Math.floor((Date.parse(iso + "T00:00:00Z") - EPOCH) / 86400000);
 export const dateOfDay = (d: number) => new Date(EPOCH + d * 86400000).toISOString().slice(0, 10);
 const NONE = 0xffffffff;
-const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 9, W_DESC = 1;
+const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 9, W_DESC = 0.4;
 
 export class Engine {
   m!: Manifest;
@@ -43,7 +45,9 @@ export class Engine {
   tagCountsAll: number[] = [];
   tagId = new Map<string, number>();
   stop = new Set<string>();
-  prior!: Float32Array;
+  prior!: Float32Array; // multiplicative popularity prior
+  lp!: Float32Array; // log popularity (also used for semantic hits)
+  groupOf = new Map<string, string>();
   private sc!: Float32Array;
   private cnt!: Uint8Array;
   private tw!: Float32Array;
@@ -61,7 +65,9 @@ export class Engine {
     this.stop = new Set(this.m.stop);
     const n = c.n;
     this.prior = new Float32Array(n);
-    for (let i = 0; i < n; i++) this.prior[i] = 0.45 * Math.log10(1 + c.visits[i]) + 0.25 * Math.log10(1 + c.fav[i]);
+    this.lp = new Float32Array(n);
+    for (let i = 0; i < n; i++) { this.lp[i] = Math.log10(1 + c.visits[i]) + 0.5 * Math.log10(1 + c.fav[i]); this.prior[i] = Math.exp(0.3 * this.lp[i]); }
+    for (const [g, ks] of Object.entries(this.m.tagGroups ?? {})) for (const k of ks) this.groupOf.set(k, g);
     this.sc = new Float32Array(n);
     this.cnt = new Uint8Array(n);
     this.tw = new Float32Array(n);
@@ -111,7 +117,18 @@ export class Engine {
     let flagReq = 0, flagForbid = 0;
     const csrReq: number[] = [], csrForbid: number[] = [];
     const rareMasks: Uint8Array[] = [], rareForbid: Uint8Array[] = [];
+    const orGroups: { fm: number; csr: number[] }[] = [];
     const resolve = async (raw: string, forbid: boolean) => {
+      if (raw.startsWith("~")) { // UI tag group: any member (case/plural variants)
+        const g = { fm: 0, csr: [] as number[] };
+        for (const k of this.m.tagGroups?.[raw.slice(1)] ?? [raw.slice(1)]) {
+          const id = this.tagId.get(k);
+          if (id === undefined) continue;
+          if (id < this.m.flagTags) g.fm |= 1 << id; else g.csr.push(id);
+        }
+        orGroups.push(g);
+        return;
+      }
       const key = this.resolveTag(raw);
       const id = this.tagId.get(key);
       if (id === undefined) {
@@ -130,7 +147,7 @@ export class Engine {
       authorMask = new Uint8Array(n);
       for (const i of await authorWorlds(f.author)) authorMask[i] = 1;
     }
-    const any = useCap || lim >= 0 || !!plat || useDate || flagReq > 0 || flagForbid > 0 || csrReq.length > 0 || csrForbid.length > 0 || rareMasks.length > 0 || rareForbid.length > 0 || !!authorMask;
+    const any = useCap || lim >= 0 || !!plat || useDate || flagReq > 0 || flagForbid > 0 || csrReq.length > 0 || csrForbid.length > 0 || rareMasks.length > 0 || rareForbid.length > 0 || orGroups.length > 0 || !!authorMask;
     if (!any) { mask.fill(1); return { mask, any }; }
     const { cap, pc, quest, plat: pl, updated, flags, tagOff, tagIds } = c;
     for (let i = 0; i < n; i++) {
@@ -155,6 +172,13 @@ export class Engine {
           let found = false;
           for (let j = tagOff[i]; j < tagOff[i + 1]; j++) if (tagIds[j] === id) { found = true; break; }
           if (!found) { ok = false; break; }
+        }
+      }
+      if (ok && orGroups.length) {
+        for (const g of orGroups) {
+          let hit = (flags[i] & g.fm) !== 0;
+          for (let j = tagOff[i]; !hit && j < tagOff[i + 1]; j++) if (g.csr.includes(tagIds[j])) hit = true;
+          if (!hit) { ok = false; break; }
         }
       }
       if (ok && flagForbid && (flags[i] & flagForbid)) ok = false;
@@ -219,11 +243,12 @@ export class Engine {
     };
     const jobs: Promise<void>[] = [];
     if (tk) {
-      if (clean) jobs.push(add(TITLE_MARK + tk, (t) => (t === TITLE_MARK + tk ? 1000 : 60), true));
-      jobs.push(add(TAG_MARK + tk, () => 70, false));
+      if (clean) jobs.push(add(TITLE_MARK + tk, (t) => (t === TITLE_MARK + tk ? 150 : 35), true));
+      jobs.push(add(TAG_MARK + tk, () => 45, false));
+      jobs.push(add(AUTHOR_MARK + tk, () => 80, false));
     }
     const pcs = pieces(q);
-    for (let i = 0; i + 1 < pcs.length; i++) jobs.push(add(PAIR_MARK + pcs[i] + " " + pcs[i + 1], () => (clean ? 30 : 60), false));
+    for (let i = 0; i + 1 < pcs.length; i++) jobs.push(add(PAIR_MARK + pcs[i] + " " + pcs[i + 1], () => (clean ? 20 : 40), false));
     await Promise.all(jobs);
     return toks.length;
   }
@@ -279,10 +304,20 @@ export class Engine {
     const cw: Record<string, number> = {};
     for (const [k] of this.m.cw ?? []) { const v = cntOf(k); if (v || this.tagId.has(k)) cw[k.slice(8)] = v; }
     const userTags: Record<string, number> = {};
-    for (const i of this.userOrder(tagCnt)) userTags[this.tagKeys[i]] = tagCnt[i];
+    for (const [k, v] of this.userOrder(tagCnt)) userTags[k] = v;
     const facetCounts: FacetCounts = { platform: { pc: pcN, quest: qN, both: bothN }, tags, capacity, status, cw, userTags };
     // top-k
     const idx = this.topK(sort, need > 0, limit, total);
+    if (inp.whatIf) {
+      const pi = { any: 0, pc: 0, quest: 0, both: 0 };
+      for (const p of ["", "pc", "quest", "both"] as const) {
+        const { mask: m2 } = await this.filterMask({ ...f, platform: p });
+        let k = 0;
+        for (let i = 0; i < n; i++) if (m2[i] && (!need || cnt[i] === need)) k++;
+        pi[p || "any"] = k;
+      }
+      facetCounts.platformIf = pi;
+    }
     return { idx, total, facetCounts, ms: performance.now() - t0 };
   }
 
@@ -291,14 +326,15 @@ export class Engine {
     const n = c.n;
     k = Math.min(k, total);
     if (!k) return [];
-    const byPop = sort === "visits" || (sort === "relevance" && !hasText);
+    const byPop = sort === "visits" || ((sort === "relevance" || sort === "text") && !hasText);
     if (byPop) { // index order is visits desc
       const out: number[] = [];
       for (let i = 0; i < n && out.length < k; i++) if (mask[i]) out.push(i);
       return out;
     }
     let key: (i: number) => number;
-    if (sort === "relevance") key = (i) => sc[i] + prior[i];
+    if (sort === "relevance") key = (i) => sc[i] * prior[i];
+    else if (sort === "text") key = (i) => sc[i];
     else if (sort === "favorites") key = (i) => c.fav[i] * 1e-3 + 0; // refined below
     else if (sort === "updated") key = (i) => c.updated[i];
     else key = (i) => c.created[i];
@@ -320,11 +356,17 @@ export class Engine {
   }
 
   private userIds: number[] | null = null;
-  /** ids of user-class core tags with nonzero count, count desc, top 40 */
-  private userOrder(tagCnt: Uint32Array): number[] {
+  /** user tags grouped by case/plural variants (key '~g' for merged groups), count desc, top 40 */
+  private userOrder(tagCnt: Uint32Array): [string, number][] {
     this.userIds ??= this.tagKeys.map((k, i) => (tagClass(k) === "user" ? i : -1)).filter((i) => i >= 0);
-    return this.userIds.filter((i) => tagCnt[i] > 0)
-      .sort((a, b) => tagCnt[b] - tagCnt[a] || (this.tagKeys[a] < this.tagKeys[b] ? -1 : 1)).slice(0, 40);
+    const agg = new Map<string, number>();
+    for (const i of this.userIds) {
+      if (!tagCnt[i]) continue;
+      const g = this.groupOf.get(this.tagKeys[i]);
+      const key = g ? "~" + g : this.tagKeys[i];
+      agg.set(key, (agg.get(key) ?? 0) + tagCnt[i]);
+    }
+    return [...agg].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 40);
   }
 
   /** filter-only eligibility mask (no text); a view of internal state, copy before keeping */

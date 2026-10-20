@@ -109,7 +109,7 @@ export class Sem {
   }
 
   /** returns world indices, best first. allow: optional filter mask (1 = eligible). */
-  search(q: string, k: number, allow?: Uint8Array | null): number[] {
+  search(q: string, k: number, allow?: Uint8Array | null, lp?: Float32Array | null): number[] {
     const v = this.encode(q);
     const qb = new Uint8Array(32);
     for (let d = 0; d < DIM; d++) if (v[d] > 0) qb[d >> 3] |= 0x80 >> (d & 7);
@@ -130,7 +130,7 @@ export class Sem {
       dist[i] = c;
       hist[c]++;
     }
-    const M = Math.max(500, k * 5);
+    const M = lp ? 1500 : Math.max(500, k * 5);
     let cut = 0, acc = 0;
     while (cut < 257 && acc + hist[cut] < M) acc += hist[cut++];
     const cand: [number, number][] = [];
@@ -140,7 +140,7 @@ export class Sem {
       let s = 0;
       const b = i * 32;
       for (let d = 0; d < DIM; d++) s += bytes[b + (d >> 3)] & (0x80 >> (d & 7)) ? v[d] : -v[d];
-      cand.push([s, i]);
+      cand.push([lp ? s / 16 + 0.015 * lp[i] : s, i]);
     }
     cand.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
     return cand.slice(0, k).map((c) => c[1]);

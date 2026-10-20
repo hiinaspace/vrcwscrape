@@ -115,3 +115,15 @@ card 12.7 MB (512-world chunks), ids 5.4 MB, authors 2.6 MB, sim 0.75 MB, core 2
 * First-view transfer with the toggle off (same-origin bytes): 2.15 MB (empty query), 2.65-2.88 MB with a text query. Thumbnails
   (~75 KB PNG each, hotlinked from the VRChat CDN, third-party) load immediately for cards in view (IntersectionObserver, 100 px margin);
   ~0.6 MB extra on a 1440x900 viewport, 24 eager thumbs were 1.78 MB. No delay is applied.
+
+## Round 4 (2026-10-20): ranking, UI polish
+* **Relevance = text score x popularity prior.** text = field weights (title 10, tag 9, author 6, description 0.4) + bonuses
+  (exact title +150, title prefix +35, exact tag phrase +45, exact author name +80 via `\u0004` terms, adjacent title pair +20/+40).
+  prior = exp(0.3 * (log10(1+visits) + 0.5*log10(1+favorites))) (1.0 .. ~25). Ties -> lower index = more visits. New sort `text`
+  ("best text match") = text score only. Semantic hits: cosine(sign vectors, float query) + 0.015 * log-popularity over the Hamming top-1500.
+  Top-5 before/after for horror/club/avatar/chill/spookyghostboo is in the round-4 report; tag-word precision@10 (own check) 0.76, any-hit 0.94.
+* **UI-only defaults** (the hook/contract is untouched): adult content warnings (`content_adult`, `content_sex`) are hidden unless "Show adult worlds"
+  is ticked (persistent in localStorage, URL `adult=1` overrides). Platform button counts are what-if counts (`facetCounts.platformIf`, only when
+  `query({whatIf:true})`). Tag facet and tag search merge case/plural variants into groups (`tags=~chill` = any of chill|Chill; manifest `tagGroups`);
+  plain `tags=chill` keeps exact raw semantics and `facetCounts.tags` stays raw for the oracle. Merged counts are sums (a world with two variants counts twice).
+* Result rows show PC / Quest badges from `platforms` (size only when known); date shown matches the sort; semantic hits are a strip above the FTS list.

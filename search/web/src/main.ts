@@ -10,13 +10,16 @@ declare global {
 interface State {
   q: string; cap_min?: number; cap_max?: number; size_max_mb?: number; platform: "" | "pc" | "quest" | "both";
   after: string; before: string; tags: string[]; author: string; sort: Sort; world: string;
-  status: string[]; cw: string[]; cwx: string[];
+  status: string[]; cw: string[]; cwx: string[]; adult: boolean;
 }
 
 const $ = <T extends HTMLElement>(s: string) => document.querySelector(s) as T;
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
 const num = (v: string | null) => (v === null || v === "" || isNaN(+v) ? undefined : +v);
-const SORTS: Sort[] = ["relevance", "visits", "favorites", "updated", "published"];
+const SORTS: Sort[] = ["relevance", "text", "visits", "favorites", "updated", "published"];
+const SORT_LABEL: Record<string, string> = { relevance: "relevance (popularity-weighted)", text: "best text match", visits: "visits", favorites: "favorites", updated: "recently updated", published: "recently published" };
+const lsGet = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 
 const csv = (v: string | null) => (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 function readUrl(): State {
@@ -27,7 +30,7 @@ function readUrl(): State {
     q: p.get("q") ?? "", cap_min: num(p.get("cap_min")), cap_max: num(p.get("cap_max")), size_max_mb: num(p.get("size_max_mb")),
     platform: pf === "pc" || pf === "quest" || pf === "both" ? pf : "",
     after: p.get("after") ?? "", before: p.get("before") ?? "",
-    tags: csv(p.get("tags")), status: csv(p.get("status")), cw: csv(p.get("cw")), cwx: csv(p.get("cw_exclude")),
+    tags: csv(p.get("tags")), adult: p.get("adult") === "1" || (p.get("adult") === null && lsGet("vrcw-adult") === "1"), status: csv(p.get("status")), cw: csv(p.get("cw")), cwx: csv(p.get("cw_exclude")),
     author: p.get("author") ?? "", sort: SORTS.includes(sort) ? sort : "relevance", world: p.get("world") ?? "",
   };
 }
@@ -45,17 +48,21 @@ function toUrl(s: State): string {
   if (s.status.length) p.set("status", s.status.join(","));
   if (s.cw.length) p.set("cw", s.cw.join(","));
   if (s.cwx.length) p.set("cw_exclude", s.cwx.join(","));
+  if (s.adult) p.set("adult", "1");
   if (s.sort !== "relevance") p.set("sort", s.sort);
   if (s.world) p.set("world", s.world);
   const q = p.toString();
   return location.pathname + (q ? "?" + q : "");
 }
+const ADULT = ["adult", "sex"]; // content_adult / content_sex
 const filtersOf = (s: State): Filters => ({
   cap_min: s.cap_min, cap_max: s.cap_max, size_max_mb: s.size_max_mb, platform: s.platform, after: s.after || undefined,
   before: s.before || undefined, tags: s.tags, author: s.author || undefined,
-  status: s.status, cw: s.cw, cw_exclude: s.cwx,
+  status: s.status, cw: s.cw,
+  cw_exclude: [...new Set([...s.cwx, ...(s.adult ? [] : ADULT.filter((a) => !s.cw.includes(a)))])],
 });
 const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+const label = (k: string) => (k.startsWith("~") ? k.slice(1) : k);
 const kb = (v: number) => (v === 0xffffffff ? "–" : v >= 1024 ? (v / 1024).toFixed(v >= 10240 ? 0 : 1) + " MB" : v + " KB");
 
 const eng = new Engine();
@@ -92,7 +99,7 @@ async function boot() {
     semantic: async (q: string, k = 20) => {
       const sm = await ensureSem();
       const t1 = performance.now();
-      const idx = sm.search(q, k);
+      const idx = sm.search(q, k, null, eng.lp);
       (window.vrcwStats.semMs ??= []).push(Math.round((performance.now() - t1) * 10) / 10);
       return (await eng.info(idx)).map((x) => x.id);
     },
@@ -140,7 +147,7 @@ function onChange(debounce = 0) {
 
 async function refresh() {
   const my = ++seq;
-  const r = await eng.run({ q: state.q, filters: filtersOf(state), sort: state.sort, limit: shown, exactTail: false });
+  const r = await eng.run({ q: state.q, filters: filtersOf(state), sort: state.sort, limit: shown, exactTail: false, whatIf: true });
   if (my !== seq) return;
   const infos = await eng.info(r.idx);
   if (my !== seq) return;
@@ -151,14 +158,16 @@ async function refresh() {
 
 function itemHtml(i: number, w: WorldInfo, tid = "result-item"): string {
   const c = eng.c;
-  const sizes = [c.plat[i] & 1 ? "PC " + kb(c.pc[i]) : "", c.plat[i] & 2 ? "Quest " + kb(c.quest[i]) : ""].filter(Boolean).join(" · ");
+  const badge = (on: boolean, name: string, size: number) => (on ? `<span class="pb ${name.toLowerCase()}">${name}${size !== 0xffffffff ? " " + kb(size) : ""}</span>` : "");
+  const plats = badge(!!(c.plat[i] & 1), "PC", c.pc[i]) + badge(!!(c.plat[i] & 2), "Quest", c.quest[i]) || `<span class="pb">no package</span>`;
+  const date = state.sort === "published" ? "pub " + dateOfDay(c.created[i]) : "upd " + dateOfDay(c.updated[i]);
   const thumb = w.thumb
     ? `<img decoding="async" data-src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">`
     : `<div class="ph" style="--h:${(parseInt(w.id.slice(5, 9), 16) % 360) || 0}"></div>`;
   return `<li data-testid="${tid}" data-id="${esc(w.id)}"><a href="?world=${esc(w.id)}" class="thumb">${thumb}</a>
     <div class="body"><a class="title" href="?world=${esc(w.id)}">${esc(w.name || "(untitled)")}</a>
     <div class="by">${esc(w.author)}</div>
-    <div class="facts">cap ${c.cap[i]} · ${fmt(c.visits[i])} visits · ${fmt(c.fav[i])} ♥ · ${sizes || "no package"} · upd ${dateOfDay(c.updated[i])}</div></div></li>`;
+    <div class="facts">cap ${c.cap[i]} · ${fmt(c.visits[i])} visits · ${fmt(c.fav[i])} ♥ · ${date}</div><div class="plats">${plats}</div></div></li>`;
 }
 
 function renderResults(idx: number[], infos: WorldInfo[], total: number, ms: number) {
@@ -198,7 +207,7 @@ async function renderSemantic(my: number, shownIds: Set<number>) {
   if (!sem || state.q.trim().length < 2) { box.hidden = true; return; }
   const t0 = performance.now();
   const allow = (await eng.allowMask(filtersOf(state))).slice();
-  const hits = sem.search(state.q, 40, allow).filter((i) => !shownIds.has(i)).slice(0, 12);
+  const hits = sem.search(state.q, 40, allow, eng.lp).filter((i) => !shownIds.has(i)).slice(0, 8);
   const ms = performance.now() - t0;
   const infos = await eng.info(hits);
   if (my !== seq) return;
@@ -222,7 +231,7 @@ function buildFacets() {
   const s = state;
   f.innerHTML = `<div class="drawer-head"><b>Filters</b><button id="fdone" type="button">Show results</button></div>
   
-  <section data-testid="facet-sort"><h3>Sort</h3><select id="f-sort">${SORTS.map((x) => `<option ${x === s.sort ? "selected" : ""}>${x}</option>`).join("")}</select></section>
+  <section data-testid="facet-sort"><h3>Sort</h3><select id="f-sort">${SORTS.map((x) => `<option value="${x}" ${x === s.sort ? "selected" : ""}>${SORT_LABEL[x]}</option>`).join("")}</select></section>
   <section data-testid="facet-platform"><h3>Platform</h3><div class="seg" id="f-plat">${["", "pc", "quest", "both"].map((p) => `<button data-v="${p}" class="${p === s.platform ? "on" : ""}">${p || "any"}<small></small></button>`).join("")}</div></section>
   <section data-testid="facet-capacity"><h3>Capacity</h3><div class="row"><input id="f-capmin" type="number" min="0" placeholder="min" value="${s.cap_min ?? ""}"><span>–</span><input id="f-capmax" type="number" min="0" placeholder="max" value="${s.cap_max ?? ""}"></div><div id="capbars" class="bars"></div></section>
   <section data-testid="facet-size"><h3>Download size ≤ (MB)</h3><div class="row"><input id="f-size" type="number" min="0" step="1" placeholder="any" value="${s.size_max_mb ?? ""}"><input id="f-sizer" type="range" min="0" max="500" step="5" value="${s.size_max_mb ?? 500}"></div></section>
@@ -235,6 +244,9 @@ function buildFacets() {
   const q = $<HTMLInputElement>("#q");
   q.value = s.q;
   q.addEventListener("input", () => { state.q = q.value; onChange(90); });
+  const at = $<HTMLInputElement>("#adult-toggle");
+  at.checked = state.adult;
+  at.addEventListener("change", () => { state.adult = at.checked; lsSet("vrcw-adult", at.checked ? "1" : "0"); onChange(); });
   $("#f-sort").addEventListener("change", (e) => { state.sort = (e.target as HTMLSelectElement).value as Sort; onChange(); });
   $("#f-plat").addEventListener("click", (e) => {
     const b = (e.target as HTMLElement).closest("button"); if (!b) return;
@@ -280,8 +292,16 @@ function buildFacets() {
     const v = (e.target as HTMLInputElement).value.trim().toLowerCase().replace(/\s+/g, "_");
     if (!v) { $("#f-tagres").innerHTML = ""; return; }
     const all = await eng.tagsAll();
-    const hits = all.filter(([k]) => k.includes(v)).sort((a, b) => (+b[0].startsWith(v) - +a[0].startsWith(v)) || b[1] - a[1]).slice(0, 14);
-    $("#f-tagres").innerHTML = hits.map(([k, n]) => `<button data-t="${esc(k)}">${esc(k)} <small>${n}</small></button>`).join("") || "<em>no tags</em>";
+    const grouped = new Map<string, [string, number]>();
+    for (const [k, n] of all) {
+      if (!k.toLowerCase().includes(v) || tagClass(k) !== "user") continue;
+      const g = eng.groupOf.get(k);
+      const key = g && eng.m.tagGroups[g] ? "~" + g : k;
+      const e = grouped.get(key);
+      if (e) e[1] += n; else grouped.set(key, [key, n]);
+    }
+    const hits = [...grouped.values()].sort((a, b) => (+label(b[0]).startsWith(v) - +label(a[0]).startsWith(v)) || b[1] - a[1]).slice(0, 14);
+    $("#f-tagres").innerHTML = hits.map(([k, n]) => `<button data-t="${esc(k)}">${esc(label(k))} <small>${n}</small></button>`).join("") || "<em>no tags</em>";
   });
   window.addEventListener("popstate", () => { state = readUrl(); syncInputs(); refresh(); if (state.world) openCard(state.world, false); else closeCard(false); });
   $("#more");
@@ -290,7 +310,7 @@ function buildFacets() {
 function markPlat() { document.querySelectorAll("#f-plat button").forEach((b) => b.classList.toggle("on", (b as HTMLElement).dataset.v === state.platform)); }
 function syncInputs() {
   const set = (id: string, v: any) => ($<HTMLInputElement>(id).value = v ?? "");
-  set("#q", state.q); set("#f-capmin", state.cap_min); set("#f-capmax", state.cap_max); set("#f-size", state.size_max_mb);
+  set("#q", state.q); $<HTMLInputElement>("#adult-toggle").checked = state.adult; set("#f-capmin", state.cap_min); set("#f-capmax", state.cap_max); set("#f-size", state.size_max_mb);
   set("#f-sizer", state.size_max_mb ?? 500); set("#f-after", state.after); set("#f-before", state.before); set("#f-sort", state.sort);
   markPlat();
 }
@@ -304,19 +324,20 @@ let authorLabelFor = "";
 async function renderFacets(fc: FacetCounts, total: number) {
   if (!facetsBuilt) return;
   const plat = $("#f-plat").querySelectorAll("button");
-  const pc = [total, fc.platform.pc, fc.platform.quest, fc.platform.both];
+  const pi = fc.platformIf ?? { any: total, ...fc.platform };
+  const pc = [pi.any, pi.pc, pi.quest, pi.both];
   plat.forEach((b, i) => (b.querySelector("small")!.textContent = " " + fmt(pc[i])));
   const mx = Math.max(1, ...Object.values(fc.capacity));
   $("#capbars").innerHTML = Object.entries(fc.capacity).map(([k, v]) => `<div title="${k}: ${v}"><i style="height:${Math.round((v / mx) * 100)}%"></i><b>${k}</b></div>`).join("");
-  $("#f-sel").innerHTML = state.tags.map((t) => `<button data-t="${esc(t)}" class="on">${esc(t)} ✕</button>`).join("");
+  $("#f-sel").innerHTML = state.tags.map((t) => `<button data-t="${esc(t)}" class="on">${esc(label(t))} ✕</button>`).join("");
   $("#f-tags").innerHTML = Object.entries(fc.userTags).filter(([k]) => !state.tags.includes(k)).slice(0, 30)
-    .map(([k, v]) => `<li data-t="${esc(k)}"><span>${esc(k)}</span><small>${fmt(v)}</small></li>`).join("");
+    .map(([k, v]) => `<li data-t="${esc(k)}"><span>${esc(label(k))}</span><small>${fmt(v)}</small></li>`).join("");
   $("#f-status").querySelectorAll("button").forEach((b) => {
     const k = (b as HTMLElement).dataset.s as "approved" | "labs";
     b.classList.toggle("on", state.status.includes(k));
     b.querySelector("small")!.textContent = fmt(fc.status[k] ?? 0);
   });
-  const names = new Set([...Object.keys(fc.cw), ...state.cw, ...state.cwx]);
+  const names = new Set([...Object.keys(fc.cw).filter((k) => state.adult || !ADULT.includes(k)), ...state.cw, ...state.cwx]);
   $("#f-cw").innerHTML = [...names].sort((a, b) => (fc.cw[b] ?? 0) - (fc.cw[a] ?? 0)).map((k) => {
     const st = state.cwx.includes(k) ? "hide" : state.cw.includes(k) ? "req" : "";
     return `<li data-cw="${esc(k)}" class="${st}"><span>${st === "hide" ? "− " : st === "req" ? "+ " : ""}${esc(k)}</span><small>${fmt(fc.cw[k] ?? 0)}</small></li>`;
@@ -360,7 +381,6 @@ async function openCard(id: string, push: boolean) {
     <h2>${esc(w.name)}</h2>
     <p class="by">by <a href="#" id="c-author">${esc(w.author)}</a> · <a href="https://vrchat.com/home/world/${esc(w.id)}" target="_blank" rel="noopener">open on vrchat.com ↗</a></p>
     <table>${row("Capacity", String(c.cap[idx]))}${row("Visits", c.visits[idx].toLocaleString())}${row("Favorites", c.fav[idx].toLocaleString())}
-      ${row("Heat / popularity", `${cc.hp[j]?.[0] ?? 0} / ${cc.hp[j]?.[1] ?? 0}`)}
       ${row("PC package", c.plat[idx] & 1 ? kb(c.pc[idx]) : "none")}${row("Quest package", c.plat[idx] & 2 ? kb(c.quest[idx]) : "none")}
       ${row("Published", dateOfDay(c.created[idx]))}${row("Updated", dateOfDay(c.updated[idx]))}${row("World id", `<code>${esc(w.id)}</code>`)}</table>
     <div class="badges">${badges.map((t) => `<span class="badge ${tagClass(t)}">${esc(t.replace(/^(content_|system_)/, ""))}</span>`).join("")}</div>
