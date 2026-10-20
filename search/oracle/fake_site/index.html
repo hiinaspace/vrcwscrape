@@ -252,12 +252,12 @@ async function render() {
   const url = await thumbUrl();
   for (const w of r._hits.slice(0, shown)) {
     const d = document.createElement("li"); d.className = "item"; d.dataset.testid = "result-item"; d.dataset.id = w.id;
-    d.innerHTML = `<img alt=""><div><b></b> <small></small><div class="t"></div><div class="d"></div></div>`;
+    d.innerHTML = `<a href="?world=${w.id}"><img alt=""></a><div><a class="title" href="?world=${w.id}"><b></b></a> <small></small><div class="t"></div><div class="d"></div></div>`;
     d.querySelector("img").src = url;
     d.querySelector("b").textContent = w.name; d.querySelector("small").textContent = w.author + " (cap " + w.cap + ")";
     d.querySelector(".t").innerHTML = w.tagset.filter(t => !HIDDEN.some(h => t.startsWith(h))).map(t => `<span class="chip">${t.replace(/</g, "")}</span>`).join("");
     d.querySelector(".d").textContent = (w.desc || "").slice(0, 120);
-    d.onclick = () => setParams({ world: w.id });
+    d.onclick = (ev) => { ev.preventDefault(); setParams({ world: w.id }); };
     el.appendChild(d);
   }
   document.getElementById("more").hidden = shown >= r._hits.length;

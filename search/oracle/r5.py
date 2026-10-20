@@ -98,6 +98,17 @@ def collect_dom_ids(page, want: int, max_rounds: int = 25) -> list[str | None]:
     return dom_ids(page, want)
 
 
+def open_first_result(page) -> None:
+    """Open a result's detail panel the way a user does: the UI only listens on the row's `?world=` links."""
+    links = page.locator(css("result_item") + ' a[href^="?world="]')
+    (links.nth(1) if links.count() > 1 else links.first).click()  # nth(1) = the title link
+    # `detail-panel` is an always-present hidden <aside>; the open state is a visible world-card inside it
+    page.wait_for_selector(
+        '[data-testid="world-card"]:visible, [data-testid="detail-panel"]:not([hidden])',
+        timeout=10000,
+    )
+
+
 def open_site(browser, base: str, viewport=(1440, 900), **params):
     ctx = browser.new_context(viewport={"width": viewport[0], "height": viewport[1]})
     page = ctx.new_page()
@@ -566,8 +577,7 @@ def thumbs_eval(browser, base: str, parquet: str, wid: str) -> dict:
         n_before = len(reqs)
         # detail panel: UI click path
         page.evaluate("window.scrollTo(0, 0)")
-        loc(page, "result_item").first.click()
-        loc(page, "detail").first.wait_for(state="visible", timeout=10000)
+        open_first_result(page)
         page.wait_for_timeout(2000)
         out["detail_panel_vrchat_requests"] = vrchat_requests([r.url for r in reqs[n_before:]])[:5]
         out["detail_has_official_link"] = bool(
@@ -603,6 +613,13 @@ def thumbs_eval(browser, base: str, parquet: str, wid: str) -> dict:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:  # noqa: BLE001
                 pass
+            try:  # packed thumbs are filled in lazily (IntersectionObserver + object URL)
+                page.wait_for_function(
+                    f"document.querySelector({css('result_item')!r} + ' img') !== null",
+                    timeout=6000,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             th = page.evaluate(THUMB_JS, css("result_item"))
             for t in th:
                 seen.setdefault(t["src"] + str(len(seen)), t)
@@ -630,8 +647,10 @@ def thumbs_eval(browser, base: str, parquet: str, wid: str) -> dict:
     out["pages"] = page_bytes
     if not real:
         out["decode"] = {
-            "skipped": "no packed-thumbnail images in the DOM (placeholders only / thumbUrl null)"
+            "skipped": "no thumbs packed: the first result rows contain no <img>, only placeholders "
+            "(thumbUrl null / no thumbs in the build)"
         }
+        out["no_thumbs_packed"] = True
     else:
         ok = sum(1 for t in real if t["w"] > 0)
         out["decode"] = {
@@ -723,8 +742,7 @@ def owner_screenshots(browser, base: str, parquet: str, outdir: Path) -> dict:
                     except Exception:  # noqa: BLE001
                         status[fn + ":pills"] = "no pill element found (testid pill)"
                 if action == "detail":
-                    loc(page, "result_item").first.click()
-                    loc(page, "detail").first.wait_for(state="visible", timeout=10000)
+                    open_first_result(page)
                 elif action == "brush":
                     hist = loc(page, "hist_date")
                     if not (
