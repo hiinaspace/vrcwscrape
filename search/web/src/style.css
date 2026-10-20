@@ -186,3 +186,5 @@ main{min-width:0}
   .sorts{overflow-x:auto;flex-wrap:nowrap;max-width:100%;padding-bottom:2px}.sorts button{white-space:nowrap}
   #semantic .results>li{flex-basis:240px}
 }
+
+.results>li[data-id]{cursor:pointer}.results>li[data-id]:hover{border-color:var(--acc)}.results>li[data-id]:focus-visible{outline:2px solid var(--acc);outline-offset:1px}

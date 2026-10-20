@@ -116,7 +116,7 @@ async function boot() {
     s.sort = v;
     change();
   });
-  for (const id of ["#results", "#sem-list"]) $(id).addEventListener("click", onListClick);
+  for (const id of ["#results", "#sem-list"]) { $(id).addEventListener("click", onListClick); $(id).addEventListener("keydown", onListKey as EventListener); }
   window.addEventListener("popstate", () => {
     ctx.state = readUrl();
     $<HTMLInputElement>("#q").value = ctx.state.q;
@@ -205,9 +205,15 @@ function onListClick(e: Event) {
   const tag = t.closest(".tag[data-t]") as HTMLElement | null;
   if (tag) { const s = ctx.state, k = tag.dataset.t!; if (!s.tags.includes(k)) s.tags.push(k); s.tags_ex = s.tags_ex.filter((x) => x !== k); change(); return; }
   const a = t.closest("a[href^='?world=']") as HTMLAnchorElement | null;
-  if (!a || me.ctrlKey || me.metaKey || me.shiftKey) return;
-  e.preventDefault();
-  void detail.open(a.getAttribute("href")!.slice(7), true);
+  if (me.ctrlKey || me.metaKey || me.shiftKey || me.button) return; // new-tab clicks keep the real link
+  if (a) { e.preventDefault(); void detail.open(a.getAttribute("href")!.slice(7), true); return; }
+  if (t.closest("a, button, input, select, textarea")) return; // other inner controls keep their own action
+  const li = t.closest("li[data-id]") as HTMLElement | null;
+  if (li && !window.getSelection()?.toString()) void detail.open(li.dataset.id!, true); // whole row is a click target
+}
+function onListKey(e: KeyboardEvent) {
+  const li = e.target as HTMLElement;
+  if ((e.key === "Enter" || e.key === " ") && li.matches?.("li[data-id]")) { e.preventDefault(); void detail.open(li.dataset.id!, true); }
 }
 function mark(id: string) {
   document.querySelectorAll<HTMLElement>("#results > li, #sem-list > li").forEach((li) => li.classList.toggle("sel", !!id && li.dataset.id === id));

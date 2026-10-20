@@ -39,7 +39,7 @@ export function rowHtml(eng: Engine, meters: Meters, i: number, w: WorldInfo, ti
   const c = eng.c;
   const card: RowCard = { desc: w.desc ?? "", tags: w.tags ?? [] }; // info() carries desc[0:160] + visible tags in the meta chunk
   const href = `?world=${esc(w.id)}`;
-  return `<li data-testid="${tid}" data-id="${esc(w.id)}" data-i="${i}" class="${selected ? "sel" : ""}">
+  return `<li data-testid="${tid}" data-id="${esc(w.id)}" data-i="${i}" tabindex="0" class="${selected ? "sel" : ""}">
     <a href="${href}" class="thumb" tabindex="-1" aria-hidden="true">${thumbBox(i, w.id)}</a>
     <div class="body">
       <div class="l1"><a class="title" href="${href}">${esc(w.name || "(untitled)")}</a><span class="by">${esc(w.author)}</span><span class="rbadges">${rowBadges(card)}</span></div>

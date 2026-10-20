@@ -99,6 +99,19 @@ ok("selected row highlighted", await p.locator("[data-testid=result-item].sel").
 ok("list still present", await p.locator("[data-testid=result-item]").count() === n0);
 const hero = await p.locator("[data-testid=world-card] a.hero").getAttribute("href");
 ok("hero links to official page", /^https:\/\/vrchat\.com\/home\/world\/wrld_/.test(hero), hero);
+// whole-row click, keyboard, inner controls
+await p.click("[data-testid=detail-panel] .x"); await settle(p);
+await p.locator("[data-testid=result-item] .rdesc").nth(2).click(); await settle(p);
+ok("clicking row body opens panel", await p.locator("[data-testid=detail-panel]").isVisible() && await p.locator("[data-testid=result-item].sel").count() === 1);
+const w1 = sp(p).get("world");
+await p.locator("[data-testid=result-item]").nth(3).locator(".tag").first().click(); await settle(p);
+ok("tag chip click filters, row not opened", !!sp(p).get("tags") && sp(p).get("world") === w1, p.url());
+await p.click("#f-reset"); await settle(p);
+await p.click("[data-testid=detail-panel] .x"); await settle(p);
+await p.locator("[data-testid=result-item]").nth(1).focus(); await p.keyboard.press("Enter"); await settle(p);
+ok("Enter on focused row opens panel", !!sp(p).get("world"));
+await p.locator("[data-testid=result-item]").nth(4).focus(); await p.keyboard.press("Space"); await settle(p);
+ok("Space on focused row opens other world", !!sp(p).get("world") && sp(p).get("world") !== w1);
 await p.click("[data-testid=detail-panel] .x"); await settle(p);
 ok("panel closes", !(await p.locator("[data-testid=detail-panel]").isVisible()) && !sp(p).get("world"));
 await p.goBack(); await p.waitForTimeout(500);
