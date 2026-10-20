@@ -1,0 +1,27 @@
+Third-party model assets in this directory (data/sem/)
+=====================================================
+
+Model:     sentence-transformers/static-similarity-mrl-multilingual-v1
+Source:    https://huggingface.co/sentence-transformers/static-similarity-mrl-multilingual-v1
+Publisher: the sentence-transformers organization on the Hugging Face Hub
+Licence:   Apache License 2.0 (full text below)
+
+The tokenizer (vocabulary) of this model is the BERT Multilingual uncased tokenizer
+(google-bert/bert-base-multilingual-uncased, Apache License 2.0).
+
+CHANGES MADE (Apache-2.0 section 4(b)): the original float32 embedding table was truncated to its first 256 dimensions
+(Matryoshka), quantised to int8 with a per-row float16 scale, and split into four gzip files (tokens.N.bin, scale.bin);
+the tokenizer.json was copied and gzip-compressed (tokenizer.bin); vecs.bin holds 1-bit (sign) vectors of the world
+descriptions computed with the model. A small JavaScript reimplementation of the tokenizer and mean pooling runs in the
+visitor's browser. These files are provided "AS IS" without warranties of any kind; see the licence text below.
+
+The model card asks for the following to be cited:
+  - Sentence-BERT: Nils Reimers and Iryna Gurevych, "Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks", EMNLP 2019.
+  - MatryoshkaLoss: Aditya Kusupati et al., "Matryoshka Representation Learning", NeurIPS 2022.
+  - MultipleNegativesRankingLoss: Matthew Henderson et al., "Efficient Natural Language Response Suggestion for Smart Reply", 2017.
+
+The precomputed "similar worlds" lists elsewhere in this site (data/sim/) are derived outputs of the embeddinggemma-2 text
+embedding model; no weights of that model are distributed.
+
+-----------------------------------------------------------------------------------------------------------------------
+

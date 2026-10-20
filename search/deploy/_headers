@@ -46,6 +46,9 @@
 /about.css
   Cache-Control: public, max-age=300
 
-# Keep the pages.dev alias out of search engines (the custom domain is the canonical one).
-https://worldsearch.pages.dev/*
+# Keep every pages.dev alias (production and per-deployment previews) out of search engines; the custom domain is canonical.
+https://:project.pages.dev/*
+  X-Robots-Tag: noindex
+
+https://:version.:project.pages.dev/*
   X-Robots-Tag: noindex

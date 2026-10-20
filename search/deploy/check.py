@@ -76,6 +76,7 @@ def main() -> int:
     ap.add_argument("dist", type=Path)
     ap.add_argument("--full-parquet", type=Path, default=DATA / "worlds-2026-10-20.parquet")
     ap.add_argument("--public-parquet", type=Path, default=DATA / "worlds-2026-10-20-public-v2.parquet")
+    ap.add_argument("--excluded", type=Path, default=Path(__file__).resolve().parent / "excluded_ids.txt")
     ap.add_argument("--skip-gitleaks", action="store_true")
     a = ap.parse_args()
     dist: Path = a.dist.resolve()
@@ -114,8 +115,20 @@ def main() -> int:
         else:
             m = re.search(r"Snapshot: newest scrape <strong>([^<]+)</strong>", t)
             ok(f"about.html stamped (snapshot {m.group(1) if m else '?'})")
+        if "<!--" in t:
+            err("about.html still has THUMBS markers (run finalize.py)")
+        has_thumb_claim = "re-encoded previews" in t
+        mj = dist / "data/manifest.json"
+        if mj.is_file() and has_thumb_claim != bool(json.loads(mj.read_text()).get("hasThumb")):
+            err(f"about.html thumbnail claim ({has_thumb_claim}) disagrees with manifest.hasThumb")
         if "mailto:hiina@hiina.space" not in t:
             err("about.html has no takedown contact")
+    if (dist / "data/sem").is_dir():
+        lic = dist / "data/sem/LICENSE.txt"
+        if not lic.is_file() or "Apache License" not in lic.read_text() or "CHANGES MADE" not in lic.read_text():
+            err("data/sem/LICENSE.txt missing or incomplete (Apache-2.0 text + notice)")
+        else:
+            ok("data/sem/LICENSE.txt present (Apache-2.0 text + changes notice)")
     idx = dist / "index.html"
     if idx.is_file() and "about.html" not in idx.read_text(encoding="utf-8"):
         err("index.html has no link to about.html")
@@ -175,6 +188,20 @@ def main() -> int:
     pub = {s[5:] if s.startswith("wrld_") else s for s in t["world_id"].filter(pc.equal(st, "public")).to_pylist()}
     privb = {s.encode() for s in priv}
     print(f"        {len(priv):,} non-public ids and {len(pub):,} public ids in {a.full_parquet.name}")
+    ex_w, ex_a = set(), set()
+    if a.excluded.is_file():
+        for line in a.excluded.read_text(encoding="utf-8").splitlines():
+            v = line.split("#", 1)[0].strip()
+            if not v:
+                continue
+            bare = v.split("_", 1)[1] if v.startswith(("wrld_", "usr_")) else v
+            if not v.startswith("usr_"):
+                ex_w.add(bare)
+            if not v.startswith("wrld_"):
+                ex_a.add(bare)
+    ex_hits: set[str] = set()
+    ex_text: Counter[str] = Counter()
+    pub -= ex_w  # excluded worlds must be absent, so they are not expected by the scanner sanity check
     seen_pub: set[bytes] = set()
     leak_tables: set[str] = set()
     leak_text: Counter[str] = Counter()
@@ -183,6 +210,15 @@ def main() -> int:
         if not (r.startswith("data/") and p.suffix == ".bin"):
             continue
         b = read_maybe_gz(p)
+        if ex_w or ex_a:
+            if r.startswith(("data/ids/", "data/authors/", "data/meta/")):
+                doc = json.loads(b)
+                keys = set(doc) if r.startswith(("data/ids/", "data/authors/")) else set(doc["id"]) | set(doc["au"])
+                ex_hits |= keys & (ex_w | ex_a)
+            else:
+                for e in ex_w | ex_a:
+                    if e.encode() in b:
+                        ex_text[r.split("/")[1]] += 1
         found = set(UUID.findall(b))
         if not found:
             continue
@@ -197,6 +233,13 @@ def main() -> int:
         else:
             for u in found & privb:
                 leak_text[r.split("/")[1]] += 1
+    if a.excluded.is_file():
+        if ex_hits:
+            err(f"{len(ex_hits)} EXCLUDED world/author ids present in id/author/meta tables, e.g. {sorted(ex_hits)[:3]}")
+        else:
+            ok(f"none of the {len(ex_w) + len(ex_a)} excluded ids ({a.excluded.name}) present in id/author/meta tables")
+        if ex_text:
+            warn(f"excluded ids mentioned in other data files (text of other worlds): {dict(ex_text)}")
     if leak_tables:
         err(f"{len(leak_tables)} NON-PUBLIC world ids in the id/meta tables, e.g. {sorted(leak_tables)[:3]}")
     else:

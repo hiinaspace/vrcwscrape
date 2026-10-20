@@ -1,0 +1,5 @@
+# Removal list: worlds and/or authors that must never appear in the published site.
+# One id per line: wrld_<uuid> excludes that world, usr_<uuid> excludes every world by that author.
+# A bare <uuid> is treated as both. '#' starts a comment. Applied by deploy.sh (filter_parquet.py) before the build,
+# and asserted absent from dist by check.py. After editing: deploy/deploy.sh --build [--test], then redeploy.
+# (With a non-empty list the neighbour lists and semantic vectors are recomputed from the embeddings, ~8-10 min.)

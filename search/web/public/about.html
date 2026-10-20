@@ -24,11 +24,11 @@
     public are included (<span id="count">@@COUNT@@</span> worlds). Private worlds are not.</li>
     <li>Snapshot: newest scrape <strong>@@SNAPSHOT@@</strong>. Individual worlds may have been scraped earlier, and
     anything changed on VRChat since then (renamed, made private, deleted) is not reflected until the next refresh.</li>
-    <li>Thumbnails are small re-encoded previews (256 px wide, AVIF) of each world's public image, served from this site.
-    The full-size image and the official page are on vrchat.com; the detail panel links there.</li>
+    <!--THUMBS--><li>Thumbnails are small re-encoded previews (256 px wide, AVIF) of each world's public image, served from this site.
+    The full-size image and the official page are on vrchat.com; the detail panel links there.</li><!--/THUMBS-->
     <li>The underlying database is public: a live mirror, updated daily, is on
     <a href="https://www.dolthub.com/repositories/hiinaspace/vrcwscrape" rel="noopener">DoltHub</a>, and the scraper and this
-    site's source are on <a href="https://github.com/hiinaspace/vrcwscrape" rel="noopener">GitHub</a>.</li>
+    site's source are on <a href="https://github.com/hiinaspace/vrcwscrape/tree/search-static" rel="noopener">GitHub</a>.</li>
     <li>This site is not affiliated with, endorsed by, or sponsored by VRChat Inc. "VRChat" is a trademark of VRChat Inc.
     World names, descriptions and images belong to their authors.</li>
   </ul>
@@ -52,7 +52,8 @@
     <code>embeddinggemma-2</code> (Apache-2.0). Only the resulting neighbour lists ship with the site.</li>
     <li><strong>Semantic search</strong> (optional, off by default; downloads about 33 MB after you confirm):
     <code>static-similarity-mrl-multilingual-v1</code> from the sentence-transformers project (Apache-2.0), quantised and
-    truncated, run in your browser with a small JavaScript reimplementation of its tokenizer.</li>
+    truncated, run in your browser with a small JavaScript reimplementation of its tokenizer
+    (<a href="./data/sem/LICENSE.txt">licence text, changes and citations</a>).</li>
     <li><strong>Code and fonts</strong>: the page is plain TypeScript built with Vite (MIT); it bundles no third-party
     libraries and no web fonts (your system fonts are used).</li>
   </ul>

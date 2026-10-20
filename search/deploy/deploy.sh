@@ -2,7 +2,7 @@
 # Publish prep for the static world search. Builds (or reuses) search/dist, stamps about.html, installs _headers, runs the
 # preflight (check.py), then PRINTS the deploy commands. It never deploys, uploads, or calls a Cloudflare write API.
 #
-# usage: search/deploy/deploy.sh [--build] [--no-thumbs] [--test] [--dist DIR]
+# usage: search/deploy/deploy.sh [--build] [--no-thumbs] [--test] [--no-swap] [--dist DIR]
 #   --build       rebuild into a temp dir (search/dist.new) with the thumbnail packs, run the checks there, then swap into search/dist
 #                 (a failed check leaves search/dist untouched and the new build in search/dist.new for inspection).
 #   --no-thumbs   with --build: skip thumbnails even if thumbs.parquet exists (site then shows placeholders)
@@ -20,41 +20,59 @@ THUMBS="${THUMBS:-$DATA/thumbs/thumbs.parquet}"
 PROJECT="${PROJECT:-worldsearch}"
 DOMAIN="${DOMAIN:-worldsearch.hiina.space}"
 NATTO_DIR="${NATTO_DIR:-\$HOME/scratch/worldsearch-dist}"
-DIST="$SEARCH/dist"; BUILD=0; USE_THUMBS=1; TEST=0
+DIST="$SEARCH/dist"; BUILD=0; USE_THUMBS=1; TEST=0; SWAP=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --build) BUILD=1 ;;
     --no-thumbs) USE_THUMBS=0 ;;
     --test) TEST=1 ;;
+    --no-swap) SWAP=0 ;;   # with --build: leave the checked build in search/dist.new
     --dist) DIST="$(cd "$2" && pwd)"; shift ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac; shift
 done
 PY=(uv run --project "$SEARCH/build" python)
 
+EXCL="${EXCL:-$HERE/excluded_ids.txt}"
 if [ "$BUILD" = 1 ]; then
   NEW="$SEARCH/dist.new"
   if [ "$USE_THUMBS" = 1 ] && [ ! -f "$THUMBS" ]; then
     echo "no $THUMBS yet (thumbnails still encoding?). Use --no-thumbs to build without." >&2; exit 3
   fi
   [ "$USE_THUMBS" = 1 ] || THUMBS=/nonexistent
-  # sim/ + sem/ are reused from the current dist (same world order = same public parquet); drop REUSE_DATA to recompute (~8 min + 33 MB assets).
-  REUSE=""; [ -f "$SEARCH/dist/data/manifest.json" ] && REUSE="$SEARCH/dist/data"
-  DIST="$NEW" WORK="$SEARCH/work.pub" THUMBS="$THUMBS" REUSE_DATA="$REUSE" PUBLISH_PQ="$PQ" "$SEARCH/build.sh" "$PQ"
+  # Removal list: excluded worlds/authors are dropped from the parquet before anything is built (check.py asserts they are absent).
+  FILTERED="$SEARCH/filtered.public.parquet"; rm -f "$FILTERED"
+  REMOVED="$("${PY[@]}" "$HERE/filter_parquet.py" "$PQ" "$EXCL" "$FILTERED" | tail -1)"
+  if [ "$REMOVED" = 0 ]; then
+    BUILD_PQ="$PQ"; BUILD_ARGS=()
+    # same world order as the public parquet: reuse neighbour lists + semantic assets from the current dist (drop to recompute, ~8 min)
+    REUSE=""; [ -f "$SEARCH/dist/data/manifest.json" ] && REUSE="$SEARCH/dist/data"
+    STATIC=""
+  else
+    echo "exclusions remove $REMOVED worlds: world order changes, recomputing neighbours + semantic vectors from the embeddings (~10 min)"
+    BUILD_PQ="$FILTERED"; PQ="$FILTERED"
+    BUILD_ARGS=("$DATA/emb/gemma2_full_f16.npy" "$DATA/emb/ids.parquet")
+    REUSE=""; STATIC="$DATA/emb/static"
+  fi
+  DIST="$NEW" WORK="$SEARCH/work.pub" THUMBS="$THUMBS" REUSE_DATA="$REUSE" STATIC_DIR="$STATIC" PUBLISH_PQ="$PQ" \
+    "$SEARCH/build.sh" "$BUILD_PQ" "${BUILD_ARGS[@]}"
   rm -rf "$SEARCH/work.pub"
   DIST="$NEW"
 fi
 
 "${PY[@]}" "$HERE/finalize.py" "$DIST" "$PQ"
 echo
-if ! "${PY[@]}" "$HERE/check.py" "$DIST" --full-parquet "$FULL" --public-parquet "$PQ"; then
+if ! "${PY[@]}" "$HERE/check.py" "$DIST" --full-parquet "$FULL" --public-parquet "$PQ" --excluded "$EXCL"; then
   echo "PREFLIGHT FAILED: nothing swapped, nothing to deploy." >&2
   exit 1
 fi
 
-if [ "$BUILD" = 1 ]; then  # swap only after the checks passed
+if [ "$BUILD" = 1 ] && [ "$SWAP" = 0 ]; then
+  DIST="$NEW"; echo "built and checked in $DIST (not swapped)"
+elif [ "$BUILD" = 1 ]; then  # swap only after the checks passed
   rm -rf "$SEARCH/dist.old"; mv "$SEARCH/dist" "$SEARCH/dist.old"; mv "$SEARCH/dist.new" "$SEARCH/dist"; rm -rf "$SEARCH/dist.old"
   DIST="$SEARCH/dist"; echo "swapped into $DIST"
+  rm -f "$SEARCH/filtered.public.parquet"
 fi
 
 STAMP="$(date -u +%F)"
