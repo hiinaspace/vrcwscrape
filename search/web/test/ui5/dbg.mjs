@@ -1,0 +1,11 @@
+import { launch } from "./launch.mjs";
+const b = await launch(process.argv[3] ?? "chromium");
+const p = await b.newPage();
+p.on("pageerror", (e) => console.log("PAGEERR", e.message, e.stack?.split("\n").slice(0,4).join(" | ")));
+p.on("console", (m) => console.log("console", m.type(), m.text()));
+p.on("requestfailed", (r) => console.log("REQFAIL", r.url()));
+p.on("response", (r) => r.status() >= 400 && console.log("HTTP", r.status(), r.url()));
+await p.goto(process.argv[2] ?? "http://localhost:5199/");
+await p.waitForTimeout(4000);
+console.log(await p.textContent("#status"), await p.$$eval("[data-testid=result-item]", (e) => e.length), await p.textContent("#summary"));
+await b.close();

@@ -10,22 +10,30 @@
 <div id="app">
   <header class="top">
     <h1>VRChat World Search</h1>
-    <input id="q" data-testid="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search worlds, authors, tags (日本語 OK)" aria-label="Search">
-    <label class="adult"><input type="checkbox" id="adult-toggle" data-testid="adult-toggle"> Show adult worlds</label>
-    <label class="sem"><input type="checkbox" id="sem-toggle" data-testid="semantic-toggle"> semantic search (downloads ~33 MB) <span id="sem-note"></span></label>
+    <div class="qwrap">
+      <input id="q" data-testid="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search worlds, authors, tags (日本語 OK)   e.g. lake -hangout" aria-label="Search">
+      <button id="syntax-btn" data-testid="syntax-help" class="help" type="button" aria-expanded="false" aria-controls="syntax-pop" title="Search syntax">?</button>
+      <div id="syntax-pop" class="pop" hidden></div>
+    </div>
+    <div id="sem-host" class="sem"></div>
     <button id="fbtn" class="fbtn" type="button">Filters</button>
     <span id="status" class="status" aria-live="polite"></span>
   </header>
+  <div id="sem-panel" class="sem-panel" hidden></div>
   <div class="layout">
     <aside id="facets" class="facets"></aside>
     <main>
-      <div id="summary" class="summary"></div>
-      <section id="semantic" data-testid="semantic-results" hidden><h3>Related by meaning <small id="sem-ms"></small></h3><ol id="sem-list" class="results"></ol></section>
+      <div id="pills" class="pills" data-testid="pills" hidden></div>
+      <div class="toolbar">
+        <div id="summary" class="summary"></div>
+        <div id="sorts" class="sorts" data-testid="facet-sort" role="group" aria-label="Sort by"></div>
+      </div>
+      <section id="semantic" data-testid="semantic-results" hidden><h3>Related by meaning <small id="sem-ms"></small></h3><p id="sem-hint" class="dim" hidden>Type a search to see worlds related by meaning.</p><ol id="sem-list" class="results strip"></ol></section>
       <ol id="results" data-testid="results" class="results"></ol>
       <button id="more" class="more" hidden>Show more</button>
     </main>
+    <aside id="detail" class="detail" data-testid="detail-panel" hidden></aside>
   </div>
-  <div id="card-root"></div>
 </div>
 <script type="module" src="./src/main.ts"></script>
 </body>

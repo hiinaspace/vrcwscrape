@@ -1,0 +1,16 @@
+import { launch } from "./launch.mjs";
+const kind = process.argv[2] ?? "chromium", accept = process.argv[3] !== "dismiss", q = process.argv[4] ?? "";
+const b = await launch(kind);
+const p = await b.newPage({ viewport: { width: 1280, height: 800 } });
+const dialogs = [];
+p.on("dialog", async (d) => { dialogs.push(d.type() + ": " + d.message().slice(0, 60)); accept ? await d.accept() : await d.dismiss(); });
+p.on("pageerror", (e) => console.log("pageerror", e.message));
+await p.goto("http://localhost:5173/" + (q ? "?q=" + encodeURIComponent(q) : ""));
+await p.waitForSelector("[data-testid=result-item]");
+const sel = "[data-testid=semantic-toggle]";
+console.log(kind, "accept=" + accept, "q=" + JSON.stringify(q), "visible", await p.isVisible(sel));
+await p.click(sel);
+await p.waitForTimeout(3500);
+console.log("dialogs", dialogs, "checked", await p.isChecked(sel), "note", JSON.stringify(await p.textContent("#sem-note")), "semantic hidden", await p.$eval("#semantic", (e) => e.hidden));
+await p.screenshot({ path: "/tmp/ui5-semrepro-" + kind + ".png" });
+await b.close();

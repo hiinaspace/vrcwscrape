@@ -214,3 +214,38 @@ facets stay conjunctive (counted over the final result set). `ms` includes parse
   (`cap:abc`) falls back to a plain word and reports an error. Unknown `foo:bar` is a plain word.
 * Ranking: sum of field-weighted scores of the positive leaves (+ the round-4 bonuses computed from the top-level plain terms) x popularity prior. With no positive text
   condition, "relevance" = popularity order.
+
+## Round 5 UI (owner: UI builder; files `web/index.html`, `web/src/main.ts`, `style.css`, `sem.ts`, `web/src/ui/**`)
+Layout: header (search box + `?` syntax popover + semantic switch), pill row, toolbar (summary + sort chips), results, optional right detail panel;
+left sidebar order = uploads-over-time histogram, tag bar chart, platform, capacity, download size, content warnings, status, author.
+Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right drawer; <= 760 px: full-screen sheet with a back button, filters in a drawer.
+* **Semantic toggle bug (root cause, reproduced in Playwright Chromium 156 and Firefox 157 with real clicks)**: the old checkbox called native `confirm()`. (1) When the dialog
+  is dismissed/suppressed (Playwright's default, Chrome after "prevent more dialogs", embedded webviews) `confirm()` returns false and the handler silently un-ticked the box: click
+  = nothing. (2) When it is accepted, the 33 MB loaded in 0.3-0.4 s but the only visible results were a 12 px grey "ready" note, because the "Related by meaning" strip is hidden
+  unless the query has >= 2 characters (empty/1-char: `semantic hidden = true`). The control was not hidden on mobile. Fix: a switch (`sem-toggle`) opens an inline confirm
+  (`sem-enable` "Download 33 MB and enable"), a visible byte-based progress bar, and a visible "on" state; with no/short query the strip shows "Semantic search is on. Type a
+  search ... " instead of disappearing. Consent is remembered (`localStorage vrcw-sem=1`) and re-enables from the HTTP cache on the next visit (no 33 MB download without prior consent).
+  The semantic query text is the positive plain terms of the box (not `-x`, `tag:x`, `cap:>=8`).
+* **State / URL** (additive to the oracle contract; `adult=` is ignored, nothing is hidden by default): `sort=` only when the user chose one (absent = automatic: `trending`
+  without a positive text condition, `relevance` with one; an explicit choice sticks), `asc=1`, `platform_ex=pc|quest`, `tags_ex=`, `status_ex=`, `pub_after=`, `pub_before=`,
+  `datef=updated|published` (which range the histogram edits). Existing: `q cap_min cap_max size_max_mb platform after before tags author status cw cw_exclude world`.
+  Clicking the active sort chip flips ascending/descending (not for trending/relevance).
+* **Controls**: sort = chips; capacity = double-ended slider with stops 1,2,4,8,16,24,32,40,50,64,80+ (lowest/highest stop = open end) over a mini histogram (`capacityHist`);
+  download size = single-ended slider (5..1000 MB, any) + exact number input; uploads histogram = month bars from `facetCounts.months|updatedMonths`, fixed axis (global min..max
+  of created/updated), drag = brush, drag handles = resize, drag body = move, click = one month / clear; year-quantised double slider below it; presets this week / this month /
+  this year (rolling 7/30/365 days ending at the newest date in the data) / any. Updated/Published switch picks `after,before` vs `pub_after,pub_before` (both can be active).
+  Tags, content warnings, status, platform are rows `[+][-] name bar count` with explicit include / exclude buttons (no click cycling); tag search rows use the same buttons.
+* **Pills**: `parseQuery(q).pills` (sign flip = `flipPill`, x = `removePill`, both rewrite the box text) plus facet conditions (tags, warnings, status, platform with sign; capacity,
+  size, dates, author without). Parse errors show next to the pills. Syntax popover examples fill the box.
+* **Result row**: thumbnail (`eng.thumbUrl(i)`, gradient placeholder when null, never a CDN URL), title, author, cw/status badges, ALL user tags (click = include), first 160 chars of the
+  description, log-scale bars for capacity, PC size, Quest size, visits (2nd..99.5th dataset percentile of the sampled column, numeric label inline, exact value in `title`),
+  favorites, updated date. Rows render before the card chunks arrive; tags + description are patched in afterwards (`ui/rows.ts fillCards`).
+* **Detail panel**: `[data-testid=detail-panel]` wraps `[data-testid=world-card]`; hero image links to `https://vrchat.com/home/world/<id>` (new tab). Esc / x / browser back close it; `world=` deep links open it.
+* **Test ids added**: `sem-toggle` (button, `aria-checked`), `sem-enable`, `semantic-item`, `pill` (+ `data-src=query|facet`, `data-kind`, `data-neg`), `pill-sign`, `pill-remove`, `sort-<name>`
+  (trending relevance visits favorites updated published capacity; container keeps `facet-sort`), `tag-include-<tag>` / `tag-exclude-<tag>` (tag without the `~` group prefix),
+  `cw-include-<name>` / `cw-exclude-<name>`, `status-include-<name>` / `status-exclude-<name>`, `platform-include-pc|quest` / `platform-exclude-pc|quest`, `date-hist`, `date-years`,
+  `datef-updated|published`, `date-preset-week|month|year|any`, `cap-range`, `size-range`, `syntax-help`, `detail-panel`, `no-results`. Kept: `results result-item search-input
+  facet-<name> world-card similar-list semantic-results`. Removed: `adult-toggle`, `semantic-toggle` (checkbox). `window.vrcwSearch` is unchanged (query forwards `q` verbatim).
+* **Checks**: `web/test/ui5/{launch,interact,semtest,shots,bytes}.mjs` (Playwright; Firefox 157 is installed under `/work/.tools/pw-browsers` because `~` is full, its GTK libs under
+  `/work/.tools/ffdeps/root`). `interact.mjs` = 36 real-click/drag assertions, green in Chromium and Firefox; `semtest.mjs` = toggle flow incl. dialogs recorded (none are opened).
+* **First-view bytes** (headless Chromium, localhost, with row cards): empty 2.37 MB, `?q=chill` 2.52 MB, `?q=lake -hangout` 2.90 MB (46 requests: scattered 512-world card chunks, see ROUND5-REQUESTS.md).
