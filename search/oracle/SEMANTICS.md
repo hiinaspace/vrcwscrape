@@ -60,3 +60,10 @@ and `query(q, k) -> Promise<string[] | {ids}>`, or a plain function `(q, k)` who
 Set: the 400 `cjk2en` rows of `/work/projects/vrcwscrape-data/emb/queries.parquet` (set, world_id, query); a hit is the source world_id in
 the top 10 (offline static-model number: 20.2% recall@10, MRR 12.7). Reported: download bytes (CDP delta around `load()`), load time,
 per-query latency p50/p95, recall@10 vs 20.2%. Recall is report-only: the queries derive from the indexed docs' own description text, so in-page recall is contaminated; the leak-free offline estimate is ~0.20. Graded: download <= 40 MiB, per-query p95 <= 100 ms, no errors.
+
+## Popularity, author and content-default oracles
+- Popularity: ~30 generic queries (`POP_QUERIES` in run.py); median log10(visits+1) of the site's top 10 (sort=relevance) must be >= the p75
+  of all worlds whose title or tag ILIKE-matches the query (needs >= 20 matches); PASS if >= 80% of queries do.
+- Author: 30 seeded authors with 3-150 worlds; query = exact `author_name`; share of top 10 by that author name, capped at min(10, their worlds); PASS if mean >= 0.7.
+- Content default: `query({q:"", filters:{}, sort:"published", limit:50})` must contain zero worlds tagged content_sex / content_adult.
+  Runs only when DESIGN.md documents the show-param (or `--content-default on`), else skipped.

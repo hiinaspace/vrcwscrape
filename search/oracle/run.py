@@ -8,6 +8,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
+import re
 import json
 import os
 import random
@@ -17,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+import numpy as np
 from playwright.sync_api import sync_playwright
 
 from common import DEFAULT_PARQUET, HERE, connect, script_of, tag_class
@@ -389,6 +392,112 @@ def duckdb_rows(path: str) -> list[tuple[str, str]]:
     )
 
 
+# ---------------------------------------------------------------- popularity / author / content-default
+POP_QUERIES = (
+    "horror club avatar chill pool game shrine japan sleep dance music anime quest pvp puzzle "
+    "cafe forest space city beach cozy fantasy escape maze parkour movie bar home night castle"
+).split()
+
+
+def _top_ids(page, items):
+    return [r["ids"] or [] for r in chunked(page, QUERY_JS, items)]
+
+
+def popularity_eval(page, parquet: str) -> dict:
+    """Median log10(visits+1) of the site's top 10 vs p75 of all DuckDB text matches (title/tag ILIKE)."""
+    con = connect(parquet)
+    vis = dict(con.execute("select world_id, coalesce(visits,0) from w").fetchall())
+    tops = _top_ids(
+        page, [{"q": q, "filters": {}, "sort": "relevance", "limit": 10} for q in POP_QUERIES]
+    )
+    rows, passed = [], 0
+    for q, top in zip(POP_QUERIES, tops):
+        like = "%" + q.replace("%", "") + "%"
+        match = [
+            math.log10(v + 1)
+            for (v,) in con.execute(
+                "select coalesce(visits,0) from w where name ilike ? or "
+                "list_bool_or(list_transform(tagset, t -> t ilike ?))",
+                [like, like],
+            ).fetchall()
+        ]
+        if len(match) < 20 or not top:
+            rows.append({"q": q, "skipped": f"matches={len(match)} top={len(top)}"})
+            continue
+        p75 = float(np.percentile(match, 75))
+        med = statistics.median(math.log10(vis.get(i, 0) + 1) for i in top)
+        ok = med >= p75
+        passed += ok
+        rows.append(
+            {
+                "q": q,
+                "top10_median_log10": med,
+                "match_p75_log10": p75,
+                "n_match": len(match),
+                "pass": ok,
+            }
+        )
+    graded = [r for r in rows if "pass" in r]
+    return {"n": len(graded), "passed": passed, "rate": passed / max(1, len(graded)), "rows": rows}
+
+
+def author_eval(page, parquet: str, n: int = 30, seed: int = 11) -> dict:
+    con = connect(parquet)
+    cands = con.execute(
+        "select author_name, count(*) c from w where author_name is not null and length(author_name) >= 3 "
+        "group by author_name having count(*) between 3 and 150 order by author_name"
+    ).fetchall()
+    rnd = random.Random(seed)
+    picks = rnd.sample(cands, min(n, len(cands)))
+    authored = {
+        nm: {
+            r[0]
+            for r in con.execute("select world_id from w where author_name = ?", [nm]).fetchall()
+        }
+        for nm, _ in picks
+    }
+    tops = _top_ids(
+        page, [{"q": nm, "filters": {}, "sort": "relevance", "limit": 10} for nm, _ in picks]
+    )
+    shares = []
+    for (nm, c), top in zip(picks, tops):
+        denom = min(10, c)
+        shares.append(
+            {"author": nm, "worlds": c, "share": sum(i in authored[nm] for i in top[:10]) / denom}
+        )
+    mean = statistics.mean(x["share"] for x in shares) if shares else 0.0
+    return {
+        "n": len(shares),
+        "mean_share": mean,
+        "frac_ge_0_7": sum(x["share"] >= 0.7 for x in shares) / max(1, len(shares)),
+        "worst": sorted(shares, key=lambda x: x["share"])[:5],
+    }
+
+
+DESIGN_MD = HERE.parent / "DESIGN.md"
+CONTENT_DOC_RE = re.compile(
+    r"show_?(adult|nsfw|content|all)|nsfw|hidden by default|hide_?adult", re.I
+)
+
+
+def content_default_eval(page, parquet: str, mode: str) -> dict:
+    documented = DESIGN_MD.exists() and bool(CONTENT_DOC_RE.search(DESIGN_MD.read_text()))
+    if mode == "off" or (mode == "auto" and not documented):
+        return {
+            "skipped": "default-hide / show param not documented in DESIGN.md (use --content-default on to force)"
+        }
+    top = _top_ids(page, [{"q": "", "filters": {}, "sort": "published", "limit": 50}])[0]
+    con = connect(parquet)
+    bad_ids = {
+        r[0]
+        for r in con.execute(
+            "select world_id from w where list_contains(tagset,'content_sex') or list_contains(tagset,'content_adult')"
+        ).fetchall()
+    }
+    bad = [i for i in top if i in bad_ids]
+    return {"n": len(top), "flagged": len(bad), "flagged_ids": bad[:5]}
+
+
 # ---------------------------------------------------------------- dist audit
 def dist_audit(dist: Path) -> dict:
     files = [(p, p.stat().st_size) for p in dist.rglob("*") if p.is_file()]
@@ -546,6 +655,38 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
             "jaccard >1.5x, author >=, script > random",
             s["verdict_pass"],
         )
+    pp = m.get("popularity", {})
+    if "rate" in pp:
+        add(
+            "popularity sanity (top-10 median >= match p75)",
+            f"{pp['passed']}/{pp['n']} queries ({pp['rate']:.2f})",
+            ">= 0.80",
+            pp["rate"] >= 0.8,
+        )
+    elif pp:
+        add("popularity sanity", pp.get("error", "?"), ">= 0.80", False)
+    au = m.get("authors", {})
+    if "mean_share" in au:
+        add(
+            "author-name query top-10 share",
+            f"mean {au['mean_share']:.2f}; {au['frac_ge_0_7']:.2f} of {au['n']} authors >= 0.7",
+            "mean >= 0.70",
+            au["mean_share"] >= 0.7,
+        )
+    elif au:
+        add("author-name query", au.get("error", "?"), "mean >= 0.70", False)
+    cd = m.get("content_default", {})
+    if "flagged" in cd:
+        add(
+            "default hides content_sex/adult (first 50, published)",
+            f"{cd['flagged']} flagged of {cd['n']}",
+            "0",
+            cd["flagged"] == 0,
+        )
+    elif "error" in cd:
+        add("content default check", cd["error"], "0 flagged", False)
+    elif cd:
+        add("content default check", "skipped: " + cd["skipped"], "optional", None)
     sm = m.get("semantic", {})
     if "recall_at_10" in sm:
         add(
@@ -640,6 +781,7 @@ def main() -> None:
     ap.add_argument("--dist")
     ap.add_argument("--label", default="")
     ap.add_argument("--build-time-s", type=float)
+    ap.add_argument("--content-default", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--no-shots", action="store_true")
     ap.add_argument("--runs-dir", default=str(HERE / "runs"))
     a = ap.parse_args()
@@ -676,6 +818,18 @@ def main() -> None:
                 m["similar"] = similar_eval(page, a.parquet)
             except Exception as e:  # noqa: BLE001
                 m["similar"] = {"error": f"harness error: {e}"[:300]}
+            for key, fn in (
+                ("popularity", lambda: popularity_eval(page, a.parquet)),
+                ("authors", lambda: author_eval(page, a.parquet)),
+                (
+                    "content_default",
+                    lambda: content_default_eval(page, a.parquet, a.content_default),
+                ),
+            ):
+                try:
+                    m[key] = fn()
+                except Exception as e:  # noqa: BLE001
+                    m[key] = {"error": f"harness error: {e}"[:300]}
             ctx.close()
             try:
                 m["semantic"] = semantic_eval(browser, a.url)
