@@ -44,7 +44,9 @@ export interface Card { d: string[]; t: string[][]; hp: number[][] }
 export const bytesFetched = { total: 0, requests: 0 };
 
 const base = new URL("data/", document.baseURI);
+export const dataBase = base;
 let ver = "";
+export const dataVersion = () => ver;
 
 export async function fetchBin(rel: string): Promise<Uint8Array> {
   const r = await fetch(new URL(rel, base) + (ver ? "?v=" + ver : ""));
