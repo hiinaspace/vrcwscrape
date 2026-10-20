@@ -1,0 +1,5 @@
+.venv/
+runs/
+gold/*
+!gold/queries.sample.jsonl
+__pycache__/

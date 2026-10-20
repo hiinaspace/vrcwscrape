@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>FAKE vrcw search (oracle harness self-test)</title>
+<style>body{font:14px sans-serif;margin:1em}.item{border-bottom:1px solid #ccc;padding:4px;cursor:pointer}
+#banner{background:#fc0;padding:4px;font-weight:bold}</style>
+<div id="banner">FAKE SITE - oracle self-test, not the real search</div>
+<input data-testid="search-input" id="q" placeholder="search" size="40">
+<div><span data-testid="facet-platform" id="fp"></span> | <span data-testid="facet-capacity" id="fc"></span></div>
+<div data-testid="facet-tags" id="ft"></div>
+<div>total: <b id="total">-</b></div>
+<div data-testid="results" id="results"></div>
+<div data-testid="world-card" id="card" hidden></div>
+<script>
+let W = [];
+const stripTag = t => t.replace(/^author_tag_/, "");
+function prep(w) {
+  w.tagset = [...new Set((w.tags || []).map(stripTag))].sort();
+  w.hay = (w.name + " " + (w.author || "") + " " + w.tagset.join(" ") + " " + (w.desc || "")).toLowerCase();
+  w.hasPc = w.pc != null; w.hasQuest = w.quest != null;
+}
+function matchF(w, f) {
+  if (f.cap_min != null && f.cap_min !== "" && !(w.cap >= +f.cap_min)) return false;
+  if (f.cap_max != null && f.cap_max !== "" && !(w.cap <= +f.cap_max)) return false;
+  const p = f.platform;
+  if (p === "pc" && !w.hasPc) return false;
+  if (p === "quest" && !w.hasQuest) return false;
+  if (p === "both" && !(w.hasPc && w.hasQuest)) return false;
+  if (f.size_max_mb != null && f.size_max_mb !== "") {
+    const x = +f.size_max_mb, pc = w.hasPc ? w.pc : Infinity, qu = w.hasQuest ? w.quest : Infinity;
+    if (p === "pc") { if (!(pc <= x)) return false; }
+    else if (p === "quest") { if (!(qu <= x)) return false; }
+    else if (p === "both") { if (!(pc <= x && qu <= x)) return false; }
+    else if (!(Math.min(pc, qu) <= x)) return false;
+  }
+  if (f.after && !(w.updated.slice(0, 10) >= f.after)) return false;
+  if (f.before && !(w.updated.slice(0, 10) <= f.before)) return false;
+  for (const t of f.tags || []) if (!w.tagset.includes(t)) return false;
+  if (f.author && w.author_id !== f.author) return false;
+  return true;
+}
+function runQuery({ q = "", filters = {}, sort = "relevance", limit = 20 } = {}) {
+  const t0 = performance.now();
+  const toks = q.toLowerCase().split(/\s+/).filter(Boolean);
+  let hits = W.filter(w => matchF(w, filters) && toks.every(t => w.hay.includes(t)));
+  const total = hits.length;
+  const score = w => toks.reduce((s, t) => s + (w.name.toLowerCase().includes(t) ? 10 : 0), 0) + Math.log1p(w.visits || 0) / 100;
+  const key = { relevance: score, visits: w => w.visits || 0, favorites: w => w.fav || 0,
+    updated: w => w.updated, published: w => w.created }[sort] || score;
+  hits = hits.slice().sort((a, b) => (key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0));
+  const pc = hits.filter(w => w.hasPc).length, qu = hits.filter(w => w.hasQuest).length;
+  const tags = {}, capacity = {};
+  for (const w of hits) {
+    for (const t of w.tagset) tags[t] = (tags[t] || 0) + 1;
+    if (w.cap != null) { const b = w.cap <= 8 ? "1-8" : w.cap <= 16 ? "9-16" : w.cap <= 32 ? "17-32" : w.cap <= 64 ? "33-64" : "65+"; capacity[b] = (capacity[b] || 0) + 1; }
+  }
+  const top = Object.entries(tags).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 30);
+  return { ids: hits.slice(0, limit).map(w => w.id), total,
+    facetCounts: { platform: { pc, quest: qu, both: hits.filter(w => w.hasPc && w.hasQuest).length }, tags: Object.fromEntries(top), capacity },
+    ms: performance.now() - t0, _hits: hits.slice(0, limit) };
+}
+function similar(id, k = 10) {
+  const me = W.find(w => w.id === id); if (!me) return [];
+  const s = new Set(me.tagset);
+  return W.filter(w => w.id !== id).map(w => {
+    const i = w.tagset.filter(t => s.has(t)).length, u = new Set([...w.tagset, ...me.tagset]).size || 1;
+    return [i / u + (w.author_id === me.author_id ? 0.5 : 0), w.id]; }).sort((a, b) => b[0] - a[0]).slice(0, k).map(x => x[1]);
+}
+function readUrl() {
+  const p = new URLSearchParams(location.search), f = {};
+  for (const k of ["cap_min", "cap_max", "size_max_mb", "platform", "after", "before", "author"]) if (p.get(k)) f[k] = p.get(k);
+  if (p.get("tags")) f.tags = p.get("tags").split(",");
+  return { q: p.get("q") || "", filters: f, sort: p.get("sort") || "relevance", world: p.get("world") };
+}
+function render() {
+  const s = readUrl(); document.getElementById("q").value = s.q;
+  const r = runQuery({ ...s, limit: 30 });
+  document.getElementById("total").textContent = r.total;
+  document.getElementById("fp").textContent = "platform pc " + r.facetCounts.platform.pc + " quest " + r.facetCounts.platform.quest;
+  document.getElementById("fc").textContent = "capacity " + JSON.stringify(r.facetCounts.capacity);
+  document.getElementById("ft").textContent = "tags " + Object.entries(r.facetCounts.tags).slice(0, 12).map(e => e.join(":")).join(" ");
+  const el = document.getElementById("results"); el.innerHTML = "";
+  for (const w of r._hits) {
+    const d = document.createElement("div"); d.className = "item"; d.dataset.testid = "result-item";
+    d.textContent = w.name + " - " + w.author + " (cap " + w.cap + ")";
+    d.onclick = () => { const u = new URL(location); u.searchParams.set("world", w.id); history.pushState({}, "", u); render(); };
+    el.appendChild(d);
+  }
+  const card = document.getElementById("card");
+  if (s.world) {
+    const w = W.find(x => x.id === s.world); card.hidden = !w;
+    if (w) card.innerHTML = "<h2></h2><p></p><div data-testid='similar-list'></div>",
+      card.querySelector("h2").textContent = w.name, card.querySelector("p").textContent = w.author + " | cap " + w.cap + " | " + w.updated,
+      card.querySelector("[data-testid=similar-list]").textContent = "similar: " + similar(w.id, 8).map(i => W.find(x => x.id === i).name).join(" / ");
+  } else card.hidden = true;
+}
+document.getElementById("q").addEventListener("input", e => {
+  const u = new URL(location); e.target.value ? u.searchParams.set("q", e.target.value) : u.searchParams.delete("q");
+  history.replaceState({}, "", u); render();
+});
+window.vrcwSearchReady = fetch("data.json").then(r => r.json()).then(d => {
+  W = d; W.forEach(prep);
+  window.vrcwSearch = { query: async o => { const r = runQuery(o); delete r._hits; return r; }, similar: async (id, k) => similar(id, k) };
+  render();
+});
+</script>
