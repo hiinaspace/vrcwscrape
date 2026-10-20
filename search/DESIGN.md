@@ -249,3 +249,32 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
 * **Checks**: `web/test/ui5/{launch,interact,semtest,shots,bytes}.mjs` (Playwright; Firefox 157 is installed under `/work/.tools/pw-browsers` because `~` is full, its GTK libs under
   `/work/.tools/ffdeps/root`). `interact.mjs` = 36 real-click/drag assertions, green in Chromium and Firefox; `semtest.mjs` = toggle flow incl. dialogs recorded (none are opened).
 * **First-view bytes** (headless Chromium, localhost, with row cards): empty 2.37 MB, `?q=chill` 2.52 MB, `?q=lake -hangout` 2.90 MB (46 requests: scattered 512-world card chunks, see ROUND5-REQUESTS.md).
+
+## Round 5 (engine): implementation notes and measurements
+* **API additions after the v2 stub** (all in `web/src/engine.ts`): `eng.allowMask(filters, q?)` (typed conditions included; fresh array), `eng.rowCards(idx[]) -> {desc, tags}[]`
+  (meta chunks now carry the 160-char description + visible tags, so `eng.info(idx)` returns `desc`/`tags` with no extra request), `eng.maxDay`
+  (newest `updated` day), `QueryOut.literal`. `run()`/`allowMask()` are serialised (shared scratch buffers). `WorldInfo.thumb` is always "".
+* **Evaluation**: parse -> dense per-leaf membership masks (postings decoded from the existing shards; all shards for a query are fetched in one parallel wave),
+  AND/OR/NOT = byte-mask ops, NOT is a complement then ANDed with the filter mask. Scores = field-weighted sum of positive leaves; the round-4 bonuses use the raw top-level
+  plain terms. Queries with no operators go through the unchanged round-4 path (319 gold/extra queries: identical top-10 and totals to the round-4 engine).
+  A query whose raw adjacent word pairs all occur in one world's title (`Nest -night-`, `(Fixed for`, gold titles with ` -`) is read literally (`QueryOut.literal`);
+  `-name-` (leading and trailing dash) is a plain word. Phrases: title-adjacent pair index, exact tag/author, or all words in the description (no positions in the index).
+  `size:` = the smallest available package; `tag:x` merges case/plural variants of core tags (rare tags: exact lowercase match).
+* **Filters/sorts/facets** as in "Engine API v2". One pass computes total, tag/group counts (groups counted once per world via a precomputed list of multi-variant worlds),
+  month/capacity what-if histograms (per-world failure bits per dimension) and platform what-if counts (option bits, no extra scans). The last 4 (query, filters) results are cached
+  (mask + scores), so sort changes and "load more" (`facets:false, offset`) cost ~1-2 ms. `exactTail` (rare-tag exact top-20) now defaults to on only for an empty `q`.
+* **Trending** = column `trend` in core.bin (u16, 1024*log10(1+recent visits/day), +180 KB gz). Source `recent_visits_per_day` from `worlds-2026-10-20-public-v2.parquet`
+  (window ~30 d; 181,506 worlds measured). The 16,486 worlds with `recent_basis = popularity_fallback` get the median recent rate of measured worlds with the same VRChat
+  `popularity` value. Without the v2 columns the key degrades to `popularity*5000 + heat*500` (manifest `trend.basis = "popularity_fallback"`). Ties -> more visits first.
+* **Chunk sizes**: meta 32 worlds (now with desc[0:160] + tags), card 64 worlds (full description 700 chars, for the detail panel). A scattered result page costs one ~3-5 KB meta
+  request per distinct 32-world chunk instead of 128-world meta + 512-world card chunks (was ~1 MB, now ~0.15 MB). 10,116 files, largest 6.4 MB, core.bin 2.32 MB.
+* **Thumbnails** (`build/pack_thumbs.py`, `web/src/thumbs.ts`): unique AVIFs (dedupe on sha256) stored back to back in `thumbs/p-NNN.bin` (<= 24 MiB, popularity order of first use, so the
+  popular worlds share the first packs). Lazy index: `data/thumbs_index.bin` (header) + `data/th/w<k>.bin` (4096 worlds each: blob id codes) + `data/th/b<k>.bin` (2048 blobs each: u32 lengths;
+  offsets are prefix sums per pack). A result page loads a few ~2-4 KB index shards. `thumbUrl(i)` coalesces requests made within 3 ms into one Range request per pack (gap <= 8 KB),
+  returns a cached object URL per blob; HTTP 200 to a Range request switches to whole-pack download + slicing. `manifest.thumbs.base` (default `../thumbs/`) may be an absolute URL when the
+  packs live on B2 (needs CORS: allow `Range` request header). Expected full scale: ~190k blobs x 3.7 KB = ~700 MB (does not fit Cloudflare Pages -> B2); index ~350 KB total, ~40 KB per page.
+  `vite preview` (sirv) honours Range (206 verified); headless Chromium decodes the AVIFs (naturalWidth 256). Fixture measurement (5,455 worlds, real pilot AVIFs, 24-result pages):
+  20 images = 74 KB in 10 requests (trending), 38 KB in 1 request (relevance, adjacent ordinals); waste from gap merging 3-9%.
+* **Build**: `build.sh` packs thumbs when `THUMBS` (default `/work/projects/vrcwscrape-data/thumbs/thumbs.parquet`) exists, `REUSE_DATA=<old dist/data>` reuses sim/ + sem/ for an unchanged
+  world order (full build 50-80 s). Tests: `cd web && node test/run.mjs` (bundles `test/*.test.ts` with esbuild, runs node:test against `work/r5/data`; `VRCW_DATA`, `VRCW_EXPECT` for thumbs).
+  Latency (headless Chromium on a load-17 cc-0, uncached, 24 results + facets + what-if): p50 9-42 ms, p95 40-127 ms; node: cold-cache `q=""` facets 22 ms.

@@ -24,14 +24,15 @@ import tok
 
 EPOCH = np.datetime64("2010-01-01", "D")
 N_FTS_SHARDS = 192
-META_CHUNK = 128
-CARD_CHUNK = 512
+META_CHUNK = 32
+CARD_CHUNK = 64
 TAG_SHARDS = 64
 STOP_FRAC = 0.05  # desc-only stopword threshold (fraction of docs)
 MIN_CORE_TAG = 20
 N_FLAG_TAGS = 8
 DESC_INDEX_CHARS = 1000
 DESC_STORE_CHARS = 700
+ROW_DESC = 160
 
 
 class Out:
@@ -419,6 +420,9 @@ def main() -> None:
             "n": [d["name"][i] for i in r],
             "an": [d["author_name"][i] for i in r],
             "au": [strip(d["author_id"][i], "usr_") for i in r],
+            # row-sized card data: first 160 chars of the description + visible tags, so a result row needs no card chunk
+            "d": [d["desc"][i][:ROW_DESC].replace("\n", " ") for i in r],
+            "t": [[x for x in canon_lists[i] if tag_class(x) != "hidden"] for i in r],
         }
         out.json(f"meta/{k // META_CHUNK}.bin", m)
     for k in range(0, n, CARD_CHUNK):

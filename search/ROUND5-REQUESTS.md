@@ -9,3 +9,10 @@
 3. **Optional: newest-date anchor.** The "this week/month/year" presets are relative to the newest `updated` day found by scanning `core` once in the UI; an `eng.maxDay`
    (days since 2010-01-01) would remove that scan.
 4. **Info only, no action:** with a query that matches nothing the histogram and tag bars are empty (conjunctive facets); this is correct but may look odd next to the "No worlds match" state.
+
+## ENGINE replies (2026-10-20)
+1. Done differently, cheaper: meta chunks (32 worlds) now include desc[0:160] + visible tags, so eng.info(idx) / eng.rowCards(idx) need no card chunk at all
+   (one ~4 KB request per distinct 32-world chunk). Card chunks (64 worlds, full 700-char description) are for the detail panel only. NOTE: the dist built at 16:10 still carries the UI bundle
+   compiled from the old main.ts; rebuild web after switching rows to info.desc/info.tags.
+2. Done: eng.allowMask(filters, q) (q conditions included, fresh array).
+3. Done: eng.maxDay.

@@ -24,7 +24,10 @@ export interface QueryIn {
   whatIf?: boolean; q?: string; filters?: Filters; sort?: Sort;
   /** ascending instead of the default descending (ignored for trending/relevance/text) */
   asc?: boolean;
-  limit?: number; offset?: number; exactTail?: boolean;
+  limit?: number; offset?: number;
+  /** count rare (non-core) tags exactly so facetCounts.tags has a true top-20 (oracle contract). Default: true when q is empty, false for text queries
+   *  (saves ~500 KB of tag tables on the first narrow query; the UI uses userTagList, which is always exact for core tags) */
+  exactTail?: boolean;
   /** skip facet counting (paging / "load more"); total is still exact */
   facets?: boolean;
   /** number of entries in facetCounts.userTagList (default 40) */
@@ -78,7 +81,10 @@ const NONE = 0xffffffff;
 const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 9, W_DESC = 0.4;
 const F_TITLE = 1, F_AUTHOR = 2, F_TAG = 4, F_DESC = 8, F_ANY = 15;
 // per-world filter failure bits (filterMask)
-const X_CAP = 1, X_PUB = 2, X_UPD = 4, X_REST = 8;
+const X_CAP = 1, X_PUB = 2, X_UPD = 4, X_REST = 8, X_PS = 16; // X_PS: platform + size condition under the chosen platform
+const MAIN = X_CAP | X_PUB | X_UPD | X_REST | X_PS;
+// what-if bits (only filled when requested): the platform+size condition would fail if the platform option were any/pc/quest/both
+const O_ANY = 32, O_PC = 64, O_Q = 128, O_BOTH = 256;
 
 /** a set of tags matching "any of": flag bits, core tag ids and/or a per-world mask (rare tags) */
 interface TagSel { fm: number; csr: number[]; mask: Uint8Array | null }
@@ -110,12 +116,13 @@ export class Engine {
   private cnt!: Uint8Array;
   private tw!: Float32Array;
   private mask!: Uint8Array;
-  private fail!: Uint8Array;
+  private fail!: Uint16Array;
   private pool8: Uint8Array[] = [];
   private poolF: Float32Array[] = [];
   private lowerTags: Map<string, number[]> | null = null;
   private grpId!: Int16Array; // core tag id -> merged-group index, -1 none
   private grpKeys: string[] = [];
+  private dupW: number[] = []; // flat triples (world, group, extra)
   private monC!: Uint16Array; // month index of created (0 = unknown)
   private monU!: Uint16Array;
   allTags: Promise<[string, number][]> | null = null;
@@ -150,11 +157,23 @@ export class Engine {
       if (gi === undefined) { gi = this.grpKeys.length; gidx.set(g, gi); this.grpKeys.push("~" + g); }
       this.grpId[i] = gi;
     });
+    // worlds carrying two or more variants of one merged tag group (counted once per group in facets): (world, group, extra copies)
+    {
+      const { flags, tagOff, tagIds } = c, nfl = this.m.flagTags, gc = new Uint16Array(this.grpKeys.length), touched: number[] = [];
+      for (let i = 0; i < n; i++) {
+        touched.length = 0;
+        const bump = (t: number) => { const g = this.grpId[t]; if (g >= 0) { if (gc[g]++ === 0) touched.push(g); } };
+        const fb = flags[i];
+        if (fb) for (let b = 0; b < nfl; b++) if (fb & (1 << b)) bump(b);
+        for (let j = tagOff[i]; j < tagOff[i + 1]; j++) bump(tagIds[j]);
+        for (const g of touched) { if (gc[g] > 1) this.dupW.push(i, g, gc[g] - 1); gc[g] = 0; }
+      }
+    }
     this.sc = new Float32Array(n);
     this.cnt = new Uint8Array(n);
     this.tw = new Float32Array(n);
     this.mask = new Uint8Array(n);
-    this.fail = new Uint8Array(n);
+    this.fail = new Uint16Array(n);
     // month tables
     const monOfDay = new Uint16Array(65536);
     {
@@ -173,6 +192,7 @@ export class Engine {
       if (a > 0) { this.monC[i] = monOfDay[a]; mn = Math.min(mn, this.monC[i]); mx = Math.max(mx, this.monC[i]); }
       if (b > 0) { this.monU[i] = monOfDay[b]; mn = Math.min(mn, this.monU[i]); mx = Math.max(mx, this.monU[i]); }
     }
+    for (let i = 0; i < n; i++) if (c.updated[i] > this.maxDay) this.maxDay = c.updated[i];
     this.months = mn <= mx ? { min: mn, max: mx } : { min: 0, max: 0 };
     if (this.m.trend) { this.trend = { basis: this.m.trend.basis, windowDays: this.m.trend.windowDays }; this.trendScale = this.m.trend.scale; }
     if (this.m.thumbs) { this.thumbs = new Thumbs(this.m); this.hasThumbs = true; }
@@ -275,7 +295,7 @@ export class Engine {
 
   // ---------------------------------------------------------------- filters
   /** per-world failure bits (0 = passes every filter). Shared buffer: consume before the next call. */
-  private async filterMask(f: Filters): Promise<{ fail: Uint8Array; any: boolean }> {
+  private async filterMask(f: Filters, whatIf = false): Promise<{ fail: Uint16Array; any: boolean }> {
     const c = this.c, n = c.n, fail = this.fail;
     const capLo = f.cap_min ?? -1, capHi = f.cap_max ?? 1e9;
     const useCap = f.cap_min !== undefined || f.cap_max !== undefined;
@@ -307,7 +327,7 @@ export class Engine {
       for (const i of await authorWorlds(f.author)) authorMask[i] = 1;
     }
     const any = useCap || lim >= 0 || !!plat || !!platEx || useUpd || usePub || req.length > 0 || forbid.length > 0 || !!authorMask;
-    if (!any) { fail.fill(0); return { fail, any }; }
+    if (!any && !whatIf) { fail.fill(0); return { fail, any }; }
     const { cap, pc, quest, plat: pl, updated, created, flags, tagOff, tagIds } = c;
     const hit = (s: TagSel, i: number) => {
       if ((flags[i] & s.fm) !== 0 || (s.mask !== null && s.mask[i] === 1)) return true;
@@ -320,23 +340,28 @@ export class Engine {
       if (useCap && (cap[i] < capLo || cap[i] > capHi)) fl |= X_CAP;
       if (usePub && (created[i] < pLo || created[i] > pHi)) fl |= X_PUB;
       if (useUpd && (updated[i] < uLo || updated[i] > uHi)) fl |= X_UPD;
-      if (plat) {
-        const p = pl[i];
-        if (plat === "pc" ? !(p & 1) : plat === "quest" ? !(p & 2) : p !== 3) fl |= X_REST;
-      }
       if (platEx && (pl[i] & platEx)) fl |= X_REST;
-      if (lim >= 0) {
-        const okPc = pc[i] <= lim || (rem > 0 && pc[i] === lim + 1 && loPc![i] < rem);
-        const okQ = quest[i] <= lim || (rem > 0 && quest[i] === lim + 1 && loQ![i] < rem);
-        let ok: boolean;
-        if (plat === "pc") ok = okPc;
-        else if (plat === "quest") ok = okQ;
-        else if (plat === "both") ok = okPc && okQ;
-        else ok = okPc || okQ;
-        if (!ok) fl |= X_REST;
+      {
+        const p = pl[i];
+        let okPc = true, okQ = true;
+        if (lim >= 0) {
+          okPc = pc[i] <= lim || (rem > 0 && pc[i] === lim + 1 && loPc![i] < rem);
+          okQ = quest[i] <= lim || (rem > 0 && quest[i] === lim + 1 && loQ![i] < rem);
+        }
+        // platform option -> passes? (platform presence AND size under that option)
+        const passAny = okPc || okQ || lim < 0;
+        const passPc = (p & 1) !== 0 && okPc, passQ = (p & 2) !== 0 && okQ, passBoth = p === 3 && okPc && okQ;
+        const cur = plat === "pc" ? passPc : plat === "quest" ? passQ : plat === "both" ? passBoth : passAny;
+        if (!cur) fl |= X_PS;
+        if (whatIf) {
+          if (!passAny) fl |= O_ANY;
+          if (!passPc) fl |= O_PC;
+          if (!passQ) fl |= O_Q;
+          if (!passBoth) fl |= O_BOTH;
+        }
       }
       if (authorMask && !authorMask[i]) fl |= X_REST;
-      if (!(fl & X_REST)) {
+      if (!(fl & X_REST) && (req.length || forbid.length)) {
         for (let k = 0; k < req.length; k++) if (!hit(req[k], i)) { fl |= X_REST; break; }
         if (!(fl & X_REST)) for (let k = 0; k < forbid.length; k++) if (hit(forbid[k], i)) { fl |= X_REST; break; }
       }
@@ -418,6 +443,8 @@ export class Engine {
 
   // ---------------------------------------------------------------- query-language evaluation
   private ranked = false;
+  /** last few (query, filters) results: sort changes and paging reuse the final mask and scores instead of re-evaluating */
+  private cache: { key: string; total: number; mask: Uint8Array; sc: Float32Array | null; textRanked: boolean; literal: boolean; parse: ParseResult; facets: FacetCounts | null }[] = [];
 
   private leafToks(text: string): Tok[] {
     let toks = tokens(text);
@@ -627,18 +654,9 @@ export class Engine {
     return !!acc && acc.size > 0;
   }
 
-  // ---------------------------------------------------------------- run
-  async run(inp: QueryIn): Promise<QueryOut> {
-    const t0 = performance.now();
-    const q = inp.q ?? "";
-    const f = inp.filters ?? {};
-    const sort: Sort = inp.sort ?? "relevance";
-    const limit = Math.max(0, inp.limit ?? 50), offset = Math.max(0, inp.offset ?? 0);
-    const doFacets = inp.facets !== false;
-    const parse = parseQuery(q);
-    const c = this.c, n = c.n;
-
-    // --- text condition -> tm (null = none), scores in this.sc
+  /** text/operator part of a query as a mask (pooled array, caller frees; null = no constraint); scores land in this.sc */
+  private async textMask(q: string, parse: ParseResult): Promise<{ tm: Uint8Array | null; textRanked: boolean; literal: boolean }> {
+    const n = this.c.n;
     let tm: Uint8Array | null = null;
     let textRanked = false, literal = false;
     if (q.trim()) {
@@ -657,7 +675,44 @@ export class Engine {
         }
       }
     }
-    const { fail } = await this.filterMask(f);
+    return { tm, textRanked, literal };
+  }
+
+  // ---------------------------------------------------------------- run
+  /** queries share scratch buffers, so run()/allowMask() are serialised */
+  private lock: Promise<unknown> = Promise.resolve();
+  private serial<T>(f: () => Promise<T>): Promise<T> {
+    const p = this.lock.then(f, f);
+    this.lock = p.catch(() => undefined);
+    return p;
+  }
+
+  run(inp: QueryIn): Promise<QueryOut> { return this.serial(() => this.runInner(inp)); }
+
+  private async runInner(inp: QueryIn): Promise<QueryOut> {
+    const t0 = performance.now();
+    const q = inp.q ?? "";
+    const f = inp.filters ?? {};
+    const sort: Sort = inp.sort ?? "relevance";
+    const limit = Math.max(0, inp.limit ?? 50), offset = Math.max(0, inp.offset ?? 0);
+    const doFacets = inp.facets !== false;
+    const c = this.c, n = c.n;
+    const key = JSON.stringify([q, f, inp.tagLimit ?? 40, inp.exactTail ?? !q.trim()]);
+    const hit = this.cache.findIndex((e) => e.key === key);
+    if (hit >= 0) {
+      const e = this.cache[hit];
+      if (!doFacets || (e.facets && (!inp.whatIf || e.facets.platformIf))) {
+        if (hit > 0) { this.cache.splice(hit, 1); this.cache.unshift(e); }
+        const idx = this.topK(sort, e.textRanked, limit + offset, e.total, !!inp.asc, e.mask, e.sc ?? this.sc).slice(offset);
+        const fc = doFacets ? { ...e.facets! } : this.emptyFacets();
+        return { idx, total: e.total, facetCounts: fc, ms: performance.now() - t0, parse: e.parse, textRanked: e.textRanked, literal: e.literal };
+      }
+    }
+    const parse = parseQuery(q);
+
+    // --- text condition -> tm (null = none), scores in this.sc
+    const { tm, textRanked, literal } = await this.textMask(q, parse);
+    const { fail } = await this.filterMask(f, !!inp.whatIf && doFacets);
     const mask = this.mask;
     mask.fill(0);
 
@@ -666,18 +721,18 @@ export class Engine {
     const nf = this.m.flagTags, nt = this.tagKeys.length;
     const tagCnt = new Uint32Array(nt);
     const ng = this.grpKeys.length;
-    const gcnt = new Uint32Array(ng), gst = new Int32Array(ng);
+    const gcnt = new Uint32Array(ng);
     const capB = [0, 0, 0, 0, 0];
     let pcN = 0, qN = 0, bothN = 0;
     const m0 = this.months.min, span = this.months.max - m0 + 1;
     const mon = new Uint32Array(span), monU = new Uint32Array(span), capH = new Uint32Array(256);
     const { plat, flags, tagOff, tagIds, cap } = c;
-    const grpId = this.grpId, monC = this.monC, monUa = this.monU;
+    const monC = this.monC, monUa = this.monU;
     for (let i = 0; i < n; i++) {
       const fl = fail[i];
-      if (fl & X_REST) continue;
+      if (fl & (X_REST | X_PS)) continue;
       if (tm !== null && !tm[i]) continue;
-      if (fl === 0) {
+      if ((fl & MAIN) === 0) {
         mask[i] = 1;
         total++;
         if (!doFacets) continue;
@@ -685,35 +740,28 @@ export class Engine {
         if (p & 1) pcN++;
         if (p & 2) qN++;
         if (p === 3) bothN++;
-        const stamp = i + 1;
         const fb = flags[i];
-        if (fb) for (let b = 0; b < nf; b++) if (fb & (1 << b)) {
-          tagCnt[b]++;
-          const g = grpId[b];
-          if (g >= 0 && gst[g] !== stamp) { gst[g] = stamp; gcnt[g]++; }
-        }
-        for (let j = tagOff[i]; j < tagOff[i + 1]; j++) {
-          const t = tagIds[j];
-          tagCnt[t]++;
-          const g = grpId[t];
-          if (g >= 0 && gst[g] !== stamp) { gst[g] = stamp; gcnt[g]++; }
-        }
+        if (fb) for (let b = 0; b < nf; b++) if (fb & (1 << b)) tagCnt[b]++;
+        for (let j = tagOff[i], e2 = tagOff[i + 1]; j < e2; j++) tagCnt[tagIds[j]]++;
         const cp = cap[i];
         if (cp >= 1) capB[cp <= 8 ? 0 : cp <= 16 ? 1 : cp <= 32 ? 2 : cp <= 64 ? 3 : 4]++;
       }
       if (!doFacets) continue;
       // what-if histograms: every filter except the histogram's own dimension
-      if ((fl & ~X_PUB) === 0 && monC[i]) mon[monC[i] - m0]++;
-      if ((fl & ~X_UPD) === 0 && monUa[i]) monU[monUa[i] - m0]++;
-      if ((fl & ~X_CAP) === 0) capH[cap[i]]++;
+      if ((fl & MAIN & ~X_PUB) === 0 && monC[i]) mon[monC[i] - m0]++;
+      if ((fl & MAIN & ~X_UPD) === 0 && monUa[i]) monU[monUa[i] - m0]++;
+      if ((fl & MAIN & ~X_CAP) === 0) capH[cap[i]]++;
     }
 
     let facetCounts: FacetCounts;
     if (doFacets) {
+      // merged group counts = sum of member counts minus worlds that carry several members (each world counts once per group)
+      for (let t = 0; t < nt; t++) { const g = this.grpId[t]; if (g >= 0) gcnt[g] += tagCnt[t]; }
+      for (let k = 0; k < this.dupW.length; k += 3) if (mask[this.dupW[k]]) gcnt[this.dupW[k + 1]] -= this.dupW[k + 2];
       const order = Array.from({ length: nt }, (_, i) => i).filter((i) => tagCnt[i] > 0)
         .sort((a, b) => tagCnt[b] - tagCnt[a] || (this.tagKeys[a] < this.tagKeys[b] ? -1 : 1)).slice(0, 60);
       let tagEntries: [string, number][] = order.map((i) => [this.tagKeys[i], tagCnt[i]]);
-      if (inp.exactTail !== false && total > 0 && (tagEntries.length < 20 || tagEntries[19][1] < this.m.minCoreTag)) {
+      if ((inp.exactTail ?? !q.trim()) && total > 0 && (tagEntries.length < 20 || tagEntries[19][1] < this.m.minCoreTag)) {
         // the 20th core count is below the vocabulary cutoff: rare tags could tie/overtake, count them exactly
         const { r, keys } = await this.ensureRare();
         const extra = new Map<number, number>();
@@ -738,32 +786,42 @@ export class Engine {
         months: { m0, counts: Array.from(mon) }, updatedMonths: { m0, counts: Array.from(monU) }, capacityHist: Array.from(capH),
       };
     } else {
-      facetCounts = {
-        platform: { pc: 0, quest: 0, both: 0 }, tags: {}, capacity: {}, status: {}, cw: {}, userTags: {}, userTagList: [],
-        months: { m0, counts: [] }, updatedMonths: { m0, counts: [] }, capacityHist: [],
-      };
+      facetCounts = this.emptyFacets();
     }
     // --- top-k
-    const idx = this.topK(sort, textRanked, limit + offset, total, !!inp.asc).slice(offset);
-    if (inp.whatIf && doFacets) {
+    const idx = this.topK(sort, textRanked, limit + offset, total, !!inp.asc, mask, this.sc).slice(offset);
+    if (inp.whatIf && doFacets) { // what-if platform counts, computed from the option bits of the same pass (mask is already final)
       const pi = { any: 0, pc: 0, quest: 0, both: 0 };
-      for (const p of ["", "pc", "quest", "both"] as const) {
-        const { fail: f2 } = await this.filterMask({ ...f, platform: p });
-        let k = 0;
-        for (let i = 0; i < n; i++) if (f2[i] === 0 && (!tm || tm[i])) k++;
-        pi[p || "any"] = k;
+      const base = X_CAP | X_PUB | X_UPD | X_REST;
+      for (let i = 0; i < n; i++) {
+        const fl = fail[i];
+        if ((fl & base) !== 0 || (tm !== null && !tm[i])) continue;
+        if (!(fl & O_ANY)) pi.any++;
+        if (!(fl & O_PC)) pi.pc++;
+        if (!(fl & O_Q)) pi.quest++;
+        if (!(fl & O_BOTH)) pi.both++;
       }
       facetCounts.platformIf = pi;
     }
     this.free8(tm);
+    this.cache.unshift({ key, total, mask: mask.slice(), sc: textRanked ? this.sc.slice() : null, textRanked, literal, parse, facets: doFacets ? { ...facetCounts } : null });
+    if (this.cache.length > 4) this.cache.pop();
     return { idx, total, facetCounts, ms: performance.now() - t0, parse, textRanked, literal };
+  }
+
+  private emptyFacets(): FacetCounts {
+    const m0 = this.months.min;
+    return {
+      platform: { pc: 0, quest: 0, both: 0 }, tags: {}, capacity: {}, status: {}, cw: {}, userTags: {}, userTagList: [],
+      months: { m0, counts: [] }, updatedMonths: { m0, counts: [] }, capacityHist: [],
+    };
   }
 
   /** v2 entry point (alias of run) */
   query(inp: QueryIn): Promise<QueryOut> { return this.run(inp); }
 
-  private topK(sort: Sort, hasText: boolean, k: number, total: number, asc: boolean): number[] {
-    const { mask, c, sc, prior } = this as any as { mask: Uint8Array; c: Core; sc: Float32Array; prior: Float32Array };
+  private topK(sort: Sort, hasText: boolean, k: number, total: number, asc: boolean, mask: Uint8Array, sc: Float32Array): number[] {
+    const c = this.c, prior = this.prior;
     const n = c.n;
     k = Math.min(k, total);
     if (!k) return [];
@@ -811,13 +869,24 @@ export class Engine {
     return out.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, limit);
   }
 
-  /** filter-only eligibility mask (no text): fresh array, 1 = allowed */
-  async allowMask(f: Filters): Promise<Uint8Array> {
+  /** eligibility mask (1 = allowed) for filters AND, when q is given, every condition of the typed query (operators, fields, terms). Fresh array. */
+  allowMask(f: Filters, q = ""): Promise<Uint8Array> { return this.serial(() => this.allowMaskInner(f, q)); }
+  private async allowMaskInner(f: Filters, q: string): Promise<Uint8Array> {
+    const { tm } = await this.textMask(q, parseQuery(q));
     const { fail } = await this.filterMask(f);
     const out = new Uint8Array(this.c.n);
-    for (let i = 0; i < out.length; i++) out[i] = fail[i] === 0 ? 1 : 0;
+    for (let i = 0; i < out.length; i++) out[i] = (fail[i] & MAIN) === 0 && (tm === null || tm[i] === 1) ? 1 : 0;
+    this.free8(tm);
     return out;
   }
+
+  /** row-sized card data for a result page: description prefix (160 chars) + visible tags; comes with the meta chunk, no extra request */
+  async rowCards(idx: number[]): Promise<{ desc: string; tags: string[] }[]> {
+    return (await worldInfo(this.m, idx)).map((w) => ({ desc: w.desc, tags: w.tags }));
+  }
+
+  /** newest `updated` day (days since 2010-01-01) */
+  maxDay = 0;
 
   async similar(idx: number, k: number) { return similarIdx(idx, k); }
   idToIdx = idToIdx;

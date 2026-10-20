@@ -212,3 +212,27 @@ test("hook-style: window.vrcwSearch contract fields", async () => {
   assert.ok(r.facetCounts.platform && r.facetCounts.tags && r.facetCounts.capacity);
   assert.ok(Object.keys(r.facetCounts.tags).length >= 20);
 });
+
+test("allowMask(filters, q) honours typed conditions; rowCards come with the meta chunk", async () => {
+  const m = await e.allowMask({}, "cap:>=16 -tag:game");
+  let k = 0; for (let i = 0; i < m.length; i++) k += m[i];
+  assert.equal(k, await total("cap:>=16 -tag:game"));
+  const m2 = await e.allowMask({ platform: "quest" }, "");
+  let k2 = 0; for (let i = 0; i < m2.length; i++) k2 += m2[i];
+  assert.equal(k2, await total("", { filters: { platform: "quest" } }));
+  const rc = await e.rowCards([0, 1, 5000]);
+  assert.equal(rc.length, 3);
+  assert.ok(rc[0].tags.length > 0 && rc[0].desc.length <= 160);
+  assert.ok(e.maxDay > 5000);
+});
+
+test("cache: sort change / paging reuse the evaluated query", async () => {
+  const a = await Q("lake -hangout ", { sort: "relevance", limit: 10 });
+  const b = await Q("lake -hangout ", { sort: "updated", limit: 10, facets: false });
+  const c = await Q("lake -hangout ", { sort: "relevance", limit: 10, offset: 5, facets: false });
+  assert.deepEqual(c.idx, a.idx.slice(5).concat([]).slice(0, 5).length ? (await Q("lake -hangout ", { limit: 15 })).idx.slice(5) : []);
+  assert.equal(a.total, b.total);
+  assert.ok(b.ms < a.ms + 5);
+  const fresh = await e.query({ q: "lake -hangout ", sort: "updated", limit: 10, filters: { cap_min: 0 } });
+  assert.deepEqual(fresh.idx, b.idx);
+});

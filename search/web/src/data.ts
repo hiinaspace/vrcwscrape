@@ -38,7 +38,7 @@ export interface Core {
   tagIds: Uint16Array;
 }
 
-export interface Meta { id: string[]; n: string[]; an: string[]; au: string[] }
+export interface Meta { id: string[]; n: string[]; an: string[]; au: string[]; d?: string[]; t?: string[][] }
 export interface Card { d: string[]; t: string[][]; hp: number[][] }
 
 export const bytesFetched = { total: 0, requests: 0 };
@@ -131,7 +131,7 @@ export async function metaFor(m: Manifest, idx: number[]): Promise<Meta[]> {
 }
 
 /** `thumb` is always "" (deprecated, kept for compatibility): use Engine.thumbUrl(idx) */
-export interface WorldInfo { id: string; name: string; author: string; authorId: string; thumb: string }
+export interface WorldInfo { id: string; name: string; author: string; authorId: string; thumb: string; /** first 160 chars of the description */ desc: string; /** visible tags (user, status, content warnings; hidden system/admin tags dropped) */ tags: string[] }
 export async function worldInfo(m: Manifest, idxs: number[]): Promise<WorldInfo[]> {
   const ks = [...new Set(idxs.map((i) => Math.floor(i / m.metaChunk)))];
   const chunks = new Map<number, Meta>();
@@ -139,7 +139,7 @@ export async function worldInfo(m: Manifest, idxs: number[]): Promise<WorldInfo[
   return idxs.map((i) => {
     const c = chunks.get(Math.floor(i / m.metaChunk))!;
     const j = i % m.metaChunk;
-    return { id: "wrld_" + c.id[j], name: c.n[j], author: c.an[j], authorId: "usr_" + c.au[j], thumb: "" };
+    return { id: "wrld_" + c.id[j], name: c.n[j], author: c.an[j], authorId: "usr_" + c.au[j], thumb: "", desc: c.d?.[j] ?? "", tags: c.t?.[j] ?? [] };
   });
 }
 
