@@ -29,8 +29,13 @@ MAX_TITLE = 48
 F_TITLE, F_AUTHOR, F_TAG, F_DESC = 1, 2, 4, 8
 
 
+# VRChat titles use lookalike punctuation that NFKC leaves alone (and some of it is a *letter* to the tokenizer): fold to ASCII.
+# Keep in sync with CONFUSABLES in web/src/tok.ts. NFKC already handles fullwidth ASCII and U+2024.
+CONFUSABLES = str.maketrans({"\u01c3": "!", "\ua4f8": ".", "\ua4f9": ",", "\ua4fc": ";", "\ua4fd": ":", "\u201a": ",", "\u2024": "."})
+
+
 def norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s).lower()
+    return unicodedata.normalize("NFKC", s).lower().translate(CONFUSABLES)
 
 
 def title_key(s: str) -> str:

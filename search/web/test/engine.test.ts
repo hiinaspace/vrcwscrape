@@ -3,6 +3,7 @@ import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import "./shim.mjs";
 import { Engine, QueryIn } from "../src/engine";
+import { tokens, norm } from "../src/tok";
 
 let e: Engine;
 before(async () => { e = await new Engine().init(); });
@@ -265,4 +266,23 @@ test("CJK a -b subtracts the negated term and keeps description matches", async 
     assert.equal(D, A - B, a);
   }
   assert.ok((await T("ール")) > 10000); // description-only matches count (no CJK stopword dropping)
+});
+
+test("author: is the whole author name (case-insensitive); author:x* is a word prefix", async () => {
+  const top = await e.info(Array.from({ length: 400 }, (_, i) => i));
+  const a = top.find((w) => /^[A-Za-z]{5,}$/.test(w.author))!;
+  const exact = await ids(`author:${a.author.toUpperCase()}`);
+  assert.ok(exact.length >= 1 && exact.includes(top.indexOf(a)));
+  for (const w of await e.info(exact)) assert.equal(norm(w.author), norm(a.author));
+  const short = a.author.slice(0, 3);
+  const pre = await total(`author:${short}*`), ex = await total(`author:${short}`);
+  assert.ok(pre > ex, `${short}: prefix ${pre} vs exact ${ex}`);
+  assert.equal(await total(`author:"${a.author}"`), exact.length);
+  assert.equal(await total("author:usr_00000000-0000-0000-0000-000000000000"), 0);
+});
+
+test("lookalike punctuation folds to ASCII in the tokenizer", () => {
+  assert.deepEqual(tokens("Trustsǃ Shiny").map((t) => t.term), ["trusts", "shiny"]);
+  assert.equal(norm("a\ua4f8b\u201ac\u01c3"), "a.b,c!");
+  assert.deepEqual(tokens("ＡＢＣ１２３").map((t) => t.term), ["abc123"]);
 });

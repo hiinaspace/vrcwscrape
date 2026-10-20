@@ -206,7 +206,7 @@ facets stay conjunctive (counted over the final result set). `ms` includes parse
 * `"quoted phrase"`: title-adjacent words (title pair index), or the exact tag / author name, or all words in the description. Single quoted word = exact word, no prefix expansion.
 * A plain term matches any indexed field (title, author, tags, description) with the site tokenizer (CJK bigrams). The last plain term of the query is prefix-expanded
   while the text has no trailing space (as-you-type), positive or negative.
-* Fields: `tag:x` (exact tag, case/plural-merged; `tag:"escape room"`), `title:x`, `author:x` (name words, or `usr_...` id), `cw:x` (content_x), `status:approved|labs`,
+* Fields: `tag:x` (exact tag, case/plural-merged; `tag:"escape room"`), `title:x`, `author:x` (the WHOLE author name, case-insensitive, punctuation-insensitive: `author:jar` does not match Jared; `author:jar*` = any author word starting with jar; `author:"some name"`; or a `usr_...` id), `cw:x` (content_x), `status:approved|labs`,
   `platform:pc|quest|both`. Numeric: `cap:>=16`, `cap:8..32`, `size:<50` (MB, any platform), `visits:>1000` (k/m suffix ok), `favorites:>=50` (`favs`).
   Dates: `updated:>=2025`, `published:2024-06`, `published:2023..2024-06` (YYYY, YYYY-MM, YYYY-MM-DD; periods expand to their first/last day).
 * Pure negative queries (`-hangout`) = all worlds minus the matches. Empty/incomplete conditions (`tag:`) are ignored while typing.
@@ -284,3 +284,9 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   or when all the words occur in the first 1000 characters of the description. The index has no description positions, so a description-only hit is "all words present", not verified adjacent, and text beyond 1000 chars is not indexed at all.
 * **CJK bigrams are no longer description stopwords** (`ール` appears in over 5% of descriptions, so it used to match title/author/tag only: 2.9k worlds instead of 14.7k, which broke `ール -game`). Only the 19 latin stopwords are dropped now.
 * Chunk size trade-off: 32-world meta chunks give 6,188 files (dist 10,116 files, CF limit 20k) and `cozy hangout` cold = 3.02 MB; 64-world chunks would halve the files but add about 0.12 MB to a scattered page (over 3 MiB), so they stay at 32.
+
+### Round 5e (engine)
+* `author:x` is exact (whole name, case-insensitive) unless it ends with `*` (word prefix). `tag:x` was already exact (case-insensitive, case/plural-merged core variants); `title:x` stays word match, prefix-expanded only as the last term of the query.
+  Pill labels show the value as typed (`author: jar*`).
+* Tokenizer folds lookalike punctuation (`ǃ`->`!`, `ꓸ`->`.`, `ꓹ`->`,`, `ꓼ`->`;`, `ꓽ`->`:`, `‚`->`,`, U+2024->`.`) after NFKC (which already maps fullwidth ASCII) in both index and query (`norm` in tok.py/tok.ts).
+  319-query regression after the change: 17 queries gained 1-6 matches, none lost any, no top-1 changed.

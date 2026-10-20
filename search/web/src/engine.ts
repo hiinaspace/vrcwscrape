@@ -561,7 +561,10 @@ export class Engine {
               for (const i of await authorWorlds(node.value)) out[i] = 1;
               return out;
             }
-            return this.tokenAnd(this.leafToks(node.value), node === lastLeaf, F_AUTHOR, pos);
+            if (node.value.endsWith("*")) return this.tokenAnd(this.leafToks(node.value.slice(0, -1)), true, F_AUTHOR, pos); // author:jar* = word prefix
+            // default: the whole author name, case-insensitive (author:jar does not match Jared)
+            const key = titleKey(node.value);
+            return key ? this.markerMask(AUTHOR_MARK + key, 80, pos) : null;
           }
         }
         return null;
@@ -599,7 +602,12 @@ export class Engine {
           for (let i = 0; i + 1 < ws.length; i++) out.add(WP_MARK + ws[i] + " " + ws[i + 1]);
         }
         break;
-      case "field": if (node.field === "title" || (node.field === "author" && !/^usr_/.test(node.value))) toks(node.value); break;
+      case "field":
+        if (node.field === "title") toks(node.value);
+        else if (node.field === "author" && !/^usr_/.test(node.value)) {
+          if (node.value.endsWith("*")) toks(node.value.slice(0, -1)); else { const k = titleKey(node.value); if (k) out.add(AUTHOR_MARK + k); }
+        }
+        break;
       case "not": this.collectTerms(node.c, out); break;
       case "and": case "or": node.c.forEach((c) => this.collectTerms(c, out)); break;
     }
@@ -608,7 +616,7 @@ export class Engine {
   private lastTermNode(node: Node, end: number): Node | null {
     switch (node.t) {
       case "term": return !node.phrase && node.end === end ? node : null;
-      case "field": return (node.field === "title" || node.field === "author") && node.end === end ? node : null;
+      case "field": return node.field === "title" && node.end === end ? node : null;
       case "not": return this.lastTermNode(node.c, end);
       case "and": case "or": for (let i = node.c.length - 1; i >= 0; i--) { const r = this.lastTermNode(node.c[i], end); if (r) return r; } return null;
     }

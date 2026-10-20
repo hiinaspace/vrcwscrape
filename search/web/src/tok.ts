@@ -13,7 +13,10 @@ export const WP_MARK = "\u0005";
 const MAX_WORD = 32;
 const MAX_TITLE = 48;
 
-export const norm = (s: string) => s.normalize("NFKC").toLowerCase();
+// lookalike punctuation that NFKC leaves alone (some are letters to the tokenizer): fold to ASCII; keep in sync with CONFUSABLES in build/tok.py
+const CONFUSABLES: Record<string, string> = { "\u01c3": "!", "\ua4f8": ".", "\ua4f9": ",", "\ua4fc": ";", "\ua4fd": ":", "\u201a": ",", "\u2024": "." };
+const CONF_RE = /[\u01c3\ua4f8\ua4f9\ua4fc\ua4fd\u201a\u2024]/g;
+export const norm = (s: string) => s.normalize("NFKC").toLowerCase().replace(CONF_RE, (c) => CONFUSABLES[c]);
 
 export function titleKey(s: string): string {
   return Array.from(norm(s).replace(NONWORD, " ").trim()).slice(0, MAX_TITLE).join("").trim();
