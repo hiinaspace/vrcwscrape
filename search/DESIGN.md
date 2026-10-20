@@ -280,8 +280,7 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   Latency (headless Chromium on a load-17 cc-0, uncached, 24 results + facets + what-if): p50 9-42 ms, p95 40-127 ms; node: cold-cache `q=""` facets 22 ms.
 
 ### Round 5c (engine): phrase and CJK fixes
-* **Phrase ** matches a world when the words are adjacent inside one title, author name or tag (punctuation ignored: , ; new index terms , ~+2 MB of fts), or when all the words occur in the first
-  1000 characters of the description. The index has no description positions, so a description-only hit is "all words present", not verified adjacent, and text beyond 1000 chars is not indexed at all.
-* **CJK bigrams are no longer description stopwords** ( appears in >5% of descriptions, so it used to match title/author/tag only: 2.9k worlds instead of 14.7k, which broke ).
-  Only latin stopwords (19) are dropped now.
-* Chunk size trade-off: 32-world meta chunks give 6,188 files (dist 10,116 files, CF limit 20k) and  cold = 3.02 MB; 64-world chunks would halve the files but add ~0.12 MB to a scattered page (> 3 MiB), so they stay at 32.
+* **Phrase `"two words"`** matches a world when the words are adjacent inside one title, author name or tag (punctuation ignored: `Mario_Kart`, `Mario Kart:`; new index terms `\u0005 w1 w2`, about +2 MB of fts),
+  or when all the words occur in the first 1000 characters of the description. The index has no description positions, so a description-only hit is "all words present", not verified adjacent, and text beyond 1000 chars is not indexed at all.
+* **CJK bigrams are no longer description stopwords** (`ール` appears in over 5% of descriptions, so it used to match title/author/tag only: 2.9k worlds instead of 14.7k, which broke `ール -game`). Only the 19 latin stopwords are dropped now.
+* Chunk size trade-off: 32-world meta chunks give 6,188 files (dist 10,116 files, CF limit 20k) and `cozy hangout` cold = 3.02 MB; 64-world chunks would halve the files but add about 0.12 MB to a scattered page (over 3 MiB), so they stay at 32.
