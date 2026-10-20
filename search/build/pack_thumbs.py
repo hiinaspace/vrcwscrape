@@ -15,7 +15,7 @@ Index (all little endian; every file gzip'd and magic-sniffed like the other pay
                                 ceil(nWorlds/WS) x u32 maxBlobBefore (-1 as 0xFFFFFFFF); ceil(nBlobs/BS) x u32 offsetOfFirstBlobInItsPack
   <index-dir>/th/w<k>.bin       world shard k (WS worlds): u32 codes as 4 byte planes. 0 = next fresh blob, 1 = no thumbnail,
                                 c >= 2 = an already-used blob: (maxSeen - (c - 2))
-  <index-dir>/th/b<k>.bin       blob shard k (BS blobs): u16 lengths as 2 byte planes
+  <index-dir>/th/b<k>.bin       blob shard k (BS blobs): u32 lengths as 4 byte planes (rare AVIFs exceed 64 KiB)
 Blobs are stored back to back inside a pack in blob-id order; a blob's offset is the prefix sum of lengths from the pack's first blob
 (reset to 0 at each pack boundary). Blob ids are assigned in order of first use by world ordinal (= popularity), so the popular worlds
 live in the first shards/packs and a result page touches only a handful of tiny shards.
@@ -103,8 +103,6 @@ def main() -> None:
         b = blob_of.get(s)
         if b is None:
             data = avif[s]
-            if len(data) > 0xFFFF:
-                raise SystemExit(f"thumbnail {s} is {len(data)} bytes; index stores u16 lengths")
             if len(cur) + len(data) > limit:
                 flush()
             b = len(lens)
@@ -144,7 +142,7 @@ def main() -> None:
         (idx_dir / "th" / f"w{k}.bin").write_bytes(d)
         shard_bytes += len(d)
     for k in range(nbs):
-        d = gzip.compress(planes(np.array(lens[k * BS_ : (k + 1) * BS_], dtype=np.uint16)), 9, mtime=0)
+        d = gzip.compress(planes(np.array(lens[k * BS_ : (k + 1) * BS_], dtype=np.uint32)), 9, mtime=0)
         (idx_dir / "th" / f"b{k}.bin").write_bytes(d)
         shard_bytes += len(d)
     total = sum(nb for _, nb in packs)

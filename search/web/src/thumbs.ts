@@ -66,17 +66,17 @@ export class Thumbs {
   }
 
   /** (length, offset-in-pack) of every blob in blob shard k */
-  private blobShard(h: Head, k: number): Promise<{ len: Uint16Array; off: Uint32Array }> {
+  private blobShard(h: Head, k: number): Promise<{ len: Uint32Array; off: Uint32Array }> {
     return cached("thb" + k, async () => {
       const buf = await fetchBin(`th/b${k}.bin`);
-      const cnt = buf.length >> 1;
-      const len = new Uint16Array(cnt), off = new Uint32Array(cnt);
+      const cnt = buf.length >> 2;
+      const len = new Uint32Array(cnt), off = new Uint32Array(cnt);
       const first = k * h.bs;
       let o = h.bsBase[k], pi = h.packFirst.findIndex((f, j) => f <= first && (j + 1 >= h.nPacks || h.packFirst[j + 1] > first));
       for (let i = 0; i < cnt; i++) {
         const b = first + i;
         if (pi + 1 < h.nPacks && b === h.packFirst[pi + 1]) { pi++; o = 0; }
-        len[i] = buf[i] | (buf[cnt + i] << 8);
+        len[i] = (buf[i] | (buf[cnt + i] << 8) | (buf[2 * cnt + i] << 16) | (buf[3 * cnt + i] << 24)) >>> 0;
         off[i] = o;
         o += len[i];
       }
