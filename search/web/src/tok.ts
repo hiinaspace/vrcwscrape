@@ -8,6 +8,8 @@ export const TITLE_MARK = "\u0001";
 export const TAG_MARK = "\u0002";
 export const PAIR_MARK = "\u0003";
 export const AUTHOR_MARK = "\u0004";
+/** adjacent word pair inside one title / author / tag, punctuation ignored (phrase queries) */
+export const WP_MARK = "\u0005";
 const MAX_WORD = 32;
 const MAX_TITLE = 48;
 
@@ -40,7 +42,7 @@ export function tokens(text: string): Tok[] {
 }
 
 export function shardKey(term: string): string {
-  if (term[0] === TITLE_MARK || term[0] === TAG_MARK || term[0] === PAIR_MARK || term[0] === AUTHOR_MARK) term = term.slice(1);
+  if (term[0] === TITLE_MARK || term[0] === TAG_MARK || term[0] === PAIR_MARK || term[0] === AUTHOR_MARK || term[0] === WP_MARK) term = term.slice(1);
   return Array.from(term).slice(0, 2).join("");
 }
 
@@ -57,3 +59,14 @@ export const shardOf = (term: string, n: number) => fnv1a(shardKey(term)) % n;
 
 /** whitespace pieces of the normalized text, punctuation kept (mirrors tok.pieces) */
 export const pieces = (text: string, maxn = 10): string[] => norm(text).split(/\s+/).filter(Boolean).slice(0, maxn).map((w) => Array.from(w).slice(0, 24).join(""));
+
+/** normalized words as the phrase operator sees them: latin word or whole CJK run, punctuation dropped (mirrors tok.words) */
+export function words(text: string, maxn = 24): string[] {
+  const out: string[] = [];
+  TOK.lastIndex = 0;
+  for (const m of norm(text).matchAll(TOK)) {
+    out.push(Array.from(m[1] !== undefined ? m[1] : m[2]).slice(0, MAX_WORD).join(""));
+    if (out.length >= maxn) break;
+  }
+  return out;
+}

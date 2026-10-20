@@ -14,13 +14,15 @@ import regex
 CJK = "々-〇぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿가-힯\U00020000-\U0002fa1f"
 WORD = r"[\p{L}\p{N}\p{M}]"
 _TOK = regex.compile(rf"([{CJK}]+)|((?:(?![{CJK}]){WORD})+)")
+_CJK_ANY = regex.compile(f"[{CJK}]")
 _NONWORD = regex.compile(rf"[^\p{{L}}\p{{N}}\p{{M}}]+")
 
 TITLE_MARK = "\u0001"
 TAG_MARK = "\u0002"
 PAIR_MARK = "\u0003"
 AUTHOR_MARK = "\u0004"
-MARKS = (TITLE_MARK, TAG_MARK, PAIR_MARK, AUTHOR_MARK)
+WP_MARK = "\u0005"  # adjacent word pair inside one title / author / tag (punctuation ignored): phrase queries
+MARKS = (TITLE_MARK, TAG_MARK, PAIR_MARK, AUTHOR_MARK, WP_MARK)
 MAX_WORD = 32
 MAX_TITLE = 48
 
@@ -39,6 +41,20 @@ def title_key(s: str) -> str:
 def pieces(text: str, maxn: int = 10) -> list[str]:
     """whitespace pieces of the normalized (punctuation kept) title, for adjacent-pair terms"""
     return [w[:24] for w in norm(text).split()[:maxn]]
+
+
+def words(text: str, maxn: int = 24) -> list[str]:
+    """normalized words (latin word or whole CJK run, punctuation dropped), as the phrase operator sees them"""
+    out = []
+    for m in _TOK.finditer(norm(text)):
+        out.append((m.group(1) if m.group(1) is not None else m.group(2))[:MAX_WORD])
+        if len(out) >= maxn:
+            break
+    return out
+
+
+def is_cjk(term: str) -> bool:
+    return _CJK_ANY.search(term) is not None
 
 
 def tokens(text: str, unigrams: bool) -> list[str]:

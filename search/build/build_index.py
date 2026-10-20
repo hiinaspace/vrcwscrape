@@ -330,6 +330,10 @@ def main() -> None:
         ak = tok.title_key(d["author_name"][i])
         if ak:
             emit(tok.AUTHOR_MARK + ak, i, tok.F_AUTHOR)
+        for fld, txt in ((tok.F_TITLE, d["name"][i]), (tok.F_AUTHOR, d["author_name"][i])):
+            ws = tok.words(txt)
+            for a_, b_ in zip(ws, ws[1:]):
+                emit(tok.WP_MARK + a_ + " " + b_, i, fld)
         pcs = tok.pieces(d["name"][i])
         for a_, b_ in zip(pcs, pcs[1:]):
             emit(tok.PAIR_MARK + a_ + " " + b_, i, tok.F_TITLE)
@@ -339,6 +343,9 @@ def main() -> None:
                 continue
             for tm in tok.tokens(c, True):
                 emit(tm, i, tok.F_TAG)
+            ws = tok.words(c)
+            for a_, b_ in zip(ws, ws[1:]):
+                emit(tok.WP_MARK + a_ + " " + b_, i, tok.F_TAG)
             if cl == "user":
                 tk_ = tok.title_key(c)
                 if tk_:
@@ -364,15 +371,16 @@ def main() -> None:
     nterms = len(tid)
     # stopwords: terms frequent in descriptions
     dfd = np.bincount(T[(M & 8) > 0], minlength=nterms)
-    stop_ids = np.flatnonzero(dfd > STOP_FRAC * n)
+    terms = [None] * nterms
+    for s, i in tid.items():
+        terms[i] = s
+    # CJK bigrams are never description stopwords (ー/ル fragments are common in katakana, but a CJK-only query must still match descriptions)
+    stop_ids = np.array([t for t in np.flatnonzero(dfd > STOP_FRAC * n) if not tok.is_cjk(terms[int(t)])], dtype=np.int64)
     isstop = np.zeros(nterms, dtype=bool)
     isstop[stop_ids] = True
     M = np.where(isstop[T], M & ~np.uint8(8), M)
     keep = M > 0
     T, D, M = T[keep], D[keep], M[keep]
-    terms = [None] * nterms
-    for s, i in tid.items():
-        terms[i] = s
     stop_terms = sorted(terms[i] for i in stop_ids)
     print(f"stopwords (desc-dropped): {len(stop_terms)}; postings kept {len(T)}")
     # group boundaries (T is sorted ascending already)

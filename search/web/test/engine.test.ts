@@ -236,3 +236,33 @@ test("cache: sort change / paging reuse the evaluated query", async () => {
   const fresh = await e.query({ q: "lake -hangout ", sort: "updated", limit: 10, filters: { cap_min: 0 } });
   assert.deepEqual(fresh.idx, b.idx);
 });
+
+test("phrases: adjacent words in a title/author/tag (punctuation ignored) or all words in the description", async () => {
+  const wordsOf = (t: string) => t.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? [];
+  const adjacent = (t: string, a: string, b: string) => { const w = wordsOf(t); return w.some((x, i) => x === a && w[i + 1] === b); };
+  for (const [a, b] of [["mario", "kart"], ["particle", "live"], ["escape", "room"]]) {
+    const phrase = await set(`"${a} ${b}"`);
+    const and = await ids(`${a} ${b} `);
+    assert.ok(phrase.size > 0 && phrase.size <= and.length, `${a} ${b}`);
+    const infos = await e.info(and);
+    let missed = 0;
+    infos.forEach((w, k) => {
+      const hit = adjacent(w.name, a, b) || adjacent(w.author, a, b) || w.tags.some((t) => adjacent(t, a, b));
+      if (hit && !phrase.has(and[k])) missed++;
+    });
+    assert.equal(missed, 0, `${a} ${b}: title/author/tag adjacency must be in the phrase set`);
+  }
+  // punctuation between the words does not break the phrase
+  const inf = await e.info(Array.from({ length: 128 * 60 }, (_, i) => i));
+  const w = inf.find((x) => /^[A-Za-z]+[_\-][A-Za-z]+$/.test(x.name));
+  if (w) { const [a, b] = wordsOf(w.name); assert.ok((await set(`"${a} ${b}"`)).size > 0); }
+  assert.equal(await total('"zzqq xxyy"'), 0);
+});
+
+test("CJK a -b subtracts the negated term and keeps description matches", async () => {
+  for (const a of ["ール", "ワー", "ルド", "神社"]) {
+    const A = await T(a), B = await T(`${a} game`), D = await T(`${a} -game`);
+    assert.equal(D, A - B, a);
+  }
+  assert.ok((await T("ール")) > 10000); // description-only matches count (no CJK stopword dropping)
+});

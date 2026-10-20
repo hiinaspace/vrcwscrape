@@ -2,7 +2,7 @@ import {
   Core, Manifest, Shard, TITLE_MARK, authorWorlds, fetchJson, forEachPosting, getShard, idToIdx, loadCore,
   loadManifest, lowerBound, loadRare, loadSizeLo, Rare, worldInfo, similarIdx, cached,
 } from "./data";
-import { AUTHOR_MARK, PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
+import { AUTHOR_MARK, PAIR_MARK, TAG_MARK, WP_MARK, Tok, norm, pieces, titleKey, tokens, words } from "./tok";
 import { Node, parseQuery } from "./query";
 import type { ParseResult } from "./query";
 import { Thumbs } from "./thumbs";
@@ -485,27 +485,23 @@ export class Engine {
 
   private async evalPhrase(text: string, pos: boolean): Promise<Uint8Array | null> {
     const toks = this.leafToks(text);
-    const pcs = pieces(text);
-    const all = await this.tokenAnd(toks, false, F_ANY, pos);
-    if (!all || pcs.length <= 1) return all;
-    const tk = titleKey(text);
+    const ws = words(text);
+    if (ws.length <= 1) return this.tokenAnd(toks, false, F_ANY, pos); // one word: exact (no prefix)
     const n = this.c.n;
+    // adjacent words inside one title / author name / tag (punctuation ignored), or all the words in the description
+    // (the index has no description positions, so a description match is "all words present", not verified adjacent)
     const adj = this.u8();
     adj.fill(1);
-    for (let i = 0; i + 1 < pcs.length; i++) {
-      const pm = await this.markerMask(PAIR_MARK + pcs[i] + " " + pcs[i + 1], 30, pos);
+    for (let i = 0; i + 1 < ws.length; i++) {
+      const pm = await this.markerMask(WP_MARK + ws[i] + " " + ws[i + 1], 30, pos);
       for (let d = 0; d < n; d++) adj[d] &= pm[d];
       this.free8(pm);
     }
-    // exact tag / author phrase and description words (no positions in the index: all words in the description field)
-    const tagM = tk ? await this.markerMask(TAG_MARK + tk, 0, false) : null;
-    const autM = tk ? await this.markerMask(AUTHOR_MARK + tk, 0, false) : null;
     const desc = await this.tokenAnd(toks, false, F_DESC, false);
-    for (let d = 0; d < n; d++) {
-      const ok = adj[d] || (tagM && tagM[d]) || (autM && autM[d]) || (desc && desc[d]);
-      if (!ok) all[d] = 0;
-    }
-    this.free8(adj); this.free8(tagM); this.free8(autM); this.free8(desc);
+    const all = await this.tokenAnd(toks, false, F_ANY, pos); // scores
+    if (!all) { this.free8(adj); this.free8(desc); return null; }
+    for (let d = 0; d < n; d++) if (all[d] && !(adj[d] || (desc && desc[d]))) all[d] = 0;
+    this.free8(adj); this.free8(desc);
     return all;
   }
 
@@ -599,9 +595,8 @@ export class Engine {
       case "term":
         toks(node.text);
         if (node.phrase) {
-          const pcs = pieces(node.text), tk = titleKey(node.text);
-          for (let i = 0; i + 1 < pcs.length; i++) out.add(PAIR_MARK + pcs[i] + " " + pcs[i + 1]);
-          if (tk) { out.add(TAG_MARK + tk); out.add(AUTHOR_MARK + tk); }
+          const ws = words(node.text);
+          for (let i = 0; i + 1 < ws.length; i++) out.add(WP_MARK + ws[i] + " " + ws[i + 1]);
         }
         break;
       case "field": if (node.field === "title" || (node.field === "author" && !/^usr_/.test(node.value))) toks(node.value); break;
