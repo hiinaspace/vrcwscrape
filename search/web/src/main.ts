@@ -1,0 +1,288 @@
+import "./style.css";
+import { Engine, Filters, QueryIn, Sort, FacetCounts, dateOfDay } from "./engine";
+import { bytesFetched, cardChunk, WorldInfo } from "./data";
+
+declare global {
+  interface Window { vrcwSearch: any; vrcwSearchReady: Promise<any>; vrcwStats: any }
+}
+
+interface State {
+  q: string; cap_min?: number; cap_max?: number; size_max_mb?: number; platform: "" | "pc" | "quest" | "both";
+  after: string; before: string; tags: string[]; author: string; sort: Sort; world: string;
+}
+
+const $ = <T extends HTMLElement>(s: string) => document.querySelector(s) as T;
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
+const num = (v: string | null) => (v === null || v === "" || isNaN(+v) ? undefined : +v);
+const SORTS: Sort[] = ["relevance", "visits", "favorites", "updated", "published"];
+
+function readUrl(): State {
+  const p = new URLSearchParams(location.search);
+  const sort = p.get("sort") as Sort;
+  const pf = p.get("platform");
+  return {
+    q: p.get("q") ?? "", cap_min: num(p.get("cap_min")), cap_max: num(p.get("cap_max")), size_max_mb: num(p.get("size_max_mb")),
+    platform: pf === "pc" || pf === "quest" || pf === "both" ? pf : "",
+    after: p.get("after") ?? "", before: p.get("before") ?? "",
+    tags: (p.get("tags") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    author: p.get("author") ?? "", sort: SORTS.includes(sort) ? sort : "relevance", world: p.get("world") ?? "",
+  };
+}
+function toUrl(s: State): string {
+  const p = new URLSearchParams();
+  if (s.q) p.set("q", s.q);
+  if (s.cap_min !== undefined) p.set("cap_min", String(s.cap_min));
+  if (s.cap_max !== undefined) p.set("cap_max", String(s.cap_max));
+  if (s.size_max_mb !== undefined) p.set("size_max_mb", String(s.size_max_mb));
+  if (s.platform) p.set("platform", s.platform);
+  if (s.after) p.set("after", s.after);
+  if (s.before) p.set("before", s.before);
+  if (s.tags.length) p.set("tags", s.tags.join(","));
+  if (s.author) p.set("author", s.author);
+  if (s.sort !== "relevance") p.set("sort", s.sort);
+  if (s.world) p.set("world", s.world);
+  const q = p.toString();
+  return location.pathname + (q ? "?" + q : "");
+}
+const filtersOf = (s: State): Filters => ({
+  cap_min: s.cap_min, cap_max: s.cap_max, size_max_mb: s.size_max_mb, platform: s.platform, after: s.after || undefined,
+  before: s.before || undefined, tags: s.tags, author: s.author || undefined,
+});
+const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+const kb = (v: number) => (v === 0xffffffff ? "–" : v >= 1024 ? (v / 1024).toFixed(v >= 10240 ? 0 : 1) + " MB" : v + " KB");
+
+const eng = new Engine();
+let state = readUrl();
+let shown = 24;
+let seq = 0;
+let facetsBuilt = false;
+
+let resolveReady!: (v: any) => void;
+window.vrcwSearchReady = new Promise((r) => (resolveReady = r));
+window.vrcwStats = bytesFetched;
+
+function normFilters(f: any): Filters {
+  const o: Filters = { ...f };
+  if (typeof (f?.tags) === "string") o.tags = (f.tags as string).split(",").filter(Boolean);
+  for (const k of ["cap_min", "cap_max", "size_max_mb"] as const) if (o[k] === null || (o[k] as any) === "") delete o[k];
+  return o;
+}
+
+function setStatus(t: string) { $("#status").textContent = t; }
+
+async function boot() {
+  const t0 = performance.now();
+  setStatus("loading index…");
+  // start the text shard early so it overlaps with core column download
+  await eng.init();
+  const info = {
+    query: async (inp: QueryIn) => {
+      const t1 = performance.now();
+      const r = await eng.run({ q: inp.q ?? "", filters: normFilters(inp.filters ?? {}), sort: inp.sort ?? "relevance", limit: inp.limit ?? 50 });
+      const infos = await eng.info(r.idx);
+      return { ids: infos.map((i) => i.id), total: r.total, facetCounts: r.facetCounts, ms: Math.round((performance.now() - t1) * 100) / 100 };
+    },
+    similar: async (worldId: string, k = 20) => {
+      const i = await eng.idToIdx(worldId);
+      if (i === undefined) return [];
+      const nb = await eng.similar(i, k);
+      return (await eng.info(nb)).map((x) => x.id);
+    },
+  };
+  window.vrcwSearch = info;
+  buildFacets();
+  await refresh();
+  setStatus(`${eng.c.n.toLocaleString()} worlds · ready in ${Math.round(performance.now() - t0)} ms`);
+  resolveReady(info);
+  if (state.world) openCard(state.world, false);
+}
+
+// ---------------- UI
+function commit(push = false) {
+  const u = toUrl(state);
+  if (u !== location.pathname + location.search) (push ? history.pushState : history.replaceState).call(history, null, "", u);
+}
+
+let timer: any;
+function onChange(debounce = 0) {
+  clearTimeout(timer);
+  timer = setTimeout(() => { shown = 24; commit(); refresh(); }, debounce);
+}
+
+async function refresh() {
+  const my = ++seq;
+  const r = await eng.run({ q: state.q, filters: filtersOf(state), sort: state.sort, limit: shown, exactTail: false });
+  if (my !== seq) return;
+  const infos = await eng.info(r.idx);
+  if (my !== seq) return;
+  renderResults(r.idx, infos, r.total, r.ms);
+  renderFacets(r.facetCounts, r.total);
+}
+
+function renderResults(idx: number[], infos: WorldInfo[], total: number, ms: number) {
+  const c = eng.c;
+  $("#summary").textContent = `${total.toLocaleString()} worlds · ${ms.toFixed(0)} ms`;
+  const ol = $("#results");
+  ol.innerHTML = idx.map((i, j) => {
+    const w = infos[j];
+    const sizes = [c.plat[i] & 1 ? "PC " + kb(c.pc[i]) : "", c.plat[i] & 2 ? "Quest " + kb(c.quest[i]) : ""].filter(Boolean).join(" · ");
+    const thumb = w.thumb
+      ? `<img loading="lazy" decoding="async" src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">`
+      : `<div class="ph" style="--h:${(parseInt(w.id.slice(5, 9), 16) % 360) || 0}"></div>`;
+    return `<li data-testid="result-item" data-id="${esc(w.id)}"><a href="?world=${esc(w.id)}" class="thumb">${thumb}</a>
+      <div class="body"><a class="title" href="?world=${esc(w.id)}">${esc(w.name || "(untitled)")}</a>
+      <div class="by">${esc(w.author)}</div>
+      <div class="facts">cap ${c.cap[i]} · ${fmt(c.visits[i])} visits · ${fmt(c.fav[i])} ♥ · ${sizes || "no package"} · upd ${dateOfDay(c.updated[i])}</div></div></li>`;
+  }).join("");
+  ($("#more") as HTMLButtonElement).hidden = idx.length >= total;
+}
+
+$("#results").addEventListener("click", (e) => {
+  const a = (e.target as HTMLElement).closest("a[href^='?world=']") as HTMLAnchorElement | null;
+  if (!a || (e as MouseEvent).ctrlKey || (e as MouseEvent).metaKey) return;
+  e.preventDefault();
+  openCard(a.getAttribute("href")!.slice(7), true);
+});
+$("#more").addEventListener("click", () => { shown += 24; refresh(); });
+
+// facets
+function buildFacets() {
+  const f = $("#facets");
+  const s = state;
+  f.innerHTML = `
+  <section data-testid="facet-sort"><h3>Sort</h3><select id="f-sort">${SORTS.map((x) => `<option ${x === s.sort ? "selected" : ""}>${x}</option>`).join("")}</select></section>
+  <section data-testid="facet-platform"><h3>Platform</h3><div class="seg" id="f-plat">${["", "pc", "quest", "both"].map((p) => `<button data-v="${p}" class="${p === s.platform ? "on" : ""}">${p || "any"}<small></small></button>`).join("")}</div></section>
+  <section data-testid="facet-capacity"><h3>Capacity</h3><div class="row"><input id="f-capmin" type="number" min="0" placeholder="min" value="${s.cap_min ?? ""}"><span>–</span><input id="f-capmax" type="number" min="0" placeholder="max" value="${s.cap_max ?? ""}"></div><div id="capbars" class="bars"></div></section>
+  <section data-testid="facet-size"><h3>Download size ≤ (MB)</h3><div class="row"><input id="f-size" type="number" min="0" step="1" placeholder="any" value="${s.size_max_mb ?? ""}"><input id="f-sizer" type="range" min="0" max="500" step="5" value="${s.size_max_mb ?? 500}"></div></section>
+  <section data-testid="facet-date"><h3>Updated</h3><div class="row"><input id="f-after" type="date" value="${s.after}"><span>–</span><input id="f-before" type="date" value="${s.before}"></div></section>
+  <section data-testid="facet-author"><h3>Author</h3><div id="f-author"></div></section>
+  <section data-testid="facet-tags"><h3>Tags</h3><div id="f-sel" class="chips"></div><input id="f-tagq" type="search" placeholder="find tag…" autocomplete="off"><div id="f-tagres" class="chips found"></div><ul id="f-tags" class="taglist"></ul></section>
+  <button id="f-reset" class="reset">Reset filters</button>`;
+  const q = $<HTMLInputElement>("#q");
+  q.value = s.q;
+  q.addEventListener("input", () => { state.q = q.value; onChange(90); });
+  $("#f-sort").addEventListener("change", (e) => { state.sort = (e.target as HTMLSelectElement).value as Sort; onChange(); });
+  $("#f-plat").addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest("button"); if (!b) return;
+    state.platform = b.dataset.v as State["platform"]; markPlat(); onChange();
+  });
+  const numIn = (id: string, key: "cap_min" | "cap_max" | "size_max_mb") =>
+    $<HTMLInputElement>(id).addEventListener("input", (e) => { state[key] = num((e.target as HTMLInputElement).value); if (key === "size_max_mb") $<HTMLInputElement>("#f-sizer").value = String(state[key] ?? 500); onChange(150); });
+  numIn("#f-capmin", "cap_min"); numIn("#f-capmax", "cap_max"); numIn("#f-size", "size_max_mb");
+  $("#f-sizer").addEventListener("input", (e) => {
+    const v = +(e.target as HTMLInputElement).value;
+    state.size_max_mb = v >= 500 ? undefined : v; $<HTMLInputElement>("#f-size").value = state.size_max_mb === undefined ? "" : String(v); onChange(60);
+  });
+  $("#f-after").addEventListener("change", (e) => { state.after = (e.target as HTMLInputElement).value; onChange(); });
+  $("#f-before").addEventListener("change", (e) => { state.before = (e.target as HTMLInputElement).value; onChange(); });
+  $("#f-reset").addEventListener("click", () => {
+    state = { ...state, cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", after: "", before: "", tags: [], author: "" };
+    syncInputs(); onChange();
+  });
+  $("#f-tags").addEventListener("click", (e) => {
+    const li = (e.target as HTMLElement).closest("li[data-t]") as HTMLElement | null; if (li) toggleTag(li.dataset.t!);
+  });
+  $("#f-sel").addEventListener("click", (e) => { const b = (e.target as HTMLElement).closest("[data-t]") as HTMLElement | null; if (b) toggleTag(b.dataset.t!); });
+  $("#f-tagres").addEventListener("click", (e) => { const b = (e.target as HTMLElement).closest("[data-t]") as HTMLElement | null; if (b) { toggleTag(b.dataset.t!); $<HTMLInputElement>("#f-tagq").value = ""; $("#f-tagres").innerHTML = ""; } });
+  $("#f-author").addEventListener("click", (e) => { if ((e.target as HTMLElement).closest("button")) { state.author = ""; onChange(); } });
+  $("#f-tagq").addEventListener("input", async (e) => {
+    const v = (e.target as HTMLInputElement).value.trim().toLowerCase().replace(/\s+/g, "_");
+    if (!v) { $("#f-tagres").innerHTML = ""; return; }
+    const all = await eng.tagsAll();
+    const hits = all.filter(([k]) => k.includes(v)).sort((a, b) => (+b[0].startsWith(v) - +a[0].startsWith(v)) || b[1] - a[1]).slice(0, 14);
+    $("#f-tagres").innerHTML = hits.map(([k, n]) => `<button data-t="${esc(k)}">${esc(k)} <small>${n}</small></button>`).join("") || "<em>no tags</em>";
+  });
+  window.addEventListener("popstate", () => { state = readUrl(); syncInputs(); refresh(); if (state.world) openCard(state.world, false); else closeCard(false); });
+  $("#more");
+  facetsBuilt = true;
+}
+function markPlat() { document.querySelectorAll("#f-plat button").forEach((b) => b.classList.toggle("on", (b as HTMLElement).dataset.v === state.platform)); }
+function syncInputs() {
+  const set = (id: string, v: any) => ($<HTMLInputElement>(id).value = v ?? "");
+  set("#q", state.q); set("#f-capmin", state.cap_min); set("#f-capmax", state.cap_max); set("#f-size", state.size_max_mb);
+  set("#f-sizer", state.size_max_mb ?? 500); set("#f-after", state.after); set("#f-before", state.before); set("#f-sort", state.sort);
+  markPlat();
+}
+function toggleTag(t: string) {
+  const i = state.tags.indexOf(t);
+  if (i >= 0) state.tags.splice(i, 1); else state.tags.push(t);
+  onChange();
+}
+
+let authorLabelFor = "";
+async function renderFacets(fc: FacetCounts, total: number) {
+  if (!facetsBuilt) return;
+  const plat = $("#f-plat").querySelectorAll("button");
+  const pc = [total, fc.platform.pc, fc.platform.quest, fc.platform.both];
+  plat.forEach((b, i) => (b.querySelector("small")!.textContent = " " + fmt(pc[i])));
+  const mx = Math.max(1, ...Object.values(fc.capacity));
+  $("#capbars").innerHTML = Object.entries(fc.capacity).map(([k, v]) => `<div title="${k}: ${v}"><i style="height:${Math.round((v / mx) * 100)}%"></i><b>${k}</b></div>`).join("");
+  $("#f-sel").innerHTML = state.tags.map((t) => `<button data-t="${esc(t)}" class="on">${esc(t)} ✕</button>`).join("");
+  $("#f-tags").innerHTML = Object.entries(fc.tags).filter(([k]) => !state.tags.includes(k)).slice(0, 30)
+    .map(([k, v]) => `<li data-t="${esc(k)}"><span>${esc(k)}</span><small>${fmt(v)}</small></li>`).join("");
+  const fa = $("#f-author");
+  if (!state.author) { fa.textContent = "any (click an author on a world card)"; authorLabelFor = ""; }
+  else if (authorLabelFor !== state.author) {
+    authorLabelFor = state.author;
+    const idx = (await import("./data")).authorWorlds(state.author);
+    const first = (await idx)[0];
+    const name = first === undefined ? state.author : (await eng.info([first]))[0].author;
+    fa.innerHTML = `<button class="on">${esc(name)} ✕</button>`;
+  }
+}
+
+// ---------------- world card
+let cardSeq = 0;
+async function openCard(id: string, push: boolean) {
+  const my = ++cardSeq;
+  state.world = id;
+  if (push) commit(true);
+  const idx = await eng.idToIdx(id);
+  const root = $("#card-root");
+  if (idx === undefined) { root.innerHTML = `<div class="overlay"><div class="card" data-testid="world-card"><button class="x">✕</button><p>World not found: ${esc(id)}</p></div></div>`; wireClose(); return; }
+  const [w] = await eng.info([idx]);
+  const c = eng.c;
+  const cc = await cardChunk(Math.floor(idx / eng.m.cardChunk));
+  if (my !== cardSeq) return;
+  const j = idx % eng.m.cardChunk;
+  const tags = cc.t[j] ?? [];
+  const row = (k: string, v: string) => `<tr><th>${k}</th><td>${v}</td></tr>`;
+  root.innerHTML = `<div class="overlay"><article class="card" data-testid="world-card" data-id="${esc(w.id)}">
+    <button class="x" aria-label="close">✕</button>
+    <div class="hero">${w.thumb ? `<img src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">` : `<div class="ph" style="--h:${parseInt(w.id.slice(5, 9), 16) % 360}"></div>`}</div>
+    <h2>${esc(w.name)}</h2>
+    <p class="by">by <a href="#" id="c-author">${esc(w.author)}</a> · <a href="https://vrchat.com/home/world/${esc(w.id)}" target="_blank" rel="noopener">open on vrchat.com ↗</a></p>
+    <table>${row("Capacity", String(c.cap[idx]))}${row("Visits", c.visits[idx].toLocaleString())}${row("Favorites", c.fav[idx].toLocaleString())}
+      ${row("Heat / popularity", `${cc.hp[j]?.[0] ?? 0} / ${cc.hp[j]?.[1] ?? 0}`)}
+      ${row("PC package", c.plat[idx] & 1 ? kb(c.pc[idx]) : "none")}${row("Quest package", c.plat[idx] & 2 ? kb(c.quest[idx]) : "none")}
+      ${row("Published", dateOfDay(c.created[idx]))}${row("Updated", dateOfDay(c.updated[idx]))}${row("World id", `<code>${esc(w.id)}</code>`)}</table>
+    <div class="chips">${tags.map((t) => `<button data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
+    <p class="desc">${esc(cc.d[j] ?? "")}</p>
+    <h3>Similar worlds</h3><ol data-testid="similar-list" class="similar"><li class="dim">loading…</li></ol></article></div>`;
+  wireClose();
+  $("#c-author").addEventListener("click", (e) => { e.preventDefault(); state.author = w.authorId; closeCard(true); syncInputs(); onChange(); });
+  root.querySelectorAll(".chips [data-t]").forEach((b) => b.addEventListener("click", () => { const t = (b as HTMLElement).dataset.t!; if (!state.tags.includes(t)) state.tags.push(t); closeCard(true); onChange(); }));
+  const nb = await eng.similar(idx, 20);
+  const list = $("[data-testid=similar-list]");
+  if (my !== cardSeq) return;
+  if (!nb.length) { list.innerHTML = `<li class="dim">no neighbor data for this world</li>`; return; }
+  const infos = await eng.info(nb);
+  list.innerHTML = infos.map((x) => `<li data-id="${esc(x.id)}"><a href="?world=${esc(x.id)}">${esc(x.name)}</a> <small>${esc(x.author)}</small></li>`).join("");
+  list.addEventListener("click", (e) => {
+    const a = (e.target as HTMLElement).closest("a"); if (!a) return;
+    e.preventDefault(); openCard(a.getAttribute("href")!.slice(7), true);
+  });
+}
+function wireClose() {
+  const ov = $(".overlay");
+  ov.addEventListener("click", (e) => { if (e.target === ov || (e.target as HTMLElement).closest(".x")) closeCard(true); });
+}
+function closeCard(push: boolean) {
+  cardSeq++;
+  state.world = "";
+  $("#card-root").innerHTML = "";
+  if (push) commit(true);
+}
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.world) closeCard(true); });
+
+boot().catch((e) => { console.error(e); setStatus("failed to load: " + e.message); });
