@@ -14,8 +14,12 @@ export interface Manifest {
   minCoreTag: number;
   flagTags: number;
   sizeUnit: number;
+  /** legacy hotlink config, always null since round 5 (no CDN URLs) */
   thumb: { prefix: string; suffix: string } | null;
   hasThumb: boolean;
+  trend?: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null; scale: number; measured: number; fallbackRows?: number };
+  /** self-hosted AVIF packs (build/pack_thumbs.py); null when not built */
+  thumbs?: { base: string; packs: number; count: number; index: string; bytes: number } | null;
 }
 
 export interface Core {
@@ -27,13 +31,14 @@ export interface Core {
   updated: Uint16Array;
   visits: Uint32Array;
   fav: Uint32Array;
+  trend: Uint16Array | null; // round(scale*log10(1+recent visits/day)); null in pre-round-5 builds
   plat: Uint8Array; // bit0 pc, bit1 quest
   flags: Uint8Array; // top flagTags tags as bits
   tagOff: Uint32Array; // CSR offsets (n+1)
   tagIds: Uint16Array;
 }
 
-export interface Meta { id: string[]; n: string[]; an: string[]; au: string[]; th?: string[] }
+export interface Meta { id: string[]; n: string[]; an: string[]; au: string[] }
 export interface Card { d: string[]; t: string[][]; hp: number[][] }
 
 export const bytesFetched = { total: 0, requests: 0 };
@@ -105,7 +110,7 @@ export async function loadCore(m: Manifest): Promise<Core> {
   for (let i = 0; i < n; i++) tagOff[i + 1] = tagOff[i] + tc[i];
   return {
     n, cap: col.cap, pc: col.pc, quest: col.quest, created: col.created, updated: col.updated,
-    visits, fav: col.fav, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
+    visits, fav: col.fav, trend: col.trend ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
   };
 }
 
@@ -123,6 +128,7 @@ export async function metaFor(m: Manifest, idx: number[]): Promise<Meta[]> {
   return idx.map((i) => cache.get("meta" + Math.floor(i / m.metaChunk)) as any);
 }
 
+/** `thumb` is always "" (deprecated, kept for compatibility): use Engine.thumbUrl(idx) */
 export interface WorldInfo { id: string; name: string; author: string; authorId: string; thumb: string }
 export async function worldInfo(m: Manifest, idxs: number[]): Promise<WorldInfo[]> {
   const ks = [...new Set(idxs.map((i) => Math.floor(i / m.metaChunk)))];
@@ -131,11 +137,7 @@ export async function worldInfo(m: Manifest, idxs: number[]): Promise<WorldInfo[
   return idxs.map((i) => {
     const c = chunks.get(Math.floor(i / m.metaChunk))!;
     const j = i % m.metaChunk;
-    const th = c.th?.[j];
-    return {
-      id: "wrld_" + c.id[j], name: c.n[j], author: c.an[j], authorId: "usr_" + c.au[j],
-      thumb: th && m.thumb ? m.thumb.prefix + th + m.thumb.suffix : "",
-    };
+    return { id: "wrld_" + c.id[j], name: c.n[j], author: c.an[j], authorId: "usr_" + c.au[j], thumb: "" };
   });
 }
 

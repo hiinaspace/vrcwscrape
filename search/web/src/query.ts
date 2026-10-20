@@ -49,6 +49,13 @@ export interface ParseResult { ast: Node | null; pills: Pill[]; errors: string[]
 type TokK = "LP" | "RP" | "OR" | "AND" | "NOT" | "WORD" | "PHRASE";
 interface Tok { k: TokK; s: number; e: number; text: string }
 
+/** `-name-`: a leading dash on a word that also ends in a dash is part of the word, not a negation */
+function decorated(src: string, i: number): boolean {
+  let j = i;
+  while (j < src.length && !/[\s()|"]/.test(src[j])) j++;
+  return j - i >= 3 && src[j - 1] === "-";
+}
+
 function lex(src: string, errors: string[]): Tok[] {
   const out: Tok[] = [];
   const n = src.length;
@@ -60,8 +67,8 @@ function lex(src: string, errors: string[]): Tok[] {
     if (c === "(") { out.push({ k: "LP", s: i, e: i + 1, text: c }); i++; continue; }
     if (c === ")") { out.push({ k: "RP", s: i, e: i + 1, text: c }); i++; continue; }
     if (c === "|") { out.push({ k: "OR", s: i, e: i + 1 + (src[i + 1] === "|" ? 1 : 0), text: "|" }); i += src[i + 1] === "|" ? 2 : 1; continue; }
-    if (c === "-" && i + 1 < n && !isWs(src[i + 1])) { out.push({ k: "NOT", s: i, e: i + 1, text: "-" }); i++; continue; }
-    if (c === "-") { i++; continue; } // lone dash
+    if (c === "-" && i + 1 < n && !isWs(src[i + 1]) && !decorated(src, i)) { out.push({ k: "NOT", s: i, e: i + 1, text: "-" }); i++; continue; }
+    if (c === "-" && (i + 1 >= n || isWs(src[i + 1]))) { i++; continue; } // lone dash
     if (c === '"') {
       let j = i + 1;
       while (j < n && src[j] !== '"') j++;
