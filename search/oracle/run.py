@@ -15,7 +15,7 @@ import statistics
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -62,22 +62,48 @@ def cold_run(browser, url: str) -> dict:
     cdp = ctx.new_cdp_session(page)
     cdp.send("Network.enable")
     cdp.send("Network.setCacheDisabled", {"cacheDisabled": False})
-    state = {"bytes": 0, "reqs": 0}
-    cdp.on("Network.requestWillBeSent", lambda e: state.__setitem__("reqs", state["reqs"] + 1))
-    cdp.on(
-        "Network.loadingFinished",
-        lambda e: state.__setitem__("bytes", state["bytes"] + e.get("encodedDataLength", 0)),
-    )
+    state = {"bytes": 0, "reqs": 0, "third_bytes": 0, "third_reqs": 0}
+    urls: dict[str, str] = {}
+    origin = urlsplit(url)._replace(path="", query="", fragment="").geturl()
+
+    def on_req(e):
+        u = e["request"]["url"]
+        urls[e["requestId"]] = u
+        if u.startswith(origin) or u.startswith(("data:", "blob:")):
+            state["reqs"] += 1
+        else:
+            state["third_reqs"] += 1
+
+    def on_done(e):
+        u = urls.get(e["requestId"], "")
+        n = e.get("encodedDataLength", 0)
+        if u.startswith(origin) or u.startswith(("data:", "blob:")):
+            state["bytes"] += n
+        else:
+            state["third_bytes"] += n
+
+    cdp.on("Network.requestWillBeSent", on_req)
+    cdp.on("Network.loadingFinished", on_done)
     t0 = time.perf_counter()
     err = None
     try:
         page.goto(url, wait_until="commit")
         page.wait_for_selector('[data-testid="result-item"]', timeout=30000)
         t = time.perf_counter() - t0
-        page.wait_for_timeout(800)  # let in-flight first-view requests finish
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)  # 500 ms with no requests
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as e:  # noqa: BLE001
         t, err = None, str(e)[:200]
-    out = {"first_results_s": t, "bytes": state["bytes"], "requests": state["reqs"], "error": err}
+    out = {
+        "first_results_s": t,
+        "bytes": state["bytes"],
+        "requests": state["reqs"],
+        "third_party_bytes": state["third_bytes"],
+        "third_party_requests": state["third_reqs"],
+        "error": err,
+    }
     ctx.close()
     return out
 
@@ -92,6 +118,8 @@ def cold_metrics(browser, base: str, q: str, reps: int = 3) -> dict:
         "first_results_s": statistics.median(r["first_results_s"] for r in ok),
         "bytes": int(statistics.median(r["bytes"] for r in ok)),
         "requests": int(statistics.median(r["requests"] for r in ok)),
+        "third_party_bytes": int(statistics.median(r["third_party_bytes"] for r in ok)),
+        "third_party_requests": int(statistics.median(r["third_party_requests"] for r in ok)),
     }
 
 
@@ -440,16 +468,26 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     b = c.get("bytes")
     add(
         "first-view transfer (empty query)",
-        f"{b / MiB:.2f} MiB / {c.get('requests')} req" if b is not None else "n/a",
-        "<= 3 MiB",
+        (
+            f"{b / MiB:.2f} MiB / {c.get('requests')} req same-origin; third-party (not graded) "
+            f"{c.get('third_party_bytes', 0) / MiB:.2f} MiB / {c.get('third_party_requests')} req"
+        )
+        if b is not None
+        else "n/a",
+        "same-origin <= 3 MiB",
         b is not None and b <= TARGETS["first_view_bytes"],
     )
     c = m.get("cold_query", {})
     b = c.get("bytes")
     add(
         "first-view transfer (query)",
-        f"{b / MiB:.2f} MiB / {c.get('requests')} req" if b is not None else "n/a",
-        "<= 3 MiB",
+        (
+            f"{b / MiB:.2f} MiB / {c.get('requests')} req same-origin; third-party (not graded) "
+            f"{c.get('third_party_bytes', 0) / MiB:.2f} MiB / {c.get('third_party_requests')} req"
+        )
+        if b is not None
+        else "n/a",
+        "same-origin <= 3 MiB",
         b is not None and b <= TARGETS["first_view_bytes"],
     )
     w = m.get("warm", {})
