@@ -315,6 +315,9 @@ export class Engine {
       .sort((a, b) => tagCnt[b] - tagCnt[a] || (this.tagKeys[a] < this.tagKeys[b] ? -1 : 1)).slice(0, 40);
   }
 
+  /** filter-only eligibility mask (no text); a view of internal state, copy before keeping */
+  async allowMask(f: Filters): Promise<Uint8Array> { return (await this.filterMask(f)).mask; }
+
   async similar(idx: number, k: number) { return similarIdx(idx, k); }
   idToIdx = idToIdx;
   info(idx: number[]) { return worldInfo(this.m, idx); }

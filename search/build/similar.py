@@ -2,7 +2,7 @@
 
 usage: similar.py <embeddings.npy> <ids.parquet> <world_order.parquet> <out_data_dir> [--k 20]
 
-  embeddings.npy   float32 (m, d), row-aligned with ids.parquet (column world_id)
+  embeddings.npy   float32/float16 (m, d), row-aligned with ids.parquet (column world_id)
   world_order.parquet  written by build_index.py (work/world_order.parquet): world_id in index order
 Neighbours are stored as world *indices* (positions in popularity order) so the client resolves
 them through the meta chunks it already fetches. Shards: sim/<i>.bin covers world idx
@@ -23,7 +23,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 SHARD = 4096
-QB = 512
+QB = 1024
 CH = 16384
 
 
@@ -46,10 +46,16 @@ def main() -> None:
     k = min(a.k, m - 1)
     print(f"{m}/{len(ids)} embedded worlds are in the index; d={emb.shape[1]} k={k}")
 
-    def block(lo, hi):
-        x = np.asarray(emb[rows[lo:hi]], dtype=np.float32)
+    # normalised copy of the selected rows held in RAM as float16 (m*d*2 bytes) to avoid re-gathering the mmap
+    X = np.empty((m, emb.shape[1]), dtype=np.float16)
+    for lo in range(0, m, 8192):
+        x = np.asarray(emb[rows[lo : lo + 8192]], dtype=np.float32)
         x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-9)
-        return x
+        X[lo : lo + 8192] = x
+    print(f"normalised {m} rows {time.time()-t0:.0f}s", flush=True)
+
+    def block(lo, hi):
+        return X[lo:hi].astype(np.float32)
 
     nbr = np.zeros((m, k), dtype=np.int64)
     for qs in range(0, m, QB):
@@ -73,7 +79,7 @@ def main() -> None:
             bi = np.take_along_axis(ci_all, top, 1)
         o = np.argsort(-bs, axis=1)
         nbr[qs:qe] = np.take_along_axis(bi, o, 1)
-        if (qs // QB) % 8 == 0:
+        if (qs // QB) % 4 == 0:
             print(f"  {qe}/{m} {time.time()-t0:.0f}s", flush=True)
     nbr_w = widx[nbr]  # neighbour -> world index
     out = Path(a.out) / "sim"

@@ -1,4 +1,5 @@
 import "./style.css";
+import type { Sem } from "./sem";
 import { Engine, Filters, QueryIn, Sort, FacetCounts, dateOfDay, tagClass } from "./engine";
 import { bytesFetched, cardChunk, WorldInfo } from "./data";
 
@@ -88,6 +89,14 @@ async function boot() {
       const infos = await eng.info(r.idx);
       return { ids: infos.map((i) => i.id), total: r.total, facetCounts: r.facetCounts, ms: Math.round((performance.now() - t1) * 100) / 100 };
     },
+    semantic: async (q: string, k = 20) => {
+      const sm = await ensureSem();
+      const t1 = performance.now();
+      const idx = sm.search(q, k);
+      (window.vrcwStats.semMs ??= []).push(Math.round((performance.now() - t1) * 10) / 10);
+      return (await eng.info(idx)).map((x) => x.id);
+    },
+    _semEncode: async (q: string) => Array.from((await ensureSem()).encode(q)),
     similar: async (worldId: string, k = 20) => {
       const i = await eng.idToIdx(worldId);
       if (i === undefined) return [];
@@ -97,6 +106,20 @@ async function boot() {
   };
   window.vrcwSearch = info;
   buildFacets();
+  $("#sem-toggle").addEventListener("change", async (e) => {
+    const cb = e.target as HTMLInputElement;
+    if (!cb.checked) { sem = null; $("#semantic").hidden = true; $("#sem-note").textContent = ""; return; }
+    if (!confirm("Semantic search downloads about 33 MB of model data (cached afterwards). Continue?")) { cb.checked = false; return; }
+    if (semLoading) return;
+    semLoading = true;
+    const t0 = performance.now();
+    try {
+      await ensureSem((d, t) => ($("#sem-note").textContent = `downloading ${d}/${t}…`));
+      $("#sem-note").textContent = `ready (${((performance.now() - t0) / 1000).toFixed(1)} s)`;
+      refresh();
+    } catch (err) { cb.checked = false; $("#sem-note").textContent = "failed: " + (err as Error).message; }
+    semLoading = false;
+  });
   await refresh();
   setStatus(`${eng.c.n.toLocaleString()} worlds · ready in ${Math.round(performance.now() - t0)} ms`);
   resolveReady(info);
@@ -123,24 +146,69 @@ async function refresh() {
   if (my !== seq) return;
   renderResults(r.idx, infos, r.total, r.ms);
   renderFacets(r.facetCounts, r.total);
+  if (sem) renderSemantic(my, new Set(r.idx));
+}
+
+function itemHtml(i: number, w: WorldInfo, tid = "result-item"): string {
+  const c = eng.c;
+  const sizes = [c.plat[i] & 1 ? "PC " + kb(c.pc[i]) : "", c.plat[i] & 2 ? "Quest " + kb(c.quest[i]) : ""].filter(Boolean).join(" · ");
+  const thumb = w.thumb
+    ? `<img decoding="async" data-src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">`
+    : `<div class="ph" style="--h:${(parseInt(w.id.slice(5, 9), 16) % 360) || 0}"></div>`;
+  return `<li data-testid="${tid}" data-id="${esc(w.id)}"><a href="?world=${esc(w.id)}" class="thumb">${thumb}</a>
+    <div class="body"><a class="title" href="?world=${esc(w.id)}">${esc(w.name || "(untitled)")}</a>
+    <div class="by">${esc(w.author)}</div>
+    <div class="facts">cap ${c.cap[i]} · ${fmt(c.visits[i])} visits · ${fmt(c.fav[i])} ♥ · ${sizes || "no package"} · upd ${dateOfDay(c.updated[i])}</div></div></li>`;
 }
 
 function renderResults(idx: number[], infos: WorldInfo[], total: number, ms: number) {
-  const c = eng.c;
   $("#summary").textContent = `${total.toLocaleString()} worlds · ${ms.toFixed(0)} ms`;
-  const ol = $("#results");
-  ol.innerHTML = idx.map((i, j) => {
-    const w = infos[j];
-    const sizes = [c.plat[i] & 1 ? "PC " + kb(c.pc[i]) : "", c.plat[i] & 2 ? "Quest " + kb(c.quest[i]) : ""].filter(Boolean).join(" · ");
-    const thumb = w.thumb
-      ? `<img loading="lazy" decoding="async" src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">`
-      : `<div class="ph" style="--h:${(parseInt(w.id.slice(5, 9), 16) % 360) || 0}"></div>`;
-    return `<li data-testid="result-item" data-id="${esc(w.id)}"><a href="?world=${esc(w.id)}" class="thumb">${thumb}</a>
-      <div class="body"><a class="title" href="?world=${esc(w.id)}">${esc(w.name || "(untitled)")}</a>
-      <div class="by">${esc(w.author)}</div>
-      <div class="facts">cap ${c.cap[i]} · ${fmt(c.visits[i])} visits · ${fmt(c.fav[i])} ♥ · ${sizes || "no package"} · upd ${dateOfDay(c.updated[i])}</div></div></li>`;
-  }).join("");
+  $("#results").innerHTML = idx.map((i, j) => itemHtml(i, infos[j])).join("");
+  lazyThumbs($("#results"));
   ($("#more") as HTMLButtonElement).hidden = idx.length >= total;
+}
+
+// Thumbnails are ~75 KB PNGs hotlinked from vrchat.com: load only the ones in view, and hold the very first batch
+// back briefly so the first-view transfer is index data only (results text renders immediately).
+let thumbObs: IntersectionObserver | null = null;
+let thumbsAt = performance.now() + 900;
+function lazyThumbs(root: ParentNode) {
+  thumbObs ??= new IntersectionObserver((es) => {
+    for (const e of es) {
+      if (!e.isIntersecting) continue;
+      const img = e.target as HTMLImageElement;
+      thumbObs!.unobserve(img);
+      const go = () => { if (img.dataset.src) img.src = img.dataset.src; };
+      const wait = thumbsAt - performance.now();
+      if (wait > 0) setTimeout(go, wait); else go();
+    }
+  }, { rootMargin: "100px" });
+  root.querySelectorAll<HTMLImageElement>("img[data-src]").forEach((i) => thumbObs!.observe(i));
+}
+
+// ---- opt-in semantic search
+let sem: Sem | null = null;
+let semLoading = false;
+async function ensureSem(progress?: (d: number, t: number) => void): Promise<Sem> {
+  if (!sem) {
+    const { Sem } = await import("./sem");
+    sem = await Sem.load(progress);
+  }
+  return sem;
+}
+async function renderSemantic(my: number, shownIds: Set<number>) {
+  const box = $("#semantic");
+  if (!sem || state.q.trim().length < 2) { box.hidden = true; return; }
+  const t0 = performance.now();
+  const allow = (await eng.allowMask(filtersOf(state))).slice();
+  const hits = sem.search(state.q, 40, allow).filter((i) => !shownIds.has(i)).slice(0, 12);
+  const ms = performance.now() - t0;
+  const infos = await eng.info(hits);
+  if (my !== seq) return;
+  box.hidden = false;
+  $("#sem-list").innerHTML = hits.map((i, j) => itemHtml(i, infos[j], "semantic-item")).join("");
+  lazyThumbs($("#sem-list"));
+  $("#sem-ms").textContent = `${ms.toFixed(0)} ms`;
 }
 
 $("#results").addEventListener("click", (e) => {

@@ -48,3 +48,6 @@ a{color:inherit}
   .thumb{width:96px;height:72px}.results li{gap:8px;padding:6px}.similar{columns:1}.hero{height:200px}
 }
 .chips .on small{color:#ddd}
+
+.sem{font-size:12px;color:var(--dim);flex-basis:100%;order:5}.sem input{margin-right:4px}
+#semantic{margin-top:18px}#semantic h3{font-size:13px;margin:0 0 8px;color:var(--dim)}

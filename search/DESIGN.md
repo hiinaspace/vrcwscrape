@@ -94,3 +94,24 @@ card 12.7 MB (512-world chunks), ids 5.4 MB, authors 2.6 MB, sim 0.75 MB, core 2
 * Mobile (<=760px): filters live in a full-screen drawer behind a "Filters (n)" button; results are above the fold.
 * Fresh data: built against `worlds-2026-10-20.parquet` (197,991 worlds; `platforms` list used, thumbnails from `thumbnail_url`
   hotlinked, naturalWidth 256 confirmed in headless Chromium on cc-0). Build 37 s, dist 65 MB, core.bin 2.14 MB.
+
+## Round 3 (2026-10-20): public data, gemma2 neighbours, opt-in semantic search
+* Site data: `worlds-2026-10-20-public.parquet`, 197,992 worlds. Build ~29 s for the index; `dist` 104 MB, 2,767 files, largest file 6.4 MB.
+* Neighbours: embeddinggemma-2 fp16 768-d vectors, rows mapped to the public ids (all 197,992 have one), exact cosine top-20 by blocked
+  matmul over RAM-resident normalised fp16 (460 s on cc-0, 8 threads, ~1 GB RSS). `data/sim/`: 49 shards, 9.3 MB, largest 193 KB.
+* **Semantic search** (`web/src/sem.ts`, lazy chunk of 1.6 KB gz, assets in `data/sem/`, ~33 MB, only fetched after the user ticks
+  "semantic search (downloads ~33 MB)" and confirms): static-similarity-mrl-multilingual-v1 truncated to 256-d. JS reimplements
+  BertNormalizer (clean, CJK spacing, accent strip, lowercase) + BertPreTokenizer + WordPiece, wraps with [CLS]/[SEP], and mean-pools the
+  int8 table rows x per-row f16 scale (token table 4 x 6.4 MB gz, scale 173 KB, tokenizer.json 0.8 MB gz, world sign vectors
+  `vecs.bin` 6.3 MB = 197,992 x 32 bytes in index order, public only). Query vector -> sign bits -> Hamming scan of all worlds
+  (honouring the active filters) -> best 500 rescored with the float query against the sign vectors -> top-k. No int8 world vectors
+  (50 MB extra); the eval notes put binary at ~3 points of recall@10 below int8, so this is a deliberate size trade.
+  Blending: semantic hits are shown as a separate "Related by meaning" section (12 hits, skipping worlds already in the FTS list)
+  below the FTS results, never mixed into them, so FTS ranking and the oracle metrics are untouched. Hook:
+  `window.vrcwSearch.semantic(q, k) -> Promise<string[]>` (unfiltered; loads the assets on first call without a prompt).
+* Verified: JS query vectors vs a numpy reference (HF `tokenizers` + dequantised table) on 20 queries (en/ja/ko/zh/mixed/accents/
+  fullwidth/punctuation): min cosine 1.00000. Semantic query latency in headless Chromium on cc-0 (n=60): p50 5.3 ms, p95 9.8 ms.
+  Loading all assets: 35 MB transferred, 455 ms on localhost.
+* First-view transfer with the toggle off: 2.15 MB (empty query), 2.65-2.88 MB with a text query. Thumbnails (~75 KB PNG each,
+  hotlinked) are loaded only for visible cards and the first batch is held back ~0.9 s; with them eagerly loaded the first view was
+  3.7-3.9 MB. Visible thumbnails add roughly 0.6 MB on a 1440x900 viewport.

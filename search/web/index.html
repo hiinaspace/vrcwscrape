@@ -11,6 +11,7 @@
   <header class="top">
     <h1>VRChat World Search</h1>
     <input id="q" data-testid="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Search worlds, authors, tags (日本語 OK)" aria-label="Search">
+    <label class="sem"><input type="checkbox" id="sem-toggle" data-testid="semantic-toggle"> semantic search (downloads ~33 MB) <span id="sem-note"></span></label>
     <button id="fbtn" class="fbtn" type="button">Filters</button>
     <span id="status" class="status" aria-live="polite"></span>
   </header>
@@ -19,6 +20,7 @@
     <main>
       <div id="summary" class="summary"></div>
       <ol id="results" data-testid="results" class="results"></ol>
+      <section id="semantic" data-testid="semantic-results" hidden><h3>Related by meaning <small id="sem-ms"></small></h3><ol id="sem-list" class="results"></ol></section>
       <button id="more" class="more" hidden>Show more</button>
     </main>
   </div>
