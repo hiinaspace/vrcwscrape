@@ -133,7 +133,16 @@ def load_jsonl(p: Path) -> list[dict]:
     return [json.loads(line) for line in open(p) if line.strip()]
 
 
-def warm_and_recall(page, gold: list[dict], facets: list[dict]) -> dict:
+def warm_and_recall(page, gold: list[dict], facets: list[dict], parquet: str) -> dict:
+    con = connect(parquet)
+    tag_ids = {}
+    for t in {g["tag"] for g in gold if g.get("tag")}:
+        tag_ids[t] = {
+            r[0]
+            for r in con.execute(
+                "select world_id from w where list_contains(tagset, ?)", [t]
+            ).fetchall()
+        }
     items = [{"q": g["q"], "filters": {}, "sort": "relevance", "limit": 10} for g in gold]
     chunked(page, QUERY_JS, items[:25])  # warm-up pass, discarded
     res = chunked(page, QUERY_JS, items)
@@ -149,19 +158,21 @@ def warm_and_recall(page, gold: list[dict], facets: list[dict]) -> dict:
         c = cats.setdefault(g["cat"], {"n": 0, "hit": 0, "target_hit": 0, "prec": []})
         c["n"] += 1
         top = r["ids"] or []
-        exp = set(g["expected"])
+        exp = tag_ids[g["tag"]] if g.get("tag") else set(g["expected"])
         hit = any(i in exp for i in top)
         c["hit"] += hit
         c["target_hit"] += g["target"] in top
         c["prec"].append(sum(i in exp for i in top) / max(1, len(top)) if top else 0.0)
         if not hit and len(misses) < 15:
             misses.append({"cat": g["cat"], "q": g["q"], "err": r["err"], "top3": top[:3]})
-    for c in cats.values():
+    for k, c in cats.items():
+        c["graded_by"] = "precision" if k == "tag_word" else "recall"
         c["recall_at_10"] = c["hit"] / c["n"]
         c["target_at_10"] = c["target_hit"] / c["n"]
         c["precision_at_10"] = sum(c.pop("prec")) / c["n"]
-    n = sum(c["n"] for c in cats.values())
-    overall = sum(c["hit"] for c in cats.values()) / max(1, n)
+    rc = [c for c in cats.values() if c["graded_by"] == "recall"]
+    n = sum(c["n"] for c in rc)
+    overall = sum(c["hit"] for c in rc) / max(1, n)
     return {
         "warm": {
             "n": len(walls),
@@ -373,10 +384,22 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     add(
         "FTS recall@10 overall",
         f"{r.get('overall', 0):.3f} (n={r.get('n')})",
-        ">= 0.90 overall and per category",
-        r.get("overall", 0) >= 0.9 and all(c["recall_at_10"] >= 0.9 for c in cats.values()),
+        ">= 0.90 recall overall/per category (tag_word: precision >= 0.70)",
+        r.get("overall", 0) >= 0.9
+        and all(
+            c["recall_at_10"] >= 0.9 if c["graded_by"] == "recall" else c["precision_at_10"] >= 0.7
+            for c in cats.values()
+        ),
     )
     for k, c in sorted(cats.items()):
+        if c["graded_by"] == "precision":
+            add(
+                f"  precision@10 {k} (share of top 10 carrying the tag)",
+                f"{c['precision_at_10']:.3f} (n={c['n']})",
+                ">= 0.70",
+                c["precision_at_10"] >= 0.7,
+            )
+            continue
         add(
             f"  recall@10 {k}",
             f"{c['recall_at_10']:.3f} (target-id@10 {c['target_at_10']:.3f}, p@10 {c['precision_at_10']:.2f}, n={c['n']})",
@@ -500,7 +523,7 @@ def main() -> None:
             page.goto(site_url(a.url), wait_until="load")
             page.wait_for_function("window.vrcwSearchReady !== undefined", timeout=30000)
             page.evaluate("window.vrcwSearchReady")
-            wr = warm_and_recall(page, gold, facets)
+            wr = warm_and_recall(page, gold, facets, a.parquet)
             fres = wr.pop("fres")
             m["warm"], m["recall"] = wr["warm"], wr["recall"]
             m["facets"] = facet_eval(facets, fres)

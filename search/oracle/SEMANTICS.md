@@ -38,7 +38,7 @@ Write to the oracle author if a choice is unworkable; do not silently diverge.
 ## Search quality scoring (gold set)
 Gold query types: exact title, 2-3 word title substring, 2-4 char CJK substring (ja/ko/zh), tag word
 (tag key with `_` -> space), author name. Each has an `expected` id set (all worlds matching the substring/name/tag,
-capped at 200). **recall@10 = fraction of queries whose top-10 `ids` contain at least one expected id**
+capped at 200). Tag-word queries (>= 4 chars, stopwords dropped) are instead graded by **precision@10 = share of the top-10 that carry the tag (target >= 0.7)**. **recall@10 = fraction of queries whose top-10 `ids` contain at least one expected id**
 (hit rate). We also report target-id@10 (the specific sampled world is in the top 10) and p@10. Gold substrings are
 chosen so the title-match set has <= 20-30 worlds (not trivially common). The site's `ids` order is its
 `sort=relevance` ranking. Tag words and author names must therefore be searchable via `q`.

@@ -13,6 +13,30 @@ from pathlib import Path
 from common import CJK_RE, CJK_RUN_RE, HAN_RE, HANGUL_RE, KANA_RE, connect
 
 
+STOP = {
+    "this",
+    "that",
+    "with",
+    "from",
+    "your",
+    "have",
+    "will",
+    "they",
+    "them",
+    "more",
+    "into",
+    "only",
+    "also",
+    "just",
+    "some",
+    "world",
+    "worlds",
+    "vrchat",
+    "none",
+    "test",
+}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("parquet")
@@ -137,13 +161,19 @@ def main() -> None:
     cand_tags = sorted(
         t
         for t, c in tagcount.items()
-        if c >= 20 and t.isascii() and t.replace("_", "").isalnum() and not t.startswith("system_")
+        if c >= 20
+        and len(t) >= 4
+        and t not in STOP
+        and t.isascii()
+        and t.replace("_", "").isalnum()
+        and not t.startswith("system_")
     )
     rnd.shuffle(cand_tags)
     for t in cand_tags:
         if cnt["tag_word"] >= quota["tag_word"]:
             break
         if add("tag_word", t.replace("_", " "), tag_ids[t], tag_ids[t][0]):
+            out[-1]["tag"] = t
             cnt["tag_word"] += 1
 
     by_author: dict[str, list[int]] = {}
