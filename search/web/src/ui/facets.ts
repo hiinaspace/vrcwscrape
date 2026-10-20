@@ -53,7 +53,7 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
       if (u > hi) hi = u;
       if (a > hi) hi = a;
     }
-    minDay = lo; maxDay = hi;
+    minDay = lo; maxDay = eng.maxDay || hi;
     startYM = ymOfIso(dateOfDay(lo)); endYM = ymOfIso(dateOfDay(hi));
     y0 = Math.floor(startYM / 12); y1 = Math.floor(endYM / 12);
   }

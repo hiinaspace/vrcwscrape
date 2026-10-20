@@ -1,14 +1,14 @@
 import "./style.css";
 import type { Sem } from "./sem";
 import { Engine, Filters, QueryIn, Sort, FacetCounts } from "./engine";
-import { authorWorlds, bytesFetched, cardChunk } from "./data";
+import { authorWorlds, bytesFetched } from "./data";
 import { parseQuery } from "./query";
 import type { Ctx } from "./ui/ctx";
 import { createDetail } from "./ui/detail";
 import { createFacets } from "./ui/facets";
 import { Meters } from "./ui/meters";
 import { createPills, createSyntaxHelp, setAuthorName } from "./ui/pills";
-import { RowCard, fillCards, rowHtml } from "./ui/rows";
+import { rowHtml } from "./ui/rows";
 import { semUi, SemUi } from "./ui/semui";
 import { SORTS, State, facetCount, filtersOf, readUrl, toUrl } from "./ui/state";
 import { initThumbs, lazyThumbs } from "./ui/thumbs";
@@ -159,13 +159,6 @@ function renderSorts() {
   }).join("");
 }
 
-async function cardsFor(idx: number[]): Promise<RowCard[]> {
-  const cs = eng.m.cardChunk;
-  const chunks = new Map<number, any>();
-  await Promise.all([...new Set(idx.map((i) => Math.floor(i / cs)))].map(async (k) => chunks.set(k, await cardChunk(k))));
-  return idx.map((i) => { const cc = chunks.get(Math.floor(i / cs)), j = i % cs; return { desc: cc.d[j] ?? "", tags: cc.t[j] ?? [] }; });
-}
-
 async function refresh() {
   const my = ++seq;
   const s = ctx.state;
@@ -175,17 +168,14 @@ async function refresh() {
   if (my !== seq) return;
   $("#summary").textContent = `${r.total.toLocaleString()} worlds · ${r.ms.toFixed(0)} ms`;
   $("#results").innerHTML = r.idx.length
-    ? r.idx.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], undefined, "result-item", infos[j].id === s.world)).join("")
+    ? r.idx.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], "result-item", infos[j].id === s.world)).join("")
     : `<li class="empty-state" data-testid="no-results"><div><b>No worlds match.</b><br>Remove a pill above, or relax a filter.</div></li>`;
   lazyThumbs($("#results"));
   ($("#more") as HTMLButtonElement).hidden = r.idx.length >= r.total;
   pills.render();
   renderSorts();
-  // tags + description arrive with the card chunks: patched into the rows already on screen
-  const cardsP = cardsFor(r.idx).then((cards) => { if (my === seq) fillCards($("#results"), r.idx, cards); return cards; });
   await facets.render(r.facetCounts as FacetCounts, r.total);
   if (s.author) setAuthorName(await authorLabel(s.author));
-  await cardsP;
   if (my !== seq) return;
   void renderSemantic(my, new Set(r.idx));
 }
@@ -205,10 +195,9 @@ async function loadMore() {
   const r = await eng.query({ q: s.q, filters: filtersOf(s), sort: effSort(), asc: s.asc, limit: PAGE, offset: off, facets: false });
   if (my !== seq) return;
   const infos = await eng.info(r.idx);
-  $("#results").insertAdjacentHTML("beforeend", r.idx.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], undefined, "result-item", infos[j].id === s.world)).join(""));
+  $("#results").insertAdjacentHTML("beforeend", r.idx.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], "result-item", infos[j].id === s.world)).join(""));
   lazyThumbs($("#results"));
   ($("#more") as HTMLButtonElement).hidden = off + r.idx.length >= r.total;
-  fillCards($("#results"), r.idx, await cardsFor(r.idx));
 }
 
 function onListClick(e: Event) {
@@ -236,6 +225,11 @@ async function ensureSem(progress?: (d: number, t: number) => void): Promise<Sem
 function semText(): string {
   return parseQuery(ctx.state.q).pills.filter((p) => !p.negated && (p.kind === "term" || p.kind === "phrase")).map((p) => p.value).join(" ");
 }
+/** the typed conditions of the box WITHOUT its positive plain text (that is what the semantic strip replaces): fields, numbers, dates, negations */
+function semConditions(): string {
+  const q = ctx.state.q;
+  return parseQuery(q).pills.filter((p) => p.negated || !(p.kind === "term" || p.kind === "phrase" || p.kind === "group")).map((p) => q.slice(p.start, p.end)).join(" ");
+}
 async function renderSemantic(my: number, shownIds: Set<number>) {
   const box = $("#semantic"), hint = $("#sem-hint"), list = $("#sem-list");
   if (!semOn || !sem) { box.hidden = true; return; }
@@ -249,12 +243,12 @@ async function renderSemantic(my: number, shownIds: Set<number>) {
   }
   hint.hidden = true;
   const t0 = performance.now();
-  const allow = (await eng.allowMask(filtersOf(ctx.state))).slice();
+  const allow = await eng.allowMask(filtersOf(ctx.state), semConditions());
   const hits = sem.search(text, 40, allow, eng.lp).filter((i) => !shownIds.has(i)).slice(0, 8);
   const ms = performance.now() - t0;
-  const [infos, cards] = await Promise.all([eng.info(hits), cardsFor(hits)]);
+  const infos = await eng.info(hits);
   if (my !== seq) return;
-  list.innerHTML = hits.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], cards[j], "semantic-item", infos[j].id === ctx.state.world, true)).join("")
+  list.innerHTML = hits.map((i, j) => rowHtml(eng, ctx.meters, i, infos[j], "semantic-item", infos[j].id === ctx.state.world, true)).join("")
     || `<li class="dim empty">nothing new beyond the results above</li>`;
   lazyThumbs(list);
   $("#sem-ms").textContent = `${ms.toFixed(0)} ms`;

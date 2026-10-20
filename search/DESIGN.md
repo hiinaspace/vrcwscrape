@@ -225,7 +225,7 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   unless the query has >= 2 characters (empty/1-char: `semantic hidden = true`). The control was not hidden on mobile. Fix: a switch (`sem-toggle`) opens an inline confirm
   (`sem-enable` "Download 33 MB and enable"), a visible byte-based progress bar, and a visible "on" state; with no/short query the strip shows "Semantic search is on. Type a
   search ... " instead of disappearing. Consent is remembered (`localStorage vrcw-sem=1`) and re-enables from the HTTP cache on the next visit (no 33 MB download without prior consent).
-  The semantic query text is the positive plain terms of the box (not `-x`, `tag:x`, `cap:>=8`).
+  The semantic query text is the positive plain terms of the box (not `-x`, `tag:x`, `cap:>=8`); the strip is restricted with `eng.allowMask(filters, q')` where q' = the box minus its positive plain text (typed fields, numbers, dates and negations still apply).
 * **State / URL** (additive to the oracle contract; `adult=` is ignored, nothing is hidden by default): `sort=` only when the user chose one (absent = automatic: `trending`
   without a positive text condition, `relevance` with one; an explicit choice sticks), `asc=1`, `platform_ex=pc|quest`, `tags_ex=`, `status_ex=`, `pub_after=`, `pub_before=`,
   `datef=updated|published` (which range the histogram edits). Existing: `q cap_min cap_max size_max_mb platform after before tags author status cw cw_exclude world`.
@@ -238,8 +238,8 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
 * **Pills**: `parseQuery(q).pills` (sign flip = `flipPill`, x = `removePill`, both rewrite the box text) plus facet conditions (tags, warnings, status, platform with sign; capacity,
   size, dates, author without). Parse errors show next to the pills. Syntax popover examples fill the box.
 * **Result row**: thumbnail (`eng.thumbUrl(i)`, gradient placeholder when null, never a CDN URL), title, author, cw/status badges, ALL user tags (click = include), first 160 chars of the
-  description, log-scale bars for capacity, PC size, Quest size, visits (2nd..99.5th dataset percentile of the sampled column, numeric label inline, exact value in `title`),
-  favorites, updated date. Rows render before the card chunks arrive; tags + description are patched in afterwards (`ui/rows.ts fillCards`).
+  description (both come from `eng.info(idx)` `desc`/`tags`, i.e. the meta chunk: no per-card fetch; only the detail panel reads `card/`), log-scale bars for capacity, PC size, Quest size,
+  visits (2nd..99.5th dataset percentile of the sampled column, numeric label inline, exact value in `title`), favorites, updated date.
 * **Detail panel**: `[data-testid=detail-panel]` wraps `[data-testid=world-card]`; hero image links to `https://vrchat.com/home/world/<id>` (new tab). Esc / x / browser back close it; `world=` deep links open it.
 * **Test ids added**: `sem-toggle` (button, `aria-checked`), `sem-enable`, `semantic-item`, `pill` (+ `data-src=query|facet`, `data-kind`, `data-neg`), `pill-sign`, `pill-remove`, `sort-<name>`
   (trending relevance visits favorites updated published capacity; container keeps `facet-sort`), `tag-include-<tag>` / `tag-exclude-<tag>` (tag without the `~` group prefix),
@@ -248,7 +248,7 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   facet-<name> world-card similar-list semantic-results`. Removed: `adult-toggle`, `semantic-toggle` (checkbox). `window.vrcwSearch` is unchanged (query forwards `q` verbatim).
 * **Checks**: `web/test/ui5/{launch,interact,semtest,shots,bytes}.mjs` (Playwright; Firefox 157 is installed under `/work/.tools/pw-browsers` because `~` is full, its GTK libs under
   `/work/.tools/ffdeps/root`). `interact.mjs` = 36 real-click/drag assertions, green in Chromium and Firefox; `semtest.mjs` = toggle flow incl. dialogs recorded (none are opened).
-* **First-view bytes** (headless Chromium, localhost, with row cards): empty 2.37 MB, `?q=chill` 2.52 MB, `?q=lake -hangout` 2.90 MB (46 requests: scattered 512-world card chunks, see ROUND5-REQUESTS.md).
+* **First-view bytes** (headless Chromium, localhost, same-origin, incl. 1.5 s idle): empty 2.30 MB (15 requests), `?q=lake -hangout` 2.61 MB (32), `?q=cozy hangout` 2.50 MB (28).
 
 ## Round 5 (engine): implementation notes and measurements
 * **API additions after the v2 stub** (all in `web/src/engine.ts`): `eng.allowMask(filters, q?)` (typed conditions included; fresh array), `eng.rowCards(idx[]) -> {desc, tags}[]`

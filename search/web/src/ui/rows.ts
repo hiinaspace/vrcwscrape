@@ -35,18 +35,9 @@ export function rowBadges(card: RowCard | undefined): string {
   return (card?.tags ?? []).filter((t) => tagClass(t) === "cw" || tagClass(t) === "status")
     .map((t) => `<span class="badge ${tagClass(t)}">${esc(t.replace(/^(content_|system_)/, ""))}</span>`).join("");
 }
-/** patch card-derived parts into already rendered rows (rows are shown before the card chunks arrive) */
-export function fillCards(root: ParentNode, idx: number[], cards: RowCard[]) {
-  idx.forEach((i, j) => {
-    const li = root.querySelector<HTMLElement>(`li[data-i="${i}"]`);
-    if (!li) return;
-    const x = li.querySelector(".rowx"); if (x) x.innerHTML = rowExtraHtml(cards[j]);
-    const bd = li.querySelector(".rbadges"); if (bd) bd.innerHTML = rowBadges(cards[j]);
-  });
-}
-
-export function rowHtml(eng: Engine, meters: Meters, i: number, w: WorldInfo, card: RowCard | undefined, tid: string, selected: boolean, compact = false): string {
+export function rowHtml(eng: Engine, meters: Meters, i: number, w: WorldInfo, tid: string, selected: boolean, compact = false): string {
   const c = eng.c;
+  const card: RowCard = { desc: w.desc ?? "", tags: w.tags ?? [] }; // info() carries desc[0:160] + visible tags in the meta chunk
   const href = `?world=${esc(w.id)}`;
   return `<li data-testid="${tid}" data-id="${esc(w.id)}" data-i="${i}" class="${selected ? "sel" : ""}">
     <a href="${href}" class="thumb" tabindex="-1" aria-hidden="true">${thumbBox(i, w.id)}</a>

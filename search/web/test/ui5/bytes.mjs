@@ -1,6 +1,6 @@
 import { launch } from "./launch.mjs";
 const b = await launch("chromium");
-for (const url of ["", "?q=chill", "?q=lake+-hangout", "?sort=published"]) {
+for (const url of ["", "?q=lake+-hangout", "?q=cozy+hangout"]) {
   const p = await (await b.newContext({ viewport: { width: 1440, height: 900 } })).newPage();
   let bytes = 0, n = 0;
   p.on("response", async (r) => { try { bytes += (await r.body()).length; n++; } catch {} });

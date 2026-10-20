@@ -76,6 +76,7 @@ export function createPills(ctx: Ctx, host: HTMLElement, onEdit: () => void) {
 const EXAMPLES: [string, string][] = [
   ["lake -hangout", "words AND together; a leading - excludes"],
   ["(horror | scary) -tag:game", "| or OR = either; parentheses group"],
+  ["a b | c", "OR binds tighter than a space: a (b | c), not (a b) | c"],
   ['"escape room"', "exact phrase"],
   ["cap:>=16", "capacity: > >= < <= or 8..32"],
   ["size:<50", "download size in MB"],
