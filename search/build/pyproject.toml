@@ -1,0 +1,12 @@
+[project]
+name = "vrcw-search-build"
+version = "0.1.0"
+description = "Static search index builder for the vrcwscrape world search"
+requires-python = ">=3.11"
+dependencies = ["pyarrow>=15", "numpy>=1.26", "regex>=2024.0"]
+
+[dependency-groups]
+dev = ["ruff"]
+
+[tool.ruff]
+line-length = 100

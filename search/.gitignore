@@ -1,0 +1,9 @@
+dist/
+work/
+build/.venv/
+web/node_modules/
+web/dist/
+__pycache__/
+*.pyc
+test-results/
+!build/
