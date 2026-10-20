@@ -480,13 +480,18 @@ CONTENT_DOC_RE = re.compile(
 )
 
 
-def content_default_eval(page, parquet: str, mode: str) -> dict:
-    documented = DESIGN_MD.exists() and bool(CONTENT_DOC_RE.search(DESIGN_MD.read_text()))
-    if mode == "off" or (mode == "auto" and not documented):
-        return {
-            "skipped": "default-hide / show param not documented in DESIGN.md (use --content-default on to force)"
-        }
-    top = _top_ids(page, [{"q": "", "filters": {}, "sort": "published", "limit": 50}])[0]
+DOM_IDS_JS = """
+() => [...document.querySelectorAll('[data-testid="result-item"]')].slice(0, 50).map(e => {
+  const m = e.outerHTML.match(/wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/);
+  return m ? m[0] : null;
+})
+"""
+
+
+def content_default_eval(page, parquet: str, mode: str, base: str, browser) -> dict:
+    """UI-only default (DESIGN.md round 4): `?sort=published` renders no content_sex/adult worlds; `&adult=1` shows some."""
+    if mode == "off":
+        return {"skipped": "--content-default off"}
     con = connect(parquet)
     bad_ids = {
         r[0]
@@ -494,8 +499,33 @@ def content_default_eval(page, parquet: str, mode: str) -> dict:
             "select world_id from w where list_contains(tagset,'content_sex') or list_contains(tagset,'content_adult')"
         ).fetchall()
     }
-    bad = [i for i in top if i in bad_ids]
-    return {"n": len(top), "flagged": len(bad), "flagged_ids": bad[:5]}
+
+    def rendered(params: dict) -> list[str | None]:
+        ctx = browser.new_context(
+            viewport={"width": 1440, "height": 900}
+        )  # fresh: no stored adult toggle
+        pg = ctx.new_page()
+        try:
+            pg.goto(site_url(base, **params), wait_until="load")
+            pg.wait_for_selector('[data-testid="result-item"]', timeout=20000)
+            pg.wait_for_timeout(500)
+            return pg.evaluate(DOM_IDS_JS)
+        finally:
+            ctx.close()
+
+    default = rendered({"sort": "published"})
+    adult = rendered({"sort": "published", "adult": "1"})
+    unparsed = sum(1 for i in default if i is None)
+    d_flag = [i for i in default if i in bad_ids]
+    a_flag = [i for i in adult if i in bad_ids]
+    return {
+        "n_default": len(default),
+        "flagged_default": len(d_flag),
+        "flagged_default_ids": d_flag[:5],
+        "n_adult": len(adult),
+        "flagged_adult": len(a_flag),
+        "unparsed_ids": unparsed,
+    }
 
 
 # ---------------------------------------------------------------- dist audit
@@ -676,12 +706,18 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     elif au:
         add("author-name query", au.get("error", "?"), "mean >= 0.70", False)
     cd = m.get("content_default", {})
-    if "flagged" in cd:
+    if "flagged_default" in cd:
         add(
-            "default hides content_sex/adult (first 50, published)",
-            f"{cd['flagged']} flagged of {cd['n']}",
-            "0",
-            cd["flagged"] == 0,
+            "adult default hidden in UI (?sort=published, rendered items)",
+            f"{cd['flagged_default']} flagged of {cd['n_default']}; world ids unparsed from DOM: {cd['unparsed_ids']}",
+            "0 flagged, ids readable",
+            cd["flagged_default"] == 0 and cd["n_default"] > 0 and cd["unparsed_ids"] == 0,
+        )
+        add(
+            "adult=1 reveals flagged worlds",
+            f"{cd['flagged_adult']} flagged of {cd['n_adult']}",
+            ">= 1",
+            cd["flagged_adult"] >= 1,
         )
     elif "error" in cd:
         add("content default check", cd["error"], "0 flagged", False)
@@ -823,7 +859,9 @@ def main() -> None:
                 ("authors", lambda: author_eval(page, a.parquet)),
                 (
                     "content_default",
-                    lambda: content_default_eval(page, a.parquet, a.content_default),
+                    lambda: content_default_eval(
+                        page, a.parquet, a.content_default, a.url, browser
+                    ),
                 ),
             ):
                 try:

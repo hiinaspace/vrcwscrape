@@ -65,5 +65,6 @@ per-query latency p50/p95, recall@10 vs 20.2%. Recall is report-only: the querie
 - Popularity: ~30 generic queries (`POP_QUERIES` in run.py); median log10(visits+1) of the site's top 10 (sort=relevance) must be >= the p75
   of all worlds whose title or tag ILIKE-matches the query (needs >= 20 matches); PASS if >= 80% of queries do.
 - Author: 30 seeded authors with 3-150 worlds; query = exact `author_name`; share of top 10 by that author name, capped at min(10, their worlds); PASS if mean >= 0.7.
-- Content default: `query({q:"", filters:{}, sort:"published", limit:50})` must contain zero worlds tagged content_sex / content_adult.
-  Runs only when DESIGN.md documents the show-param (or `--content-default on`), else skipped.
+- Content default (UI-only; hook untouched): load `?sort=published` in a fresh context and read the rendered `result-item` world ids
+  (a `wrld_...` id found anywhere in the item's HTML); none of the first <= 50 may carry content_sex / content_adult; then `&adult=1` must show >= 1 such world.
+  Skip with `--content-default off`.
