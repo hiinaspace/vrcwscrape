@@ -1,5 +1,5 @@
 import "./style.css";
-import { Engine, Filters, QueryIn, Sort, FacetCounts, dateOfDay } from "./engine";
+import { Engine, Filters, QueryIn, Sort, FacetCounts, dateOfDay, tagClass } from "./engine";
 import { bytesFetched, cardChunk, WorldInfo } from "./data";
 
 declare global {
@@ -9,6 +9,7 @@ declare global {
 interface State {
   q: string; cap_min?: number; cap_max?: number; size_max_mb?: number; platform: "" | "pc" | "quest" | "both";
   after: string; before: string; tags: string[]; author: string; sort: Sort; world: string;
+  status: string[]; cw: string[]; cwx: string[];
 }
 
 const $ = <T extends HTMLElement>(s: string) => document.querySelector(s) as T;
@@ -16,6 +17,7 @@ const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const num = (v: string | null) => (v === null || v === "" || isNaN(+v) ? undefined : +v);
 const SORTS: Sort[] = ["relevance", "visits", "favorites", "updated", "published"];
 
+const csv = (v: string | null) => (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 function readUrl(): State {
   const p = new URLSearchParams(location.search);
   const sort = p.get("sort") as Sort;
@@ -24,7 +26,7 @@ function readUrl(): State {
     q: p.get("q") ?? "", cap_min: num(p.get("cap_min")), cap_max: num(p.get("cap_max")), size_max_mb: num(p.get("size_max_mb")),
     platform: pf === "pc" || pf === "quest" || pf === "both" ? pf : "",
     after: p.get("after") ?? "", before: p.get("before") ?? "",
-    tags: (p.get("tags") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+    tags: csv(p.get("tags")), status: csv(p.get("status")), cw: csv(p.get("cw")), cwx: csv(p.get("cw_exclude")),
     author: p.get("author") ?? "", sort: SORTS.includes(sort) ? sort : "relevance", world: p.get("world") ?? "",
   };
 }
@@ -39,6 +41,9 @@ function toUrl(s: State): string {
   if (s.before) p.set("before", s.before);
   if (s.tags.length) p.set("tags", s.tags.join(","));
   if (s.author) p.set("author", s.author);
+  if (s.status.length) p.set("status", s.status.join(","));
+  if (s.cw.length) p.set("cw", s.cw.join(","));
+  if (s.cwx.length) p.set("cw_exclude", s.cwx.join(","));
   if (s.sort !== "relevance") p.set("sort", s.sort);
   if (s.world) p.set("world", s.world);
   const q = p.toString();
@@ -47,6 +52,7 @@ function toUrl(s: State): string {
 const filtersOf = (s: State): Filters => ({
   cap_min: s.cap_min, cap_max: s.cap_max, size_max_mb: s.size_max_mb, platform: s.platform, after: s.after || undefined,
   before: s.before || undefined, tags: s.tags, author: s.author || undefined,
+  status: s.status, cw: s.cw, cw_exclude: s.cwx,
 });
 const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
 const kb = (v: number) => (v === 0xffffffff ? "–" : v >= 1024 ? (v / 1024).toFixed(v >= 10240 ? 0 : 1) + " MB" : v + " KB");
@@ -63,7 +69,7 @@ window.vrcwStats = bytesFetched;
 
 function normFilters(f: any): Filters {
   const o: Filters = { ...f };
-  if (typeof (f?.tags) === "string") o.tags = (f.tags as string).split(",").filter(Boolean);
+  for (const k of ["tags", "status", "cw", "cw_exclude"] as const) if (typeof f?.[k] === "string") o[k] = (f[k] as string).split(",").filter(Boolean);
   for (const k of ["cap_min", "cap_max", "size_max_mb"] as const) if (o[k] === null || (o[k] as any) === "") delete o[k];
   return o;
 }
@@ -149,13 +155,16 @@ $("#more").addEventListener("click", () => { shown += 24; refresh(); });
 function buildFacets() {
   const f = $("#facets");
   const s = state;
-  f.innerHTML = `
+  f.innerHTML = `<div class="drawer-head"><b>Filters</b><button id="fdone" type="button">Show results</button></div>
+  
   <section data-testid="facet-sort"><h3>Sort</h3><select id="f-sort">${SORTS.map((x) => `<option ${x === s.sort ? "selected" : ""}>${x}</option>`).join("")}</select></section>
   <section data-testid="facet-platform"><h3>Platform</h3><div class="seg" id="f-plat">${["", "pc", "quest", "both"].map((p) => `<button data-v="${p}" class="${p === s.platform ? "on" : ""}">${p || "any"}<small></small></button>`).join("")}</div></section>
   <section data-testid="facet-capacity"><h3>Capacity</h3><div class="row"><input id="f-capmin" type="number" min="0" placeholder="min" value="${s.cap_min ?? ""}"><span>–</span><input id="f-capmax" type="number" min="0" placeholder="max" value="${s.cap_max ?? ""}"></div><div id="capbars" class="bars"></div></section>
   <section data-testid="facet-size"><h3>Download size ≤ (MB)</h3><div class="row"><input id="f-size" type="number" min="0" step="1" placeholder="any" value="${s.size_max_mb ?? ""}"><input id="f-sizer" type="range" min="0" max="500" step="5" value="${s.size_max_mb ?? 500}"></div></section>
   <section data-testid="facet-date"><h3>Updated</h3><div class="row"><input id="f-after" type="date" value="${s.after}"><span>–</span><input id="f-before" type="date" value="${s.before}"></div></section>
   <section data-testid="facet-author"><h3>Author</h3><div id="f-author"></div></section>
+  <section data-testid="facet-status"><h3>Status</h3><div class="chips" id="f-status">${["approved", "labs"].map((x) => `<button data-s="${x}" class="${s.status.includes(x) ? "on" : ""}">${x} <small></small></button>`).join("")}</div></section>
+  <section data-testid="facet-cw"><h3>Content warnings</h3><p class="hint">click: hide → require → off</p><ul id="f-cw" class="taglist cw"></ul></section>
   <section data-testid="facet-tags"><h3>Tags</h3><div id="f-sel" class="chips"></div><input id="f-tagq" type="search" placeholder="find tag…" autocomplete="off"><div id="f-tagres" class="chips found"></div><ul id="f-tags" class="taglist"></ul></section>
   <button id="f-reset" class="reset">Reset filters</button>`;
   const q = $<HTMLInputElement>("#q");
@@ -175,8 +184,25 @@ function buildFacets() {
   });
   $("#f-after").addEventListener("change", (e) => { state.after = (e.target as HTMLInputElement).value; onChange(); });
   $("#f-before").addEventListener("change", (e) => { state.before = (e.target as HTMLInputElement).value; onChange(); });
+  $("#fbtn").addEventListener("click", () => document.body.classList.toggle("drawer"));
+  $("#fdone").addEventListener("click", () => document.body.classList.remove("drawer"));
+  $("#f-status").addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest("button"); if (!b) return;
+    const v = b.dataset.s!; const i = state.status.indexOf(v);
+    if (i >= 0) state.status.splice(i, 1); else state.status.push(v);
+    onChange();
+  });
+  $("#f-cw").addEventListener("click", (e) => {
+    const li = (e.target as HTMLElement).closest("li[data-cw]") as HTMLElement | null; if (!li) return;
+    const k = li.dataset.cw!;
+    const hid = state.cwx.indexOf(k), req = state.cw.indexOf(k);
+    if (hid >= 0) { state.cwx.splice(hid, 1); state.cw.push(k); }
+    else if (req >= 0) state.cw.splice(req, 1);
+    else state.cwx.push(k);
+    onChange();
+  });
   $("#f-reset").addEventListener("click", () => {
-    state = { ...state, cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", after: "", before: "", tags: [], author: "" };
+    state = { ...state, cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", after: "", before: "", tags: [], author: "", status: [], cw: [], cwx: [] };
     syncInputs(); onChange();
   });
   $("#f-tags").addEventListener("click", (e) => {
@@ -218,8 +244,22 @@ async function renderFacets(fc: FacetCounts, total: number) {
   const mx = Math.max(1, ...Object.values(fc.capacity));
   $("#capbars").innerHTML = Object.entries(fc.capacity).map(([k, v]) => `<div title="${k}: ${v}"><i style="height:${Math.round((v / mx) * 100)}%"></i><b>${k}</b></div>`).join("");
   $("#f-sel").innerHTML = state.tags.map((t) => `<button data-t="${esc(t)}" class="on">${esc(t)} ✕</button>`).join("");
-  $("#f-tags").innerHTML = Object.entries(fc.tags).filter(([k]) => !state.tags.includes(k)).slice(0, 30)
+  $("#f-tags").innerHTML = Object.entries(fc.userTags).filter(([k]) => !state.tags.includes(k)).slice(0, 30)
     .map(([k, v]) => `<li data-t="${esc(k)}"><span>${esc(k)}</span><small>${fmt(v)}</small></li>`).join("");
+  $("#f-status").querySelectorAll("button").forEach((b) => {
+    const k = (b as HTMLElement).dataset.s as "approved" | "labs";
+    b.classList.toggle("on", state.status.includes(k));
+    b.querySelector("small")!.textContent = fmt(fc.status[k] ?? 0);
+  });
+  const names = new Set([...Object.keys(fc.cw), ...state.cw, ...state.cwx]);
+  $("#f-cw").innerHTML = [...names].sort((a, b) => (fc.cw[b] ?? 0) - (fc.cw[a] ?? 0)).map((k) => {
+    const st = state.cwx.includes(k) ? "hide" : state.cw.includes(k) ? "req" : "";
+    return `<li data-cw="${esc(k)}" class="${st}"><span>${st === "hide" ? "− " : st === "req" ? "+ " : ""}${esc(k)}</span><small>${fmt(fc.cw[k] ?? 0)}</small></li>`;
+  }).join("");
+  const nAct = (state.cap_min !== undefined || state.cap_max !== undefined ? 1 : 0) + (state.size_max_mb !== undefined ? 1 : 0) + (state.platform ? 1 : 0)
+    + (state.after || state.before ? 1 : 0) + state.tags.length + (state.author ? 1 : 0) + state.status.length + state.cw.length + state.cwx.length;
+  $("#fbtn").textContent = nAct ? `Filters (${nAct})` : "Filters";
+  $("#fdone").textContent = `Show ${total.toLocaleString()} results`;
   const fa = $("#f-author");
   if (!state.author) { fa.textContent = "any (click an author on a world card)"; authorLabelFor = ""; }
   else if (authorLabelFor !== state.author) {
@@ -245,17 +285,20 @@ async function openCard(id: string, push: boolean) {
   const cc = await cardChunk(Math.floor(idx / eng.m.cardChunk));
   if (my !== cardSeq) return;
   const j = idx % eng.m.cardChunk;
-  const tags = cc.t[j] ?? [];
+  const alltags = cc.t[j] ?? [];
+  const tags = alltags.filter((t) => tagClass(t) === "user");
+  const badges = alltags.filter((t) => tagClass(t) === "cw" || tagClass(t) === "status");
   const row = (k: string, v: string) => `<tr><th>${k}</th><td>${v}</td></tr>`;
   root.innerHTML = `<div class="overlay"><article class="card" data-testid="world-card" data-id="${esc(w.id)}">
     <button class="x" aria-label="close">✕</button>
-    <div class="hero">${w.thumb ? `<img src="${esc(w.thumb)}" alt="" referrerpolicy="no-referrer">` : `<div class="ph" style="--h:${parseInt(w.id.slice(5, 9), 16) % 360}"></div>`}</div>
+    <div class="hero">${w.thumb ? `<img src="${esc(w.thumb.replace(/\/256$/, "/512"))}" data-fb="${esc(w.thumb)}" onerror="if(this.dataset.fb&&this.src!==this.dataset.fb)this.src=this.dataset.fb" alt="" referrerpolicy="no-referrer">` : `<div class="ph" style="--h:${parseInt(w.id.slice(5, 9), 16) % 360}"></div>`}</div>
     <h2>${esc(w.name)}</h2>
     <p class="by">by <a href="#" id="c-author">${esc(w.author)}</a> · <a href="https://vrchat.com/home/world/${esc(w.id)}" target="_blank" rel="noopener">open on vrchat.com ↗</a></p>
     <table>${row("Capacity", String(c.cap[idx]))}${row("Visits", c.visits[idx].toLocaleString())}${row("Favorites", c.fav[idx].toLocaleString())}
       ${row("Heat / popularity", `${cc.hp[j]?.[0] ?? 0} / ${cc.hp[j]?.[1] ?? 0}`)}
       ${row("PC package", c.plat[idx] & 1 ? kb(c.pc[idx]) : "none")}${row("Quest package", c.plat[idx] & 2 ? kb(c.quest[idx]) : "none")}
       ${row("Published", dateOfDay(c.created[idx]))}${row("Updated", dateOfDay(c.updated[idx]))}${row("World id", `<code>${esc(w.id)}</code>`)}</table>
+    <div class="badges">${badges.map((t) => `<span class="badge ${tagClass(t)}">${esc(t.replace(/^(content_|system_)/, ""))}</span>`).join("")}</div>
     <div class="chips">${tags.map((t) => `<button data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
     <p class="desc">${esc(cc.d[j] ?? "")}</p>
     <h3>Similar worlds</h3><ol data-testid="similar-list" class="similar"><li class="dim">loading…</li></ol></article></div>`;

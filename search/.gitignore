@@ -6,4 +6,3 @@ web/dist/
 __pycache__/
 *.pyc
 test-results/
-!build/

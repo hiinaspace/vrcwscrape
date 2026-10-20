@@ -142,6 +142,20 @@ def load(path: str) -> dict:
     return d
 
 
+HIDDEN_PREFIXES = ("admin_", "adm_", "feature_", "debug_")
+
+
+def tag_class(raw: str) -> str:
+    """hidden | status | cw | user (mirrored in web/src/engine.ts)"""
+    if raw in ("system_approved", "system_labs"):
+        return "status"
+    if raw.startswith(HIDDEN_PREFIXES) or raw.startswith("system_"):
+        return "hidden"
+    if raw.startswith("content_"):
+        return "cw"
+    return "user"
+
+
 def canon_tag(raw: str) -> str:
     if raw.startswith("author_tag_"):
         return raw[len("author_tag_") :]
@@ -256,9 +270,19 @@ def main() -> None:
             emit(tok.TITLE_MARK + tk, i, tok.F_TITLE)
         for tm in tok.tokens(d["author_name"][i], True):
             emit(tm, i, tok.F_AUTHOR)
+        pcs = tok.pieces(d["name"][i])
+        for a_, b_ in zip(pcs, pcs[1:]):
+            emit(tok.PAIR_MARK + a_ + " " + b_, i, tok.F_TITLE)
         for c in canon_lists[i]:
+            cl = tag_class(c)
+            if cl in ("hidden", "status"):
+                continue
             for tm in tok.tokens(c, True):
                 emit(tm, i, tok.F_TAG)
+            if cl == "user":
+                tk_ = tok.title_key(c)
+                if tk_:
+                    emit(tok.TAG_MARK + tk_, i, tok.F_TAG)
         for tm in tok.tokens(d["desc"][i][:DESC_INDEX_CHARS], False):
             emit(tm, i, tok.F_DESC)
     print(f"tokenized: {len(tid)} terms, {len(A_t)} raw postings, {time.time()-t1:.1f}s")
@@ -384,6 +408,7 @@ def main() -> None:
         "sizeUnit": 1024,
         "thumb": thumb,
         "hasThumb": bool(thumb),
+        "cw": [[k, c] for k, c in all_tags if tag_class(k) == "cw"],
         "date_max": int(max(d["updated"].max(), d["created"].max())) if n else 0,
     }
     out.json("manifest.json", manifest, gz=False)

@@ -5,6 +5,8 @@ const TOK = new RegExp(`([${CJK}]+)|((?:(?![${CJK}])${WORD})+)`, "gu");
 const NONWORD = /[^\p{L}\p{N}\p{M}]+/gu;
 
 export const TITLE_MARK = "\u0001";
+export const TAG_MARK = "\u0002";
+export const PAIR_MARK = "\u0003";
 const MAX_WORD = 32;
 const MAX_TITLE = 48;
 
@@ -37,7 +39,7 @@ export function tokens(text: string): Tok[] {
 }
 
 export function shardKey(term: string): string {
-  if (term.startsWith(TITLE_MARK)) term = term.slice(1);
+  if (term[0] === TITLE_MARK || term[0] === TAG_MARK || term[0] === PAIR_MARK) term = term.slice(1);
   return Array.from(term).slice(0, 2).join("");
 }
 
@@ -51,3 +53,6 @@ export function fnv1a(s: string): number {
 }
 
 export const shardOf = (term: string, n: number) => fnv1a(shardKey(term)) % n;
+
+/** whitespace pieces of the normalized text, punctuation kept (mirrors tok.pieces) */
+export const pieces = (text: string, maxn = 10): string[] => norm(text).split(/\s+/).filter(Boolean).slice(0, maxn).map((w) => Array.from(w).slice(0, 24).join(""));

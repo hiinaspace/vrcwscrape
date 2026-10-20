@@ -1,0 +1,25 @@
+import { chromium } from "playwright";
+const b = await chromium.launch();
+const pg = await b.newPage({ viewport: { width: 1440, height: 900 } });
+const errs = []; pg.on("pageerror", (e) => errs.push(String(e)));
+await pg.goto("http://localhost:4317/?q=chill"); await pg.waitForSelector('[data-testid=result-item]');
+await pg.evaluate(() => window.vrcwSearchReady); await pg.waitForTimeout(2500);
+const th = await pg.evaluate(() => [...document.images].slice(0, 8).map((i) => [i.complete, i.naturalWidth]));
+console.log("thumbs", JSON.stringify(th));
+const qs = [{ filters: { status: ["approved"], cw_exclude: ["horror", "gore"] } }, { filters: { cw: ["adult"] } }, { filters: { cw_exclude: ["sex"], tags: ["chill"] } }];
+for (const q of qs) { const r = await pg.evaluate((q) => window.vrcwSearch.query({ q: "", ...q, limit: 1 }), q); console.log(JSON.stringify(q), r.total, JSON.stringify(r.facetCounts.status), JSON.stringify(r.facetCounts.cw)); }
+await pg.screenshot({ path: "/tmp/d1440.png" });
+await pg.goto("http://localhost:4317/?status=approved&cw_exclude=horror"); await pg.waitForSelector('[data-testid=result-item]'); await pg.waitForTimeout(500);
+console.log("desktop url-state chip", await pg.locator("#f-cw li.hide").count(), await pg.locator("#summary").textContent());
+const m = await b.newPage({ viewport: { width: 390, height: 844 } });
+await m.goto("http://localhost:4317/?q=chill&status=approved"); await m.waitForSelector('[data-testid=result-item]'); await m.waitForTimeout(1500);
+const y = await m.locator('[data-testid=result-item]').first().boundingBox();
+console.log("mobile first result y", y.y, "btn", await m.locator("#fbtn").textContent());
+await m.screenshot({ path: "/tmp/m1.png" });
+await m.locator("#fbtn").click(); await m.waitForTimeout(300); await m.screenshot({ path: "/tmp/m2.png" });
+await m.locator("#fdone").click();
+await m.locator('[data-testid=result-item] .title').first().click(); await m.waitForSelector('[data-testid=similar-list] li'); await m.waitForTimeout(800);
+await m.screenshot({ path: "/tmp/m3.png" });
+console.log("card badges", await m.locator(".badges").innerText(), "tags", await m.locator(".card .chips").innerText());
+console.log(errs);
+await b.close();

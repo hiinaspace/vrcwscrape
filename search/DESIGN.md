@@ -78,3 +78,19 @@ an embedding show "no neighbor data". Full 235k at k=20 would be ~14 MB (budget 
 ## Sizes (June build)
 dist: 60 MB, 2,913 files, largest file `core.bin` 2.36 MB (limit 25 MiB). By dir: fts 14.2 MB, meta 15 MB (128-world chunks),
 card 12.7 MB (512-world chunks), ids 5.4 MB, authors 2.6 MB, sim 0.75 MB, core 2.4 MB, tag lists 0.55 MB.
+
+## Round 2 changes (2026-10-20)
+* **Ranking**: tag words are a weighted field (9 vs title 10); an exact tag-phrase term (`\u0002<tag with spaces>`) adds +70;
+  title exact +1000, title prefix +60; adjacent-word title pairs (`\u0003w1 w2`, punctuation kept, so "Lounge -" and
+  "(Fixed for" work) add +30, or +60 and no exact/prefix title bonus when the query contains punctuation.
+  Measured on the fresh build, 80 random user-tag words: any tag carrier in top 10 = 92.5%, mean fraction of top 10 carrying the tag = 74.5% (was 78% / 33% in the harness run).
+  Punctuation-only tokens were already dropped by the tokenizer; the misses were ranking, now fixed (checked by hand on the four harness examples).
+* **Tag classes** (`tagClass` in engine.ts == `tag_class` in build_index.py): hidden = `admin_ adm_ feature_ debug_ system_*` except
+  status; status = `system_approved`, `system_labs`; cw = `content_*`; user = everything else (author tags, stripped). Hidden tags are not
+  FTS-indexed and never shown; they remain filterable through `tags=`.
+* **New URL / filter params** (additive): `status=approved,labs` (require, AND), `cw=horror,gore` (require content_*),
+  `cw_exclude=adult,sex` (exclude). Same keys in `vrcwSearch.query({filters:{status:[],cw:[],cw_exclude:[]}})`.
+  `facetCounts.tags` is unchanged (all tags, oracle contract); extras `facetCounts.status`, `.cw`, `.userTags` drive the sidebar.
+* Mobile (<=760px): filters live in a full-screen drawer behind a "Filters (n)" button; results are above the fold.
+* Fresh data: built against `worlds-2026-10-20.parquet` (197,991 worlds; `platforms` list used, thumbnails from `thumbnail_url`
+  hotlinked, naturalWidth 256 confirmed in headless Chromium on cc-0). Build 37 s, dist 65 MB, core.bin 2.14 MB.

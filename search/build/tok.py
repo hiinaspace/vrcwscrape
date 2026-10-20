@@ -17,6 +17,9 @@ _TOK = regex.compile(rf"([{CJK}]+)|((?:(?![{CJK}]){WORD})+)")
 _NONWORD = regex.compile(rf"[^\p{{L}}\p{{N}}\p{{M}}]+")
 
 TITLE_MARK = "\u0001"
+TAG_MARK = "\u0002"
+PAIR_MARK = "\u0003"
+MARKS = (TITLE_MARK, TAG_MARK, PAIR_MARK)
 MAX_WORD = 32
 MAX_TITLE = 48
 
@@ -30,6 +33,11 @@ def norm(s: str) -> str:
 def title_key(s: str) -> str:
     """normalized phrase used for exact/prefix title matching"""
     return _NONWORD.sub(" ", norm(s)).strip()[:MAX_TITLE].strip()
+
+
+def pieces(text: str, maxn: int = 10) -> list[str]:
+    """whitespace pieces of the normalized (punctuation kept) title, for adjacent-pair terms"""
+    return [w[:24] for w in norm(text).split()[:maxn]]
 
 
 def tokens(text: str, unigrams: bool) -> list[str]:
@@ -49,7 +57,7 @@ def tokens(text: str, unigrams: bool) -> list[str]:
 
 
 def shard_key(term: str) -> str:
-    if term.startswith(TITLE_MARK):
+    if term[:1] in MARKS:
         term = term[1:]
     return "".join(list(term)[:2])
 

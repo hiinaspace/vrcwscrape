@@ -2,12 +2,13 @@ import {
   Core, Manifest, TITLE_MARK, authorWorlds, fetchJson, forEachPosting, getShard, idToIdx, loadCore,
   loadManifest, lowerBound, loadRare, Rare, worldInfo, similarIdx, cached,
 } from "./data";
-import { Tok, titleKey, tokens } from "./tok";
+import { PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
 
 export interface Filters {
   cap_min?: number; cap_max?: number; size_max_mb?: number;
   platform?: "pc" | "quest" | "both" | "";
   after?: string; before?: string; tags?: string[]; author?: string;
+  status?: string[]; cw?: string[]; cw_exclude?: string[];
 }
 export type Sort = "relevance" | "visits" | "favorites" | "updated" | "published";
 export interface QueryIn { q?: string; filters?: Filters; sort?: Sort; limit?: number; exactTail?: boolean }
@@ -16,13 +17,24 @@ export interface FacetCounts {
   platform: { pc: number; quest: number; both: number };
   tags: Record<string, number>;
   capacity: Record<string, number>;
+  /** extras for the UI (not part of the oracle contract) */
+  status: Record<string, number>;
+  cw: Record<string, number>;
+  userTags: Record<string, number>;
+}
+
+const HIDDEN = ["admin_", "adm_", "feature_", "debug_"];
+export function tagClass(k: string): "hidden" | "status" | "cw" | "user" {
+  if (k === "system_approved" || k === "system_labs") return "status";
+  if (k.startsWith("system_") || HIDDEN.some((p) => k.startsWith(p))) return "hidden";
+  return k.startsWith("content_") ? "cw" : "user";
 }
 
 const EPOCH = Date.UTC(2010, 0, 1);
 const dayOf = (iso: string) => Math.floor((Date.parse(iso + "T00:00:00Z") - EPOCH) / 86400000);
 export const dateOfDay = (d: number) => new Date(EPOCH + d * 86400000).toISOString().slice(0, 10);
 const NONE = 0xffffffff;
-const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 6, W_DESC = 1;
+const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 9, W_DESC = 1;
 
 export class Engine {
   m!: Manifest;
@@ -83,11 +95,13 @@ export class Engine {
     const plat = f.platform || "";
     const dLo = f.after ? dayOf(f.after) : -1, dHi = f.before ? dayOf(f.before) : 1e9;
     const useDate = !!(f.after || f.before);
-    // tags
-    let flagReq = 0;
-    const csrReq: number[] = [];
-    const rareMasks: Uint8Array[] = [];
-    for (const raw of f.tags ?? []) {
+    // tags (explicit tags + status + content warnings): required (AND) and excluded
+    const tagKeys = [...(f.tags ?? []), ...(f.status ?? []).map((x) => "system_" + x.replace(/^system_/, "")), ...(f.cw ?? []).map((x) => "content_" + x.replace(/^content_/, ""))];
+    const exclKeys = (f.cw_exclude ?? []).map((x) => "content_" + x.replace(/^content_/, ""));
+    let flagReq = 0, flagForbid = 0;
+    const csrReq: number[] = [], csrForbid: number[] = [];
+    const rareMasks: Uint8Array[] = [], rareForbid: Uint8Array[] = [];
+    const resolve = async (raw: string, forbid: boolean) => {
       const key = this.resolveTag(raw);
       const id = this.tagId.get(key);
       if (id === undefined) {
@@ -95,16 +109,18 @@ export class Engine {
         const rid = aid.get(key);
         const mk = new Uint8Array(n);
         if (rid !== undefined) for (let i = 0; i < n; i++) for (let j = r.off[i]; j < r.off[i + 1]; j++) if (r.ids[j] === rid) { mk[i] = 1; break; }
-        rareMasks.push(mk);
-      } else if (id < this.m.flagTags) flagReq |= 1 << id;
-      else csrReq.push(id);
-    }
+        (forbid ? rareForbid : rareMasks).push(mk);
+      } else if (id < this.m.flagTags) { if (forbid) flagForbid |= 1 << id; else flagReq |= 1 << id; }
+      else (forbid ? csrForbid : csrReq).push(id);
+    };
+    for (const t of tagKeys) await resolve(t, false);
+    for (const t of exclKeys) await resolve(t, true);
     let authorMask: Uint8Array | null = null;
     if (f.author) {
       authorMask = new Uint8Array(n);
       for (const i of await authorWorlds(f.author)) authorMask[i] = 1;
     }
-    const any = useCap || lim >= 0 || !!plat || useDate || flagReq > 0 || csrReq.length > 0 || rareMasks.length > 0 || !!authorMask;
+    const any = useCap || lim >= 0 || !!plat || useDate || flagReq > 0 || flagForbid > 0 || csrReq.length > 0 || csrForbid.length > 0 || rareMasks.length > 0 || rareForbid.length > 0 || !!authorMask;
     if (!any) { mask.fill(1); return { mask, any }; }
     const { cap, pc, quest, plat: pl, updated, flags, tagOff, tagIds } = c;
     for (let i = 0; i < n; i++) {
@@ -129,7 +145,12 @@ export class Engine {
           if (!found) { ok = false; break; }
         }
       }
+      if (ok && flagForbid && (flags[i] & flagForbid)) ok = false;
+      if (ok && csrForbid.length) {
+        for (let j = tagOff[i]; j < tagOff[i + 1] && ok; j++) if (csrForbid.includes(tagIds[j])) ok = false;
+      }
       if (ok && authorMask && !authorMask[i]) ok = false;
+      if (ok) for (const rm of rareForbid) if (rm[i]) { ok = false; break; }
       if (ok) for (const rm of rareMasks) if (!rm[i]) { ok = false; break; }
       mask[i] = ok ? 1 : 0;
     }
@@ -153,7 +174,6 @@ export class Engine {
     const lastIsWord = toks[lastIdx].word && endsOpen && Array.from(toks[lastIdx].term).length >= 2;
     const shards = await Promise.all(toks.map((t) => getShard(this.m, t.term)));
     const tk = titleKey(q);
-    const titleShard = tk ? await getShard(this.m, TITLE_MARK + tk) : null;
     const tw = this.tw;
     toks.forEach((t: Tok, ti) => {
       const sh = shards[ti];
@@ -174,15 +194,25 @@ export class Engine {
       }
       for (let d = 0; d < n; d++) if (tw[d] > 0) { this.sc[d] += tw[d]; this.cnt[d]++; }
     });
-    if (titleShard && tk) {
-      const key = TITLE_MARK + tk;
-      let i = lowerBound(titleShard.terms, key);
-      let guard = 0;
-      for (; i < titleShard.terms.length && titleShard.terms[i].startsWith(key) && guard < 5000; i++, guard++) {
-        const bonus = titleShard.terms[i] === key ? 1000 : 300;
-        forEachPosting(titleShard, i, (d) => { this.sc[d] += bonus; });
+    const clean = norm(q).trim().replace(/\s+/g, " ") === tk; // no punctuation in the query
+    const add = async (term: string, bonus: (t: string) => number, prefix: boolean) => {
+      const sh = await getShard(this.m, term);
+      let i = lowerBound(sh.terms, term);
+      for (let g = 0; i < sh.terms.length && g < 5000; i++, g++) {
+        const t = sh.terms[i];
+        if (prefix ? !t.startsWith(term) : t !== term) break;
+        const bn = bonus(t);
+        forEachPosting(sh, i, (d) => { this.sc[d] += bn; });
       }
+    };
+    const jobs: Promise<void>[] = [];
+    if (tk) {
+      if (clean) jobs.push(add(TITLE_MARK + tk, (t) => (t === TITLE_MARK + tk ? 1000 : 60), true));
+      jobs.push(add(TAG_MARK + tk, () => 70, false));
     }
+    const pcs = pieces(q);
+    for (let i = 0; i + 1 < pcs.length; i++) jobs.push(add(PAIR_MARK + pcs[i] + " " + pcs[i + 1], () => (clean ? 30 : 60), false));
+    await Promise.all(jobs);
     return toks.length;
   }
 
@@ -232,7 +262,13 @@ export class Engine {
     for (const [k, v] of tagEntries) tags[k] = v;
     const capacity: Record<string, number> = {};
     ["1-8", "9-16", "17-32", "33-64", "65+"].forEach((k, i) => { if (capB[i]) capacity[k] = capB[i]; });
-    const facetCounts: FacetCounts = { platform: { pc: pcN, quest: qN, both: bothN }, tags, capacity };
+    const cntOf = (k: string) => { const id = this.tagId.get(k); return id === undefined ? 0 : tagCnt[id]; };
+    const status = { approved: cntOf("system_approved"), labs: cntOf("system_labs") };
+    const cw: Record<string, number> = {};
+    for (const [k] of this.m.cw ?? []) { const v = cntOf(k); if (v || this.tagId.has(k)) cw[k.slice(8)] = v; }
+    const userTags: Record<string, number> = {};
+    for (const i of this.userOrder(tagCnt)) userTags[this.tagKeys[i]] = tagCnt[i];
+    const facetCounts: FacetCounts = { platform: { pc: pcN, quest: qN, both: bothN }, tags, capacity, status, cw, userTags };
     // top-k
     const idx = this.topK(sort, need > 0, limit, total);
     return { idx, total, facetCounts, ms: performance.now() - t0 };
@@ -269,6 +305,14 @@ export class Engine {
       buf[j] = i;
     }
     return buf;
+  }
+
+  private userIds: number[] | null = null;
+  /** ids of user-class core tags with nonzero count, count desc, top 40 */
+  private userOrder(tagCnt: Uint32Array): number[] {
+    this.userIds ??= this.tagKeys.map((k, i) => (tagClass(k) === "user" ? i : -1)).filter((i) => i >= 0);
+    return this.userIds.filter((i) => tagCnt[i] > 0)
+      .sort((a, b) => tagCnt[b] - tagCnt[a] || (this.tagKeys[a] < this.tagKeys[b] ? -1 : 1)).slice(0, 40);
   }
 
   async similar(idx: number, k: number) { return similarIdx(idx, k); }
