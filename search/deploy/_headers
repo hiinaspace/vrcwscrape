@@ -1,0 +1,51 @@
+# Cloudflare Pages custom headers for the static world search.
+# Rules are cumulative: a request inherits the headers of EVERY matching rule, and a header named twice is comma-joined.
+# So Cache-Control is never set in a catch-all rule; the one overlap (/data/* vs the manifest) uses "! Cache-Control".
+# Limits: 100 rules, 2000 chars per line. Everything the app fetches under /data and /thumbs carries ?v=<manifest.version>,
+# so those URLs change with every build and can be cached forever; the manifest itself is fetched with no-cache.
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
+  Cross-Origin-Opener-Policy: same-origin
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'
+
+# Hashed Vite output (assets/index-<hash>.js etc.)
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Index shards, metadata chunks, neighbour lists, semantic assets: all fetched as <file>?v=<version>.
+# no-transform: the .bin payloads are already gzip (sniffed client-side); the edge must not recompress them.
+/data/*
+  Cache-Control: public, max-age=31536000, immutable, no-transform
+
+/data/*.bin
+  Content-Type: application/octet-stream
+
+# Thumbnail packs are read with HTTP Range (206); no-transform keeps byte offsets stable.
+/thumbs/*
+  Content-Type: application/octet-stream
+  Cache-Control: public, max-age=31536000, immutable, no-transform
+
+# The manifest carries the data version: revalidate often. (Detach whatever /data/* added, then set our own.)
+/data/manifest.json
+  ! Cache-Control
+  Cache-Control: public, max-age=300
+
+/
+  Cache-Control: public, max-age=300
+
+/index.html
+  Cache-Control: public, max-age=300
+
+/about.html
+  Cache-Control: public, max-age=300
+
+/about.css
+  Cache-Control: public, max-age=300
+
+# Keep the pages.dev alias out of search engines (the custom domain is the canonical one).
+https://worldsearch.pages.dev/*
+  X-Robots-Tag: noindex

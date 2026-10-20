@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About · VRChat World Search</title>
+<meta name="description" content="About the VRChat World Search: where the data comes from, how to ask for a removal, and credits.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%236d5dfc'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./about.css">
+</head>
+<body>
+<main class="about">
+  <p class="back"><a href="./">&larr; Back to search</a></p>
+  <h1>About VRChat World Search</h1>
+
+  <p>A fast, static search over public VRChat worlds: full-text search (including Japanese and other CJK text),
+  filters for capacity, download size, platform, dates, tags and author, and "similar worlds" suggestions.
+  It runs entirely in your browser from static files; there is no search server. Made by Hiina.</p>
+
+  <h2 id="data">Data</h2>
+  <ul>
+    <li>The world list is public VRChat world metadata (name, description, author name, tags, capacity,
+    sizes, dates, visit and favorite counts) collected by the author's own scraper. Only worlds whose release status is
+    public are included (<span id="count">@@COUNT@@</span> worlds). Private worlds are not.</li>
+    <li>Snapshot: newest scrape <strong>@@SNAPSHOT@@</strong>. Individual worlds may have been scraped earlier, and
+    anything changed on VRChat since then (renamed, made private, deleted) is not reflected until the next refresh.</li>
+    <li>Thumbnails are small re-encoded previews (256 px wide, AVIF) of each world's public image, served from this site.
+    The full-size image and the official page are on vrchat.com; the detail panel links there.</li>
+    <li>The underlying database is public: a live mirror, updated daily, is on
+    <a href="https://www.dolthub.com/repositories/hiinaspace/vrcwscrape" rel="noopener">DoltHub</a>, and the scraper and this
+    site's source are on <a href="https://github.com/hiinaspace/vrcwscrape" rel="noopener">GitHub</a>.</li>
+    <li>This site is not affiliated with, endorsed by, or sponsored by VRChat Inc. "VRChat" is a trademark of VRChat Inc.
+    World names, descriptions and images belong to their authors.</li>
+  </ul>
+
+  <h2 id="takedown">Removal requests</h2>
+  <p>If you are a world author (or VRChat) and want a world or your whole author profile removed, or a thumbnail or text
+  corrected, email <a href="mailto:hiina@hiina.space?subject=VRChat%20World%20Search%20removal">hiina@hiina.space</a> with the
+  world id (<code>wrld_...</code>, or the vrchat.com link) or the author id (<code>usr_...</code>). You do not need to give a
+  reason. Removals take effect at the next rebuild; I aim to do that within about a week.
+  A world you made private or deleted on VRChat stays here until the next refresh, so email if you want it gone sooner.</p>
+
+  <h2 id="privacy">Privacy</h2>
+  <p>No cookies, no analytics, no third-party requests: everything the page loads comes from this site. Your searches are
+  evaluated locally and never sent anywhere. The only thing stored is your preferences (for example, that you turned on
+  semantic search) in your browser's localStorage. The host (Cloudflare Pages) keeps ordinary server logs of requests, as any
+  web host does.</p>
+
+  <h2 id="credits">Credits and licences</h2>
+  <ul>
+    <li><strong>Similar worlds</strong>: neighbours are precomputed offline with the text embedding model
+    <code>embeddinggemma-2</code> (Apache-2.0). Only the resulting neighbour lists ship with the site.</li>
+    <li><strong>Semantic search</strong> (optional, off by default; downloads about 33 MB after you confirm):
+    <code>static-similarity-mrl-multilingual-v1</code> from the sentence-transformers project (Apache-2.0), quantised and
+    truncated, run in your browser with a small JavaScript reimplementation of its tokenizer.</li>
+    <li><strong>Code and fonts</strong>: the page is plain TypeScript built with Vite (MIT); it bundles no third-party
+    libraries and no web fonts (your system fonts are used).</li>
+  </ul>
+
+  <p class="dim">Author: Hiina, <a href="mailto:hiina@hiina.space">hiina@hiina.space</a>.</p>
+</main>
+</body>
+</html>

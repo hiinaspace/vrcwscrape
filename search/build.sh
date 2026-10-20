@@ -2,6 +2,7 @@
 # env: DIST, WORK override dirs; STATIC_DIR=<emb/static> enables the semantic assets.
 #      THUMBS=<thumbs.parquet> (default /work/projects/vrcwscrape-data/thumbs/thumbs.parquet; skipped when absent) packs self-hosted AVIFs
 #      into $DIST/thumbs (<=24 MiB packs) + data/thumbs_index.bin; THUMBS_BASE=<url> if the packs are hosted elsewhere (default ../thumbs/).
+#      PUBLISH_PQ=<public parquet>: also stamp about.html + install deploy/_headers (deploy/finalize.py); deploy/deploy.sh sets it.
 #      REUSE_DATA=<old dist/data> copies sim/ and sem/ from a previous build with the identical world order (skips the 8 min neighbour job).
 # usage: search/build.sh <worlds.parquet> [embeddings.npy ids.parquet]  ->  search/dist/ (static site)
 set -euo pipefail
@@ -32,7 +33,8 @@ fi
 wait $WEB
 mv "$WORK/data" "$DIST/data"
 [ ! -d "$WORK/thumbs" ] || mv "$WORK/thumbs" "$DIST/thumbs"
+[ -z "${PUBLISH_PQ:-}" ] || uv run --project "$HERE/build" python "$HERE/deploy/finalize.py" "$DIST" "$PUBLISH_PQ"
 T1=$(date +%s)
 echo "build done in $((T1-T0))s -> $DIST"
 du -sh "$DIST"; find "$DIST" -type f | wc -l
-find "$DIST" -type f -printf '%s %p\n' | sort -nr | head -3
+find "$DIST" -type f -printf '%s %p\n' | sort -nr | head -3  || true
