@@ -4,15 +4,40 @@ import {
 } from "./data";
 import { AUTHOR_MARK, PAIR_MARK, TAG_MARK, Tok, norm, pieces, titleKey, tokens } from "./tok";
 
+import { ParseResult, parseQuery } from "./query";
+
 export interface Filters {
   cap_min?: number; cap_max?: number; size_max_mb?: number;
   platform?: "pc" | "quest" | "both" | "";
-  after?: string; before?: string; tags?: string[]; author?: string;
-  status?: string[]; cw?: string[]; cw_exclude?: string[];
+  /** exclude worlds that have this platform */
+  platform_ex?: "pc" | "quest" | "";
+  /** UPDATED date range, inclusive calendar days (oracle contract) */
+  after?: string; before?: string;
+  /** PUBLISHED (created) date range, inclusive calendar days (round 5) */
+  pub_after?: string; pub_before?: string;
+  tags?: string[]; tags_ex?: string[]; author?: string;
+  status?: string[]; status_ex?: string[]; cw?: string[]; cw_exclude?: string[];
 }
-export type Sort = "relevance" | "text" | "visits" | "favorites" | "updated" | "published";
-export interface QueryIn { whatIf?: boolean; q?: string; filters?: Filters; sort?: Sort; limit?: number; exactTail?: boolean }
-export interface QueryOut { idx: number[]; total: number; facetCounts: FacetCounts; ms: number }
+export type Sort = "trending" | "relevance" | "text" | "visits" | "favorites" | "updated" | "published" | "capacity";
+export interface QueryIn {
+  whatIf?: boolean; q?: string; filters?: Filters; sort?: Sort;
+  /** ascending instead of the default descending (ignored for trending/relevance/text) */
+  asc?: boolean;
+  limit?: number; offset?: number; exactTail?: boolean;
+  /** skip facet counting (paging / "load more"); total is still exact */
+  facets?: boolean;
+  /** number of entries in facetCounts.userTagList (default 40) */
+  tagLimit?: number;
+}
+export interface QueryOut {
+  idx: number[]; total: number; facetCounts: FacetCounts; ms: number;
+  /** parse of `q` (pills, errors); same object parseQuery(q) returns */
+  parse: ParseResult;
+  /** true when the query had a positive text condition, i.e. sort "relevance" ranked by text */
+  textRanked: boolean;
+}
+/** month histogram: counts[k] is the number of worlds in month (m0 + k); month index = months since 2010-01 */
+export interface Histo { m0: number; counts: number[] }
 export interface FacetCounts {
   platform: { pc: number; quest: number; both: number };
   tags: Record<string, number>;
@@ -20,9 +45,17 @@ export interface FacetCounts {
   /** extras for the UI (not part of the oracle contract) */
   status: Record<string, number>;
   cw: Record<string, number>;
+  /** user-class tags, case/plural groups merged ("~group" keys), each world counted ONCE per group; top tagLimit, count desc */
   userTags: Record<string, number>;
+  userTagList: [string, number][];
   /** what-if platform counts (UI): total if that platform option were selected, other filters kept */
   platformIf?: { any: number; pc: number; quest: number; both: number };
+  /** published-date (created) histogram by month under all other filters + query, ignoring pub_after/pub_before */
+  months: Histo;
+  /** updated-date histogram by month, ignoring after/before */
+  updatedMonths: Histo;
+  /** worlds per capacity value (index 0..256), ignoring cap_min/cap_max */
+  capacityHist: number[];
 }
 
 const HIDDEN = ["admin_", "adm_", "feature_", "debug_"];
@@ -35,6 +68,9 @@ export function tagClass(k: string): "hidden" | "status" | "cw" | "user" {
 const EPOCH = Date.UTC(2010, 0, 1);
 const dayOf = (iso: string) => Math.floor((Date.parse(iso + "T00:00:00Z") - EPOCH) / 86400000);
 export const dateOfDay = (d: number) => new Date(EPOCH + d * 86400000).toISOString().slice(0, 10);
+/** month index = months since 2010-01 */
+export const monthToDate = (m: number) => `${2010 + Math.floor(m / 12)}-${String((m % 12) + 1).padStart(2, "0")}-01`;
+export const dateToMonth = (iso: string) => (+iso.slice(0, 4) - 2010) * 12 + (+iso.slice(5, 7) - 1);
 const NONE = 0xffffffff;
 const W_TITLE = 10, W_AUTHOR = 6, W_TAG = 9, W_DESC = 0.4;
 
@@ -56,6 +92,10 @@ export class Engine {
   sizeLo: Promise<{ pc: Uint16Array; quest: Uint16Array }> | null = null;
   rare: Promise<{ r: Rare; keys: string[]; id: Map<string, number> }> | null = null;
   defaultFacets!: FacetCounts;
+  hasThumbs = false; // STUB
+  trend: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null } = { basis: "popularity_fallback", windowDays: null }; // STUB
+  months = { min: 0, max: 0 }; // STUB
+  trendOf(_i: number): number { return NaN; } // STUB
 
   async init() {
     this.m = await loadManifest();
@@ -256,7 +296,7 @@ export class Engine {
   async run(inp: QueryIn): Promise<QueryOut> {
     const t0 = performance.now();
     const f = inp.filters ?? {};
-    const sort: Sort = inp.sort ?? "relevance";
+    const sort: Sort = inp.sort ?? "relevance"; // STUB: trending/capacity fall through to popularity/created for now
     const limit = Math.max(0, inp.limit ?? 50);
     const need = (inp.q ?? "").trim() ? await this.textMatch(inp.q!) : 0;
     const { mask } = await this.filterMask(f);
@@ -305,7 +345,12 @@ export class Engine {
     for (const [k] of this.m.cw ?? []) { const v = cntOf(k); if (v || this.tagId.has(k)) cw[k.slice(8)] = v; }
     const userTags: Record<string, number> = {};
     for (const [k, v] of this.userOrder(tagCnt)) userTags[k] = v;
-    const facetCounts: FacetCounts = { platform: { pc: pcN, quest: qN, both: bothN }, tags, capacity, status, cw, userTags };
+    const userTagList = this.userOrder(tagCnt);
+    const facetCounts: FacetCounts = {
+      platform: { pc: pcN, quest: qN, both: bothN }, tags, capacity, status, cw, userTags, userTagList,
+      // STUB (round 5 step 1): real histograms land with the evaluator commit
+      months: { m0: 0, counts: [] }, updatedMonths: { m0: 0, counts: [] }, capacityHist: [],
+    };
     // top-k
     const idx = this.topK(sort, need > 0, limit, total);
     if (inp.whatIf) {
@@ -318,8 +363,14 @@ export class Engine {
       }
       facetCounts.platformIf = pi;
     }
-    return { idx, total, facetCounts, ms: performance.now() - t0 };
+    return { idx, total, facetCounts, ms: performance.now() - t0, parse: parseQuery(inp.q ?? ""), textRanked: need > 0 };
   }
+
+  /** v2 entry point (alias of run) */
+  query(inp: QueryIn): Promise<QueryOut> { return this.run(inp); }
+
+  /** STUB: always null until thumbs.parquet exists and is packed (never hotlinks) */
+  async thumbUrl(_i: number): Promise<string | null> { return null; }
 
   private topK(sort: Sort, hasText: boolean, k: number, total: number): number[] {
     const { mask, c, sc, prior } = this as any as { mask: Uint8Array; c: Core; sc: Float32Array; prior: Float32Array };

@@ -127,3 +127,90 @@ card 12.7 MB (512-world chunks), ids 5.4 MB, authors 2.6 MB, sim 0.75 MB, core 2
   `query({whatIf:true})`). Tag facet and tag search merge case/plural variants into groups (`tags=~chill` = any of chill|Chill; manifest `tagGroups`);
   plain `tags=chill` keeps exact raw semantics and `facetCounts.tags` stays raw for the oracle. Merged counts are sums (a world with two variants counts twice).
 * Result rows show PC / Quest badges from `platforms` (size only when known); date shown matches the sort; semantic hits are a strip above the FTS list.
+
+## Engine API v2 (round 5; owner: ENGINE builder; UI codes against this)
+Source of truth for types: `web/src/engine.ts` (Engine, Filters, QueryIn/Out, FacetCounts) and `web/src/query.ts` (parser, Pill, helpers).
+Step-1 commit has stubs (new facets empty, `thumbUrl` null, syntax parsed but not yet evaluated); signatures are final. Status of each item is
+tracked in the Round 5 section below.
+
+```ts
+// ---- query.ts (pure, no fetch/DOM, never throws)
+parseQuery(text: string): { ast: Node | null; pills: Pill[]; errors: string[] }
+interface Pill {
+  id: string; kind: "term"|"phrase"|"field"|"num"|"date"|"group"; field?: FieldName;   // field: tag|title|author|cw|status|platform|cap|size|visits|favorites|updated|published
+  label: string;            // display text: lake | "escape room" | tag: japan | cap ≥ 8 | size < 50 MB | published 2024-06 | (horror | scary)
+  value: string;            // value part only: japan | >=8 | 2024-06
+  negated: boolean;         // pill came from -x / NOT x
+  start: number; end: number; // [start,end) span in the exact text that was parsed, including the leading '-'/'NOT '
+}
+removePill(text: string, pill: Pill): string        // new query TEXT without this condition
+flipPill(text: string, pill: Pill): string          // new query TEXT with include<->exclude flipped (group pills get -( ... ))
+condition(field: string, value: string, negated?: boolean): string  // -> `-tag:"escape room"`, `cap:>=8`, field "" = plain term
+addCondition(text: string, cond: string): string    // append (idempotent for an identical condition string)
+// top-level pills = the top-level AND items of the query. `(horror | scary) -tag:game cap:>=8` -> 3 pills (group, negated field, num).
+
+// ---- engine.ts
+class Engine {
+  init(): Promise<Engine>
+  query(q: QueryIn): Promise<QueryOut>          // run() is an alias; main.ts's window.vrcwSearch.query must forward q verbatim (syntax allowed)
+  thumbUrl(i: number): Promise<string | null>   // blob/object URL of the AVIF thumb for world ordinal i, or null (no thumb / not built). Never a remote URL.
+  hasThumbs: boolean                            // manifest says thumbs exist (decide placeholder vs img)
+  trendOf(i: number): number                    // recent visits/day estimate (dequantised); NaN when only the popularity fallback exists
+  trend: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null }
+  months: { min: number; max: number }          // global month-index domain (months since 2010-01) of published/updated, for stable histogram axes
+  // unchanged: c (columns), m (manifest), info(idx[]), similar(idx,k), idToIdx(id), allowMask(filters), lp, groupOf, tagsAll()
+}
+monthToDate(m: number): string   // "YYYY-MM-01" first day of month index m
+dateToMonth(iso: string): number
+
+interface QueryIn {
+  q?: string;                       // FULL syntax (see "Query language" below); '' = no text condition
+  filters?: Filters;                // ANDed with q
+  sort?: "trending"|"relevance"|"text"|"visits"|"favorites"|"updated"|"published"|"capacity";   // default "relevance"
+  asc?: boolean;                    // ascending (visits/favorites/updated/published/capacity); ignored for trending/relevance/text
+  limit?: number;                   // default 50
+  offset?: number;                  // default 0 (paging; sort is deterministic, ties -> lower ordinal = more visits)
+  facets?: boolean;                 // default true; false skips facet counting (total still exact) -- use for "load more"
+  tagLimit?: number;                // entries in facetCounts.userTagList, default 40
+  whatIf?: boolean;                 // adds facetCounts.platformIf
+  exactTail?: boolean;              // legacy
+}
+interface Filters {                 // all optional; dates are inclusive calendar days "YYYY-MM-DD" (UI quantises to year/month itself)
+  cap_min?, cap_max?: number;       // inclusive
+  size_max_mb?: number;
+  platform?: "pc"|"quest"|"both"|"";
+  platform_ex?: "pc"|"quest"|"";    // NEW: exclude worlds that have this platform
+  after?, before?: string;          // UPDATED date range (oracle contract: after/before = updated_at)
+  pub_after?, pub_before?: string;  // NEW: PUBLISHED (created) date range. The uploads-over-time brush writes these.
+  tags?: string[]; tags_ex?: string[];   // NEW tags_ex. "~group" = any case/plural variant (works in both)
+  status?: string[]; status_ex?: string[];   // NEW status_ex ("approved"|"labs")
+  cw?: string[]; cw_exclude?: string[]; author?: string;
+}
+interface QueryOut { idx: number[]; total: number; facetCounts: FacetCounts; ms: number; parse: ParseResult; textRanked: boolean }
+interface FacetCounts {
+  // unchanged: platform{pc,quest,both}, tags (RAW, oracle contract, top 60), capacity (5 buckets), status, cw, platformIf (whatIf only)
+  userTagList: [key: string, count: number][];   // NEW ordered top-tagLimit user tags, case/plural merged ("~group" keys), count desc.
+                                                  // Each world counts ONCE per merged group (round-4 sum double count fixed). userTags = same as a Record.
+  months: { m0: number; counts: number[] };          // NEW published (created) histogram; counts[k] = month m0+k; ignores pub_after/pub_before only
+  updatedMonths: { m0: number; counts: number[] };   // NEW updated histogram; ignores after/before only
+  capacityHist: number[];                            // NEW worlds per capacity value, index 0..256; ignores cap_min/cap_max only
+}
+```
+Histogram axes are the same for every query (m0 = `eng.months.min`, length covers `eng.months.max`), so the UI's x-axis never jumps. All other
+facets stay conjunctive (counted over the final result set). `ms` includes parse + facets + top-k.
+
+### Query language (q)
+`lake -hangout` · `lake AND NOT hangout` · `神社 OR shrine` · `(horror | scary) -tag:game cap:>=8` · `"escape room" tag:japan -cw:horror`
+* Terms AND by default (space or explicit `AND`). `-x` or `NOT x` excludes. `OR` (uppercase) or `|` = union. Parentheses group. Lowercase and/or/not are words.
+* **OR binds tighter than AND-by-space** (Google/Gmail style): `a b | c` = `a AND (b OR c)`; so `horror | scary -tag:game` needs no parentheses.
+* `"quoted phrase"`: title-adjacent words (title pair index), or the exact tag / author name, or all words in the description. Single quoted word = exact word, no prefix expansion.
+* A plain term matches any indexed field (title, author, tags, description) with the site tokenizer (CJK bigrams). The last plain term of the query is prefix-expanded
+  while the text has no trailing space (as-you-type), positive or negative.
+* Fields: `tag:x` (exact tag, case/plural-merged; `tag:"escape room"`), `title:x`, `author:x` (name words, or `usr_...` id), `cw:x` (content_x), `status:approved|labs`,
+  `platform:pc|quest|both`. Numeric: `cap:>=16`, `cap:8..32`, `size:<50` (MB, any platform), `visits:>1000` (k/m suffix ok), `favorites:>=50` (`favs`).
+  Dates: `updated:>=2025`, `published:2024-06`, `published:2023..2024-06` (YYYY, YYYY-MM, YYYY-MM-DD; periods expand to their first/last day).
+* Pure negative queries (`-hangout`) = all worlds minus the matches. Empty/incomplete conditions (`tag:`) are ignored while typing.
+* Malformed input never throws: errors are listed in `parse.errors`; unbalanced parentheses auto-close, a stray `)`/`OR` is dropped, a known field with a bad value
+  (`cap:abc`) falls back to a plain word and reports an error. Unknown `foo:bar` is a plain word.
+* Ranking: sum of field-weighted scores of the positive leaves (+ the round-4 bonuses computed from the top-level plain terms) x popularity prior. With no positive text
+  condition, "relevance" = popularity order.
