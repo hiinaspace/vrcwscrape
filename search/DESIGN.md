@@ -112,6 +112,6 @@ card 12.7 MB (512-world chunks), ids 5.4 MB, authors 2.6 MB, sim 0.75 MB, core 2
 * Verified: JS query vectors vs a numpy reference (HF `tokenizers` + dequantised table) on 20 queries (en/ja/ko/zh/mixed/accents/
   fullwidth/punctuation): min cosine 1.00000. Semantic query latency in headless Chromium on cc-0 (n=60): p50 5.3 ms, p95 9.8 ms.
   Loading all assets: 35 MB transferred, 455 ms on localhost.
-* First-view transfer with the toggle off: 2.15 MB (empty query), 2.65-2.88 MB with a text query. Thumbnails (~75 KB PNG each,
-  hotlinked) are loaded only for visible cards and the first batch is held back ~0.9 s; with them eagerly loaded the first view was
-  3.7-3.9 MB. Visible thumbnails add roughly 0.6 MB on a 1440x900 viewport.
+* First-view transfer with the toggle off (same-origin bytes): 2.15 MB (empty query), 2.65-2.88 MB with a text query. Thumbnails
+  (~75 KB PNG each, hotlinked from the VRChat CDN, third-party) load immediately for cards in view (IntersectionObserver, 100 px margin);
+  ~0.6 MB extra on a 1440x900 viewport, 24 eager thumbs were 1.78 MB. No delay is applied.

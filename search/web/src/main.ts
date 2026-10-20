@@ -168,19 +168,16 @@ function renderResults(idx: number[], infos: WorldInfo[], total: number, ms: num
   ($("#more") as HTMLButtonElement).hidden = idx.length >= total;
 }
 
-// Thumbnails are ~75 KB PNGs hotlinked from vrchat.com: load only the ones in view, and hold the very first batch
-// back briefly so the first-view transfer is index data only (results text renders immediately).
+// Thumbnails are ~75 KB PNGs hotlinked from vrchat.com: load only the ones in view
+// immediately.
 let thumbObs: IntersectionObserver | null = null;
-let thumbsAt = performance.now() + 900;
 function lazyThumbs(root: ParentNode) {
   thumbObs ??= new IntersectionObserver((es) => {
     for (const e of es) {
       if (!e.isIntersecting) continue;
       const img = e.target as HTMLImageElement;
       thumbObs!.unobserve(img);
-      const go = () => { if (img.dataset.src) img.src = img.dataset.src; };
-      const wait = thumbsAt - performance.now();
-      if (wait > 0) setTimeout(go, wait); else go();
+      if (img.dataset.src) img.src = img.dataset.src;
     }
   }, { rootMargin: "100px" });
   root.querySelectorAll<HTMLImageElement>("img[data-src]").forEach((i) => thumbObs!.observe(i));
