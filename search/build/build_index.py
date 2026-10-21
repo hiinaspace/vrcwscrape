@@ -318,8 +318,12 @@ def main() -> None:
         hr = build_history.write_shards(a.history, ids_sorted, Path(a.out), out)
         hist_info = hr["info"]
         print("history:", json.dumps(hr["stats"]))
-        asof = Path(a.history) / "asof.txt"
-        hist_info["asof"] = asof.read_text().strip().split(":", 1)[-1].strip() if asof.exists() else None
+        hist_info["asof"] = None
+        aj, at = Path(a.history) / "asof.json", Path(a.history) / "asof.txt"
+        if aj.exists():
+            hist_info["asof"] = str(json.loads(aj.read_text()).get("asof", ""))[:10] or None
+        elif at.exists():
+            hist_info["asof"] = at.read_text().strip().split(":", 1)[-1].strip()[:10]
 
     # ---- full text
     t1 = time.time()

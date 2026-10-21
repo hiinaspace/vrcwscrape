@@ -32,7 +32,7 @@ function xTicks(d0: number, d1: number, x: (d: number) => number): string {
   let s = "";
   for (let y = y0 + 1; y <= y1; y += step) {
     const d = Math.round((Date.UTC(y, 0, 1) - EPOCH) / DAY);
-    if (d <= d0 || d >= d1) continue;
+    if (d <= d0 || d >= d1 || x(d) - x(d0) < 30 || x(d1) - x(d) < 30) continue;
     s += `<line class="gx" x1="${x(d).toFixed(1)}" x2="${x(d).toFixed(1)}" y1="0" y2="H"/><text class="ax" x="${x(d).toFixed(1)}" y="AY" text-anchor="middle">${y}</text>`;
   }
   return s;
