@@ -28,3 +28,6 @@ docs/leaf_compare/*.png
 # Literature PDFs / extracted text used to derive the implementation notes.
 # Disposable; the durable summaries are merged into docs/.
 artifacts_full/
+history/
+history.json
+recent.json

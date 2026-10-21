@@ -21,6 +21,7 @@ import numpy as np
 from playwright.sync_api import sync_playwright
 
 import r5
+import r6
 from common import (
     DEFAULT_PARQUET,
     HERE,
@@ -44,7 +45,7 @@ TARGETS = {
     "recall_at_10": 0.9,
     "max_file_bytes": 25 * MiB,
     "total_bytes": 200 * 1000 * 1000,
-    "max_files": 20000,
+    "max_files": 19000,
 }
 SHOT_VIEWPORTS = {"desktop": (1440, 900), "mobile": (390, 844)}
 
@@ -495,8 +496,10 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     def add(name, value, target, ok):
         rows.append((name, value, target, ok))
 
+    if m.get("r6_only"):
+        return r6.verdict_rows(m)
     if m.get("r5_only"):
-        return r5.verdict_rows(m)
+        return r5.verdict_rows(m) + r6.verdict_rows(m)
     for key, label in [
         ("cold_empty", "cold first results, empty query"),
         ("cold_query", "cold first results, query"),
@@ -612,6 +615,7 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     elif au:
         add("author-name query", au.get("error", "?"), "mean >= 0.70", False)
     rows += r5.verdict_rows(m)
+    rows += r6.verdict_rows(m)
     sm = m.get("semantic", {})
     if "recall_at_10" in sm:
         add(
@@ -646,10 +650,16 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
             d["largest_bytes"] <= TARGETS["max_file_bytes"],
         )
         add(
-            "dist total size / files",
-            f"{d['total_bytes'] / 1e6:.1f} MB / {d['files']} files",
-            "< 200 MB, < 20k files",
-            d["total_bytes"] < TARGETS["total_bytes"] and d["files"] < TARGETS["max_files"],
+            "dist total size (report only: Pages has no total cap)",
+            f"{d['total_bytes'] / 1e6:.1f} MB",
+            "report only",
+            None,
+        )
+        add(
+            "dist file count",
+            f"{d['files']} files",
+            "< 19,000 (Pages 20k limit)",
+            d["files"] < TARGETS["max_files"],
         )
     if m.get("build_time_s") is not None:
         add("build time end to end", f"{m['build_time_s']:.0f} s", "(reported only)", None)
@@ -721,9 +731,12 @@ def main() -> None:
     ap.add_argument(
         "--r5-only", action="store_true", help="only the round-5 checks (fast iteration)"
     )
+    ap.add_argument("--no-r6", action="store_true", help="skip the round-6 checks")
+    ap.add_argument("--r6-only", action="store_true", help="only the round-6 checks")
     ap.add_argument("--no-shots", action="store_true")
     ap.add_argument("--runs-dir", default=str(HERE / "runs"))
     a = ap.parse_args()
+    a.r5_only = a.r5_only or a.r6_only
     gold = [] if a.r5_only else load_jsonl(Path(a.gold) / "queries.jsonl")
     facets = [] if a.r5_only else load_jsonl(Path(a.gold) / "facets.jsonl")
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -739,10 +752,14 @@ def main() -> None:
         "n_facet_combos": len(facets),
         "build_time_s": a.build_time_s,
         "r5_only": a.r5_only,
+        "r6_only": a.r6_only,
     }
     with sync_playwright() as p:
         browser = launch(p)
         try:
+            if a.r6_only:
+                m.update(r6.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, a))
+                raise _Done
             if a.r5_only:
                 ctx = browser.new_context(viewport={"width": 1440, "height": 900})
                 page = ctx.new_page()
@@ -751,6 +768,8 @@ def main() -> None:
                 page.evaluate("window.vrcwSearchReady")
                 m.update(r5.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, page, a))
                 ctx.close()
+                if not a.no_r6:
+                    m.update(r6.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, a))
                 raise _Done
             m["cold_empty"] = cold_metrics(browser, a.url, "")
             m["cold_query"] = cold_metrics(browser, a.url, "horror")
@@ -778,6 +797,8 @@ def main() -> None:
             if not a.no_r5:
                 m.update(r5.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, page, a))
             ctx.close()
+            if not a.no_r6:
+                m.update(r6.run_all(p, browser, a.url, a.r5_parquet or a.parquet, outdir, a))
             try:
                 m["semantic"] = semantic_eval(browser, a.url)
             except Exception as e:  # noqa: BLE001
