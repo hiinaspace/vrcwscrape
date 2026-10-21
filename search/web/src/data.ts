@@ -17,6 +17,8 @@ export interface Manifest {
   /** legacy hotlink config, always null since round 5 (no CDN URLs) */
   thumb: { prefix: string; suffix: string } | null;
   hasThumb: boolean;
+  /** round 6: per-world history shards (hist/<k>.bin), consecutive ordinals starting at starts[k]; null/absent when not built */
+  history?: { shards: number; starts: number[]; capAll: number; keepRecent: number; maxPts: number; metricsFrom: string; asof: string | null } | null;
   trend?: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null; scale: number; measured: number; fallbackRows?: number };
   /** self-hosted AVIF packs (build/pack_thumbs.py); null when not built */
   thumbs?: { base: string; packs: number; count: number; index: string; bytes: number } | null;
@@ -32,6 +34,8 @@ export interface Core {
   visits: Uint32Array;
   fav: Uint32Array;
   trend: Uint16Array | null; // round(scale*log10(1+recent visits/day)); null in pre-round-5 builds
+  lastUpload: Uint16Array | null; // days since 2010-01-01 of the newest package upload (0 = none); null without history
+  uploads90: Uint16Array | null; // upload events in the 90 days before the history as-of date
   plat: Uint8Array; // bit0 pc, bit1 quest
   flags: Uint8Array; // top flagTags tags as bits
   tagOff: Uint32Array; // CSR offsets (n+1)
@@ -112,7 +116,7 @@ export async function loadCore(m: Manifest): Promise<Core> {
   for (let i = 0; i < n; i++) tagOff[i + 1] = tagOff[i] + tc[i];
   return {
     n, cap: col.cap, pc: col.pc, quest: col.quest, created: col.created, updated: col.updated,
-    visits, fav: col.fav, trend: col.trend ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
+    visits, fav: col.fav, trend: col.trend ?? null, lastUpload: col.last_upload ?? null, uploads90: col.uploads_90d ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
   };
 }
 

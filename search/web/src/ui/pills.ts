@@ -35,6 +35,7 @@ function facetPills(ctx: Ctx): PillView[] {
   if (s.size_max_mb !== undefined) out.push({ src: "facet", kind: "size", text: `size ≤ ${s.size_max_mb} MB`, neg: null, remove: () => { s.size_max_mb = undefined; } });
   if (s.after || s.before) out.push({ src: "facet", kind: "date", text: `updated ${s.after || "…"} → ${s.before || "now"}`, neg: null, remove: () => { s.after = ""; s.before = ""; } });
   if (s.pub_after || s.pub_before) out.push({ src: "facet", kind: "date", text: `published ${s.pub_after || "…"} → ${s.pub_before || "now"}`, neg: null, remove: () => { s.pub_after = ""; s.pub_before = ""; } });
+  if (s.recent) out.push({ src: "facet", kind: "recent", text: `uploaded in the last ${s.recent} days`, neg: null, remove: () => { s.recent = 0; } });
   if (s.author) out.push({ src: "facet", kind: "author", text: `author: ${authorName || s.author}`, neg: null, remove: () => { s.author = ""; } });
   return out;
 }
@@ -81,6 +82,8 @@ const EXAMPLES: [string, string][] = [
   ["cap:>=16", "capacity: > >= < <= or 8..32"],
   ["size:<50", "download size in MB"],
   ["updated:>=2025", "also published:2024-06, visits:>1000"],
+  ["uploads:>5", "package uploads in the last 90 days"],
+  ["uploaded:>=2026-09", "newest package upload date (YYYY, YYYY-MM or YYYY-MM-DD)"],
   ["tag:japan author:Foo cw:horror", "tag:, author:, title:, cw:, platform:quest, status:labs"],
 ];
 export function createSyntaxHelp(btn: HTMLElement, pop: HTMLElement, pick: (q: string) => void) {

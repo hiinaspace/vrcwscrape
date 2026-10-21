@@ -10,6 +10,7 @@ export interface State {
   platform_ex: "" | "pc" | "quest";
   after: string; before: string;          // updated range (oracle contract)
   pub_after: string; pub_before: string;  // published range
+  recent: number;                         // 0 | 7 | 30 | 90: newest package upload within N days (round 6)
   datef: DateField;                       // which range the histogram edits (UI only)
   tags: string[]; tags_ex: string[];
   status: string[]; status_ex: string[];
@@ -20,7 +21,7 @@ export interface State {
   world: string;
 }
 
-export const SORTS: Sort[] = ["trending", "relevance", "visits", "favorites", "updated", "published", "capacity"];
+export const SORTS: Sort[] = ["trending", "relevance", "visits", "favorites", "updated", "published", "capacity", "uploads"];
 const ALL_SORTS: string[] = [...SORTS, "text"];
 
 export function readUrl(): State {
@@ -32,6 +33,7 @@ export function readUrl(): State {
     platform: pf === "pc" || pf === "quest" || pf === "both" ? pf : "",
     platform_ex: px === "pc" || px === "quest" ? px : "",
     after: p.get("after") ?? "", before: p.get("before") ?? "", pub_after: p.get("pub_after") ?? "", pub_before: p.get("pub_before") ?? "",
+    recent: [7, 30, 90].includes(+(p.get("recent") ?? 0)) ? +p.get("recent")! : 0,
     datef: p.get("datef") === "published" ? "published" : "updated",
     tags: csv(p.get("tags")), tags_ex: csv(p.get("tags_ex")), status: csv(p.get("status")), status_ex: csv(p.get("status_ex")),
     cw: csv(p.get("cw")), cwx: csv(p.get("cw_exclude")),
@@ -45,6 +47,7 @@ export function toUrl(s: State): string {
   set("q", s.q); set("cap_min", s.cap_min); set("cap_max", s.cap_max); set("size_max_mb", s.size_max_mb);
   set("platform", s.platform); set("platform_ex", s.platform_ex);
   set("after", s.after); set("before", s.before); set("pub_after", s.pub_after); set("pub_before", s.pub_before);
+  if (s.recent) p.set("recent", String(s.recent));
   if (s.datef === "published") p.set("datef", "published");
   if (s.tags.length) p.set("tags", s.tags.join(","));
   if (s.tags_ex.length) p.set("tags_ex", s.tags_ex.join(","));
@@ -64,6 +67,7 @@ export const filtersOf = (s: State): Filters => ({
   cap_min: s.cap_min, cap_max: s.cap_max, size_max_mb: s.size_max_mb,
   platform: s.platform, platform_ex: s.platform_ex,
   after: s.after || undefined, before: s.before || undefined, pub_after: s.pub_after || undefined, pub_before: s.pub_before || undefined,
+  recent_days: s.recent || undefined,
   tags: s.tags, tags_ex: s.tags_ex, author: s.author || undefined,
   status: s.status, status_ex: s.status_ex, cw: s.cw, cw_exclude: s.cwx,
 });
@@ -71,6 +75,6 @@ export const filtersOf = (s: State): Filters => ({
 /** how many sidebar-controlled conditions are active (for the mobile "Filters (n)" button) */
 export function facetCount(s: State): number {
   return (s.cap_min !== undefined || s.cap_max !== undefined ? 1 : 0) + (s.size_max_mb !== undefined ? 1 : 0) + (s.platform ? 1 : 0) + (s.platform_ex ? 1 : 0)
-    + (s.after || s.before ? 1 : 0) + (s.pub_after || s.pub_before ? 1 : 0) + s.tags.length + s.tags_ex.length + (s.author ? 1 : 0)
+    + (s.after || s.before ? 1 : 0) + (s.recent ? 1 : 0) + (s.pub_after || s.pub_before ? 1 : 0) + s.tags.length + s.tags_ex.length + (s.author ? 1 : 0)
     + s.status.length + s.status_ex.length + s.cw.length + s.cwx.length;
 }

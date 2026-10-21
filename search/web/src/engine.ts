@@ -16,10 +16,12 @@ export interface Filters {
   after?: string; before?: string;
   /** PUBLISHED (created) date range, inclusive calendar days (round 5) */
   pub_after?: string; pub_before?: string;
+  /** round 6: only worlds whose newest package upload is within the last N days of the history as-of date (7 | 30 | 90) */
+  recent_days?: number;
   tags?: string[]; tags_ex?: string[]; author?: string;
   status?: string[]; status_ex?: string[]; cw?: string[]; cw_exclude?: string[];
 }
-export type Sort = "trending" | "relevance" | "text" | "visits" | "favorites" | "updated" | "published" | "capacity";
+export type Sort = "trending" | "relevance" | "text" | "visits" | "favorites" | "updated" | "published" | "capacity" | "uploads";
 export interface QueryIn {
   whatIf?: boolean; q?: string; filters?: Filters; sort?: Sort;
   /** ascending instead of the default descending (ignored for trending/relevance/text) */
@@ -193,6 +195,7 @@ export class Engine {
       if (b > 0) { this.monU[i] = monOfDay[b]; mn = Math.min(mn, this.monU[i]); mx = Math.max(mx, this.monU[i]); }
     }
     for (let i = 0; i < n; i++) if (c.updated[i] > this.maxDay) this.maxDay = c.updated[i];
+    if (c.lastUpload) { this.hasHistory = true; for (let i = 0; i < n; i++) if (c.lastUpload[i] > this.lastDay) this.lastDay = c.lastUpload[i]; }
     this.months = mn <= mx ? { min: mn, max: mx } : { min: 0, max: 0 };
     if (this.m.trend) { this.trend = { basis: this.m.trend.basis, windowDays: this.m.trend.windowDays }; this.trendScale = this.m.trend.scale; }
     if (this.m.thumbs) { this.thumbs = new Thumbs(this.m); this.hasThumbs = true; }
@@ -315,6 +318,8 @@ export class Engine {
     const useUpd = !!(f.after || f.before);
     const pLo = f.pub_after ? dayOf(f.pub_after) : -1, pHi = f.pub_before ? dayOf(f.pub_before) : 1e9;
     const usePub = !!(f.pub_after || f.pub_before);
+    const recLo = f.recent_days && c.lastUpload ? this.lastDay - f.recent_days : -1;
+    const useRec = recLo >= 0;
     // tags (explicit tags + status + content warnings): required (AND) and excluded
     const reqKeys = [...(f.tags ?? []), ...(f.status ?? []).map((x) => "system_" + x.replace(/^system_/, "")), ...(f.cw ?? []).map((x) => "content_" + x.replace(/^content_/, ""))];
     const exclKeys = [...(f.tags_ex ?? []), ...(f.status_ex ?? []).map((x) => "system_" + x.replace(/^system_/, "")), ...(f.cw_exclude ?? []).map((x) => "content_" + x.replace(/^content_/, ""))];
@@ -326,7 +331,7 @@ export class Engine {
       authorMask = new Uint8Array(n);
       for (const i of await authorWorlds(f.author)) authorMask[i] = 1;
     }
-    const any = useCap || lim >= 0 || !!plat || !!platEx || useUpd || usePub || req.length > 0 || forbid.length > 0 || !!authorMask;
+    const any = useCap || useRec || lim >= 0 || !!plat || !!platEx || useUpd || usePub || req.length > 0 || forbid.length > 0 || !!authorMask;
     if (!any && !whatIf) { fail.fill(0); return { fail, any }; }
     const { cap, pc, quest, plat: pl, updated, created, flags, tagOff, tagIds } = c;
     const hit = (s: TagSel, i: number) => {
@@ -341,6 +346,7 @@ export class Engine {
       if (usePub && (created[i] < pLo || created[i] > pHi)) fl |= X_PUB;
       if (useUpd && (updated[i] < uLo || updated[i] > uHi)) fl |= X_UPD;
       if (platEx && (pl[i] & platEx)) fl |= X_REST;
+      if (useRec && c.lastUpload![i] < recLo) fl |= X_REST;
       {
         const p = pl[i];
         let okPc = true, okQ = true;
@@ -514,6 +520,7 @@ export class Engine {
         case "cap": hit = c.cap[i] >= 1 && ok(c.cap[i]); break;
         case "visits": hit = ok(c.visits[i]); break;
         case "favorites": hit = ok(c.fav[i]); break;
+        case "uploads": hit = !!c.uploads90 && c.lastUpload![i] > 0 && ok(c.uploads90[i]); break;
         case "size": {
           const a = c.pc[i], b = c.quest[i];
           const kb = Math.min(a === NONE ? Infinity : a, b === NONE ? Infinity : b);
@@ -528,7 +535,7 @@ export class Engine {
 
   private dateMask(nd: Extract<Node, { t: "date" }>): Uint8Array {
     const n = this.c.n, out = this.u8();
-    const arr = nd.field === "updated" ? this.c.updated : this.c.created;
+    const arr = nd.field === "updated" ? this.c.updated : nd.field === "uploaded" ? (this.c.lastUpload ?? new Uint16Array(n)) : this.c.created;
     const lo = nd.lo ? dayOf(nd.lo) : 1, hi = nd.hi ? dayOf(nd.hi) : 1e9;
     for (let i = 0; i < n; i++) out[i] = arr[i] > 0 && arr[i] >= lo && arr[i] <= hi ? 1 : 0;
     return out;
@@ -844,6 +851,7 @@ export class Engine {
       case "favorites": key = (i) => c.fav[i]; dir = asc ? -1 : 1; break;
       case "updated": key = (i) => c.updated[i]; dir = asc ? -1 : 1; break;
       case "capacity": key = (i) => c.cap[i]; dir = asc ? -1 : 1; break;
+      case "uploads": { const u = c.uploads90 ?? c.updated, l = c.lastUpload ?? c.updated; key = (i) => u[i] * 65536 + l[i]; dir = asc ? -1 : 1; break; }
       default: key = (i) => c.created[i]; dir = asc ? -1 : 1; // published
     }
     const better = (a: number, b: number) => {
@@ -888,6 +896,9 @@ export class Engine {
     return (await worldInfo(this.m, idx)).map((w) => ({ desc: w.desc, tags: w.tags }));
   }
 
+  /** newest package-upload day (history as-of; 0 without history) */
+  lastDay = 0;
+  hasHistory = false;
   /** newest `updated` day (days since 2010-01-01) */
   maxDay = 0;
 

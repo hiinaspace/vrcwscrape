@@ -8,8 +8,8 @@
 // Unknown `foo:bar` is a plain word. A known field with a bad value reports an error and falls back to plain words.
 
 export type TextField = "tag" | "title" | "author" | "cw" | "status" | "platform";
-export type NumField = "cap" | "size" | "visits" | "favorites";
-export type DateField = "updated" | "published";
+export type NumField = "cap" | "size" | "visits" | "favorites" | "uploads";
+export type DateField = "updated" | "published" | "uploaded";
 export type FieldName = TextField | NumField | DateField;
 
 export interface Span { start: number; end: number }
@@ -107,9 +107,10 @@ const FIELD_ALIAS: Record<string, FieldName> = {
   platform: "platform", plat: "platform", cap: "cap", capacity: "cap", players: "cap", size: "size", mb: "size",
   visits: "visits", visit: "visits", favorites: "favorites", favourites: "favorites", favs: "favorites", fav: "favorites",
   updated: "updated", update: "updated", published: "published", pub: "published", created: "published",
+  uploads: "uploads", uploaded: "uploaded", lastupload: "uploaded",
 };
-const NUM_FIELDS = new Set<string>(["cap", "size", "visits", "favorites"]);
-const DATE_FIELDS = new Set<string>(["updated", "published"]);
+const NUM_FIELDS = new Set<string>(["cap", "size", "visits", "favorites", "uploads"]);
+const DATE_FIELDS = new Set<string>(["updated", "published", "uploaded"]);
 
 function parseNum(s: string, field: NumField): number | null {
   const m = /^(\d+(?:\.\d+)?)([kKmM]?)$/.exec(s);

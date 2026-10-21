@@ -67,6 +67,8 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
         <div class="seg sm" id="f-datef"><button type="button" data-f="updated" data-testid="datef-updated">Updated</button><button type="button" data-f="published" data-testid="datef-published">Published</button></div></div>
       <div class="presets chips" id="f-presets"><button type="button" data-p="week" data-testid="date-preset-week" title="last 7 days of data">this week</button><button type="button" data-p="month" data-testid="date-preset-month" title="last 30 days of data">this month</button><button type="button" data-p="year" data-testid="date-preset-year" title="last 365 days of data">this year</button><button type="button" data-p="any" data-testid="date-preset-any">any</button></div>
       <div id="f-hist"></div><div id="f-years"></div><div class="rlabel" id="f-datelabel"></div></section>
+    <section data-testid="facet-recent" class="fs-recent" ${eng.hasHistory ? "" : "hidden"}><div class="fh"><h3>Recently updated</h3></div>
+      <div class="chips" id="f-recent" title="by the newest package upload (history data), not the world's updated_at"><button type="button" data-r="7" data-testid="filter-recent-7">7 days</button><button type="button" data-r="30" data-testid="filter-recent-30">30 days</button><button type="button" data-r="90" data-testid="filter-recent-90">90 days</button><button type="button" data-r="0" data-testid="filter-recent-any">any</button></div></section>
     <section data-testid="facet-tags" class="fs-tags"><h3>Tags</h3><input id="f-tagq" type="search" placeholder="find a tag…" autocomplete="off" aria-label="find a tag">
       <ul id="f-tagres" class="flist found"></ul><ul id="f-tags" class="flist"></ul><button type="button" class="linkbtn" id="f-tagmore"></button></section>
     <section data-testid="facet-platform"><h3>Platform</h3><ul id="f-plat" class="flist"></ul></section>
@@ -106,10 +108,14 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
       const b = (e.target as HTMLElement).closest("button"); if (!b) return;
       preset(b.dataset.p!); sync(); ctx.change();
     });
+    $("#f-recent").addEventListener("click", (e) => {
+      const b = (e.target as HTMLElement).closest("button"); if (!b) return;
+      const r = +b.dataset.r!; S().recent = S().recent === r ? 0 : r; sync(false); ctx.change();
+    });
     $("#f-size").addEventListener("input", (e) => { S().size_max_mb = (e.target as HTMLInputElement).value === "" ? undefined : Math.max(0, +(e.target as HTMLInputElement).value); sync(false); ctx.change(150, "type"); });
     $("#f-reset").addEventListener("click", () => {
       const s = S();
-      Object.assign(s, { cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", platform_ex: "", after: "", before: "", pub_after: "", pub_before: "", tags: [], tags_ex: [], author: "", status: [], status_ex: [], cw: [], cwx: [] });
+      Object.assign(s, { cap_min: undefined, cap_max: undefined, size_max_mb: undefined, platform: "", platform_ex: "", after: "", before: "", pub_after: "", pub_before: "", recent: 0, tags: [], tags_ex: [], author: "", status: [], status_ex: [], cw: [], cwx: [] });
       sync(); ctx.change();
     });
     $("#f-tagmore").addEventListener("click", () => { tagsMore = !tagsMore; if (lastFc) paintTags(lastFc); });
@@ -178,6 +184,7 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
       const on = p === "any" ? !s.after && !s.before && !s.pub_after && !s.pub_before : !b && a === (p === "week" ? wk : p === "month" ? mo : yr);
       x.classList.toggle("on", on);
     });
+    $("#f-recent").querySelectorAll("button").forEach((x) => x.classList.toggle("on", +(x as HTMLElement).dataset.r! === s.recent));
     // capacity
     const ci = (v: number | undefined, dflt: number) => { if (v === undefined) return dflt; let k = 0; CAP_STOPS.forEach((st, i) => { if (v >= st) k = i; }); return k; };
     const lo = ci(s.cap_min, 0), hi = s.cap_max === undefined ? CAP_STOPS.length - 1 : Math.max(lo, CAP_STOPS.findIndex((st) => st >= s.cap_max!) < 0 ? CAP_STOPS.length - 1 : CAP_STOPS.findIndex((st) => st >= s.cap_max!));

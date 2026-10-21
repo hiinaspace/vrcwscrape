@@ -208,6 +208,7 @@ def main() -> None:
     ap.add_argument("parquet")
     ap.add_argument("out")
     ap.add_argument("--work", default=None)
+    ap.add_argument("--history", default=None, help="dir with uploads/metrics/summary.parquet (round 6); adds core columns + hist/ shards")
     a = ap.parse_args()
     T0 = time.time()
     out = Out(Path(a.out))
@@ -304,7 +305,21 @@ def main() -> None:
     add("flags", flags, np.uint8)
     add("tagcnt", tagcnt, np.uint8)
     add("tagids", np.frombuffer(tagids, dtype=np.uint16), np.uint16)
+    hist_cols = None
+    if a.history:
+        import build_history
+
+        hist_cols = build_history.core_columns(a.history, ids_sorted)
+        add("last_upload", hist_cols[0], np.uint16)
+        add("uploads_90d", hist_cols[1], np.uint16)
     out.write("core.bin", bytes(blob))
+    hist_info = None
+    if a.history:
+        hr = build_history.write_shards(a.history, ids_sorted, Path(a.out), out)
+        hist_info = hr["info"]
+        print("history:", json.dumps(hr["stats"]))
+        asof = Path(a.history) / "asof.txt"
+        hist_info["asof"] = asof.read_text().strip().split(":", 1)[-1].strip() if asof.exists() else None
 
     # ---- full text
     t1 = time.time()
@@ -472,6 +487,7 @@ def main() -> None:
         "trend": trend_info,
         "tagGroups": tag_groups,
         "cw": [[k, c] for k, c in all_tags if tag_class(k) == "cw"],
+        "history": hist_info,
         "date_max": int(max(d["updated"].max(), d["created"].max())) if n else 0,
     }
     out.json("manifest.json", manifest, gz=False)

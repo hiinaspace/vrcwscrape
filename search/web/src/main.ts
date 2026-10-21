@@ -21,11 +21,11 @@ declare global {
 const PAGE = 24;
 const SORT_LABEL: Record<string, string> = {
   trending: "trending", relevance: "relevance", visits: "visits", favorites: "favorites",
-  updated: "updated", published: "published", capacity: "capacity",
+  updated: "updated", published: "published", capacity: "capacity", uploads: "most updated",
 };
 const SORT_TIP: Record<string, string> = {
   trending: "recent visits per day", relevance: "text match x popularity", visits: "all-time visits", favorites: "favorites",
-  updated: "last updated", published: "first published", capacity: "player capacity",
+  updated: "last updated", published: "first published", capacity: "player capacity", uploads: "package uploads in the last 90 days",
 };
 const NO_DIR = new Set<string>(["trending", "relevance", "text"]);
 
@@ -164,7 +164,7 @@ function change(debounce = 0, mode: "push" | "type" = "push") {
 
 function renderSorts() {
   const eff = effSort(), s = ctx.state;
-  $("#sorts").innerHTML = `<span class="lbl">Sort</span>` + SORTS.map((x) => {
+  $("#sorts").innerHTML = `<span class="lbl">Sort</span>` + SORTS.filter((x) => x !== "uploads" || eng.hasHistory).map((x) => {
     const on = x === eff;
     const arrow = on && !NO_DIR.has(x) ? (s.asc ? " ↑" : " ↓") : "";
     const tip = x === "trending" && eng.trend?.basis === "popularity_fallback" ? "recent visits per day (estimated from popularity; no recent-visit data in this build)" : SORT_TIP[x];

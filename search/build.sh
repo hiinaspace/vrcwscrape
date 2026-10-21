@@ -4,6 +4,7 @@
 #      into $DIST/thumbs (<=24 MiB packs) + data/thumbs_index.bin; THUMBS_BASE=<url> if the packs are hosted elsewhere (default ../thumbs/).
 #      PUBLISH_PQ=<public parquet>: also stamp about.html + install deploy/_headers (deploy/finalize.py); deploy/deploy.sh sets it.
 #      REUSE_DATA=<old dist/data> copies sim/ and sem/ from a previous build with the identical world order (skips the 8 min neighbour job).
+#      HISTORY=<dir with uploads/metrics/summary.parquet>: round-6 history shards (data/hist/) + last_upload/uploads_90d core columns (build/build_history.py).
 # usage: search/build.sh <worlds.parquet> [embeddings.npy ids.parquet]  ->  search/dist/ (static site)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -15,7 +16,7 @@ THUMBS="${THUMBS:-/work/projects/vrcwscrape-data/thumbs/thumbs.parquet}"
 rm -rf "$DIST" "$WORK/data" "$WORK/thumbs"; mkdir -p "$DIST" "$WORK"
 ( cd "$HERE/web" && { [ -d node_modules ] || npm install --no-audit --no-fund >/dev/null; } && npx vite build --outDir "$DIST" --emptyOutDir ) &
 WEB=$!
-uv run --project "$HERE/build" python "$HERE/build/build_index.py" "$PQ" "$WORK/data" --work "$WORK"
+uv run --project "$HERE/build" python "$HERE/build/build_index.py" "$PQ" "$WORK/data" --work "$WORK" ${HISTORY:+--history "$HISTORY"}
 if [ -n "$EMB" ]; then
   uv run --project "$HERE/build" python "$HERE/build/similar.py" "$EMB" "$IDS" "$WORK/world_order.parquet" "$WORK/data"
 fi
