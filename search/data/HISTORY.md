@@ -16,7 +16,7 @@ public mirror HEAD). The live working tree ran ahead of that commit (data to 23:
 Package names use U+2024 "one dot leader" instead of "."; platform from `_android_|_standalonewindows_|_ios_`.
 
 ## Results (2026-10-21 run)
-- uploads.parquet: 5,797,077 rows (5,797,913 version rows minus 10 without created_at minus 826 epoch-0 rows
+- uploads.parquet: 5,797,087 rows (5,797,913 version rows with created_at minus 826 epoch-0 rows
   of wrld_350c0da4-4fa6-430f-b8f6-dd6a004771c4), 197,790 worlds; 65.7 MB. 74,681 non-public package rows skipped.
   Platforms: pc 4.41M, quest 1.29M, ios 104k, other 860. 291k rows have no size, 62.7k no unity_version, 2.86M flagged deleted.
 - metrics.parquet: 1,772,916 rows, 197,992 worlds, 2025-06-24 .. 2026-10-21; 18.6 MB; per-world snapshots p50=10, p90=10, p99=13, max=262; occupants never null.
