@@ -490,16 +490,43 @@ def screenshots(browser, base: str, parquet: str, outdir: Path) -> dict:
 
 
 # ---------------------------------------------------------------- main
+def dist_rows(m: dict) -> list:
+    rows = []
+
+    def add(name, value, target, ok):
+        rows.append((name, value, target, ok))
+
+    d = m.get("dist")
+    if d:
+        add(
+            "dist largest file",
+            f"{d['largest_file']} {d['largest_bytes'] / MiB:.2f} MiB",
+            "<= 25 MiB",
+            d["largest_bytes"] <= TARGETS["max_file_bytes"],
+        )
+        add(
+            "dist total size (report only: Pages has no total cap)",
+            f"{d['total_bytes'] / 1e6:.1f} MB",
+            "report only",
+            None,
+        )
+        add(
+            "dist file count",
+            f"{d['files']} files",
+            "< 19,000 (Pages 20k limit)",
+            d["files"] < TARGETS["max_files"],
+        )
+    return rows
+
+
 def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
     rows = []
 
     def add(name, value, target, ok):
         rows.append((name, value, target, ok))
 
-    if m.get("r6_only"):
-        return r6.verdict_rows(m)
     if m.get("r5_only"):
-        return r5.verdict_rows(m) + r6.verdict_rows(m)
+        return ([] if m.get("r6_only") else r5.verdict_rows(m)) + r6.verdict_rows(m) + dist_rows(m)
     for key, label in [
         ("cold_empty", "cold first results, empty query"),
         ("cold_query", "cold first results, query"),
@@ -641,26 +668,7 @@ def verdicts(m: dict) -> list[tuple[str, str, str, bool | None]]:
         add("semantic check", sm["error"], "no errors", False)
     elif sm:
         add("semantic cjk2en", "skipped: " + sm["skipped"], "optional", None)
-    d = m.get("dist")
-    if d:
-        add(
-            "dist largest file",
-            f"{d['largest_file']} {d['largest_bytes'] / MiB:.2f} MiB",
-            "<= 25 MiB",
-            d["largest_bytes"] <= TARGETS["max_file_bytes"],
-        )
-        add(
-            "dist total size (report only: Pages has no total cap)",
-            f"{d['total_bytes'] / 1e6:.1f} MB",
-            "report only",
-            None,
-        )
-        add(
-            "dist file count",
-            f"{d['files']} files",
-            "< 19,000 (Pages 20k limit)",
-            d["files"] < TARGETS["max_files"],
-        )
+    rows += dist_rows(m)
     if m.get("build_time_s") is not None:
         add("build time end to end", f"{m['build_time_s']:.0f} s", "(reported only)", None)
     return rows

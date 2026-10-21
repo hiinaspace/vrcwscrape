@@ -26,20 +26,19 @@ from r5 import css, dom_ids, loc, open_site, req_bytes, SEL
 
 HIST_DIR = Path(os.environ.get("VRCW_HISTORY_DIR", "/work/projects/vrcwscrape-data/history"))
 TICK_MAX = int(os.environ.get("VRCW_TICK_MAX", "60"))
-BAR_NAMES = ["visits", "capacity", "size"]
+BAR_NAMES = ["cap", "pc", "quest", "visits", "fav"]  # DESIGN.md round 6: bar-cap|pc|quest|visits|fav
 SEL.update(
     {
-        "hist_panel": ["history", "detail-history", "history-panel"],
-        "hist_summary": ["history-summary", "upload-summary", "hist-summary"],
+        "hist_panel": ["history-panel"],
+        "hist_summary": ["history-summary"],
         "tick": ["upload-tick"],
-        "month": ["upload-month", "history-month", "upload-density-month"],
-        "spark": ["history-spark", "visits-spark", "metrics-spark", "sparkline"],
-        "spark_pt": ["spark-point", "visits-spark-point"],
-        "recent_preset": ["recent-{n}", "updated-{n}d", "recent-{n}d", "updated-within-{n}"],
+        "month": ["upload-month"],
+        "spark": ["visits-spark"],
+        "spark_pt": ["visits-spark-point"],  # unused: the sparkline exposes data-n
     }
 )
-SORT_CANDIDATES = ["most_updated", "updates", "uploads", "updated_count", "most-updated"]
-FILTER_KEY_CANDIDATES = ["updated_within_days", "uploaded_within_days", "recent_days", "updated_days"]
+SORT_CANDIDATES = ["uploads"]  # Sort "uploads" = most updated (uploads_90d desc)
+FILTER_KEY_CANDIDATES = ["recent_days"]  # Filters.recent_days: 7|30|90 days before the newest upload in the data
 ASOF_FILES = ["asof.txt", "ASOF", "as_of.txt", "asof.json", "meta.json", "MANIFEST.json", "README.md"]
 
 
@@ -60,6 +59,13 @@ def hcon(v2_parquet: str):
 def asof_date(con) -> tuple[date, str]:
     if os.environ.get("VRCW_ASOF"):
         return date.fromisoformat(os.environ["VRCW_ASOF"]), "env VRCW_ASOF"
+    try:
+        import json
+
+        j = json.loads((HIST_DIR / "asof.json").read_text())
+        return date.fromisoformat(str(j["asof"])[:10]), "history/asof.json (reported; the filter rule is relative to the newest upload)"
+    except Exception:  # noqa: BLE001
+        pass
     for f in ASOF_FILES:
         p = HIST_DIR / f
         if p.exists():
@@ -82,14 +88,16 @@ BARS_JS = """
     for (const t of r.querySelectorAll('[data-testid^="bar-"]')) {
       const name = t.getAttribute('data-testid').slice(4);
       if (name.startsWith('fill-')) continue;
-      const b = t.getBoundingClientRect();
-      const fillEl = r.querySelector('[data-testid="bar-fill-' + name + '"]') || t.querySelector('[class*=fill],i,b,span,div') ;
+      const trk = t.querySelector('.bar') || t;
+      const b = trk.getBoundingClientRect();
+      const fillEl = trk.querySelector('i') || trk.firstElementChild;
       let frac = null;
       const attr = t.getAttribute('data-pct') ?? t.getAttribute('aria-valuenow') ?? (fillEl && fillEl.getAttribute('data-pct'));
-      if (attr !== null && attr !== undefined) { frac = parseFloat(attr); if (frac <= 1.0 && !/%%/.test(attr) && t.getAttribute('data-pct-scale') !== '100') frac = frac * 100; }
+      if (fillEl && /%%$/.test(fillEl.style.width || '')) frac = parseFloat(fillEl.style.width);
+      else if (attr !== null && attr !== undefined) { frac = parseFloat(attr); if (frac <= 1.0 && !/%%/.test(attr) && t.getAttribute('data-pct-scale') !== '100') frac = frac * 100; }
       else if (fillEl && b.width > 0) frac = 100 * fillEl.getBoundingClientRect().width / b.width;
-      const tip = [t, t.parentElement, fillEl].map(e => e && (e.getAttribute('title') || e.getAttribute('data-tip') || e.getAttribute('aria-label') || '')).filter(Boolean).join(' | ');
-      bars[name] = {left: b.left, width: b.width, right: b.right, frac, tip, text: (t.parentElement && t.parentElement.innerText) || ''};
+      const tip = [t, trk, fillEl].map(e => e && (e.getAttribute('title') || e.getAttribute('data-tip') || e.getAttribute('aria-label') || '')).filter(Boolean).join(' | ');
+      bars[name] = {left: b.left, width: b.width, right: b.right, frac, tip, none: t.classList.contains('none'), text: t.innerText || ''};
     }
     return {id: m ? m[0] : null, left: rr.left, right: rr.right, top: rr.top, bars};
   });
@@ -116,6 +124,8 @@ def alignment_eval(browser, base: str) -> dict:
             bad, worst = [], 0.0
             for n in names:
                 got = [r["bars"][n] for r in rows if n in r["bars"]]
+                if len(got) < 2:
+                    continue
                 # mobile may stack rows (or bars) but a column must stay aligned across rows
                 for key in ("left", "width"):
                     # compare relative to the row's own left edge (rows may be indented identically)
@@ -133,27 +143,25 @@ def alignment_eval(browser, base: str) -> dict:
     return out
 
 
-def true_percentiles(con) -> dict[str, tuple[int, list]]:
-    """Per bar name: list of candidate value columns -> (n, sorted values)."""
+def true_percentiles(con) -> dict[str, dict]:
+    """bar name -> sorted values among worlds that have the value (DESIGN: cap > 0; pc/quest only with that package)."""
     cols = {r[0] for r in con.execute("describe w").fetchall()}
-    spec = {
-        "visits": ["visits"],
-        "capacity": ["capacity"],
-        "size": ["pc_size_mb", "quest_size_mb", "greatest(pc_size_mb, quest_size_mb)", "least(pc_size_mb, quest_size_mb)"] if "pc_size_mb" in cols else [],
-    }  # size: the bar may rank pc, quest, the larger or the smaller package; any reading passes
+    fav = next((c for c in ("favorites", "favourites", "fav") if c in cols), None)
+    spec = {"cap": "capacity", "pc": "pc_size_mb", "quest": "quest_size_mb", "visits": "visits", "fav": fav}
     out = {}
-    for name, cs in spec.items():
-        out[name] = {c: [r[0] for r in con.execute(f"select {c} from w where {c} is not null order by 1").fetchall()] for c in cs}
-        out[name]["_ntotal"] = con.execute("select count(*) from w").fetchone()[0]
+    for name, c in spec.items():
+        if not c:
+            continue
+        cond = "capacity > 0" if name == "cap" else f"{c} is not null"
+        out[name] = {"col": c, "vals": [r[0] for r in con.execute(f"select {c} from w where {cond} order by 1").fetchall()]}
     return out
 
 
-def pct_interval(vals: list, v: float, ntotal: int) -> list[tuple[float, float]]:
+def midrank(vals: list, v: float) -> float:
     import bisect
 
     lo, hi = bisect.bisect_left(vals, v), bisect.bisect_right(vals, v)
-    n = len(vals)
-    return [(100 * lo / n, 100 * hi / n), (100 * lo / ntotal, 100 * hi / ntotal)]  # among non-null / among all
+    return 100 * (lo + (hi - lo) / 2) / len(vals)
 
 
 def percentile_eval(browser, base: str, con, n_sample: int = 50, seed: int = 61) -> dict:
@@ -176,29 +184,29 @@ def percentile_eval(browser, base: str, con, n_sample: int = 50, seed: int = 61)
             return {"error": "no rendered rows with bar tracks"}
         ids = rnd.sample(sorted(rows), min(n_sample, len(rows)))
         tr = true_percentiles(con)
+        cols = sorted({t["col"] for t in tr.values()})
         vals = {
-            r[0]: dict(zip(("visits", "capacity", "pc_size_mb", "quest_size_mb", "greatest(pc_size_mb, quest_size_mb)", "least(pc_size_mb, quest_size_mb)"), r[1:]))
+            r[0]: dict(zip(cols, r[1:]))
             for r in con.execute(
-                "select world_id, visits, capacity, pc_size_mb, quest_size_mb, greatest(pc_size_mb, quest_size_mb), least(pc_size_mb, quest_size_mb) from w where world_id in (%s)" % ",".join("'%s'" % i for i in ids)
+                f"select world_id, {', '.join(cols)} from w where world_id in (%s)" % ",".join("'%s'" % i for i in ids)
             ).fetchall()
         }
         checked, bad, tipbad, nofrac = 0, [], [], 0
         for i in ids:
             for name, b in rows[i]["bars"].items():
-                if name not in tr or i not in vals:
+                if name not in tr or i not in vals or b.get("none"):
                     continue
-                tv = [(c, vals[i].get(c)) for c in tr[name] if c != "_ntotal" and vals[i].get(c) is not None]
-                if not tv:
+                v = vals[i].get(tr[name]["col"])
+                if v is None or (name == "cap" and v < 1):
                     continue
                 if b["frac"] is None:
                     nofrac += 1
                     continue
                 checked += 1
-                # ties: any rank in [share below, share <=] is right; population = non-null or all worlds
-                ivs = [iv for c, v in tv for iv in pct_interval(tr[name][c], v, tr[name]["_ntotal"])]
-                if not any(lo - 1 <= b["frac"] <= hi + 1 for lo, hi in ivs):
-                    bad.append(f"{i[-8:]} {name} fill {b['frac']:.1f} vs true {[(round(lo, 1), round(hi, 1)) for lo, hi in ivs[:2]]}")
-                # tooltip must contain the numeric value (any digit run present in tip and in displayed label)
+                tp = midrank(tr[name]["vals"], v)
+                # the site draws round(pct) with a 2% floor, so the comparison allows +-1 point plus that rounding
+                if abs(b["frac"] - tp) > 1.5 and not (b["frac"] == 2 and tp < 3):
+                    bad.append(f"{i[-8:]} {name} fill {b['frac']:.1f} vs true mid-rank {tp:.1f}")
                 if not re.search(r"\d", b["tip"] or ""):
                     tipbad.append(f"{i[-8:]} {name}: tip={b['tip']!r}")
         return {"worlds": len(ids), "bars_checked": checked, "no_fill_value": nofrac, "bad": len(bad), "samples": bad[:5], "tip_bad": len(tipbad), "tip_samples": tipbad[:4], "pass": checked > 0 and not bad and not tipbad}
@@ -208,6 +216,7 @@ def percentile_eval(browser, base: str, con, n_sample: int = 50, seed: int = 61)
 
 # ---------------------------------------------------------------- 3. history
 def sample_worlds(con, n: int = 30, seed: int = 71) -> list[dict]:
+    # sampled by package-row count (ticks are per package row; > TICK_MAX rows -> monthly bars)
     rnd = random.Random(seed)
     top = con.execute("select world_id, uploads_total from sm order by uploads_total desc limit 3").fetchall()
     have_m = "mt" in {r[0] for r in con.execute("show tables").fetchall()} or _has_view(con, "mt")
@@ -218,6 +227,8 @@ def sample_worlds(con, n: int = 30, seed: int = 71) -> list[dict]:
     heavy = pick("uploads_total >= 20", 9)
     mid = pick("uploads_total between 5 and 19", 8)
     light = pick("uploads_total between 1 and 4", 10)
+    # make sure both sides of the 60-row threshold and the 200-row truncation are covered
+    heavy += pick("world_id in (select world_id from up group by 1 having count(*) > 200)", 3)
     seen, out = set(), []
     for w, tag in [(t[0], "top3") for t in top] + [(w, "heavy") for w in heavy] + [(w, "mid") for w in mid] + [(w, "light") for w in light]:
         if w not in seen:
@@ -270,6 +281,9 @@ def last_ok(text: str, last: datetime, now: datetime) -> tuple[bool, str]:
 
 
 def count_spark_points(page) -> int | None:
+    n = page.evaluate("(s) => { const e = document.querySelector(s); return e ? parseInt(e.getAttribute('data-n')) : null; }", css("spark"))
+    if n is not None and n == n:
+        return n
     return page.evaluate(
         """(a) => {
         const s = document.querySelector(a.spark); if (!s) return null;
@@ -289,7 +303,7 @@ def history_eval(browser, base: str, con) -> dict:
     page.wait_for_selector(css("result_item"), timeout=20000)
     page.mouse.wheel(0, 4000)
     page.wait_for_timeout(1000)
-    pre = [r.url for r in reqs if re.search(r"histor", r.url, re.I)]
+    pre = [r.url for r in reqs if re.search(r"/hist/|histor", r.url, re.I)]
     ctx.close()
     sample = sample_worlds(con)
     metrics_rows = {}
@@ -300,36 +314,41 @@ def history_eval(browser, base: str, con) -> dict:
         wid = s["id"]
         ev = true_events(con, wid)
         total, last = len(ev), (ev[-1] if ev else None)
+        nrows = con.execute("select count(*) from up where world_id=?", [wid]).fetchone()[0]
         ctx, page, reqs, _ = open_site(browser, base, world=wid)
-        row = {"id": wid, "kind": s["kind"], "true_total": total}
+        row = {"id": wid, "kind": s["kind"], "true_total": total, "package_rows": nrows}
         try:
             page.wait_for_selector(css("hist_summary"), timeout=15000)
             page.wait_for_timeout(500)
             start = len(reqs)
             txt = loc(page, "hist_summary").first.inner_text()
             row["summary"] = txt[:120]
-            row["hist_bytes"] = req_bytes([r for r in reqs if re.search(r"histor", r.url, re.I)])
-            row["hist_reqs"] = len([r for r in reqs if re.search(r"histor", r.url, re.I)])
+            row["hist_bytes"] = req_bytes([r for r in reqs if re.search(r"/hist/|histor", r.url, re.I)])
+            row["hist_reqs"] = len([r for r in reqs if re.search(r"/hist/|histor", r.url, re.I)])
             gt = parse_total(txt)
             row["total_ok"] = gt == total
+            row["summary_events"] = con.execute("select uploads_total from sm where world_id=?", [wid]).fetchone()[0]
             if last is not None:
-                row["last_ok"], row["last_how"] = last_ok(txt, last, now)
+                tl = page.evaluate("(s) => [...document.querySelector(s).querySelectorAll('[title]')].map(e => e.title).join(' ')", css("hist_summary"))
+                row["last_ok"], row["last_how"] = last_ok(tl + " " + txt, last, now)
             nt = loc(page, "tick").count()
             row["ticks"] = nt
+            # every stacked segment of a month carries the month's total in its <title> ("2026-09: 5 package uploads"): count each month once
             msum = page.evaluate(
-                """(sel) => { const e=[...document.querySelectorAll(sel)]; if(!e.length) return null;
-                  return e.reduce((a,x)=>a+(parseInt(x.getAttribute('data-count')||x.dataset.n||x.textContent)||0),0);}""",
+                """(sel) => { const e=[...document.querySelectorAll(sel)]; if(!e.length) return null; const mo = {};
+                  for (const x of e) { const t=(x.querySelector('title')||{}).textContent||''; const m=t.match(/^(\\d{4}-\\d{2}):\\s*(\\d+)/); if (m) mo[m[1]]=parseInt(m[2]); }
+                  return Object.values(mo).reduce((a,b)=>a+b,0);}""",
                 css("month"),
             )
             row["month_sum"] = msum
-            if total <= TICK_MAX:
-                row["detail_ok"] = nt == total
+            if nrows <= TICK_MAX:
+                row["detail_ok"] = nt == nrows
             else:
-                row["detail_ok"] = msum == total
+                row["detail_ok"] = msum == nrows and nt == 0
             sp = count_spark_points(page)
             mr = metrics_rows.get(wid, 0)
             row["spark_pts"], row["metrics_rows"] = sp, mr
-            row["spark_ok"] = (sp is not None and 0 < sp <= mr) if mr else True
+            row["spark_ok"] = (sp is not None and 0 < sp <= mr) if mr else sp in (0, None)
         except Exception as e:  # noqa: BLE001
             row["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         finally:
@@ -374,7 +393,8 @@ def recent_eval(browser, base: str, con) -> dict:
             res["error"] = f"no recent-days filter key accepted by the hook (tried {FILTER_KEY_CANDIDATES}; set VRCW_RECENT_KEY)"
         else:
             for n in (7, 30, 90):
-                truth = con.execute("select count(*) from sm where last_upload >= (?::date - to_days(?))::timestamp", [asof, n]).fetchone()[0]
+                # DESIGN: newest package upload within N days of the newest upload in the data (calendar days)
+                truth = con.execute("select count(*) from sm where last_upload::date >= (select max(last_upload)::date from sm) - ?::int", [n]).fetchone()[0]
                 got = hook_query(page, q="", filters={key: n}, limit=1)["total"]
                 res["counts"][n] = {"truth": truth, "got": got, "ok": got == truth}
         # UI presets (when test ids exist) must show the same count in the URL-driven hook state
@@ -431,7 +451,7 @@ def verdict_rows(m: dict) -> list[tuple[str, str, str, bool | None]]:
         n = d["n"]
         add(f"history summary total == distinct upload events ({n} worlds, incl. top-3 heaviest)", f"{d['total_ok']}/{n}" + (f"; errors {d['error_samples']}" if d["errors"] else ""), "exact", d["total_ok"] == n)
         add("history summary last-upload date", f"{d['last_ok']}/{n}", "exact", d["last_ok"] == n)
-        add(f"upload ticks == events (total <= {d['tick_threshold']}); heavier: month counts sum to total", f"{d['detail_ok']}/{n}", "exact", d["detail_ok"] == n)
+        add(f"upload ticks == package rows (<= {d['tick_threshold']} rows); heavier: upload-month counts sum to package rows", f"{d['detail_ok']}/{n}", "exact", d["detail_ok"] == n)
         add("sparkline points in (0, metrics rows]", f"{d['spark_ok']}/{n}", "all", d["spark_ok"] == n)
         add("no history fetch before a detail panel opens", f"{len(d['pre_open_history_requests'])} requests", "0", not d["pre_open_history_requests"])
         add("history bytes per panel open (report only)", f"median {d['hist_bytes_median']} B, max {d['hist_bytes_max']} B; top-3 heaviest (id,events,bytes) {d['hist_bytes_top3']}", "report only", None)
@@ -439,7 +459,7 @@ def verdict_rows(m: dict) -> list[tuple[str, str, str, bool | None]]:
             add("history sample failures (report only)", str([{k: r.get(k) for k in ('id', 'true_total', 'summary', 'ticks', 'month_sum', 'error')} for r in d["bad_rows"][:3]])[:400], "-", None)
     if not skip("r6_recent", "recently-updated filter / most-updated sort", "exact"):
         d = m["r6_recent"]
-        add(f"recently updated 7/30/90 d counts vs DuckDB (as-of {d['asof']}: {d['asof_source']})", ", ".join(f"{n}d {c['got']}/{c['truth']}" for n, c in d["counts"].items()), "exact", all(c["ok"] for c in d["counts"].values()))
+        add(f"recently updated 7/30/90 d counts vs DuckDB (rule: within N days of newest upload; data as-of {d['asof']}: {d['asof_source']})", ", ".join(f"{n}d {c['got']}/{c['truth']}" for n, c in d["counts"].items()), "exact", all(c["ok"] for c in d["counts"].values()))
         add(f"'most updated' top 20 have uploads_90d >= p99 ({d['p99_uploads_90d']})", f"sort={d['sort_key']}, min {d.get('top20_min_uploads_90d')}" + ("" if d["sort_ok"] else f"; tried {d.get('sort_tried')}"), ">= p99", d["sort_ok"])
     return rows
 
