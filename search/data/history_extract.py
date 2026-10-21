@@ -75,9 +75,10 @@ try:
     con.register("raw", t)
     con.execute(f"""copy (select world_id, platform, unity_version, version,
         cast(try_cast(created_raw as timestamptz) at time zone 'UTC' as timestamp) as created_at, size_bytes, deleted
-        from raw where try_cast(created_raw as timestamptz) is not null order by world_id, created_at, platform)
+        from raw where try_cast(created_raw as timestamptz) >= timestamptz '2015-01-01' order by world_id, created_at, platform)
         to '{out}/uploads.parquet' (format parquet, compression zstd)""")
 
+    bad["epoch_or_unparseable_dropped"] = len(rows) - con.execute(f"select count(*) from '{out}/uploads.parquet'").fetchone()[0]
     # metrics: stream to parquet
     cur3 = pymysql.cursors.SSCursor(cn)
     cur3.execute("select world_id, scrape_time, visits, favorites, occupants from world_metrics")
@@ -102,7 +103,7 @@ try:
     os.remove(f"{out}/metrics.unsorted.parquet")
 
     # summary: events = per-world uploads collapsed within 10 min (gap-based chaining)
-    asof = head[1]
+    asof = con.execute(f"select max(t) from '{out}/metrics.parquet'").fetchone()[0]  # data time; working tree runs ahead of the HEAD commit
     con.execute(f"""create temp table ev as
       with u as (select world_id, created_at, lag(created_at) over (partition by world_id order by created_at) p
                  from read_parquet('{out}/uploads.parquet')),
@@ -116,7 +117,7 @@ try:
         count(*) filter (where e.t >= timestamp '{asof:%Y-%m-%d %H:%M:%S}' - interval 365 day)::int uploads_365d
       from (select world_id, file_row_number r from read_parquet('{public_pq}', file_row_number=true)) p left join ev e using (world_id)
       group by p.world_id, p.r order by p.r) to '{out}/summary.tmp.parquet'""")
-    con.execute(f"copy (select * exclude rn from read_parquet('{out}/summary.tmp.parquet')) to '{out}/summary.parquet' (format parquet, compression zstd)")
+    con.execute(f"copy (select * from read_parquet('{out}/summary.tmp.parquet')) to '{out}/summary.parquet' (format parquet, compression zstd)")
     os.remove(f"{out}/summary.tmp.parquet")
     json.dump({"head": head[0], "head_date": str(head[1]), "asof": str(asof), **bad}, open(f"{out}/asof.json", "w"))
 finally:
