@@ -22,8 +22,8 @@ const W = (id) => "?world=" + id;
 await shot("desktop-home", D, "");
 await shot("mobile-home", M, "");
 for (const [n, id] of Object.entries(JSON.parse(process.argv[4] ?? "{}"))) {
-  await shot("desktop-detail-" + n, D, W(id), async (p) => { await p.waitForSelector("[data-testid=similar-list] li"); await p.waitForTimeout(800); });
-  await shot("mobile-detail-" + n, M, W(id), async (p) => { await p.waitForSelector("[data-testid=similar-list] li"); await p.waitForTimeout(800); });
+  await shot("desktop-detail-" + n, D, W(id), async (p) => { await p.waitForSelector("[data-testid=similar-list] li"); await p.waitForTimeout(800); await p.evaluate(() => document.querySelector(".history")?.scrollIntoView()); });
+  await shot("mobile-detail-" + n, M, W(id), async (p) => { await p.waitForSelector("[data-testid=similar-list] li"); await p.waitForTimeout(800); await p.evaluate(() => document.querySelector(".history")?.scrollIntoView()); });
 }
 console.log("errors:", errs);
 await b.close();

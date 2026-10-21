@@ -3,6 +3,7 @@ import { cardChunk } from "../data";
 import { dateOfDay, tagClass } from "../engine";
 import type { Ctx } from "./ctx";
 import { meterBlock } from "./rows";
+import { fillHistory } from "./history";
 import { lazyThumbs, thumbBox } from "./thumbs";
 import { esc, fmt, label } from "./util";
 
@@ -54,10 +55,12 @@ export function createDetail(ctx: Ctx, host: HTMLElement, hooks: {
         <div class="badges">${badges.map((t) => `<span class="badge ${tagClass(t)}">${esc(t.replace(/^(content_|system_)/, ""))}</span>`).join("")}</div>
         <div class="tg">${tags.map((t) => `<button type="button" class="tag" data-t="${esc(t)}" title="show only worlds tagged ${esc(label(t))}">${esc(label(t))}</button>`).join("")}</div>
         <p class="desc">${esc(cc.d[j] ?? "")}</p>
+        <section class="history" data-testid="history-panel" ${eng.m.history ? "" : "hidden"}><h3>History</h3><p class="dim">loading…</p></section>
         <h3>Similar worlds</h3><ol data-testid="similar-list" class="similar"><li class="dim">loading…</li></ol></article>`;
     host.scrollTop = 0;
     wire();
     lazyThumbs(host);
+    void fillHistory(eng, host.querySelector(".history") as HTMLElement, idx, () => my === seq);
     host.querySelector("#c-author")!.addEventListener("click", (e) => { e.preventDefault(); hooks.setAuthor(w.authorId); });
     host.querySelectorAll<HTMLElement>(".tg [data-t]").forEach((b) => b.addEventListener("click", () => hooks.addTag(b.dataset.t!)));
     const nb = await eng.similar(idx, 20);
