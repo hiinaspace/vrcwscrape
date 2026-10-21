@@ -2,25 +2,29 @@
 import { dateOfDay, tagClass } from "../engine";
 import type { Engine } from "../engine";
 import type { WorldInfo } from "../data";
-import type { Meters } from "./meters";
+import type { Kind, Meters } from "./meters";
 import { thumbBox } from "./thumbs";
 import { NOSIZE, esc, fmt, kb, label } from "./util";
 
 export interface RowCard { desc: string; tags: string[] }
 
 export function meter(cls: string, name: string, frac: number | null, text: string, title: string): string {
-  return `<span class="m ${cls}${frac === null ? " none" : ""}" title="${esc(title)}"><em>${name}</em><span class="bar"><i style="width:${frac === null ? 0 : Math.round(frac * 100)}%"></i></span><b>${esc(text)}</b></span>`;
+  return `<span class="m ${cls}${frac === null ? " none" : ""}" data-testid="bar-${cls}" title="${esc(title)}"><em>${name}</em><span class="bar"><i style="width:${frac === null ? 0 : Math.max(2, Math.round(frac * 100))}%"></i></span><b>${esc(text)}</b></span>`;
 }
 
+/** five fixed-column rank bars (percentile among all worlds that have the value); every row uses the same grid so the columns line up */
 export function meterBlock(eng: Engine, meters: Meters, i: number): string {
   const c = eng.c;
   const hasPc = !!(c.plat[i] & 1), hasQ = !!(c.plat[i] & 2);
-  const pc = hasPc ? (c.pc[i] === NOSIZE ? { f: null, t: "?", ti: "PC package (size unknown)" } : { f: meters.frac("pc", c.pc[i]), t: kb(c.pc[i]), ti: `PC download ${kb(c.pc[i])}` }) : { f: null, t: "–", ti: "no PC package" };
-  const qu = hasQ ? (c.quest[i] === NOSIZE ? { f: null, t: "?", ti: "Quest package (size unknown)" } : { f: meters.frac("quest", c.quest[i]), t: kb(c.quest[i]), ti: `Quest download ${kb(c.quest[i])}` }) : { f: null, t: "–", ti: "no Quest package" };
-  return meter("cap", "cap", c.cap[i] ? meters.frac("cap", c.cap[i]) : null, String(c.cap[i] || "?"), `Capacity: ${c.cap[i]} players`)
-    + meter("pc", "PC", pc.f, pc.t, pc.ti)
-    + meter("quest", "Quest", qu.f, qu.t, qu.ti)
-    + meter("visits", "visits", meters.frac("visits", c.visits[i]), fmt(c.visits[i]), `${c.visits[i].toLocaleString()} visits`);
+  const rk = (k: Kind, v: number, what: string, shown: string) => ({ f: meters.frac(k, v), t: shown, ti: `${shown} ${what} · ${meters.top(k, v)}` });
+  const pc = hasPc ? (c.pc[i] === NOSIZE ? { f: null, t: "?", ti: "PC package (size unknown)" } : rk("pc", c.pc[i], "PC download", kb(c.pc[i]))) : { f: null, t: "–", ti: "no PC package" };
+  const qu = hasQ ? (c.quest[i] === NOSIZE ? { f: null, t: "?", ti: "Quest package (size unknown)" } : rk("quest", c.quest[i], "Quest download", kb(c.quest[i]))) : { f: null, t: "–", ti: "no Quest package" };
+  const cap = c.cap[i] ? rk("cap", c.cap[i], "player capacity", String(c.cap[i])) : { f: null, t: "?", ti: "capacity unknown" };
+  const vis = rk("visits", c.visits[i], "visits", fmt(c.visits[i]));
+  const fav = rk("fav", c.fav[i], "favorites", fmt(c.fav[i]));
+  return meter("cap", "cap", cap.f, cap.t, cap.ti) + meter("pc", "PC", pc.f, pc.t, pc.ti) + meter("quest", "Quest", qu.f, qu.t, qu.ti)
+    + meter("visits", "visits", vis.f, vis.t, `${c.visits[i].toLocaleString()} visits · ${meters.top("visits", c.visits[i])}`)
+    + meter("fav", "favs", fav.f, fav.t, `${c.fav[i].toLocaleString()} favorites · ${meters.top("fav", c.fav[i])}`);
 }
 
 /** tags + description start; rendered into `.rowx`, which is filled in once the card chunk has arrived */
@@ -46,7 +50,7 @@ export function rowHtml(eng: Engine, meters: Meters, i: number, w: WorldInfo, ti
     <div class="body">
       <div class="l1"><a class="title" href="${href}">${esc(w.name || "(untitled)")}</a><span class="by">${esc(w.author)}</span><span class="rbadges">${rowBadges(card)}</span></div>
       ${compact ? "" : `<div class="rowx">${rowExtraHtml(card)}</div>`}
-      <div class="mrow">${meterBlock(eng, meters, i)}<span class="m fav" title="${c.fav[i].toLocaleString()} favorites">♥ ${fmt(c.fav[i])}</span>
+      <div class="mrow">${meterBlock(eng, meters, i)}
         <span class="m date" title="updated ${dateOfDay(c.updated[i])}, published ${dateOfDay(c.created[i])}">upd ${dateOfDay(c.updated[i])}</span></div>
     </div></li>`;
 }
