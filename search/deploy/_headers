@@ -52,3 +52,7 @@ https://:project.pages.dev/*
 
 https://:version.:project.pages.dev/*
   X-Robots-Tag: noindex
+
+# Test custom domain: also keep it out of search engines (remove this rule when the real domain launches).
+https://worldsearch-test.hiina.space/*
+  X-Robots-Tag: noindex
