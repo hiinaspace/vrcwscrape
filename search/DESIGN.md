@@ -166,7 +166,7 @@ dateToMonth(iso: string): number
 interface QueryIn {
   q?: string;                       // FULL syntax (see "Query language" below); '' = no text condition
   filters?: Filters;                // ANDed with q
-  sort?: "trending"|"relevance"|"text"|"visits"|"favorites"|"updated"|"published"|"capacity";   // default "relevance"
+  sort?: "trending"|"relevance"|"text"|"visits"|"favorites"|"updated"|"published"|"capacity"|"uploads";   // default "relevance"
   asc?: boolean;                    // ascending (visits/favorites/updated/published/capacity); ignored for trending/relevance/text
   limit?: number;                   // default 50
   offset?: number;                  // default 0 (paging; sort is deterministic, ties -> lower ordinal = more visits)
@@ -181,6 +181,7 @@ interface Filters {                 // all optional; dates are inclusive calenda
   platform?: "pc"|"quest"|"both"|"";
   platform_ex?: "pc"|"quest"|"";    // NEW: exclude worlds that have this platform
   after?, before?: string;          // UPDATED date range (oracle contract: after/before = updated_at)
+  recent_days?: number;             // round 6: 7|30|90, newest package upload within N days (see Round 6)
   pub_after?, pub_before?: string;  // NEW: PUBLISHED (created) date range. The uploads-over-time brush writes these.
   tags?: string[]; tags_ex?: string[];   // NEW tags_ex. "~group" = any case/plural variant (works in both)
   status?: string[]; status_ex?: string[];   // NEW status_ex ("approved"|"labs")
@@ -295,3 +296,31 @@ Desktop >= 1024 px: detail panel is a sticky third column; 761-1023 px: right dr
   Pill labels show the value as typed (`author: jar*`).
 * Tokenizer folds lookalike punctuation (`ǃ`->`!`, `ꓸ`->`.`, `ꓹ`->`,`, `ꓼ`->`;`, `ꓽ`->`:`, `‚`->`,`, U+2024->`.`) after NFKC (which already maps fullwidth ASCII) in both index and query (`norm` in tok.py/tok.ts).
   319-query regression after the change: 17 queries gained 1-6 matches, none lost any, no top-1 changed.
+
+## Round 6 (web builder): percentile bars, history, recently updated
+**Owner-judged property**: result bars line up across rows and read as "rank among all worlds"; the detail panel shows a world's upload history and visits trend with honest coverage.
+
+### Bars (no new bytes)
+* Bars are **percentile rank** (mid-rank: share of worlds below the value plus half of those equal), computed client-side from the already-loaded core columns (`ui/meters.ts`: sorted typed-array copies, two binary searches per bar; ~30 ms at boot, 0 extra bytes).
+  Ranked among all worlds that have the value (capacity > 0; PC / Quest size only for worlds with that package). Five bars: cap, PC, Quest, visits, favorites (`bar-cap|pc|quest|visits|fav`). Numeric labels stay; tooltip = `4.1M visits · top 0.3%`. Legend line `bars-legend` above the results.
+* Fixed grid: `.mrow` is `repeat(5, 1fr) 84px` (date); every row's body has the same left offset (fixed thumbnail) and width, so the columns align. A container query (< 600 px body, i.e. with the detail panel open) switches to 3 columns; phones use 2. Still aligned in every case.
+* Visits/favourites bars at the top of the list are all near 100%: that is the rank semantics (top 0.1% .. 1%), not a bug; the exact percentile is in the tooltip.
+
+### History data (build/build_history.py; `build.sh` env `HISTORY=<dir>`; `build_index.py --history <dir>`)
+* Input: `uploads.parquet`, `metrics.parquet`, `summary.parquet` (+ optional `asof.txt`) from the DATA builder.
+* Core columns (in `core.bin`, found by name): `last_upload` (u16 days since 2010-01-01, 0 = none), `uploads_90d` (u16). `manifest.history = {shards, starts[], capAll, keepRecent, maxPts, metricsFrom, asof}`.
+* Shards `data/hist/<k>.bin`: gzip, consecutive world ordinals (`starts[k]` .. next start), greedily packed to <= 100 KB gz (recursive split if over). A detail panel loads exactly one shard (`hist.ts`, cached). Record format: see the docstring of `build_history.py` (varints, day deltas, sizes in KB, metrics as zigzag deltas).
+* **Heavy tail**: a world with <= 200 package rows keeps every row. Above that only the newest 150 rows are kept individually; older rows become per-month bins (count, last PC size, last Quest size). The summary always shows true totals (events from `summary.uploads_total`), and a note `showing monthly counts before YYYY-MM`. Metrics: last snapshot per day, thinned evenly to <= 90 points, true snapshot count kept.
+* File count: ~120 shards on top of the ~10.3k existing files (limit 19,000).
+
+### Detail panel History (`ui/history.ts`, pure SVG, `data-testid="history-panel"`)
+* Summary line (`history-summary`): `182 uploads · last 3 days ago · PC 40 MB→161 MB · Quest ...`; "ago" is relative to the data as-of date.
+* Upload timeline (`upload-timeline`): time axis from the first upload to the as-of date. Size step line per platform (own colour; shared linear y axis, max labelled). <= 60 package rows: one tick per upload per platform lane (`upload-tick`, `<title>` = date, size). More than 60: per-month stacked bars (`upload-month`; platform colours for recent rows, grey for older history without platform detail).
+* Visits / favourites sparkline (`visits-spark`, `data-n` = points drawn): the x axis always runs from the start of metrics tracking (`metricsFrom`, 2025-06) to the as-of date, so coverage is visible. Each snapshot is a point; a line joins neighbours at most 21 days apart only, so sparse worlds stay as bare points (no smoothing). Caption: snapshot count, first/last dates, "too few snapshots for a trend" under 4 points. No metrics: an explicit "no visit snapshots" message.
+
+### Search additions
+* Engine: `Filters.recent_days` (7 | 30 | 90: newest package upload within N days of the newest upload in the data), `Sort "uploads"` ("most updated": `uploads_90d` desc, ties by last upload date), `eng.hasHistory`, `eng.lastDay`. Core fields `lastUpload`, `uploads90` (null without history; all features then hidden).
+* Query syntax: `uploads:>5` (package upload events in the last 90 days; also `>= < <= = a..b`), `uploaded:>=2026-09` (date of the newest package upload; same period grammar as `updated:`; aliases `lastupload:`). Pills and `parse.errors` as for the other fields.
+* URL: `recent=7|30|90`, `sort=uploads`. Facet section "Recently updated" (chips; the world's `updated_at` is a different field, hence the tooltip).
+* Test ids added: `history-panel`, `history-summary`, `upload-timeline`, `upload-tick`, `upload-month`, `visits-spark`, `bar-cap|pc|quest|visits|fav`, `bars-legend`, `facet-recent`, `filter-recent-7|30|90|any`, `sort-uploads`.
+* Checks: `web/test/ui5/r6search.mjs <base>` (filter/sort/syntax/chips), `web/test/ui5/r6shots.mjs <base> <outdir> '{"name":"wrld_..."}'` (screenshots).
