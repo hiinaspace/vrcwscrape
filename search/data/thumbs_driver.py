@@ -33,6 +33,27 @@ def health(tag: str) -> str:
     return r.stdout
 
 
+def wait_inactive() -> None:
+    """Block until the scraper is idle (inactive or failed; i.e. not active/activating) before starting a batch."""
+    while True:
+        r = sh(["ssh", "chirashi", "systemctl --user is-active vrcwscrape.service"], timeout=60)
+        if r.stdout.strip() not in ("active", "activating"):
+            return
+        time.sleep(20)
+
+
+def scraper_runs_ok() -> bool:
+    """Stop rule: any recent run failing with a reason other than the known 'timeout' shutdown hang, or >=5 of the
+    last 6 runs failing (baseline ~40%), means we stop and report."""
+    r = sh(["ssh", "chirashi", "journalctl --user -u vrcwscrape.service --since -4h --no-pager -o cat | "
+            "grep -E \"^(Finished vrcwscrape|vrcwscrape.service: Failed with result)\" | tail -6"], timeout=120)
+    lines = r.stdout.strip().splitlines()
+    bad = [x for x in lines if "Failed with result" in x]
+    odd = [x for x in bad if "'timeout'" not in x]
+    print(f"scraper last {len(lines)} runs: {len(bad)} failed, {len(odd)} non-timeout", flush=True)
+    return not odd and not (len(lines) >= 6 and len(bad) >= 5)
+
+
 def main() -> None:
     shas = sh(["ssh", CC, f"cat {D}/all_shas.txt"]).stdout.split()
     nb = (len(shas) + BATCH - 1) // BATCH
@@ -44,18 +65,31 @@ def main() -> None:
         if sh(["ssh", CC, f"test -f {part}"]).returncode == 0:
             continue
         chunk = shas[b * BATCH:(b + 1) * BATCH]
+        wait_inactive()
         h = health(f"before batch {b}/{nb}")
-        if "ActiveState=failed" in h or not h:
-            print("scraper state unexpected, stopping", flush=True)
+        if not h or not scraper_runs_ok():
+            print("scraper failure pattern changed, stopping", flush=True)
             sys.exit(3)
         lst = f"{D}/lists/batch-{b:04d}.txt"
         sh(["ssh", CC, f"mkdir -p {D}/lists {D}/parts && cat > {lst}"], input="".join(f"{s}\n" for s in chunk))
         t0 = time.time()
         paths = "".join(f"{s[:2]}/{s[2:4]}/{s}.png\n" for s in chunk)
-        remote = (f"nice -n19 ionice -c3 tar -cf - -C {IMAGES} -T - 2>/dev/null | "
-                  f"ssh claude@cc.hl 'cd {SRC} && nice -n10 ~/.local/bin/uv run python encode_stream.py --out {part} "
-                  f"--expect {lst} --rate {RATE}'")
+        enc = (f"ssh claude@cc.hl 'cd {SRC} && nice -n10 ~/.local/bin/uv run python encode_stream.py --out {part} "
+               f"--expect {lst} --rate {RATE}'")
+        # tar runs in the background so its PID is recorded; the watchdog SIGSTOPs exactly that PID whenever the
+        # scraper unit is not 'inactive' and SIGCONTs it afterwards. Pause/resume events go to stderr (-> health.log).
+        remote = (
+            f"{{ nice -n19 ionice -c3 tar -cf - -C {IMAGES} -T - <&0 2>/dev/null & TP=$!; "
+            "( st=run; while kill -0 $TP 2>/dev/null; do "
+            "a=$(systemctl --user is-active vrcwscrape.service); "
+            "if [ \"$a\" = active ] || [ \"$a\" = activating ]; then if [ $st = run ]; then kill -STOP $TP; st=stop; echo \"PAUSE $(date +%T) unit=$a\" >&2; fi; "
+            "else if [ $st = stop ]; then kill -CONT $TP; st=run; echo \"RESUME $(date +%T)\" >&2; fi; fi; sleep 2; done ) & WD=$!; "
+            f"wait $TP; kill $WD 2>/dev/null; }} | {enc}"
+        )
         r = sh(["ssh", "-A", "chirashi", remote], input=paths)
+        ev = [l for l in r.stderr.splitlines() if l.startswith(("PAUSE", "RESUME"))]
+        if ev:
+            sh(["ssh", CC, f"echo 'batch {b}: {len(ev)//2} pauses: {' ; '.join(ev)}' >> {D}/run/health.log"])
         print(f"batch {b}: {time.time()-t0:.0f}s rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()[-200:]}", flush=True)
         if r.returncode not in (0, 2):
             print("unexpected failure, stopping", flush=True)

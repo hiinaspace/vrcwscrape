@@ -45,17 +45,18 @@ def encode_named(args):
 
 
 class Throttled:
-    """File-like wrapper limiting average read rate."""
+    """File-like wrapper limiting read rate to --rate MB/s. No credit accumulates across stalls (e.g. while the
+    upstream tar is SIGSTOPped), so a pause never turns into a catch-up burst."""
 
     def __init__(self, f, mb_per_s: float):
-        self.f, self.rate, self.n, self.t0 = f, mb_per_s * 1e6, 0, time.monotonic()
+        self.f, self.rate, self.next = f, mb_per_s * 1e6, time.monotonic()
 
     def read(self, size=-1):
         b = self.f.read(min(size, 1 << 16) if size and size > 0 else 1 << 16)
-        self.n += len(b)
-        ahead = self.n / self.rate - (time.monotonic() - self.t0)
-        if ahead > 0:
-            time.sleep(ahead)
+        now = time.monotonic()
+        self.next = max(self.next, now) + len(b) / self.rate
+        if self.next > now:
+            time.sleep(self.next - now)
         return b
 
 

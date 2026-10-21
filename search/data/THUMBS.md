@@ -24,3 +24,15 @@ driver logs chirashi load/swap/IO pressure/scraper unit state to `thumbs/run/hea
 Encoder: Pillow 13 native AVIF, LANCZOS resize to 256 px wide (height keeps aspect, mostly 192), RGB, quality 50, speed 4.
 Pilot (500 random images): avg 3.6 KB, p95 6.6 KB; q30 averaged 2.2 KB and q70 6.2 KB on the contact-sheet sample
 (`thumbs/pilot/contact_q{30,50,70}.png`). Missing images (no file in store) are listed per batch in `*.missing.txt`.
+
+## Result (run 2026-10-20 15:49..20:57 MDT)
+- 193,235 unique shas encoded, 0 missing in the store, 0 decode errors. 196,778 of 197,992 public worlds have a thumb
+  (the other 1,214 = 0.61% have no `thumb_sha256` in the DB; they get the placeholder).
+- Size: avg 3.59 KB, median 3.4 KB, p95 6.6 KB, p99 8.3 KB, max 250 KB (1 outlier); 699 MB unique
+  (`thumbs-by-sha.parquet`), 706 MB per-world (`thumbs.parquet`, 3.5k worlds repeat a shared image; dedupe on sha256).
+- Dimensions: 256 x 192 for most; 800 images have another height (non-4:3 originals), max 455.
+- Rules in the driver: streaming pauses (SIGSTOP of our own tar PID) while vrcwscrape.service is `active`/`activating`;
+  `inactive` and `failed` are idle. Stops if a run fails with a reason other than the known `timeout` shutdown hang, or
+  5 of the last 6 runs fail. Throttle has no catch-up credit after pauses. Wall time is dominated by pauses.
+- Scraper impact (journal): 128 runs before the stream, 41% `timeout` failures, median successful run 12.6 min;
+  during the stream 30% failures, median 12.8 min. No change observed.

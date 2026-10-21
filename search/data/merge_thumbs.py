@@ -29,6 +29,6 @@ r = con.execute(f"""SELECT
   (SELECT count(*) FROM read_parquet('{pub}') WHERE thumb_sha256 IS NOT NULL),
   (SELECT count(DISTINCT thumb_sha256) FROM read_parquet('{pub}')),
   (SELECT count(*) FROM p), (SELECT count(*) FROM read_parquet('{D}/thumbs/thumbs.parquet')),
-  (SELECT avg(length(avif)) FROM p), (SELECT quantile_cont(length(avif),0.95) FROM p),
-  (SELECT sum(length(avif)) FROM p)""").fetchone()
+  (SELECT avg(octet_length(avif)) FROM p), (SELECT quantile_cont(octet_length(avif),0.95) FROM p),
+  (SELECT sum(octet_length(avif)) FROM p)""").fetchone()
 print(r)
