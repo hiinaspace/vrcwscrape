@@ -24,12 +24,12 @@ async function fill(el: HTMLElement) {
   } catch { /* placeholder stays */ }
 }
 
-/** lazily resolve `[data-i]` placeholders under root when they come into view */
+/** lazily resolve `.tb[data-i]` thumbnail slots (rows also carry data-i) under root when they come into view */
 export function lazyThumbs(root: ParentNode) {
   obs ??= new IntersectionObserver((es) => {
     for (const e of es) if (e.isIntersecting) { obs!.unobserve(e.target); void fill(e.target as HTMLElement); }
   }, { rootMargin: "200px" });
-  root.querySelectorAll<HTMLElement>("[data-i]").forEach((el) => obs!.observe(el));
+  root.querySelectorAll<HTMLElement>(".tb[data-i]").forEach((el) => obs!.observe(el));
 }
 
 export const thumbBox = (i: number, id: string) => `<span class="tb" data-i="${i}">${placeholder(id)}</span>`;
