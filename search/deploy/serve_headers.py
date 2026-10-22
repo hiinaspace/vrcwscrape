@@ -98,8 +98,9 @@ def main() -> None:
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5180
     H.root = root
     H.rules = parse_headers((root / "_headers").read_text()) if (root / "_headers").is_file() else []
-    print(f"serving {root} with {len(H.rules)} _headers rules on http://127.0.0.1:{port}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+    host = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
+    print(f"serving {root} with {len(H.rules)} _headers rules on http://{host}:{port}", flush=True)
+    ThreadingHTTPServer((host, port), H).serve_forever()
 
 
 if __name__ == "__main__":
