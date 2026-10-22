@@ -31,6 +31,16 @@ def connect(parquet: str) -> duckdb.DuckDBPyConnection:
     has_q = (
         "list_contains(platforms, 'quest')" if "platforms" in cols else "quest_size_mb is not null"
     )
+    # round 6b: "updated" = max(updated_at, newest package upload); raw value kept as updated_at_raw
+    hs = Path(os.environ.get("VRCW_HISTORY_DIR", "/work/projects/vrcwscrape-data/history")) / "summary.parquet"
+    if hs.exists() and "updated_at" in cols and os.environ.get("VRCW_RAW_UPDATED") != "1":
+        con.execute(
+            f"create view base as select p.* replace (greatest(p.updated_at, s.last_upload::timestamp) as updated_at), p.updated_at as updated_at_raw "
+            f"from read_parquet('{parquet}') p left join read_parquet('{hs}') s using (world_id)"
+        )
+        src = "base"
+    else:
+        src = f"read_parquet('{parquet}')"
     con.execute(
         f"""
         create view w as select *,
@@ -38,7 +48,7 @@ def connect(parquet: str) -> duckdb.DuckDBPyConnection:
           coalesce({has_q}, false) as has_quest,
           list_sort(list_distinct(list_transform(coalesce(tags, []),
               t -> regexp_replace(t, '^author_tag_', '')))) as tagset
-        from read_parquet('{parquet}')
+        from {src}
         """
     )
     return con

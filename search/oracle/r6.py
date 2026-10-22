@@ -216,7 +216,7 @@ def percentile_eval(browser, base: str, con, n_sample: int = 50, seed: int = 61)
 
 # ---------------------------------------------------------------- 3. history
 def sample_worlds(con, n: int = 30, seed: int = 71) -> list[dict]:
-    # sampled by package-row count (ticks are per package row; > TICK_MAX rows -> monthly bars)
+    # sampled by upload events (summary.uploads_total; > TICK_MAX events -> monthly bars)
     rnd = random.Random(seed)
     top = con.execute("select world_id, uploads_total from sm order by uploads_total desc limit 3").fetchall()
     have_m = "mt" in {r[0] for r in con.execute("show tables").fetchall()} or _has_view(con, "mt")
@@ -228,6 +228,7 @@ def sample_worlds(con, n: int = 30, seed: int = 71) -> list[dict]:
     mid = pick("uploads_total between 5 and 19", 8)
     light = pick("uploads_total between 1 and 4", 10)
     # make sure both sides of the 60-row threshold and the 200-row truncation are covered
+    heavy += pick("uploads_total between 56 and 64", 2)
     heavy += pick("world_id in (select world_id from up group by 1 having count(*) > 200)", 3)
     seen, out = set(), []
     for w, tag in [(t[0], "top3") for t in top] + [(w, "heavy") for w in heavy] + [(w, "mid") for w in mid] + [(w, "light") for w in light]:
@@ -336,15 +337,22 @@ def history_eval(browser, base: str, con) -> dict:
             # every stacked segment of a month carries the month's total in its <title> ("2026-09: 5 package uploads"): count each month once
             msum = page.evaluate(
                 """(sel) => { const e=[...document.querySelectorAll(sel)]; if(!e.length) return null; const mo = {};
+                  if (e.every(x => x.getAttribute('data-count') !== null)) return e.reduce((a,x)=>a+parseInt(x.getAttribute('data-count')),0);
                   for (const x of e) { const t=(x.querySelector('title')||{}).textContent||''; const m=t.match(/^(\\d{4}-\\d{2}):\\s*(\\d+)/); if (m) mo[m[1]]=parseInt(m[2]); }
                   return Object.values(mo).reduce((a,b)=>a+b,0);}""",
                 css("month"),
             )
             row["month_sum"] = msum
-            if nrows <= TICK_MAX:
-                row["detail_ok"] = nt == nrows
+            ut = row["summary_events"]  # round 6b: ticks / month bars count upload EVENTS = summary.uploads_total
+            row["total_ok"] = row["total_ok"] and gt == ut
+            ev_attr = page.evaluate("(s) => { const e = document.querySelector(s); return e && e.getAttribute('data-events') !== null ? parseInt(e.getAttribute('data-events')) : null; }", css("hist_panel"))
+            row["data_events"] = ev_attr
+            if ev_attr is not None and ev_attr != ut:
+                row["total_ok"] = False
+            if ut <= TICK_MAX:
+                row["detail_ok"] = nt == ut
             else:
-                row["detail_ok"] = msum == nrows and nt == 0
+                row["detail_ok"] = msum == ut
             sp = count_spark_points(page)
             mr = metrics_rows.get(wid, 0)
             row["spark_pts"], row["metrics_rows"] = sp, mr
@@ -451,7 +459,7 @@ def verdict_rows(m: dict) -> list[tuple[str, str, str, bool | None]]:
         n = d["n"]
         add(f"history summary total == distinct upload events ({n} worlds, incl. top-3 heaviest)", f"{d['total_ok']}/{n}" + (f"; errors {d['error_samples']}" if d["errors"] else ""), "exact", d["total_ok"] == n)
         add("history summary last-upload date", f"{d['last_ok']}/{n}", "exact", d["last_ok"] == n)
-        add(f"upload ticks == package rows (<= {d['tick_threshold']} rows); heavier: upload-month counts sum to package rows", f"{d['detail_ok']}/{n}", "exact", d["detail_ok"] == n)
+        add(f"upload ticks == events (summary.uploads_total <= {d['tick_threshold']}); heavier: upload-month counts sum to uploads_total", f"{d['detail_ok']}/{n}", "exact", d["detail_ok"] == n)
         add("sparkline points in (0, metrics rows]", f"{d['spark_ok']}/{n}", "all", d["spark_ok"] == n)
         add("no history fetch before a detail panel opens", f"{len(d['pre_open_history_requests'])} requests", "0", not d["pre_open_history_requests"])
         add("history bytes per panel open (report only)", f"median {d['hist_bytes_median']} B, max {d['hist_bytes_max']} B; top-3 heaviest (id,events,bytes) {d['hist_bytes_top3']}", "report only", None)
