@@ -129,12 +129,12 @@ def summ_ev(sm: dict, w: str) -> int:
     return int(sm[w][0]) if w in sm else -1
 
 
-GAP_S = 600
+GAP_US = 600_000_000  # history_extract.py: an upload chains onto the previous one when created_at - previous <= 10 minutes (microsecond timestamps)
 
 
 def collapse(day: np.ndarray, t: np.ndarray, plat: np.ndarray, size: np.ndarray, dele: np.ndarray) -> dict:
     """package rows (sorted by time) -> upload events: consecutive rows <= 10 min apart (any platform) are one event"""
-    new = np.concatenate([[True], np.diff(t) > GAP_S])
+    new = np.concatenate([[True], np.diff(t) > GAP_US])
     ev = np.cumsum(new) - 1
     n = int(ev[-1]) + 1
     first = np.flatnonzero(new)
@@ -165,7 +165,7 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
     hd = Path(history_dir)
     ut = pq.read_table(hd / "uploads.parquet")
     u_id = np.array(ut["world_id"].to_pylist(), dtype=object)
-    u_t = ut["created_at"].cast(pa.timestamp("s"), safe=False).to_numpy(zero_copy_only=False).astype("int64")
+    u_t = ut["created_at"].cast(pa.timestamp("us"), safe=False).to_numpy(zero_copy_only=False).astype("int64")
     u_day = days(ut["created_at"])
     u_plat = np.array([PLAT.get(p, 3) for p in ut["platform"].to_pylist()], dtype=np.int8)
     u_size = np.array([-1 if x is None else x for x in ut["size_bytes"].to_pylist()], dtype=np.int64)
@@ -217,6 +217,8 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
                 keep = keep[np.unique(np.linspace(0, len(keep) - 1, MAX_PTS).round().astype(int))]
             if len(keep):
                 mtd = {"day": d[keep], "vis": v[keep], "fav": f[keep], "total": total}
+        if up is None and summ_ev(sm, w) > 0:
+            stats["event_mismatch"] += 1
         recs.append(enc_world(up, mtd, sm.get(w)) if (up or mtd) else b"\x00")
 
     # pack consecutive ordinals into shards of <= SHARD_GZ_TARGET gzip bytes
@@ -276,6 +278,8 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
         "shard_count": len(shards),
         "largest_record_raw": max(len(r) for r in recs),
     }
+    if stats["event_mismatch"]:
+        raise SystemExit(f"history: {stats['event_mismatch']} worlds whose event count differs from summary.uploads_total; one definition required (see history_extract.py)")
     return {"info": info, "stats": summary}
 
 

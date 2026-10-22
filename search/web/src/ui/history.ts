@@ -89,7 +89,7 @@ export function renderUploads(h: WorldHistory, asofDay: number, lastDay: number)
     const mw = Math.max(1.2, ((px1 - px0) / Math.max(1, d1 - d0)) * 30.4 - 0.6);
     for (const [m, n] of mon) {
       const hgt = (n / mx) * BH;
-      marks += `<rect data-testid="upload-month" x="${x(monthStart(m)).toFixed(1)}" y="${(laneTop + BH - hgt).toFixed(1)}" width="${mw.toFixed(1)}" height="${hgt.toFixed(1)}" class="mbar"><title>${ym(m)}: ${n} upload${n === 1 ? "" : "s"}</title></rect>`;
+      marks += `<rect data-testid="upload-month" x="${x(monthStart(m)).toFixed(1)}" y="${(laneTop + BH - hgt).toFixed(1)}" width="${mw.toFixed(1)}" height="${hgt.toFixed(1)}" class="mbar" data-count="${n}"><title>${ym(m)}: ${n} upload${n === 1 ? "" : "s"}</title></rect>`;
     }
     marks += `<text class="ax" x="${px0 - 4}" y="${laneTop + 9}" text-anchor="end">max ${mx}</text><text class="ax" x="${px0 - 4}" y="${laneTop + BH}" text-anchor="end">0</text>`;
     bottom = laneTop + BH;
@@ -109,7 +109,7 @@ export function renderUploads(h: WorldHistory, asofDay: number, lastDay: number)
   const sum = `${h.events.toLocaleString()} upload${h.events === 1 ? "" : "s"} · last <span title="${ymd(lastD)}">${ago(asofDay - lastD)}</span>${sizes ? " · " + esc(sizes) : ""}`
     + (h.old ? ` <span class="dim">· per-upload sizes from ${ymd(rows[0].day).slice(0, 7)}; earlier months combined</span>` : "");
   return `<p class="hsum" data-testid="history-summary">${sum}</p>
-    <svg class="hsvg" data-testid="upload-timeline" viewBox="0 0 ${W} ${H}" role="img" aria-label="package upload timeline" preserveAspectRatio="xMidYMid meet">${ticks}${axis}${svg}${marks}${yl}${edge}</svg>
+    <svg class="hsvg" data-testid="upload-timeline" data-events="${h.events}" viewBox="0 0 ${W} ${H}" role="img" aria-label="package upload timeline" preserveAspectRatio="xMidYMid meet">${ticks}${axis}${svg}${marks}${yl}${edge}</svg>
     <div class="hleg">${legend}</div>`;
 }
 
@@ -152,5 +152,6 @@ export async function fillHistory(eng: Engine, host: HTMLElement, idx: number, a
   const asof = hi.asof ? Math.round((Date.parse(hi.asof + "T00:00:00Z") - EPOCH) / DAY) : eng.lastDay;
   if (!h || (!h.events && !h.metrics)) { host.innerHTML = `<h3>History</h3><p class="dim">No package upload history recorded for this world.</p>`; return; }
   const up = h.events || h.recent.length ? renderUploads(h, asof, h.recent.length ? h.recent[h.recent.length - 1].day : asof) : `<p class="dim" data-testid="history-summary">No package uploads recorded.</p>`;
+  host.dataset.events = String(h?.events ?? 0);
   host.innerHTML = `<h3>History</h3>${up}${renderMetrics(h, asof, hi.metricsFrom)}<p class="hnote dim">as of ${esc(hi.asof ?? "")}; from the public data mirror</p>`;
 }
