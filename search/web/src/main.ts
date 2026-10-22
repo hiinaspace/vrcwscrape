@@ -7,6 +7,7 @@ import type { Ctx } from "./ui/ctx";
 import { createDetail } from "./ui/detail";
 import { createFacets } from "./ui/facets";
 import { Meters } from "./ui/meters";
+import { setUploadsView } from "./ui/rows";
 import { createPills, createSyntaxHelp, setAuthorName } from "./ui/pills";
 import { rowHtml } from "./ui/rows";
 import { semUi, SemUi } from "./ui/semui";
@@ -25,7 +26,7 @@ const SORT_LABEL: Record<string, string> = {
 };
 const SORT_TIP: Record<string, string> = {
   trending: "recent visits per day", relevance: "text match x popularity", visits: "all-time visits", favorites: "favorites",
-  updated: "last updated", published: "first published", capacity: "player capacity", uploads: "package uploads in the last 90 days",
+  updated: "newer of the world's update date and its newest package upload", published: "first published", capacity: "player capacity", uploads: "package uploads in the last 90 days",
 };
 const NO_DIR = new Set<string>(["trending", "relevance", "text"]);
 
@@ -181,6 +182,7 @@ function sortFade() {
 async function refresh() {
   const my = ++seq;
   const s = ctx.state;
+  setUploadsView(!!s.recent || effSort() === "uploads");
   const r = await eng.query({ q: s.q, filters: filtersOf(s), sort: effSort(), asc: s.asc, limit: shown, tagLimit: 40 });
   if (my !== seq) return;
   const infos = await eng.info(r.idx);

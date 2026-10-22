@@ -5,8 +5,9 @@ build_index.py calls `core_columns()` (last_upload, uploads_90d) and `write_shar
 
 Per-world record (before gzip; shards are consecutive world ordinals, shard k = ordinals starts[k]..starts[k+1]-1):
   flags u8 (bit0 uploads, bit1 metrics)
-  uploads: v events(collapsed, from summary) v rowsTotal v firstDay v nOld [v m0, nOld x (v count, v pcKB, v questKB)] v nKept nKept x (v dDay, u8 plat|deleted<<3, v sizeKB+1)
-           rows beyond CAP_ALL keep only the newest KEEP_RECENT individually; older rows become per-month bins (count + last size per platform)
+  uploads: v events(true total; one event = package rows of a world chained within 10 minutes, any platform) v firstDay v nOld [v m0, nOld x (v events, v pcKB, v questKB)] v nKept nKept x (v dDay, u8 mask, nPresent x v sizeKB+1)
+           mask: bits0-3 = platforms present (pc, quest, ios, other), bit4 = every row of the event deleted; sizes follow in platform order (0 = size unknown)
+           events beyond CAP_ALL keep only the newest KEEP_RECENT individually; older events become per-month bins (event count + last known size per platform)
   metrics: v snapsTotal v n n x (v dDay, zigzag dVisits, zigzag dFav)   (<= MAX_PTS points, one per day, thinned evenly)
 Days are days since 2010-01-01 (same as core.bin created/updated); months are months since 2010-01.
 """
@@ -75,9 +76,8 @@ def enc_world(up: dict | None, mt: dict | None, summ: tuple | None) -> bytes:
     out = bytearray()
     out.append((1 if up else 0) | (2 if mt else 0))
     if up:
-        day, plat, size, dele = up["day"], up["plat"], up["size"], up["del"]
+        day, mask, dele, kb = up["day"], up["mask"], up["del"], up["kb"]
         n = len(day)
-        vi(out, int(summ[0]) if summ else n)
         vi(out, n)
         vi(out, int(day[0]))
         keep = n if n <= CAP_ALL else KEEP_RECENT
@@ -87,11 +87,11 @@ def enc_world(up: dict | None, mt: dict | None, summ: tuple | None) -> bytes:
             m0 = int(mo[0])
             span = int(mo[-1]) - m0 + 1
             cnt = np.bincount(mo - m0, minlength=span)
-            last = {0: [0] * span, 1: [0] * span}
+            last = [[0] * span, [0] * span]
             for k in range(old):
-                p = int(plat[k])
-                if p in last and size[k] > 0:
-                    last[p][int(mo[k]) - m0] = int(size[k]) // 1024 + 1
+                for p in (0, 1):
+                    if kb[p][k] > 0:
+                        last[p][int(mo[k]) - m0] = int(kb[p][k])
             vi(out, span)
             vi(out, m0)
             for k in range(span):
@@ -106,8 +106,11 @@ def enc_world(up: dict | None, mt: dict | None, summ: tuple | None) -> bytes:
         for k in range(old, n):
             vi(out, int(day[k]) - prev)
             prev = int(day[k])
-            out.append((int(plat[k]) & 3) | (4 if dele[k] else 0))
-            vi(out, 0 if size[k] <= 0 else int(size[k]) // 1024 + 1)
+            m = int(mask[k]) | (16 if dele[k] else 0)
+            out.append(m)
+            for p in range(4):
+                if m & (1 << p):
+                    vi(out, int(kb[p][k]))
     if mt:
         day, vis, fav = mt["day"], mt["vis"], mt["fav"]
         vi(out, mt["total"])
@@ -120,6 +123,33 @@ def enc_world(up: dict | None, mt: dict | None, summ: tuple | None) -> bytes:
             zz(out, int(fav[k]) - pf)
             pd, pv, pf = int(day[k]), int(vis[k]), int(fav[k])
     return bytes(out)
+
+
+def summ_ev(sm: dict, w: str) -> int:
+    return int(sm[w][0]) if w in sm else -1
+
+
+GAP_S = 600
+
+
+def collapse(day: np.ndarray, t: np.ndarray, plat: np.ndarray, size: np.ndarray, dele: np.ndarray) -> dict:
+    """package rows (sorted by time) -> upload events: consecutive rows <= 10 min apart (any platform) are one event"""
+    new = np.concatenate([[True], np.diff(t) > GAP_S])
+    ev = np.cumsum(new) - 1
+    n = int(ev[-1]) + 1
+    first = np.flatnonzero(new)
+    mask = np.zeros(n, dtype=np.uint8)
+    alld = np.ones(n, dtype=bool)
+    kb = [np.zeros(n, dtype=np.int64) for _ in range(4)]
+    for i in range(len(t)):
+        e = ev[i]
+        p = int(plat[i]) & 3
+        mask[e] |= 1 << p
+        if not dele[i]:
+            alld[e] = False
+        if size[i] > 0:
+            kb[p][e] = max(kb[p][e], int(size[i]) // 1024 + 1)
+    return {"day": day[first], "mask": mask, "del": alld, "kb": kb}
 
 
 def group(ids: np.ndarray):
@@ -162,7 +192,7 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
     sm = {w: (a,) for w, a in zip(st["world_id"].to_pylist(), st["uploads_total"].to_pylist())}
 
     recs: list[bytes] = []
-    stats = {"uploads_rows": [], "uploads_capped": 0}
+    stats = {"uploads_rows": [], "uploads_capped": 0, "rows_raw": 0, "event_mismatch": 0}
     for w in ids:
         up = mtd = None
         if w in ug:
@@ -171,9 +201,12 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
                 dd = u_day[a:b]
             else:
                 dd = np.maximum(u_day[a:b], 0)
-            up = {"day": dd, "plat": u_plat[a:b], "size": u_size[a:b], "del": u_del[a:b]}
-            stats["uploads_rows"].append(b - a)
-            if b - a > CAP_ALL:
+            up = collapse(dd, u_t[a:b], u_plat[a:b], u_size[a:b], u_del[a:b])
+            stats["uploads_rows"].append(len(up["day"]))
+            stats["rows_raw"] += b - a
+            if summ_ev(sm, w) != len(up["day"]):
+                stats["event_mismatch"] += 1
+            if len(up["day"]) > CAP_ALL:
                 stats["uploads_capped"] += 1
         if w in mg:
             a, b = mg[w]
@@ -233,9 +266,9 @@ def write_shards(history_dir: str, ids: list[str], out_root: Path, writer=None) 
     }
     summary = {
         "worlds_with_uploads": int(len(rows)),
-        "rows_p50": float(np.percentile(rows, 50)),
-        "rows_p99": float(np.percentile(rows, 99)),
-        "rows_max": int(rows.max()),
+        "rows_raw": stats["rows_raw"], "event_mismatch_vs_summary": stats["event_mismatch"], "events_p50": float(np.percentile(rows, 50)),
+        "events_p99": float(np.percentile(rows, 99)),
+        "events_max": int(rows.max()),
         "worlds_capped": stats["uploads_capped"],
         "shard_bytes_max": max(sizes),
         "shard_bytes_median": int(np.median(sizes)),

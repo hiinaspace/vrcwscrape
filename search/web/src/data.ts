@@ -30,7 +30,10 @@ export interface Core {
   pc: Uint32Array; // KB (ceil); 0xFFFFFFFF = none
   quest: Uint32Array;
   created: Uint16Array; // days since 2010-01-01
+  /** newer of the world's updated_at and its newest package upload (history as-of is later than the world snapshot); every updated filter/sort/histogram uses this */
   updated: Uint16Array;
+  /** the world record's own updated_at (before the max with lastUpload) */
+  updatedAt: Uint16Array;
   visits: Uint32Array;
   fav: Uint32Array;
   trend: Uint16Array | null; // round(scale*log10(1+recent visits/day)); null in pre-round-5 builds
@@ -114,9 +117,18 @@ export async function loadCore(m: Manifest): Promise<Core> {
   const tagOff = new Uint32Array(n + 1);
   const tc: Uint8Array = col.tagcnt;
   for (let i = 0; i < n; i++) tagOff[i + 1] = tagOff[i] + tc[i];
+  const updatedAt: Uint16Array = col.updated;
+  let lastUpload: Uint16Array | null = null;
+  if (col.last_upload_d) { // zigzag delta from updated_at, 65535 = none
+    const zd: Uint16Array = col.last_upload_d;
+    lastUpload = new Uint16Array(n);
+    for (let i = 0; i < n; i++) { const z = zd[i]; lastUpload[i] = z === 65535 ? 0 : updatedAt[i] + (z & 1 ? -(z + 1) / 2 : z / 2); }
+  }
+  let updated = updatedAt;
+  if (lastUpload) { updated = new Uint16Array(updatedAt); const lu = lastUpload; for (let i = 0; i < n; i++) if (lu[i] > updated[i]) updated[i] = lu[i]; }
   return {
-    n, cap: col.cap, pc: col.pc, quest: col.quest, created: col.created, updated: col.updated,
-    visits, fav: col.fav, trend: col.trend ?? null, lastUpload: col.last_upload ?? null, uploads90: col.uploads_90d ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
+    n, cap: col.cap, pc: col.pc, quest: col.quest, created: col.created, updated, updatedAt,
+    visits, fav: col.fav, trend: col.trend ?? null, lastUpload, uploads90: col.uploads_90d ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
   };
 }
 

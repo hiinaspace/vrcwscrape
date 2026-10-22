@@ -49,9 +49,9 @@ export function createDetail(ctx: Ctx, host: HTMLElement, hooks: {
         <a class="hero" href="${OFFICIAL(w.id)}" target="_blank" rel="noopener" title="Open the official VRChat world page">${thumbBox(idx, w.id)}<span class="heroql">view on vrchat.com ↗</span></a>
         <h2>${esc(w.name)}</h2>
         <p class="by">by <a href="#" id="c-author">${esc(w.author)}</a> · <a href="${OFFICIAL(w.id)}" target="_blank" rel="noopener">vrchat.com ↗</a></p>
-        <div class="mrow big">${meterBlock(eng, ctx.meters, idx)}</div>
+        <div class="mrow big">${meterBlock(eng, ctx.meters, idx, true)}</div>
         <table>${row("Capacity", String(c.cap[idx]))}${row("Visits", c.visits[idx].toLocaleString())}${row("Favorites", c.fav[idx].toLocaleString())}
-          ${row("Published", dateOfDay(c.created[idx]))}${row("Updated", dateOfDay(c.updated[idx]))}${row("World id", `<code>${esc(w.id)}</code>`)}</table>
+          ${row("Published", dateOfDay(c.created[idx]))}${row("Updated", dateOfDay(c.updatedAt[idx])) + (c.lastUpload?.[idx] ? row("Last package upload", dateOfDay(c.lastUpload[idx])) : "")}${row("World id", `<code>${esc(w.id)}</code>`)}</table>
         <div class="badges">${badges.map((t) => `<span class="badge ${tagClass(t)}">${esc(t.replace(/^(content_|system_)/, ""))}</span>`).join("")}</div>
         <div class="tg">${tags.map((t) => `<button type="button" class="tag" data-t="${esc(t)}" title="show only worlds tagged ${esc(label(t))}">${esc(label(t))}</button>`).join("")}</div>
         <p class="desc">${esc(cc.d[j] ?? "")}</p>

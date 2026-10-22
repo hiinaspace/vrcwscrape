@@ -179,8 +179,7 @@ main{min-width:0}
   .detail{width:100%;z-index:50;box-shadow:none;border:0}.dhead .x{display:none}.dhead .back{display:inline-block;padding:7px 14px}
   .hero{height:190px}
   .thumb{width:84px;height:63px}.results>li{gap:8px;padding:6px}
-  .m .bar{max-width:60px}.m em{width:32px}.m b{min-width:34px}
-  .mrow{grid-template-columns:1fr 1fr;gap:2px 8px}
+  .mrow.big{grid-template-columns:1fr 1fr;gap:2px 8px}
   .sorts{overflow-x:auto;flex-wrap:nowrap;max-width:100%;padding-bottom:2px}.sorts button{white-space:nowrap}
   #semantic .results{grid-template-columns:1fr}
   .pm{width:32px;height:32px;font-size:18px}.frow{grid-template-columns:32px 32px minmax(0,1fr) 44px 34px;gap:4px;padding:3px 0}
@@ -202,11 +201,25 @@ main{min-width:0}
 .hsvg .gx{stroke:var(--line);stroke-width:1;stroke-dasharray:2 3}
 .hsvg .base{stroke:var(--line);stroke-width:1}
 .hsvg .step{fill:none;stroke-width:1.5;opacity:.85}
-.hsvg .tick{stroke-width:1.4;opacity:.8}.hsvg .tick.del{opacity:.35}
+.hsvg .tick line{stroke-width:1.4}.hsvg .tick{opacity:.85}.hsvg .tick.del{opacity:.4}.hsvg .mbar{fill:var(--acc);opacity:.8}
+.hsvg .axc{font-size:10px;font-family:inherit}.hsvg .axc.vis{fill:var(--m-vis)}.hsvg .axc.fav{fill:var(--m-fav)}.history h4 .vis-t{color:var(--m-vis)}.history h4 .fav-t{color:var(--m-fav)}
 .hsvg .ln{fill:none;stroke-width:1.4}.hsvg .ln.vis,.hsvg .pt.vis{stroke:var(--m-vis);fill:var(--m-vis)}.hsvg .ln.fav,.hsvg .pt.fav{stroke:var(--m-fav);fill:var(--m-fav)}.hsvg .pt{stroke:none}
 .hleg{display:flex;flex-wrap:wrap;gap:2px 12px;font-size:11px;color:var(--fg)}.hleg i{display:inline-block;width:10px;height:3px;margin-right:4px;vertical-align:middle;border-radius:1px}
 .hnote{font-size:11px;color:var(--dim);margin:2px 0 6px}
 .vis-dot,.fav-dot{display:inline-block;width:8px;height:8px;border-radius:50%}.vis-dot{background:var(--m-vis)}.fav-dot{background:var(--m-fav)}
 
 @container (max-width:600px){.mrow:not(.big){grid-template-columns:repeat(3,minmax(0,1fr))}}
+/* narrow rows (phones): two rows of three, each bar a full-width >= 60px track under its name and value; columns stay aligned across rows */
+@container (max-width:400px){
+  .mrow:not(.big){grid-template-columns:repeat(3,minmax(0,1fr));gap:6px 10px}
+  .mrow:not(.big) .m:not(.date){display:grid;grid-template-columns:auto 1fr;grid-template-areas:"n v" "b b";gap:1px 4px;align-items:baseline}
+  .mrow:not(.big) .m em{grid-area:n;width:auto;text-align:left}
+  .mrow:not(.big) .m b{grid-area:v;text-align:right;min-width:0}
+  .mrow:not(.big) .m .bar{grid-area:b;max-width:none;width:100%;height:6px}
+  .mrow:not(.big) .m.date{grid-column:3;align-self:end;white-space:normal;line-height:1.2}
+}
 .history{scroll-margin-top:56px}
+
+.rk{display:block;flex-basis:100%;font-size:10px;color:var(--dim);margin-left:38px}
+.mrow.big .m{flex-wrap:wrap}
+.mrow:not(.big) .rk{display:none}

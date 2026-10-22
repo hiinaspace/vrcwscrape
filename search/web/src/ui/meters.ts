@@ -30,6 +30,8 @@ export class Meters {
     while (lo < hi) { const m = (lo + hi) >> 1; if (xs[m] <= v) lo = m + 1; else hi = m; }
     return xs.length ? (below + (lo - below) / 2) / xs.length : 0;
   }
+  /** "larger than 62% of worlds" (sizes, capacity) */
+  larger(kind: Kind, v: number): string { return `larger than ${Math.round(this.frac(kind, v) * 100)}% of worlds`; }
   /** "top 0.3%" style text: share of worlds with a strictly higher value (mid-rank) */
   top(kind: Kind, v: number): string {
     const p = (1 - this.frac(kind, v)) * 100;

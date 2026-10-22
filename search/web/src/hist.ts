@@ -3,13 +3,13 @@ import { cached, fetchBin } from "./data";
 import type { Manifest } from "./data";
 
 export const PLATFORMS = ["pc", "quest", "ios", "other"] as const;
-export interface UploadRow { day: number; plat: number; deleted: boolean; kb: number } // kb = 0 when the size is unknown
+/** one upload event: package rows of one world chained within 10 minutes; mask bits 0-3 = platforms present (pc, quest, ios, other); kb[p] = package size, 0 unknown */
+export interface UploadRow { day: number; mask: number; deleted: boolean; kb: number[] }
 export interface WorldHistory {
-  /** upload events (collapsed within 10 minutes, per the summary) and raw package rows: true totals even when the payload is capped */
+  /** true number of upload events (also when the payload is capped) */
   events: number;
-  rows: number;
   firstDay: number;
-  /** rows older than the per-world cap: monthly counts (all platforms) + last known package size (KB, 0 none) per platform, month index since 2010-01 */
+  /** events older than the per-world cap: monthly event counts + last known package size (KB, 0 none) per platform, month index since 2010-01 */
   old: { m0: number; count: number[]; pcKb: number[]; questKb: number[] } | null;
   recent: UploadRow[];
   metrics: { total: number; day: number[]; vis: number[]; fav: number[] } | null;
@@ -27,9 +27,9 @@ function decode(buf: Uint8Array): WorldHistory | null {
   const r = new Rd(buf);
   const flags = r.u8();
   if (!flags) return null;
-  const h: WorldHistory = { events: 0, rows: 0, firstDay: 0, old: null, recent: [], metrics: null };
+  const h: WorldHistory = { events: 0, firstDay: 0, old: null, recent: [], metrics: null };
   if (flags & 1) {
-    h.events = r.v(); h.rows = r.v(); h.firstDay = r.v();
+    h.events = r.v(); h.firstDay = r.v();
     const nOld = r.v();
     if (nOld) {
       const m0 = r.v(), o = { m0, count: [] as number[], pcKb: [] as number[], questKb: [] as number[] };
@@ -40,8 +40,9 @@ function decode(buf: Uint8Array): WorldHistory | null {
     let day = r.v();
     for (let k = 0; k < nk; k++) {
       day += r.v();
-      const f = r.u8(), kb = r.v();
-      h.recent.push({ day, plat: f & 3, deleted: (f & 4) !== 0, kb: kb ? kb - 1 : 0 });
+      const f = r.u8(), kb = [0, 0, 0, 0];
+      for (let p = 0; p < 4; p++) if (f & (1 << p)) { const v = r.v(); kb[p] = v; }
+      h.recent.push({ day, mask: f & 15, deleted: (f & 16) !== 0, kb });
     }
   }
   if (flags & 2) {

@@ -310,7 +310,10 @@ def main() -> None:
         import build_history
 
         hist_cols = build_history.core_columns(a.history, ids_sorted)
-        add("last_upload", hist_cols[0], np.uint16)
+        # last upload as a zigzag delta from updated_at (usually 0..few days: compresses far better than raw days); 65535 = no upload
+        dl = hist_cols[0].astype(np.int64) - d["updated"].astype(np.int64)
+        zz = np.where(dl >= 0, dl * 2, -dl * 2 - 1)
+        add("last_upload_d", np.where(hist_cols[0] == 0, 65535, np.minimum(zz, 65534)), np.uint16)
         add("uploads_90d", hist_cols[1], np.uint16)
     out.write("core.bin", bytes(blob))
     hist_info = None
