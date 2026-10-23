@@ -76,7 +76,7 @@ export function renderUploads(h: WorldHistory, asofDay: number, lastDay: number)
     for (const r of rows) {
       const ps = [0, 1, 2, 3].filter((p) => r.mask & (1 << p));
       const seg = 14 / Math.max(1, ps.length);
-      const tip = `${ymd(r.day)} · ${ps.map((p) => PNAME[p] + (r.kb[p] ? " " + mb(r.kb[p]) : "")).join(", ")}${r.deleted ? " · package since deleted" : ""}`;
+      const tip = `${ymd(r.day)} · ${ps.map((p) => PNAME[p] + (r.kb[p] ? " " + mb(r.kb[p]) : "")).join(", ")}${r.deleted ? " · older version (since replaced)" : ""}`;
       marks += `<g data-testid="upload-tick" class="tick${r.deleted ? " del" : ""}"><title>${esc(tip)}</title>`
         + ps.map((p, i) => `<line x1="${x(r.day).toFixed(1)}" x2="${x(r.day).toFixed(1)}" y1="${(laneTop + i * seg).toFixed(1)}" y2="${(laneTop + (i + 1) * seg).toFixed(1)}" stroke="${COL[p]}"/>`).join("") + `</g>`;
     }
