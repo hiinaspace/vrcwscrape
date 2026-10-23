@@ -195,6 +195,7 @@ export class Engine {
       if (b > 0) { this.monU[i] = monOfDay[b]; mn = Math.min(mn, this.monU[i]); mx = Math.max(mx, this.monU[i]); }
     }
     for (let i = 0; i < n; i++) if (c.updated[i] > this.maxDay) this.maxDay = c.updated[i];
+    if (this.m.history?.asof) this.asofDay = Math.round((Date.parse(this.m.history.asof.slice(0, 10) + "T00:00:00Z") - Date.UTC(2010, 0, 1)) / 86400000);
     if (c.lastUpload) { this.hasHistory = true; for (let i = 0; i < n; i++) if (c.lastUpload[i] > this.lastDay) this.lastDay = c.lastUpload[i]; }
     this.months = mn <= mx ? { min: mn, max: mx } : { min: 0, max: 0 };
     if (this.m.trend) { this.trend = { basis: this.m.trend.basis, windowDays: this.m.trend.windowDays }; this.trendScale = this.m.trend.scale; }
@@ -318,7 +319,7 @@ export class Engine {
     const useUpd = !!(f.after || f.before);
     const pLo = f.pub_after ? dayOf(f.pub_after) : -1, pHi = f.pub_before ? dayOf(f.pub_before) : 1e9;
     const usePub = !!(f.pub_after || f.pub_before);
-    const recLo = f.recent_days && c.lastUpload ? this.lastDay - f.recent_days : -1;
+    const recLo = f.recent_days && c.lastUpload ? (this.asofDay || this.lastDay) - f.recent_days : -1;
     const useRec = recLo >= 0;
     // tags (explicit tags + status + content warnings): required (AND) and excluded
     const reqKeys = [...(f.tags ?? []), ...(f.status ?? []).map((x) => "system_" + x.replace(/^system_/, "")), ...(f.cw ?? []).map((x) => "content_" + x.replace(/^content_/, ""))];
@@ -898,6 +899,8 @@ export class Engine {
 
   /** newest package-upload day (history as-of; 0 without history) */
   lastDay = 0;
+  /** upload-history as-of day (manifest.history.asof; 0 when unknown): "recent N days" counts back from here */
+  asofDay = 0;
   hasHistory = false;
   /** newest `updated` day (days since 2010-01-01) */
   maxDay = 0;

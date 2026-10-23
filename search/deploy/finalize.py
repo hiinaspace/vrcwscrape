@@ -36,6 +36,15 @@ def main() -> int:
         s = s[:a] + repl + s[b + len("<!--/THUMBS-->") :]
         about.write_text(s, encoding="utf-8")
         print("about.html: thumbnail bullet", "kept" if man.get("hasThumb") else "replaced (hasThumb=false)")
+    # manifest.snapshot: the world-metadata snapshot date, shown in the top-bar byline ("Data as of ...")
+    snap = newest.strftime("%Y-%m-%d")
+    if man.get("snapshot") != snap:
+        man["snapshot"] = snap
+        (dist / "data/manifest.json").write_text(json.dumps(man, separators=(",", ":")), encoding="utf-8")
+        print(f"manifest.snapshot = {snap}")
+    hist_asof = ((man.get("history") or {}).get("asof") or snap)[:10]
+    s = s.replace("@@HISTORY@@", hist_asof)
+    about.write_text(s, encoding="utf-8")
     if "@@SNAPSHOT@@" not in s and "@@COUNT@@" not in s:
         print("about.html already stamped")
     else:

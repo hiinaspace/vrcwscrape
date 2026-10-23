@@ -11,6 +11,7 @@ import { setUploadsView } from "./ui/rows";
 import { createPills, createSyntaxHelp, setAuthorName } from "./ui/pills";
 import { rowHtml } from "./ui/rows";
 import { semUi, SemUi } from "./ui/semui";
+import { asofTitle, initAsof } from "./ui/asof";
 import { SORTS, State, facetCount, filtersOf, readUrl, toUrl } from "./ui/state";
 import { initThumbs, lazyThumbs } from "./ui/thumbs";
 import { $, esc } from "./ui/util";
@@ -26,7 +27,7 @@ const SORT_LABEL: Record<string, string> = {
 };
 const SORT_TIP: Record<string, string> = {
   trending: "recent visits per day", relevance: "text match x popularity", visits: "all-time visits", favorites: "favorites",
-  updated: "newer of the world's update date and its newest package upload", published: "first published", capacity: "player capacity", uploads: "package uploads in the last 90 days",
+  updated: "newer of the world's update date and its newest package upload", published: "first published", capacity: "player capacity", uploads: "package uploads in the 90 days before the data as-of date",
 };
 const NO_DIR = new Set<string>(["trending", "relevance", "text"]);
 
@@ -66,6 +67,7 @@ async function boot() {
   setStatus("loading index…");
   await eng.init();
   ctx.meters = new Meters(eng.c);
+  { const a = initAsof(eng), el = $("#asof"); el.textContent = `Data as of ${a.anchor}`; el.title = asofTitle(a); }
   initThumbs(eng);
   const info = {
     query: async (inp: QueryIn) => {

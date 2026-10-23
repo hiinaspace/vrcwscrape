@@ -20,12 +20,13 @@ const monthDay = (m: number) => monthStart(m) + 14;
 const monthOf = (day: number) => { const dt = new Date(dayMs(day)); return (dt.getUTCFullYear() - 2010) * 12 + dt.getUTCMonth(); };
 const ym = (m: number) => new Date(Date.UTC(2010 + Math.floor(m / 12), m % 12, 1)).toISOString().slice(0, 7);
 
-function ago(days: number): string {
-  if (days <= 0) return "today";
-  if (days === 1) return "yesterday";
-  if (days < 60) return `${days} days ago`;
-  if (days < 730) return `${Math.round(days / 30.4)} months ago`;
-  return `${(days / 365.25).toFixed(1)} years ago`;
+/** gap before the data as-of date (never "ago": the data is not live) */
+function before(days: number): string {
+  if (days <= 0) return "on the data as-of date";
+  if (days === 1) return "1 day before the data as-of date";
+  if (days < 60) return `${days} days before the data as-of date`;
+  if (days < 730) return `${Math.round(days / 30.4)} months before the data as-of date`;
+  return `${(days / 365.25).toFixed(1)} years before the data as-of date`;
 }
 const ymd = (d: number) => dateOfDay(d);
 
@@ -98,7 +99,7 @@ export function renderUploads(h: WorldHistory, asofDay: number, lastDay: number)
   const ticks = xTicks(d0, d1, x, bottom, AY);
   const yl = `<text class="ax" x="${px0 - 4}" y="${top + 8}" text-anchor="end">${mb(maxKb)}</text><text class="ax" x="${px0 - 4}" y="${top + SH}" text-anchor="end">0</text>`;
   const axis = `<line class="base" x1="${px0}" x2="${px1}" y1="${top + SH}" y2="${top + SH}"/>`;
-  const edge = `<text class="ax" x="${px0}" y="${AY}" text-anchor="start">${ymd(d0).slice(0, 7)}</text><text class="ax" x="${px1}" y="${AY}" text-anchor="end">${ymd(d1).slice(0, 7)}</text>`;
+  const edge = `<text class="ax" x="${px0}" y="${AY}" text-anchor="start">${ymd(d0).slice(0, 7)}</text><text class="ax" x="${px1}" y="${AY}" text-anchor="end">${ymd(d1)}</text>`;
   const legend = [0, 1, 2].filter((k) => pts[k].length).map((k) => `<span><i style="background:${COL[k]}"></i>${PNAME[k]}</span>`).join("")
     + `<span class="dim">line = package size per platform; ${dense ? "bars = uploads per month" : "ticks = one per upload, coloured by platform"}</span>`;
   // summary
@@ -106,7 +107,7 @@ export function renderUploads(h: WorldHistory, asofDay: number, lastDay: number)
   const lastKb = (k: number) => [...rows].reverse().find((r) => r.kb[k])?.kb[k] || (h.old ? [...(k === 0 ? h.old.pcKb : h.old.questKb)].reverse().find((v) => v) : 0) || 0;
   const sizes = [0, 1].map((k) => (firstKb(k) ? `${PNAME[k]} ${mb(firstKb(k))}→${mb(lastKb(k))}` : "")).filter(Boolean).join(" · ");
   const lastD = rows.length ? rows[rows.length - 1].day : lastDay;
-  const sum = `${h.events.toLocaleString()} upload${h.events === 1 ? "" : "s"} · last <span title="${ymd(lastD)}">${ago(asofDay - lastD)}</span>${sizes ? " · " + esc(sizes) : ""}`
+  const sum = `${h.events.toLocaleString()} upload${h.events === 1 ? "" : "s"} · last ${ymd(lastD)} <span class="dim">(${before(asofDay - lastD)})</span>${sizes ? " · " + esc(sizes) : ""}`
     + (h.old ? ` <span class="dim">· per-upload sizes from ${ymd(rows[0].day).slice(0, 7)}; earlier months combined</span>` : "");
   return `<p class="hsum" data-testid="history-summary">${sum}</p>
     <svg class="hsvg" data-testid="upload-timeline" data-events="${h.events}" viewBox="0 0 ${W} ${H}" role="img" aria-label="package upload timeline" preserveAspectRatio="xMidYMid meet">${ticks}${axis}${svg}${marks}${yl}${edge}</svg>
@@ -135,7 +136,7 @@ export function renderMetrics(h: WorldHistory, asofDay: number, metricsFrom: str
   const bottom = top + PH, H = bottom + 20;
   const svg = `<svg class="hsvg" data-testid="visits-spark" data-n="${m.day.length}" viewBox="0 0 ${W} ${H}" role="img" aria-label="visits and favorites over time">${xTicks(d0, d1, x, bottom, bottom + 12)}
     <line class="base" x1="${px0}" x2="${px1}" y1="${bottom}" y2="${bottom}"/>${series(m.vis, "vis", "visits", "l")}${series(m.fav, "fav", "favorites", "r")}
-    <text class="ax" x="${px0}" y="${bottom + 12}" text-anchor="start">${esc(metricsFrom)}</text><text class="ax" x="${px1}" y="${bottom + 12}" text-anchor="end">${ymd(d1).slice(0, 7)}</text></svg>`;
+    <text class="ax" x="${px0}" y="${bottom + 12}" text-anchor="start">${esc(metricsFrom)}</text><text class="ax" x="${px1}" y="${bottom + 12}" text-anchor="end">${ymd(d1)}</text></svg>`;
   const dv = m.vis[m.vis.length - 1] - m.vis[0];
   const cov = `${m.total.toLocaleString()} snapshot${m.total === 1 ? "" : "s"}${m.total > m.day.length ? ` (${m.day.length} shown, thinned)` : ""} between ${ymd(m.day[0])} and ${ymd(m.day[m.day.length - 1])}; tracking started ${metricsFrom}`;
   const note = m.day.length < 4 ? "Too few snapshots for a trend: points only." : dv > 0 ? `+${dv.toLocaleString()} visits over this window.` : "";
@@ -153,5 +154,5 @@ export async function fillHistory(eng: Engine, host: HTMLElement, idx: number, a
   if (!h || (!h.events && !h.metrics)) { host.innerHTML = `<h3>History</h3><p class="dim">No package upload history recorded for this world.</p>`; return; }
   const up = h.events || h.recent.length ? renderUploads(h, asof, h.recent.length ? h.recent[h.recent.length - 1].day : asof) : `<p class="dim" data-testid="history-summary">No package uploads recorded.</p>`;
   host.dataset.events = String(h?.events ?? 0);
-  host.innerHTML = `<h3>History</h3>${up}${renderMetrics(h, asof, hi.metricsFrom)}<p class="hnote dim">as of ${esc(hi.asof ?? "")}; from the public data mirror</p>`;
+  host.innerHTML = `<h3>History</h3>${up}${renderMetrics(h, asof, hi.metricsFrom)}<p class="hnote dim">upload history as of ${esc(hi.asof ?? "")} (data is refreshed by hand); from the public data mirror</p>`;
 }

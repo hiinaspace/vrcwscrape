@@ -189,8 +189,9 @@ main{min-width:0}
 }
 
 .results>li[data-id]{cursor:pointer}.results>li[data-id]:hover{border-color:var(--acc)}.results>li[data-id]:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
-.aboutlink{margin-left:auto;font-size:12px;color:var(--dim);white-space:nowrap}.aboutlink:hover{color:var(--acc)}
+.asof{margin-left:auto;font-size:12px;color:var(--dim);white-space:nowrap;border-bottom:1px dotted var(--dim)}.asof:hover{color:var(--acc)}.asof:empty{display:none}.aboutlink{margin-left:0;font-size:12px;color:var(--dim);white-space:nowrap}.aboutlink:hover{color:var(--acc)}
 
+.rangenote{margin:2px 0 0;font-size:11px;color:var(--dim)}
 .legend{margin:0 0 6px;font-size:12px;color:var(--dim)}
 
 /* ---- history (detail panel) */

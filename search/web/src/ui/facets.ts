@@ -8,6 +8,7 @@ import { histogram, Hist, ymLabel } from "./histogram";
 import { parseQuery, flipPill, removePill } from "../query";
 import { facetCount } from "./state";
 import { $, esc, fmt, label } from "./util";
+import { asof, DAY_MS, dayOfIso } from "./asof";
 
 export const CAP_STOPS = [1, 2, 4, 8, 16, 24, 32, 40, 50, 64, 80];
 const SIZE_STOPS = [5, 10, 25, 50, 100, 200, 500, 1000]; // MB; one past the end = any
@@ -65,10 +66,12 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     host.innerHTML = `<div class="drawer-head"><b>Filters</b><button id="fdone" type="button">Show results</button></div>
     <section data-testid="facet-date" class="fs-date"><div class="fh"><h3>Uploads over time</h3>
         <div class="seg sm" id="f-datef"><button type="button" data-f="updated" data-testid="datef-updated">Updated</button><button type="button" data-f="published" data-testid="datef-published">Published</button></div></div>
-      <div class="presets chips" id="f-presets"><button type="button" data-p="week" data-testid="date-preset-week" title="last 7 days of data">this week</button><button type="button" data-p="month" data-testid="date-preset-month" title="last 30 days of data">this month</button><button type="button" data-p="year" data-testid="date-preset-year" title="last 365 days of data">this year</button><button type="button" data-p="any" data-testid="date-preset-any">any</button></div>
+      <div class="presets chips" id="f-presets"><button type="button" data-p="week" data-testid="date-preset-week" >7 days</button><button type="button" data-p="month" data-testid="date-preset-month">30 days</button><button type="button" data-p="year" data-testid="date-preset-year">1 year</button><button type="button" data-p="any" data-testid="date-preset-any">any</button></div>
+      <p class="rangenote" id="f-anchor"></p>
       <div id="f-hist"></div><div id="f-years"></div><div class="rlabel" id="f-datelabel"></div></section>
     <section data-testid="facet-recent" class="fs-recent" ${eng.hasHistory ? "" : "hidden"}><div class="fh"><h3>Recently updated</h3></div>
-      <div class="chips" id="f-recent" title="by the newest package upload (history data), not the world's updated_at"><button type="button" data-r="7" data-testid="filter-recent-7">7 days</button><button type="button" data-r="30" data-testid="filter-recent-30">30 days</button><button type="button" data-r="90" data-testid="filter-recent-90">90 days</button><button type="button" data-r="0" data-testid="filter-recent-any">any</button></div></section>
+      <p class="rangenote" id="f-recentnote"></p>
+      <div class="chips" id="f-recent" title="by the newest package upload (history data), not the world's updated_at; counted back from the upload-history as-of date"><button type="button" data-r="7" data-testid="filter-recent-7">7 days</button><button type="button" data-r="30" data-testid="filter-recent-30">30 days</button><button type="button" data-r="90" data-testid="filter-recent-90">90 days</button><button type="button" data-r="0" data-testid="filter-recent-any">any</button></div></section>
     <section data-testid="facet-tags" class="fs-tags"><h3>Tags</h3><input id="f-tagq" type="search" placeholder="find a tag…" autocomplete="off" aria-label="find a tag">
       <ul id="f-tagres" class="flist found"></ul><ul id="f-tags" class="flist"></ul><button type="button" class="linkbtn" id="f-tagmore"></button></section>
     <section data-testid="facet-platform"><h3>Platform</h3><ul id="f-plat" class="flist"></ul></section>
@@ -143,12 +146,14 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     s[kb2] = b >= n ? "" : `${y0 + b}-12-31`;
     sync(true, false, true); ctx.change(150, "type");
   }
+  /** first day of a preset that ends on the data anchor (not today): anchor - days */
+  const presetStart = (days: number) => isoDay(new Date((dayOfIso(asof().anchor) - days) * DAY_MS + Date.UTC(2010, 0, 1)));
   function preset(p: string) {
     const [ka, kb2] = dfield(), s = S() as any;
     s[kb2] = "";
     if (p === "any") { s.after = ""; s.before = ""; s.pub_after = ""; s.pub_before = ""; return; }
     const days = p === "week" ? 6 : p === "month" ? 29 : 364;
-    s[ka] = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - days * 86400000));
+    s[ka] = presetStart(days);
   }
   function paintHist(fc: FacetCounts) {
     const src = S().datef === "published" ? fc.months : fc.updatedMonths;
@@ -174,11 +179,16 @@ export function createFacets(ctx: Ctx, host: HTMLElement): Facets {
     const [ka, kb2] = dfield(), a: string = (s as any)[ka], b: string = (s as any)[kb2];
     if (!skipYears) years.set(a ? Math.max(0, Math.min(y1 - y0, +a.slice(0, 4) - y0)) : 0, b ? Math.max(0, Math.min(y1 - y0, +b.slice(0, 4) - y0)) : y1 - y0);
     if (withHist && !skipHist) syncBrush();
-    const rng = (n: string, x: string, y: string) => (x || y ? `${n}: ${x || "…"} → ${y || "now"}` : "");
+    const rng = (n: string, x: string, y: string) => (x || y ? `${n}: ${x || "…"} → ${y || asof().anchor}` : "");
     $("#f-datelabel").textContent = [rng("updated", s.after, s.before), rng("published", s.pub_after, s.pub_before)].filter(Boolean).join(" · ") || "any time";
-    const wk = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 6 * 86400000));
-    const mo = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 29 * 86400000));
-    const yr = isoDay(new Date(Date.parse(dateOfDay(maxDay) + "T00:00:00Z") - 364 * 86400000));
+    const wk = presetStart(6), mo = presetStart(29), yr = presetStart(364);
+    const an = asof().anchor;
+    ($("#f-presets") as HTMLElement).title = "ranges are counted back from the data as-of date";
+    ($("#f-presets") as HTMLElement).querySelector("[data-p=week]")!.setAttribute("title", `${wk} to ${an}`);
+    ($("#f-presets") as HTMLElement).querySelector("[data-p=month]")!.setAttribute("title", `${mo} to ${an}`);
+    ($("#f-presets") as HTMLElement).querySelector("[data-p=year]")!.setAttribute("title", `${yr} to ${an}`);
+    $("#f-anchor").textContent = `7 / 30 / 365 days counted back from ${an} (data as-of date)`;
+    $("#f-recentnote").textContent = `counted back from ${asof().history || an} (upload data as-of date)`;
     $("#f-presets").querySelectorAll("button").forEach((x) => {
       const p = (x as HTMLElement).dataset.p;
       const on = p === "any" ? !s.after && !s.before && !s.pub_after && !s.pub_before : !b && a === (p === "week" ? wk : p === "month" ? mo : yr);

@@ -19,6 +19,8 @@ export interface Manifest {
   hasThumb: boolean;
   /** round 6: per-world history shards (hist/<k>.bin), consecutive ordinals starting at starts[k]; null/absent when not built */
   history?: { shards: number; starts: number[]; capAll: number; keepRecent: number; maxPts: number; metricsFrom: string; asof: string | null } | null;
+  /** newest last_scrape_time in the public parquet (YYYY-MM-DD), stamped by deploy/finalize.py; absent in unfinalized builds */
+  snapshot?: string | null;
   trend?: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null; scale: number; measured: number; fallbackRows?: number };
   /** self-hosted AVIF packs (build/pack_thumbs.py); null when not built */
   thumbs?: { base: string; packs: number; count: number; index: string; bytes: number } | null;
@@ -48,24 +50,41 @@ export interface Core {
 export interface Meta { id: string[]; n: string[]; an: string[]; au: string[]; d?: string[]; t?: string[][] }
 export interface Card { d: string[]; t: string[][]; hp: number[][] }
 
-export const bytesFetched = { total: 0, requests: 0 };
+/** total/requests = network traffic; cached = bytes served from Cache Storage (semantic assets) instead */
+export const bytesFetched = { total: 0, requests: 0, cached: 0 };
+
+/** Optional Cache Storage for the opt-in semantic assets (ui/semui.ts sets `cache`): a hit skips the network, a miss is stored (put) after fetch. */
+export const assetCache: { cache: Cache | null } = { cache: null };
+const CACHED_PREFIX = "sem/";
+
+export async function gunzipIfNeeded(buf: Uint8Array): Promise<Uint8Array> {
+  if (buf[0] === 0x1f && buf[1] === 0x8b) {
+    const ds = new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip")));
+    return new Uint8Array(await ds.arrayBuffer());
+  }
+  return buf;
+}
 
 const base = new URL("data/", document.baseURI);
 export const dataBase = base;
 let ver = "";
 export const dataVersion = () => ver;
 
+/** the exact (versioned) URL fetchBin requests for a data-relative path */
+export const assetUrl = (rel: string) => new URL(rel, base) + (ver ? "?v=" + ver : "");
+
 export async function fetchBin(rel: string): Promise<Uint8Array> {
-  const r = await fetch(new URL(rel, base) + (ver ? "?v=" + ver : ""));
+  const url = assetUrl(rel);
+  const ac = rel.startsWith(CACHED_PREFIX) ? assetCache.cache : null;
+  let hit: Response | undefined;
+  if (ac) { try { hit = await ac.match(url); } catch { hit = undefined; } }
+  const r = hit ?? (await fetch(url));
   if (!r.ok) throw new Error(`${rel}: ${r.status}`);
+  if (ac && !hit) { try { await ac.put(url, r.clone()); } catch { /* quota / private mode: just not cached */ } }
   const buf = new Uint8Array(await r.arrayBuffer());
-  bytesFetched.total += buf.length;
-  bytesFetched.requests++;
-  if (buf[0] === 0x1f && buf[1] === 0x8b) {
-    const ds = new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip")));
-    return new Uint8Array(await ds.arrayBuffer());
-  }
-  return buf;
+  if (hit) bytesFetched.cached += buf.length;
+  else { bytesFetched.total += buf.length; bytesFetched.requests++; }
+  return gunzipIfNeeded(buf);
 }
 
 const jsonDec = new TextDecoder();
