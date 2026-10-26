@@ -394,17 +394,19 @@ def main() -> int:
             if rc:
                 raise RuntimeError("GATE FAILED: no deploy")
         man = json.loads((dist / "data/manifest.json").read_text())
-        ddir = STATE / "dists" / RUN_ID
-        with step("save checked dist to state"):
-            shutil.copytree(dist, ddir)
-            for old in sorted(p for p in (STATE / "dists").iterdir() if p.is_dir())[:-2]:
-                shutil.rmtree(old)
-            say(f"kept dists: {sorted(p.name for p in (STATE / 'dists').iterdir())}")
+        ddir = STATE / "dists" / f"{RUN_ID}.tar"
+        with step("save checked dist to state (one tarball: NFS is slow for small files)"):
+            (STATE / "dists").mkdir(exist_ok=True)
+            sh(["tar", "-cf", str(ddir) + ".part", "-C", str(dist), "."])
+            Path(str(ddir) + ".part").rename(ddir)
+            for old in sorted(STATE.glob("dists/*.tar"))[:-2]:
+                old.unlink()
+            say(f"kept dists: {sorted(p.name for p in (STATE / 'dists').glob('*.tar'))}")
         if DRY:
             with step("deploy: skipped (DRY_RUN); wrangler smoke"):
                 sh(["npx", "--yes", WRANGLER, "--version"], check=False, tag="[wrangler] ")
                 save_cache("npm")
-            say(f"DRY_RUN done: checked dist at {ddir} (manifest version {man['version']})")
+            say(f"DRY_RUN done: checked dist tarball at {ddir} (manifest version {man['version']})")
         else:
             with step("deploy: wrangler pages deploy"):
                 sh(["npx", "--yes", WRANGLER, "pages", "deploy", str(dist), "--project-name", PROJECT, "--branch", "main",
