@@ -95,12 +95,12 @@ def sh(cmd: list[str], env: dict | None = None, cwd: Path | None = None, check: 
 
 # ---- Python env helpers
 UVENV = {
-    "UV_CACHE_DIR": str(STATE / "cache/uv"),
+    "UV_CACHE_DIR": str(WORK / "cache/uv"),
     "UV_PYTHON_DOWNLOADS": "never",
     "UV_PYTHON": "python3.12",
     "HOME": str(STATE / "home"),
     "HF_HOME": str(STATE / "cache/hf"),
-    "npm_config_cache": str(STATE / "cache/npm"),
+    "npm_config_cache": str(WORK / "cache/npm"),
     "OMP_NUM_THREADS": THREADS,
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
@@ -207,12 +207,53 @@ def restart_dolt(reason: str) -> None:
     raise RuntimeError("dolt-0 not Ready within 10 min after delete")
 
 
+# ---- dependency caches: NFS handles big sequential files well (~95 MB/s) but small files at ~8/s, so the uv wheel cache and the npm cache
+# live in the emptyDir and are persisted on the state volume as ONE tarball per lockfile hash. Cold: download from PyPI/npm, then tar once.
+import hashlib  # noqa: E402
+
+CACHES: dict[str, tuple[str, Path, bool]] = {}  # name -> (key, dir, restored)
+
+
+def _key(*parts: bytes) -> str:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p)
+    return h.hexdigest()[:12]
+
+
+def restore_cache(name: str, key: str, d: Path) -> None:
+    tar = STATE / f"cache/{name}-{key}.tar"
+    d.mkdir(parents=True, exist_ok=True)
+    ok = tar.is_file()
+    if ok:
+        sh(["tar", "-xf", str(tar), "-C", str(d.parent)], tag=f"[cache {name}] ")
+    CACHES[name] = (key, d, ok)
+    say(f"cache {name} {key}: {'restored from state' if ok else 'cold (will be downloaded and saved)'}")
+
+
+def save_cache(name: str) -> None:
+    key, d, restored = CACHES[name]
+    if restored or not d.is_dir():
+        return
+    tmp = STATE / f"cache/{name}-{key}.tar.part"
+    sh(["tar", "-cf", str(tmp), "-C", str(d.parent), d.name], tag=f"[cache {name}] ")
+    tmp.rename(STATE / f"cache/{name}-{key}.tar")
+    for old in (STATE / "cache").glob(f"{name}-*.tar"):
+        if old.name != f"{name}-{key}.tar":
+            old.unlink()
+    CACHES[name] = (key, d, True)
+    say(f"cache {name} saved ({(STATE / f'cache/{name}-{key}.tar').stat().st_size / 1e6:.0f} MB)")
+
+
 # ---- phases
 def prep_deps() -> None:
-    with step("deps: uv sync (refresh, build) + npm ci"):
+    with step("deps: caches + uv sync (refresh, build) + npm ci"):
+        restore_cache("uv", _key((SEARCH / "refresh/uv.lock").read_bytes(), (SEARCH / "build/uv.lock").read_bytes()), WORK / "cache/uv")
+        restore_cache("npm", _key((SEARCH / "web/package-lock.json").read_bytes(), WRANGLER.encode()), WORK / "cache/npm")
         for proj, venv in (("refresh", VENV_REFRESH), ("build", VENV_BUILD)):
             sh(["uv", "sync", "--frozen", "--project", str(SEARCH / proj)], env={"UV_PROJECT_ENVIRONMENT": str(venv)}, tag=f"[sync {proj}] ")
         sh(["npm", "ci", "--no-audit", "--no-fund", "--prefer-offline"], cwd=SEARCH / "web", tag="[npm] ")
+        save_cache("uv")
 
 
 def extract_window(ex: Path) -> dict:
@@ -301,7 +342,7 @@ def live_manifest() -> dict | None:
 
 def main() -> int:
     say(f"run {RUN_ID} DRY_RUN={int(DRY)} REUSE_EXTRACT={int(REUSE)} code={os.environ.get('SEARCH_COMMIT', '?')[:10]} host={os.uname().nodename}")
-    for d in ("cache/uv", "cache/hf", "cache/npm", "extract", "dists", "emb", "thumbs"):
+    for d in ("cache/hf", "extract", "dists", "emb", "thumbs"):
         (STATE / d).mkdir(parents=True, exist_ok=True)
     ex = STATE / "extract/current"
     ok = False
@@ -362,11 +403,13 @@ def main() -> int:
         if DRY:
             with step("deploy: skipped (DRY_RUN); wrangler smoke"):
                 sh(["npx", "--yes", WRANGLER, "--version"], check=False, tag="[wrangler] ")
+                save_cache("npm")
             say(f"DRY_RUN done: checked dist at {ddir} (manifest version {man['version']})")
         else:
             with step("deploy: wrangler pages deploy"):
                 sh(["npx", "--yes", WRANGLER, "pages", "deploy", str(dist), "--project-name", PROJECT, "--branch", "main",
                     "--commit-dirty=true", "--commit-message", f"refresh dolt {head['hash'][:10]}"], tag="[wrangler] ")
+                save_cache("npm")
             with step("deploy: verify live manifest"):
                 for _ in range(30):
                     lm = live_manifest()
