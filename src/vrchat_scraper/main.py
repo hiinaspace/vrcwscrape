@@ -109,8 +109,9 @@ async def stop_dolt_service():
         # Don't raise - we want to continue cleanup even if stop fails
 
 
-async def async_main(mode: str = "daemon"):
-    """Main application entry point."""
+async def async_main(mode: str = "daemon") -> int:
+    """Main application entry point. Returns the process exit code."""
+    exit_code = 0
     # Load config
     config = Config()
 
@@ -187,8 +188,10 @@ async def async_main(mode: str = "daemon"):
 
         except AuthenticationError:
             logger.critical("Authentication failed - exiting")
+            exit_code = 2
         except Exception as e:
             logger.error(f"Scraper failed: {e}")
+            exit_code = 1
         finally:
             # Cleanup scraper resources
             await scraper.close()
@@ -198,6 +201,8 @@ async def async_main(mode: str = "daemon"):
         # Stop the Dolt SQL server if we started it
         if manage_dolt:
             await stop_dolt_service()
+
+    return exit_code
 
 
 def main():
@@ -210,7 +215,7 @@ def main():
     )
 
     args = parser.parse_args()
-    asyncio.run(async_main(mode=args.mode))
+    sys.exit(asyncio.run(async_main(mode=args.mode)))
 
 
 if __name__ == "__main__":
