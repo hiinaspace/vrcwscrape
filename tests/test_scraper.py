@@ -983,3 +983,175 @@ async def test_oneshot_respects_max_worlds_limit(
     assert pending_count == num_worlds - max_worlds, (
         f"Expected {num_worlds - max_worlds} pending worlds, but got {pending_count}"
     )
+
+
+class _Clock:
+    """Hand-advanced clock for oneshot budget tests."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+async def _budget_scraper(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_sleep,
+    clock,
+    max_seconds,
+    num_worlds,
+):
+    scraper = VRChatScraper(
+        database=test_database,
+        api_client=fake_api_client,
+        image_downloader=fake_image_downloader,
+        api_rate_limiter=stub_api_rate_limiter,
+        image_rate_limiter=stub_image_rate_limiter,
+        api_circuit_breaker=stub_api_circuit_breaker,
+        image_circuit_breaker=stub_image_circuit_breaker,
+        time_source=clock,
+        sleep_func=mock_sleep.sleep,
+        oneshot_max_worlds=1000,
+        manage_dolt_service=False,
+        oneshot_max_seconds=max_seconds,
+    )
+    fake_api_client.simulate_rate_limit(True, rate=1e6)  # effectively unlimited
+    for i in range(num_worlds):
+        world_id = f"wrld_budget_{i:03d}"
+        await test_database.upsert_world(
+            world_id,
+            {"discovered_at": datetime.utcnow().isoformat()},
+            status="PENDING",
+        )
+        detail = create_test_world_detail(world_id=world_id, name=f"W{i}")
+        fake_api_client.set_world_detail_response(
+            world_id, detail.model_dump(mode="json", by_alias=True)
+        )
+    return scraper
+
+
+async def _count(test_database, status):
+    from sqlalchemy import text
+
+    async with test_database.engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM worlds WHERE scrape_status = :s"),
+            {"s": status},
+        )
+        return result.scalar()
+
+
+@pytest.mark.asyncio
+@async_timeout(10.0)
+async def test_oneshot_budget_stops_between_batches_and_exits_cleanly(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_sleep,
+):
+    """Once the budget elapses no new batch starts, and run_oneshot returns normally."""
+    clock = _Clock()
+    scraper = await _budget_scraper(
+        test_database,
+        fake_api_client,
+        fake_image_downloader,
+        stub_api_rate_limiter,
+        stub_image_rate_limiter,
+        stub_api_circuit_breaker,
+        stub_image_circuit_breaker,
+        mock_sleep,
+        clock,
+        max_seconds=100.0,
+        num_worlds=250,
+    )
+
+    real_batch = scraper._process_pending_worlds_batch
+
+    async def batch_then_tick(limit=100):
+        count = await real_batch(limit=limit)
+        clock.t += 60.0  # each batch "takes" 60s: budget gone after the 2nd
+        return count
+
+    scraper._process_pending_worlds_batch = batch_then_tick
+
+    await scraper.run_oneshot()  # must not raise
+
+    assert await _count(test_database, "SUCCESS") == 200  # 2 batches of 100
+    assert await _count(test_database, "PENDING") == 50
+
+
+@pytest.mark.asyncio
+@async_timeout(10.0)
+async def test_oneshot_budget_already_exhausted_does_no_pending_work(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_sleep,
+):
+    clock = _Clock()
+    scraper = await _budget_scraper(
+        test_database,
+        fake_api_client,
+        fake_image_downloader,
+        stub_api_rate_limiter,
+        stub_image_rate_limiter,
+        stub_api_circuit_breaker,
+        stub_image_circuit_breaker,
+        mock_sleep,
+        clock,
+        max_seconds=0.0,
+        num_worlds=10,
+    )
+
+    await scraper.run_oneshot()
+
+    assert await _count(test_database, "SUCCESS") == 0
+    assert await _count(test_database, "PENDING") == 10
+
+
+@pytest.mark.asyncio
+@async_timeout(10.0)
+async def test_oneshot_without_budget_processes_everything(
+    test_database,
+    fake_api_client,
+    fake_image_downloader,
+    stub_api_rate_limiter,
+    stub_image_rate_limiter,
+    stub_api_circuit_breaker,
+    stub_image_circuit_breaker,
+    mock_sleep,
+):
+    clock = _Clock()
+    scraper = await _budget_scraper(
+        test_database,
+        fake_api_client,
+        fake_image_downloader,
+        stub_api_rate_limiter,
+        stub_image_rate_limiter,
+        stub_api_circuit_breaker,
+        stub_image_circuit_breaker,
+        mock_sleep,
+        clock,
+        max_seconds=None,
+        num_worlds=120,
+    )
+    clock.t += 10**9  # time passing is irrelevant without a budget
+
+    await scraper.run_oneshot()
+
+    assert await _count(test_database, "SUCCESS") == 120

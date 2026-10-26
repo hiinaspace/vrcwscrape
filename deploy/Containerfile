@@ -1,0 +1,24 @@
+# vrcwscrape scraper image (scraper only; mapgen/web are not shipped).
+# Build from the repo root:
+#   podman build -f deploy/Containerfile -t 10.100.29.0:5000/vrcwscrape:$(git rev-parse --short HEAD) .
+# Push via the registry port-forward (see fleet-infra infra/my-cluster/registry/README.md),
+# then pin the resulting digest in fleet-infra infra/my-cluster/vrcw/scrape-cronjob.yaml.
+FROM ghcr.io/astral-sh/uv:0.8.22@sha256:ae1ba4db410fbe1d9eaf16c51add8e7608b271ebbb69bd58a56e80384fd190aa AS uv
+# python:3.11-slim-bookworm (multi-arch index digest); 3.11 matches .python-version
+FROM docker.io/library/python:3.11-slim-bookworm@sha256:f06d01d4ba3f8ad5af45a3ec87df19c1d317d8e8961edc0fabda61811af6f7cf
+COPY --from=uv /uv /usr/local/bin/uv
+WORKDIR /opt/vrcwscrape
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN UV_PYTHON_DOWNLOADS=never UV_PYTHON=/usr/local/bin/python \
+    uv sync --frozen --no-dev --no-editable --no-cache \
+    && rm /usr/local/bin/uv
+COPY deploy/entrypoint.py /opt/vrcwscrape/entrypoint.py
+ENV PATH="/opt/vrcwscrape/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    HOME=/tmp
+# uid/gid 1000 matches the NFS export (all_squash, anonuid=anongid=1000).
+USER 1000:1000
+WORKDIR /tmp
+ENTRYPOINT ["python", "/opt/vrcwscrape/entrypoint.py"]
+CMD ["--mode", "oneshot"]

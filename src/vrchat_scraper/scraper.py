@@ -38,6 +38,7 @@ class VRChatScraper:
         error_backoff_time: float = 60,  # 1 minute
         oneshot_max_worlds: int = 5000,
         manage_dolt_service: bool = True,
+        oneshot_max_seconds: float | None = None,
     ):
         """Initialize scraper with all dependencies."""
         self.database = database
@@ -58,6 +59,9 @@ class VRChatScraper:
         self._error_backoff_time = error_backoff_time
         self._oneshot_max_worlds = oneshot_max_worlds
         self._manage_dolt_service = manage_dolt_service
+        # Optional wall-clock budget for run_oneshot (None = unlimited).
+        self._oneshot_max_seconds = oneshot_max_seconds
+        self._oneshot_deadline: float | None = None
         self._shutdown_event = asyncio.Event()
 
         # --- Phase 2 Observability: Business Metrics ---
@@ -99,6 +103,9 @@ class VRChatScraper:
         logger.info(
             f"Starting one-shot scraping run (max {self._oneshot_max_worlds} worlds)"
         )
+        if self._oneshot_max_seconds is not None:
+            self._oneshot_deadline = self._time_source() + self._oneshot_max_seconds
+            logger.info(f"One-shot time budget: {self._oneshot_max_seconds}s")
 
         try:
             # Log how many worlds are due for scraping before we start
@@ -123,6 +130,8 @@ class VRChatScraper:
             logger.info("Processing pending worlds...")
             total_worlds_processed = 0
             while total_worlds_processed < self._oneshot_max_worlds:
+                if self._oneshot_budget_exhausted("world processing"):
+                    break
                 remaining = self._oneshot_max_worlds - total_worlds_processed
                 batch_limit = min(100, remaining)
                 processed_count = await self._process_pending_worlds_batch(
@@ -143,6 +152,8 @@ class VRChatScraper:
             # Step 3: Process all pending file metadata until queue is empty
             logger.info("Processing pending file metadata...")
             while True:
+                if self._oneshot_budget_exhausted("file metadata"):
+                    break
                 processed_count = await self._process_pending_file_metadata_batch(
                     limit=50
                 )
@@ -153,6 +164,8 @@ class VRChatScraper:
             # Step 4: Process all pending image downloads until queue is empty
             logger.info("Processing pending image downloads...")
             while True:
+                if self._oneshot_budget_exhausted("image downloads"):
+                    break
                 processed_count = await self._process_pending_image_downloads_batch(
                     limit=20
                 )
@@ -165,6 +178,22 @@ class VRChatScraper:
         except Exception as e:
             logger.error(f"Error during one-shot run: {e}")
             raise
+
+    def _oneshot_budget_exhausted(self, stage: str) -> bool:
+        """True once the optional oneshot time budget has run out.
+
+        Checked between batches, so in-flight batches finish and the run still
+        exits cleanly (status 0); remaining work is picked up by the next run.
+        """
+        if self._oneshot_deadline is None:
+            return False
+        if self._time_source() < self._oneshot_deadline:
+            return False
+        logger.info(
+            f"One-shot time budget ({self._oneshot_max_seconds}s) exhausted; "
+            f"skipping remaining {stage}"
+        )
+        return True
 
     def shutdown(self):
         """Signal the scraper to shutdown gracefully."""

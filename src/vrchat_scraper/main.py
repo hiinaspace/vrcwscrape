@@ -162,6 +162,7 @@ async def async_main(mode: str = "daemon"):
             api_circuit_breaker=api_circuit_breaker,
             image_circuit_breaker=image_circuit_breaker,
             oneshot_max_worlds=config.oneshot_max_worlds,
+            oneshot_max_seconds=config.oneshot_max_seconds,
             manage_dolt_service=False,  # We manage it here in main instead
         )
 

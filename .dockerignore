@@ -1,0 +1,9 @@
+.git
+.venv
+**/__pycache__
+images*
+output
+analytics
+mapgen*
+web
+tests
