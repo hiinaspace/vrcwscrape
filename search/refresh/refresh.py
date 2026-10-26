@@ -108,8 +108,11 @@ UVENV = {
 for k, v in UVENV.items():
     os.environ.setdefault(k, v)
 (STATE / "home").mkdir(parents=True, exist_ok=True)
-VENV_REFRESH = STATE / "venvs/refresh"
-VENV_BUILD = STATE / "venvs/build"
+# venvs live in the emptyDir (NFS small-file writes are very slow); the uv wheel cache and the npm cache stay on the state volume and are
+# only written when a lockfile changes. Copy (not hardlink) from the cache into the emptyDir.
+os.environ.setdefault("UV_LINK_MODE", "copy")
+VENV_REFRESH = WORK / "venvs/refresh"
+VENV_BUILD = WORK / "venvs/build"
 
 
 def py(args: list[str], venv: Path = VENV_REFRESH, project: str = "refresh", env: dict | None = None, **kw) -> int:
@@ -177,6 +180,17 @@ def wait_not_restart_minutes() -> None:
         time.sleep(20)
 
 
+def wait_extract_slot(need_min: int = 15) -> None:
+    """The dolt-restart cron deletes dolt-0 at :28 and :58: do not start the DB extract unless that is >= need_min away."""
+    while True:
+        m = datetime.now().astimezone().minute % 30
+        if 1 <= m <= 28 - need_min:
+            return
+        wait = ((31 - m) % 30 or 30) * 60 - datetime.now().second  # until :01 / :31 plus a minute margin
+        say(f"minute {m} of the half hour: extract would straddle the dolt-restart cron, waiting {wait // 60} min")
+        time.sleep(min(wait, 120))
+
+
 def restart_dolt(reason: str) -> None:
     old = kube("GET", f"/api/v1/namespaces/{NS}/pods/dolt-0")
     wait_not_restart_minutes()
@@ -230,6 +244,8 @@ def extract_window(ex: Path) -> dict:
                     raise RuntimeError(f"scrape still running after 20 min: {busy}")
                 say(f"scrape running: {busy}")
                 time.sleep(15)
+        with step("window: wait for a restart-free slot"):
+            wait_extract_slot()
         with step("window: fresh dolt-0"):
             d = kube("GET", f"/api/v1/namespaces/{NS}/pods/dolt-0")
             done = [parse_t(c["state"]["terminated"]["finishedAt"]) for p in pods("app=vrcw-scrape") for c in p["status"].get("containerStatuses", []) if c.get("state", {}).get("terminated")]
@@ -285,7 +301,7 @@ def live_manifest() -> dict | None:
 
 def main() -> int:
     say(f"run {RUN_ID} DRY_RUN={int(DRY)} REUSE_EXTRACT={int(REUSE)} code={os.environ.get('SEARCH_COMMIT', '?')[:10]} host={os.uname().nodename}")
-    for d in ("cache/uv", "cache/hf", "cache/npm", "venvs", "extract", "dists", "emb", "thumbs"):
+    for d in ("cache/uv", "cache/hf", "cache/npm", "extract", "dists", "emb", "thumbs"):
         (STATE / d).mkdir(parents=True, exist_ok=True)
     ex = STATE / "extract/current"
     ok = False
