@@ -6,7 +6,7 @@ import { Manifest, bytesFetched, cached, dataBase, dataVersion, fetchBin } from 
 const GAP = 8192; // merge two wanted ranges when the hole between them is at most this many bytes
 const WAIT_MS = 3; // coalescing window
 
-interface Head { nPacks: number; ws: number; bs: number; packFirst: number[]; maxBefore: Int32Array; bsBase: Uint32Array }
+interface Head { nPacks: number; ws: number; bs: number; packFirst: number[]; bsBase: Uint32Array }
 interface Want { pack: number; off: number; len: number; res: (b: Uint8Array | null) => void }
 
 export interface ThumbStats { requests: number; bytes: number; payloadBytes: number; images: number; rangeSupported: boolean | null; fullPackFallbacks: number }
@@ -25,7 +25,9 @@ export class Thumbs {
   }
 
   private packUrl(p: number) {
-    return new URL(`p-${String(p).padStart(3, "0")}.bin`, this.base) + (dataVersion() ? "?v=" + dataVersion() : "");
+    // ?v=<content hash of this pack>: an unchanged pack keeps its URL (and browser cache) across builds; older manifests fall back to the build version
+    const v = this.m.thumbs!.hashes?.[p] ?? dataVersion();
+    return new URL(`p-${String(p).padStart(3, "0")}.bin`, this.base) + (v ? "?v=" + v : "");
   }
 
   private head(): Promise<Head | null> {
@@ -33,17 +35,15 @@ export class Thumbs {
       try {
         const buf = await fetchBin(this.m.thumbs!.index);
         const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-        if (String.fromCharCode(...buf.subarray(0, 4)) !== "THM2") return null;
+        if (String.fromCharCode(...buf.subarray(0, 4)) !== "THM3") return null;
         const n = dv.getUint32(4, true), nb = dv.getUint32(8, true), np = dv.getUint32(12, true), ws = dv.getUint32(16, true), bs = dv.getUint32(20, true);
         let p = 24;
         const packFirst: number[] = [];
         for (let k = 0; k < np; k++) { packFirst.push(dv.getUint32(p, true)); p += 8; }
-        const nws = Math.ceil(n / ws), nbs = Math.ceil(nb / bs);
-        const maxBefore = new Int32Array(nws);
-        for (let k = 0; k < nws; k++) { maxBefore[k] = dv.getInt32(p, true); p += 4; }
+        const nbs = Math.ceil(nb / bs);
         const bsBase = new Uint32Array(nbs);
         for (let k = 0; k < nbs; k++) { bsBase[k] = dv.getUint32(p, true); p += 4; }
-        return { nPacks: np, ws, bs, packFirst, maxBefore, bsBase };
+        return { nPacks: np, ws, bs, packFirst, bsBase };
       } catch {
         return null;
       }
@@ -56,10 +56,13 @@ export class Thumbs {
       const buf = await fetchBin(`th/w${k}.bin`);
       const cnt = buf.length >> 2;
       const out = new Int32Array(cnt);
-      let max = h.maxBefore[k];
+      let prev = 0; // code 0 = none; else blob = prev + unzigzag(code - 1), prev = last blob with a thumbnail in this shard
       for (let i = 0; i < cnt; i++) {
         const c = (buf[i] | (buf[cnt + i] << 8) | (buf[2 * cnt + i] << 16) | (buf[3 * cnt + i] << 24)) >>> 0;
-        out[i] = c === 0 ? ++max : c === 1 ? -1 : max - (c - 2);
+        if (c === 0) { out[i] = -1; continue; }
+        const z = c - 1;
+        prev += (z >>> 1) ^ -(z & 1);
+        out[i] = prev;
       }
       return out;
     });

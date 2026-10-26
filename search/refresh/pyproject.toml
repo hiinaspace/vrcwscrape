@@ -1,0 +1,28 @@
+[project]
+name = "vrcw-search-refresh"
+version = "0.1.0"
+description = "Weekly incremental refresh job for the static VRChat world search (runs in the vrcw k8s namespace)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "duckdb==1.5.6",
+    "pymysql>=1.1.1",
+    "pyarrow>=15",
+    "numpy",
+    "pandas",
+    "pillow>=13.0.0",
+    "torch==2.14.1",
+    "torchvision",
+    "sentence-transformers",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

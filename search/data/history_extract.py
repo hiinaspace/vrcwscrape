@@ -10,26 +10,42 @@ import json, re, subprocess, sys, time, os
 import duckdb, pymysql, pyarrow as pa, pyarrow.parquet as pq
 from datetime import datetime, timezone
 
-dolt, clone, public_pq, out = sys.argv[1:5]
-port = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[5] == "--port" else 13307
+# Two modes: `history_extract.py <dolt-bin> <clone-dir> <public-v2.parquet> <out-dir> [--port N]` (spawns a local dolt sql-server on a
+# clone) or `history_extract.py --database-url mysql://user:pw@host:3306/db <public-v2.parquet> <out-dir>` (an existing server; the
+# weekly k8s refresh passes the pinned revision database `vrcwscrape/<commit>`).
+from urllib.parse import urlparse
+if sys.argv[1] == "--database-url":
+    dburl = urlparse(sys.argv[2]); public_pq, out = sys.argv[3:5]
+    dolt = clone = None; port = 0
+else:
+    dburl = None
+    dolt, clone, public_pq, out = sys.argv[1:5]
+    port = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[5] == "--port" else 13307
 os.makedirs(out, exist_ok=True)
 DOT = "․"
 PLAT = {"android": "quest", "standalonewindows": "pc", "ios": "ios"}
 
-srv = subprocess.Popen(["nice", "-n10", dolt, "sql-server", "-H", "127.0.0.1", "-P", str(port)],
+srv = None if dburl else subprocess.Popen(["nice", "-n10", dolt, "sql-server", "-H", "127.0.0.1", "-P", str(port)],
                        cwd=clone, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
-    for _ in range(60):
-        try:
-            cn = pymysql.connect(host="127.0.0.1", port=port, user="root", database=os.path.basename(clone) if False else None, autocommit=True)
-            break
-        except Exception:
-            time.sleep(1)
-    cur = cn.cursor()
-    cur.execute("show databases"); dbs = [r[0] for r in cur.fetchall()]
-    db = [d for d in dbs if d not in ("information_schema", "mysql")][0]
-    cur.execute(f"use `{db}`")
-    cur.execute("select dolt_hashof('HEAD'), max(date) from dolt_log"); head = cur.fetchone()
+    if dburl:
+        cn = pymysql.connect(host=dburl.hostname, port=dburl.port or 3306, user=dburl.username, password=dburl.password or "",
+                             database=dburl.path.lstrip("/"), autocommit=True)
+        cur = cn.cursor()
+        h = dburl.path.lstrip("/").split("/", 1)[-1]
+        cur.execute("select commit_hash, date from dolt_log where commit_hash = %s", (h,)); head = cur.fetchone() or (h, None)
+    else:
+        for _ in range(60):
+            try:
+                cn = pymysql.connect(host="127.0.0.1", port=port, user="root", database=os.path.basename(clone) if False else None, autocommit=True)
+                break
+            except Exception:
+                time.sleep(1)
+        cur = cn.cursor()
+        cur.execute("show databases"); dbs = [r[0] for r in cur.fetchall()]
+        db = [d for d in dbs if d not in ("information_schema", "mysql")][0]
+        cur.execute(f"use `{db}`")
+        cur.execute("select dolt_hashof('HEAD'), max(date) from dolt_log"); head = cur.fetchone()
     print("HEAD", head, flush=True)
 
     public = duckdb.sql(f"select world_id from read_parquet('{public_pq}')").fetchall()
@@ -121,4 +137,5 @@ try:
     os.remove(f"{out}/summary.tmp.parquet")
     json.dump({"head": head[0], "head_date": str(head[1]), "asof": str(asof), **bad}, open(f"{out}/asof.json", "w"))
 finally:
-    srv.terminate()
+    if srv:
+        srv.terminate()

@@ -113,7 +113,7 @@ def main() -> int:
         if "@@" in t:
             err("about.html still has @@placeholders@@ (run finalize.py)")
         else:
-            m = re.search(r"Snapshot: newest scrape <strong>([^<]+)</strong>", t)
+            m = re.search(r"Snapshot: (?:newest scrape|data as of) <strong>([^<]+)</strong>", t)
             ok(f"about.html stamped (snapshot {m.group(1) if m else '?'})")
         if "<!--" in t:
             err("about.html still has THUMBS markers (run finalize.py)")

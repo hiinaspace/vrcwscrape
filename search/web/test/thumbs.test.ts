@@ -19,7 +19,7 @@ test("thumbUrl returns object URLs of AVIF images and null for worlds without on
   assert.ok(got.length > 20 && got.length < 40, `got ${got.length}`); // fixture drops every 11th world
   for (const u of got.slice(0, 3)) assert.match(u, /^blob:/);
   // not-in-fixture worlds (ordinal 6000+) have no thumbnail
-  assert.equal(await e.thumbUrl(190000), null);
+  if (process.env.VRCW_EXPECT) assert.equal(await e.thumbUrl(190000), null); // fixture only; the real index has thumbnails there
   const st = e.thumbs!.stats;
   if (process.env.VRCW_NO_RANGE) { // host ignores Range: whole packs are downloaded once and sliced
     assert.equal(st.rangeSupported, false);

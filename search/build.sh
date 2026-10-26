@@ -5,12 +5,16 @@
 #      PUBLISH_PQ=<public parquet>: also stamp about.html + install deploy/_headers (deploy/finalize.py); deploy/deploy.sh sets it.
 #      REUSE_DATA=<old dist/data> copies sim/ and sem/ from a previous build with the identical world order (skips the 8 min neighbour job).
 #      HISTORY=<dir with uploads/metrics/summary.parquet>: round-6 history shards (data/hist/) + last_upload/uploads_90d core columns (build/build_history.py).
+#      THUMB_STATE=<dir> [THUMB_NEW=<new.parquet>]: incremental thumbnail packs (build/pack_thumbs.py --state; weekly refresh) instead of THUMBS.
+#      FINALIZE_ARGS="--asof ISO --commit HASH": passed to deploy/finalize.py (data-as-of = Dolt commit time).
+#      BUILD_VENV=<dir>: uv project environment for build/ (the refresh job keeps it on the state volume).
 # usage: search/build.sh <worlds.parquet> [embeddings.npy ids.parquet]  ->  search/dist/ (static site)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PQ="${1:?parquet path}"; EMB="${2:-}"; IDS="${3:-}"
 DIST="${DIST:-$HERE/dist}"; WORK="${WORK:-$HERE/work}"
 T0=$(date +%s)
+[ -z "${BUILD_VENV:-}" ] || export UV_PROJECT_ENVIRONMENT="$BUILD_VENV"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-6}"
 THUMBS="${THUMBS:-/work/projects/vrcwscrape-data/thumbs/thumbs.parquet}"
 rm -rf "$DIST" "$WORK/data" "$WORK/thumbs"; mkdir -p "$DIST" "$WORK"
@@ -27,14 +31,18 @@ if [ -n "${REUSE_DATA:-}" ]; then  # same world order only (checked by the calle
   [ -d "$WORK/data/sim" ] || cp -r "$REUSE_DATA/sim" "$WORK/data/sim"
   [ -d "$WORK/data/sem" ] || { [ ! -d "$REUSE_DATA/sem" ] || cp -r "$REUSE_DATA/sem" "$WORK/data/sem"; }
 fi
-if [ -f "$THUMBS" ]; then
+if [ -n "${THUMB_STATE:-}" ]; then
+  uv run --project "$HERE/build" python "$HERE/build/pack_thumbs.py" - "$WORK/world_order.parquet" "$WORK/thumbs" \
+    --state "$THUMB_STATE" --worlds "$PQ" ${THUMB_NEW:+--new "$THUMB_NEW"} \
+    --manifest "$WORK/data/manifest.json" --index-dir "$WORK/data" --base "${THUMBS_BASE:-../thumbs/}"
+elif [ -f "$THUMBS" ]; then
   uv run --project "$HERE/build" python "$HERE/build/pack_thumbs.py" "$THUMBS" "$WORK/world_order.parquet" "$WORK/thumbs" \
     --manifest "$WORK/data/manifest.json" --index-dir "$WORK/data" --base "${THUMBS_BASE:-../thumbs/}"
 fi
 wait $WEB
 mv "$WORK/data" "$DIST/data"
 [ ! -d "$WORK/thumbs" ] || mv "$WORK/thumbs" "$DIST/thumbs"
-[ -z "${PUBLISH_PQ:-}" ] || uv run --project "$HERE/build" python "$HERE/deploy/finalize.py" "$DIST" "$PUBLISH_PQ"
+[ -z "${PUBLISH_PQ:-}" ] || uv run --project "$HERE/build" python "$HERE/deploy/finalize.py" "$DIST" "$PUBLISH_PQ" ${FINALIZE_ARGS:-}
 T1=$(date +%s)
 echo "build done in $((T1-T0))s -> $DIST"
 du -sh "$DIST"; find "$DIST" -type f | wc -l

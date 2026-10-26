@@ -22,8 +22,7 @@
     <li>The world list is public VRChat world metadata (name, description, author name, tags, capacity,
     sizes, dates, visit and favorite counts) collected by the author's own scraper. Only worlds whose release status is
     public are included (<span id="count">@@COUNT@@</span> worlds). Private worlds are not.</li>
-    <li>Snapshot: newest scrape <strong>@@SNAPSHOT@@</strong>; upload history as of <strong>@@HISTORY@@</strong>. The data is refreshed by
-    hand for now, so anything newer than these dates is not shown (the site never uses today's date: "7 days" in the filters means 7 days
+    <li>Snapshot: data as of <strong>@@SNAPSHOT@@</strong>@@COMMIT@@; upload history as of <strong>@@HISTORY@@</strong>. The data is refreshed weekly (Sundays), so anything newer than these dates is not shown (the site never uses today's date: "7 days" in the filters means 7 days
     before the data date). Individual worlds may have been scraped earlier, and
     anything changed on VRChat since then (renamed, made private, deleted) is not reflected until the next refresh.</li>
     <!--THUMBS--><li>Thumbnails are small re-encoded previews (256 px wide, AVIF) of each world's public image, served from this site.

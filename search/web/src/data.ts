@@ -23,7 +23,7 @@ export interface Manifest {
   snapshot?: string | null;
   trend?: { basis: "recent_visits_per_day" | "popularity_fallback"; windowDays: number | null; scale: number; measured: number; fallbackRows?: number };
   /** self-hosted AVIF packs (build/pack_thumbs.py); null when not built */
-  thumbs?: { base: string; packs: number; count: number; index: string; bytes: number } | null;
+  thumbs?: { base: string; packs: number; count: number; index: string; bytes: number; hashes?: string[] } | null;
 }
 
 export interface Core {

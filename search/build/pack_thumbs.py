@@ -1,35 +1,52 @@
 """Pack self-hosted AVIF thumbnails into <=25 MiB range-addressable files + a small lazy index.
 
-usage: pack_thumbs.py <thumbs.parquet> <world_order.parquet> <out_dir> [--manifest data/manifest.json]
-                      [--pack-mib 24] [--base ../thumbs/] [--index-dir DIR]
+Two modes.
 
+Legacy / full (positional thumbs.parquet):
+  pack_thumbs.py <thumbs.parquet> <world_order.parquet> <out_dir> [--manifest data/manifest.json] [--pack-mib 24] [--base ../thumbs/]
+                 [--index-dir DIR]
   <thumbs.parquet>      world_id, sha256, avif (binary), width, height -- one row per world with an image (several worlds may share a sha)
-  <world_order.parquet> world_id in site ordinal order (written by build_index.py as work/world_order.parquet)
-Writes   <out_dir>/p-000.bin, p-001.bin ...   concatenated AVIFs, unique images only, in popularity order of first use
-         <index-dir>/thumbs_index.bin          gz; world ordinal -> blob id, blob lengths, pack table (see Thumbs in web/src/thumbs.ts)
-and sets manifest["thumbs"] = {base, packs, count, blobs, bytes, index}. `base` is resolved by the browser relative to data/ unless absolute
-(set it to e.g. https://thumbs.example.com/v1/ when the packs are hosted elsewhere; that host must allow CORS + Range).
+  Blob ids are assigned in order of first use by world ordinal (= popularity), packs are written fresh.
+
+Incremental (weekly refresh; `-` as the thumbs argument):
+  pack_thumbs.py - <world_order.parquet> <out_dir> --state DIR --worlds <public.parquet> [--new new.parquet] [--repack] [--manifest ..]
+  --worlds  parquet with world_id and thumb_sha256 (the build's world list)
+  --new     sha256, avif, width, height for shas not yet in the state (thumbs_delta.py)
+  --state   DIR/packs/p-NNN.bin (frozen), DIR/blobs.parquet (sha256, blob, len), DIR/packs.json. Blob ids are frozen per sha and existing
+            pack files are never rewritten: new blobs go into NEW packs appended after the last one. When appended packs exceed
+            --repack-frac (10%) of all pack bytes, or unreferenced blobs do, everything is repacked in popularity order (fresh ids).
+  The state packs are the only store of AVIF bytes; a repack reads the surviving blobs back out of them.
+
+Output (both modes)
+  <out_dir>/p-000.bin, p-001.bin ...   concatenated AVIFs (incremental: copies of the state packs)
+  <index-dir>/thumbs_index.bin          gz; header + pack table (see Thumbs in web/src/thumbs.ts)
+  <index-dir>/th/w<k>.bin, th/b<k>.bin  world shards / blob shards
+and sets manifest["thumbs"] = {base, packs, count, blobs, bytes, index, hashes}. `hashes[i]` is the first 16 hex chars of the sha256 of
+pack i; the browser requests `p-NNN.bin?v=<hash>`, so an unchanged pack keeps its URL (and its browser cache) across builds.
 
 Index (all little endian; every file gzip'd and magic-sniffed like the other payloads):
-  <index-dir>/thumbs_index.bin  "THM2" u32 nWorlds u32 nBlobs u32 nPacks u32 WS u32 BS ; nPacks x (u32 firstBlob, u32 bytes);
-                                ceil(nWorlds/WS) x u32 maxBlobBefore (-1 as 0xFFFFFFFF); ceil(nBlobs/BS) x u32 offsetOfFirstBlobInItsPack
-  <index-dir>/th/w<k>.bin       world shard k (WS worlds): u32 codes as 4 byte planes. 0 = next fresh blob, 1 = no thumbnail,
-                                c >= 2 = an already-used blob: (maxSeen - (c - 2))
-  <index-dir>/th/b<k>.bin       blob shard k (BS blobs): u32 lengths as 4 byte planes (rare AVIFs exceed 64 KiB)
+  thumbs_index.bin  "THM3" u32 nWorlds u32 nBlobs u32 nPacks u32 WS u32 BS ; nPacks x (u32 firstBlob, u32 bytes);
+                    ceil(nBlobs/BS) x u32 offsetOfFirstBlobInItsPack
+  th/w<k>.bin       world shard k (WS worlds): u32 codes as 4 byte planes. 0 = no thumbnail; c >= 1: blob = prev + unzigzag(c - 1), where
+                    prev is the blob of the previous world WITH a thumbnail in this shard (0 at the shard start)
+  th/b<k>.bin       blob shard k (BS blobs): u32 lengths as 4 byte planes (rare AVIFs exceed 64 KiB)
 Blobs are stored back to back inside a pack in blob-id order; a blob's offset is the prefix sum of lengths from the pack's first blob
-(reset to 0 at each pack boundary). Blob ids are assigned in order of first use by world ordinal (= popularity), so the popular worlds
-live in the first shards/packs and a result page touches only a handful of tiny shards.
+(reset to 0 at each pack boundary).
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
+import os
+import shutil
 import struct
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -40,6 +57,246 @@ def planes(a: np.ndarray) -> bytes:
 
 WS = 4096  # worlds per world shard (default; --ws)
 BS = 2048  # blobs per blob shard (default; --bs)
+
+
+def sha16(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+class PackWriter:
+    """Appends blobs to consecutive packs p-<first_no>.bin ...; blob ids continue from `first_blob`."""
+
+    def __init__(self, out: Path, first_no: int, first_blob: int, limit: int):
+        self.out, self.no, self.limit = out, first_no, limit
+        self.blob = first_blob
+        self.cur = bytearray()
+        self.cur_first = first_blob
+        self.packs: list[dict] = []
+        self.rows: list[tuple[str, int, int]] = []  # sha, blob, len
+        out.mkdir(parents=True, exist_ok=True)
+
+    def flush(self) -> None:
+        if not self.cur:
+            return
+        p = self.out / f"p-{self.no:03d}.bin"
+        p.write_bytes(self.cur)
+        self.packs.append({"first": self.cur_first, "bytes": len(self.cur), "hash": sha16(p)})
+        self.no += 1
+        self.cur = bytearray()
+        self.cur_first = self.blob
+
+    def add(self, sha: str, data: bytes) -> int:
+        if self.cur and len(self.cur) + len(data) > self.limit:
+            self.flush()
+        b = self.blob
+        self.blob += 1
+        self.cur += data
+        self.rows.append((sha, b, len(data)))
+        return b
+
+
+def write_index(idx_dir: Path, code_blob: np.ndarray, lens: list[int], packs: list[dict], ws: int, bs: int) -> int:
+    """code_blob: int64 per world ordinal, -1 = none. Returns total index bytes."""
+    n, nb = len(code_blob), len(lens)
+    pack_first = [p["first"] for p in packs]
+    off = np.zeros(nb, dtype=np.int64)
+    for k, p in enumerate(packs):
+        end = packs[k + 1]["first"] if k + 1 < len(packs) else nb
+        if end - p["first"] > 1:
+            off[p["first"] : end] = np.concatenate([[0], np.cumsum(lens[p["first"] : end - 1])])
+    nws, nbs = -(-n // ws), -(-nb // bs)
+    hdr = b"THM3" + struct.pack("<IIIII", n, nb, len(packs), ws, bs) + b"".join(struct.pack("<II", f, p["bytes"]) for f, p in zip(pack_first, packs))
+    hdr += np.array([off[k * bs] for k in range(nbs)], dtype="<u4").tobytes()
+    idx_dir.mkdir(parents=True, exist_ok=True)
+    th = idx_dir / "th"
+    if th.exists():
+        shutil.rmtree(th)
+    th.mkdir()
+    (idx_dir / "thumbs_index.bin").write_bytes(gzip.compress(hdr, 9, mtime=0))
+    total = (idx_dir / "thumbs_index.bin").stat().st_size
+    for k in range(nws):
+        seg = code_blob[k * ws : (k + 1) * ws]
+        codes = np.zeros(len(seg), dtype=np.uint32)
+        prev = 0
+        for i, b in enumerate(seg.tolist()):
+            if b < 0:
+                continue
+            d = b - prev
+            codes[i] = ((d << 1) ^ (d >> 63)) + 1
+            prev = b
+        data = gzip.compress(planes(codes), 9, mtime=0)
+        (th / f"w{k}.bin").write_bytes(data)
+        total += len(data)
+    for k in range(nbs):
+        data = gzip.compress(planes(np.array(lens[k * bs : (k + 1) * bs], dtype=np.uint32)), 9, mtime=0)
+        (th / f"b{k}.bin").write_bytes(data)
+        total += len(data)
+    return total
+
+
+def first_use_order(sha_of: dict[int, str]):
+    seen = set()
+    for i in sorted(sha_of):
+        s = sha_of[i]
+        if s not in seen:
+            seen.add(s)
+            yield s
+
+
+def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -> dict:
+    state = Path(a.state)
+    state.mkdir(parents=True, exist_ok=True)
+    ord_of = {w: i for i, w in enumerate(order)}
+    wt = pq.read_table(a.worlds, columns=["world_id", "thumb_sha256"])
+    sha_of: dict[int, str] = {}
+    for w, s in zip(wt["world_id"].to_pylist(), wt["thumb_sha256"].to_pylist()):
+        i = ord_of.get(w)
+        if i is not None and s:
+            sha_of[i] = s
+    new_avif: dict[str, bytes] = {}
+    if a.new and Path(a.new).is_file():
+        t = pq.read_table(a.new, columns=["sha256", "avif"])
+        new_avif = dict(zip(t["sha256"].to_pylist(), t["avif"].to_pylist()))
+
+    known: dict[str, tuple[int, int]] = {}
+    packs: list[dict] = []
+    if (state / "packs.json").is_file():
+        packs = json.loads((state / "packs.json").read_text())["packs"]
+        bt = pq.read_table(state / "blobs.parquet")
+        known = {s: (b, ln) for s, b, ln in zip(bt["sha256"].to_pylist(), bt["blob"].to_pylist(), bt["len"].to_pylist())}
+    assert not known or sorted(b for b, _ in known.values()) == list(range(len(known))), "state blob table is not a dense 0..N-1 sha->blob map"
+    used = set(sha_of.values())
+    add = [s for s in first_use_order(sha_of) if s not in known and s in new_avif]
+    add_bytes = sum(len(new_avif[s]) for s in add)
+    total_bytes = sum(p["bytes"] for p in packs) + add_bytes
+    app_bytes = sum(p["bytes"] for p in packs if p.get("kind") == "append") + add_bytes
+    orphan = sum(ln for s, (b, ln) in known.items() if s not in used)
+    why = None
+    if not packs:
+        why = "no state"
+    elif a.repack:
+        why = "--repack"
+    elif total_bytes and app_bytes / total_bytes > a.repack_frac:
+        why = f"appended packs are {app_bytes / total_bytes:.1%} of bytes"
+    elif total_bytes and orphan / total_bytes > a.repack_frac:
+        why = f"unreferenced blobs are {orphan / total_bytes:.1%} of bytes"
+    info = {"mode": "repack" if why else "append", "why": why, "new_blobs": len(add), "new_bytes": add_bytes,
+            "appended_bytes": app_bytes, "orphan_bytes": orphan, "missing": len(used - set(known) - set(new_avif))}
+    spacks = state / "packs"
+    if why:
+        # fresh ids in popularity order; surviving blobs are read back out of the old packs
+        old_off: dict[int, tuple[int, int]] = {}  # blob -> (pack index, offset)
+        lens = {b: ln for b, ln in known.values()}
+        for k, p in enumerate(packs):
+            end = packs[k + 1]["first"] if k + 1 < len(packs) else max(lens, default=-1) + 1
+            o = 0
+            for b in range(p["first"], end):
+                old_off[b] = (k, o)
+                o += lens.get(b, 0)
+        tmp = state / "packs.new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        wr = PackWriter(tmp, 0, 0, limit)
+        handles: dict[int, object] = {}
+        for s in first_use_order(sha_of):
+            if s in new_avif:
+                data = new_avif[s]
+            elif s in known:
+                b, ln = known[s]
+                k, o = old_off[b]
+                f = handles.get(k) or handles.setdefault(k, open(spacks / f"p-{k:03d}.bin", "rb"))
+                f.seek(o)
+                data = f.read(ln)
+                assert len(data) == ln
+            else:
+                continue
+            wr.add(s, data)
+        wr.flush()
+        for f in handles.values():
+            f.close()
+        for p in wr.packs:
+            p["kind"] = "base"
+        old = state / "packs.old"
+        shutil.rmtree(old, ignore_errors=True)
+        if spacks.exists():
+            spacks.rename(old)
+        tmp.rename(spacks)
+        shutil.rmtree(old, ignore_errors=True)
+        packs, rows = wr.packs, wr.rows
+    else:
+        first_no = len(packs)
+        # ids continue after the highest id ever assigned (unreferenced blobs keep their ids until the next repack)
+        wr = PackWriter(spacks, first_no, max(b for b, _ in known.values()) + 1, limit)
+        for s in add:
+            wr.add(s, new_avif[s])
+        wr.flush()
+        for p in wr.packs:
+            p["kind"] = "append"
+        packs = packs + wr.packs
+        rows = [(s, b, ln) for s, (b, ln) in known.items()] + wr.rows
+    # blob table + pack table (atomic)
+    rows.sort(key=lambda r: r[1])
+    bt = pa.table({"sha256": [r[0] for r in rows], "blob": pa.array([r[1] for r in rows], pa.int64()), "len": pa.array([r[2] for r in rows], pa.int64())})
+    pq.write_table(bt, state / "blobs.parquet.part")
+    (state / "packs.json.part").write_text(json.dumps({"packs": packs}))
+    os.replace(state / "blobs.parquet.part", state / "blobs.parquet")
+    os.replace(state / "packs.json.part", state / "packs.json")
+
+    blob_of = {s: b for s, b, _ in rows}
+    nblobs = (rows[-1][1] + 1) if rows else 0
+    lens_by_blob = [0] * nblobs
+    for _, b, ln in rows:
+        lens_by_blob[b] = ln
+    n = len(order)
+    code = np.full(n, -1, dtype=np.int64)
+    for i, s in sha_of.items():
+        b = blob_of.get(s)
+        if b is not None:
+            code[i] = b
+    # copy packs into the build output
+    out.mkdir(parents=True, exist_ok=True)
+    for k in range(len(packs)):
+        dst = out / f"p-{k:03d}.bin"
+        try:
+            os.link(spacks / dst.name, dst)
+        except OSError:
+            shutil.copyfile(spacks / dst.name, dst)
+    idx_bytes = write_index(idx_dir, code, lens_by_blob, packs, a.ws, a.bs)
+    info.update({"packs": len(packs), "count": int((code >= 0).sum()), "blobs": nblobs, "bytes": sum(p["bytes"] for p in packs),
+                 "hashes": [p["hash"] for p in packs], "index_gz_bytes_total": idx_bytes})
+    return info
+
+
+def run_legacy(a, order: list[str], out: Path, idx_dir: Path, limit: int) -> dict:
+    ord_of = {w: i for i, w in enumerate(order)}
+    pf = pq.ParquetFile(a.thumbs)
+    sha_of: dict[int, str] = {}
+    avif: dict[str, bytes] = {}
+    for batch in pf.iter_batches(batch_size=4096, columns=["world_id", "sha256", "avif"]):
+        for w, s, b in zip(batch["world_id"].to_pylist(), batch["sha256"].to_pylist(), batch["avif"].to_pylist()):
+            i = ord_of.get(w)
+            if i is None or s is None or not b:
+                continue
+            sha_of[i] = s
+            if s not in avif:
+                avif[s] = b
+    wr = PackWriter(out, 0, 0, limit)
+    blob_of: dict[str, int] = {}
+    for s in first_use_order(sha_of):
+        blob_of[s] = wr.add(s, avif[s])
+    wr.flush()
+    code = np.full(len(order), -1, dtype=np.int64)
+    for i, s in sha_of.items():
+        code[i] = blob_of[s]
+    lens = [0] * wr.blob
+    for _, b, ln in wr.rows:
+        lens[b] = ln
+    idx_bytes = write_index(idx_dir, code, lens, wr.packs, a.ws, a.bs)
+    return {"packs": len(wr.packs), "count": int((code >= 0).sum()), "blobs": len(lens), "bytes": sum(p["bytes"] for p in wr.packs),
+            "hashes": [p["hash"] for p in wr.packs], "index_gz_bytes_total": idx_bytes}
 
 
 def main() -> None:
@@ -53,111 +310,31 @@ def main() -> None:
     ap.add_argument("--index-dir", default=None)
     ap.add_argument("--ws", type=int, default=WS)
     ap.add_argument("--bs", type=int, default=BS)
+    ap.add_argument("--state", default=None, help="incremental mode: state dir")
+    ap.add_argument("--worlds", default=None, help="incremental mode: parquet with world_id, thumb_sha256")
+    ap.add_argument("--new", default=None, help="incremental mode: parquet of newly encoded shas")
+    ap.add_argument("--repack", action="store_true")
+    ap.add_argument("--repack-frac", type=float, default=0.10)
     a = ap.parse_args()
-    WS_, BS_ = a.ws, a.bs
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     idx_dir = Path(a.index_dir) if a.index_dir else out
     limit = int(a.pack_mib * 1048576)
-
     order = pq.read_table(a.order, columns=["world_id"])["world_id"].to_pylist()
-    ord_of = {w: i for i, w in enumerate(order)}
-    n = len(order)
-
-    # world -> sha (first row wins), sha -> avif bytes (unique)
-    pf = pq.ParquetFile(a.thumbs)
-    sha_of: dict[int, str] = {}
-    avif: dict[str, bytes] = {}
-    for batch in pf.iter_batches(batch_size=4096, columns=["world_id", "sha256", "avif"]):
-        for w, s, b in zip(batch["world_id"].to_pylist(), batch["sha256"].to_pylist(), batch["avif"].to_pylist()):
-            i = ord_of.get(w)
-            if i is None or s is None or not b:
-                continue
-            sha_of[i] = s
-            if s not in avif:
-                avif[s] = b
-
-    code = np.ones(n, dtype=np.uint32)  # 1 = none
-    blob_of: dict[str, int] = {}
-    lens: list[int] = []
-    packs: list[list[int]] = []  # [firstBlob, bytes]
-    cur = bytearray()
-    cur_first = 0
-    pack_no = 0
-
-    def flush() -> None:
-        nonlocal cur, cur_first, pack_no
-        if not lens or (packs and packs[-1][0] == cur_first) or not cur:
-            return
-        (out / f"p-{pack_no:03d}.bin").write_bytes(cur)
-        packs.append([cur_first, len(cur)])
-        pack_no += 1
-        cur = bytearray()
-        cur_first = len(lens)
-
-    maxseen = -1
-    for i in range(n):
-        s = sha_of.get(i)
-        if s is None:
-            continue
-        b = blob_of.get(s)
-        if b is None:
-            data = avif[s]
-            if len(cur) + len(data) > limit:
-                flush()
-            b = len(lens)
-            blob_of[s] = b
-            lens.append(len(data))
-            cur += data
-            code[i] = 0
-            maxseen = b
-        else:
-            code[i] = 2 + (maxseen - b)
-    flush()
-
-    nb_ = len(lens)
-    pack_first = [f for f, _ in packs]
-    # offset of each blob inside its pack
-    off = np.zeros(nb_, dtype=np.int64)
-    for k, (f, _) in enumerate(packs):
-        end = packs[k + 1][0] if k + 1 < len(packs) else nb_
-        if end > f:
-            off[f:end] = np.concatenate([[0], np.cumsum(lens[f : end - 1])]) if end - f > 1 else 0
-    nws = -(-n // WS_)
-    nbs = -(-nb_ // BS_)
-    max_before = np.zeros(nws, dtype=np.uint32)
-    fresh = (code == 0).astype(np.int64)
-    cum = np.cumsum(fresh)  # cum[i] = fresh blobs up to and including i
-    for k in range(nws):
-        j = k * WS_
-        max_before[k] = (int(cum[j - 1]) - 1) & 0xFFFFFFFF if j > 0 else 0xFFFFFFFF
-    hdr = b"THM2" + struct.pack("<IIIII", n, nb_, len(packs), WS_, BS_) + b"".join(struct.pack("<II", f, nb) for f, nb in packs)
-    hdr += max_before.astype("<u4").tobytes() + np.array([off[k * BS_] for k in range(nbs)], dtype="<u4").tobytes()
-    idx_dir.mkdir(parents=True, exist_ok=True)
-    (idx_dir / "th").mkdir(exist_ok=True)
-    (idx_dir / "thumbs_index.bin").write_bytes(gzip.compress(hdr, 9, mtime=0))
-    shard_bytes = (idx_dir / "thumbs_index.bin").stat().st_size
-    for k in range(nws):
-        d = gzip.compress(planes(code[k * WS_ : (k + 1) * WS_]), 9, mtime=0)
-        (idx_dir / "th" / f"w{k}.bin").write_bytes(d)
-        shard_bytes += len(d)
-    for k in range(nbs):
-        d = gzip.compress(planes(np.array(lens[k * BS_ : (k + 1) * BS_], dtype=np.uint32)), 9, mtime=0)
-        (idx_dir / "th" / f"b{k}.bin").write_bytes(d)
-        shard_bytes += len(d)
-    total = sum(nb for _, nb in packs)
-    info = {
-        "base": a.base, "packs": len(packs), "count": int((code != 1).sum()), "blobs": len(lens), "bytes": total,
-        "index": "thumbs_index.bin",
-    }
+    if a.state:
+        assert a.worlds, "--state needs --worlds"
+        res = run_incremental(a, order, out, idx_dir, limit)
+    else:
+        res = run_legacy(a, order, out, idx_dir, limit)
+    info = {"base": a.base, "packs": res["packs"], "count": res["count"], "blobs": res["blobs"], "bytes": res["bytes"],
+            "index": "thumbs_index.bin", "hashes": res["hashes"]}
     if a.manifest:
         mp = Path(a.manifest)
         m = json.loads(mp.read_text())
         m["thumbs"] = info
         m["hasThumb"] = True
         mp.write_text(json.dumps(m, ensure_ascii=False, separators=(",", ":")))
-    print(json.dumps({**info, "avg_bytes": round(total / max(1, len(lens))), "index_gz_bytes_total": shard_bytes, "index_files": 1 + nws + nbs,
-                      "max_pack": max(nb for _, nb in packs) if packs else 0}))
+    print(json.dumps({**{k: v for k, v in res.items() if k != "hashes"}, "avg_bytes": round(res["bytes"] / max(1, res["blobs"]))}))
 
 
 if __name__ == "__main__":
