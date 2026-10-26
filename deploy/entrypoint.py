@@ -9,7 +9,20 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
+
+# A maintenance window (e.g. the weekly worldsearch refresh) writes a unix expiry
+# time into this file on the images volume; runs skip while it is in the future.
+MAINTENANCE_FILE = os.environ.get("MAINTENANCE_FILE", "/images/.vrcw-maintenance")
+
+
+def in_maintenance() -> bool:
+    try:
+        with open(MAINTENANCE_FILE) as f:
+            return float(f.read().strip()) > time.time()
+    except (OSError, ValueError):
+        return False
 
 
 def ping(base: str | None, suffix: str) -> None:
@@ -22,10 +35,16 @@ def ping(base: str | None, suffix: str) -> None:
                 resp.read()
             return
         except Exception as exc:  # noqa: BLE001 - best effort
-            print(f"healthchecks ping failed ({suffix}): {type(exc).__name__}", file=sys.stderr)
+            print(
+                f"healthchecks ping failed ({suffix}): {type(exc).__name__}",
+                file=sys.stderr,
+            )
 
 
 def main() -> int:
+    if in_maintenance():
+        print(f"maintenance window ({MAINTENANCE_FILE}); skipping this run")
+        return 0
     base = os.environ.get("HEALTHCHECKS_PING_URL") or None
     args = sys.argv[1:] or ["--mode", "oneshot"]
     # Logfire aborts at import time when it has neither a write token nor `logfire auth`
