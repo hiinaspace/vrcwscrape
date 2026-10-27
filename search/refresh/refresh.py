@@ -98,7 +98,7 @@ UVENV = {
     "UV_PYTHON_DOWNLOADS": "never",
     "UV_PYTHON": "python3.12",
     "HOME": str(STATE / "home"),
-    "HF_HOME": str(STATE / "cache/hf"),
+    "HF_HOME": str(WORK / "cache/hf"),  # local copy of $STATE/cache/hf: loading 2 GB of weights straight from NFS took ~5 min
     "npm_config_cache": str(WORK / "cache/npm"),
     "OMP_NUM_THREADS": THREADS,
     "PYTHONDONTWRITEBYTECODE": "1",
@@ -238,6 +238,21 @@ def save_cache(name: str) -> None:
     say(f"cache {name} saved ({(STATE / f'cache/{name}-{key}.tar').stat().st_size / 1e6:.0f} MB)")
 
 
+def restore_hf() -> None:
+    src, dst = STATE / "cache/hf", WORK / "cache/hf"
+    dst.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        with step("hf cache: copy model weights from state to local disk"):
+            sh(["cp", "-a", f"{src}/.", str(dst)], tag="[hf] ")
+
+
+def save_hf() -> None:
+    """models downloaded by this run (cold state) go back to the state volume; existing files are not touched"""
+    src, dst = WORK / "cache/hf", STATE / "cache/hf"
+    dst.mkdir(parents=True, exist_ok=True)
+    sh(["cp", "-an", f"{src}/.", str(dst)], check=False, tag="[hf] ")
+
+
 # ---- phases
 def prep_deps() -> None:
     with step("deps: caches + uv sync (refresh, build) + npm ci"):
@@ -335,6 +350,8 @@ def main() -> int:
         (STATE / d).mkdir(parents=True, exist_ok=True)
     ex = STATE / "extract/current"
     ok = False
+    hf_thread = threading.Thread(target=restore_hf)
+    hf_thread.start()
     try:
         if REUSE:
             prep_deps()
@@ -363,8 +380,10 @@ def main() -> int:
             bpq = filtered if removed else pub
             say(f"removal list drops {removed} worlds")
 
+        hf_thread.join()
         with step("embeddings: delta (CPU fp32) + static bits"):
             py([str(SEARCH / "refresh/embed_delta.py"), "--parquet", str(bpq), "--state", str(STATE / "emb"), "--out", str(build / "emb")], tag="[emb] ")
+            save_hf()
         with step("thumbnails: encode new shas"):
             py([str(SEARCH / "refresh/thumbs_delta.py"), "--parquet", str(bpq), "--state", str(STATE / "thumbs"), "--images", str(IMAGES),
                 "--out", str(build / "thumbs_new.parquet"), "--workers", THREADS], tag="[thumbs] ")

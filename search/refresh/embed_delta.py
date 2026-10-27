@@ -66,9 +66,9 @@ def main() -> int:
     ap.add_argument("--parquet", required=True)
     ap.add_argument("--state", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--threads", type=int, default=int(os.environ.get("OMP_NUM_THREADS", "8")))
+    ap.add_argument("--threads", type=int, default=int(os.environ.get("EMBED_THREADS", "8")))
     ap.add_argument("--max-embed", type=int, default=8000, help="abort when more worlds than this need embedding (seed mismatch / model change)")
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=8)
     a = ap.parse_args()
     state, out = Path(a.state), Path(a.out)
     t0 = time.time()
@@ -107,11 +107,12 @@ def main() -> int:
 
         torch.set_num_threads(a.threads)
         ntexts = [texts[i] for i in need]
-        sm = SentenceTransformer(STATIC, device="cpu", trust_remote_code=False)
+        sm = SentenceTransformer(STATIC, device="cpu", trust_remote_code=False, model_kwargs={"dtype": torch.float32})
         nb = static_bits(sm, ntexts)
         print(f"static bits for {len(need)} worlds {time.time() - t0:.0f}s", flush=True)
         hf_id, rev, doc_prompt = GEMMA
-        model = SentenceTransformer(hf_id, device="cpu", trust_remote_code=False, revision=rev)
+        # float32 explicitly: the checkpoint is bf16 and sentence-transformers keeps that dtype on CPU, which is ~3.5x slower (3.7 vs 13 worlds/s on the i5-10500 nodes)
+        model = SentenceTransformer(hf_id, device="cpu", trust_remote_code=False, revision=rev, model_kwargs={"dtype": torch.float32})
         model.max_seq_length = min(512, model.max_seq_length or 512)
         emb = encode_sorted(model, ntexts, a.batch, "gemma2", prompt_name=doc_prompt)
         vec[need] = emb.astype(np.float16)
