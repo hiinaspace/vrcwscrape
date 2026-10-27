@@ -916,6 +916,9 @@ class Database:
             List of PendingImageDownload objects for PENDING images
         """
         async with self.async_session() as session:
+            # Two steps: Dolt reads file_metadata JSON for every joined row it
+            # considers, even ones it then discards, so selecting the JSON in
+            # the join cost ~2.8 GiB of heap per call when nothing was pending.
             stmt = (
                 select(
                     ImageContent.file_id,
@@ -923,7 +926,6 @@ class Database:
                     ImageContent.filename,
                     ImageContent.md5,
                     ImageContent.size_bytes,
-                    FileMetadata.file_metadata,
                 )
                 .join(FileMetadata, ImageContent.file_id == FileMetadata.file_id)
                 .where(
@@ -934,12 +936,21 @@ class Database:
                 )
                 .limit(limit)
             )
-            result = await session.execute(stmt)
+            rows = (await session.execute(stmt)).fetchall()
+            if not rows:
+                return []
+
+            metadata_result = await session.execute(
+                select(FileMetadata.file_id, FileMetadata.file_metadata).where(
+                    FileMetadata.file_id.in_({row[0] for row in rows})
+                )
+            )
+            metadata_by_id = dict(metadata_result.fetchall())
 
             # Extract download URL from file metadata
             downloads = []
-            for row in result.fetchall():
-                file_id, version, filename, md5, size_bytes, file_metadata = row
+            for file_id, version, filename, md5, size_bytes in rows:
+                file_metadata = metadata_by_id.get(file_id)
                 download_url = ""
 
                 if file_metadata and "versions" in file_metadata:
