@@ -91,10 +91,37 @@ def export_packages(conn: duckdb.DuckDBPyConnection, url: str, out: Path, tmp: P
     return len(rows)
 
 
+def load_mysql(conn) -> None:
+    """LOAD the mysql extension, installing it from an https download if needed.
+
+    DuckDB fetches extensions over plain http (its https path needs httpfs, itself
+    fetched over http), and the k8s refresh pod may only reach the internet on 443.
+    """
+    try:
+        conn.execute("LOAD mysql")
+        return
+    except duckdb.Error:
+        pass
+    import gzip
+    import tempfile
+    import urllib.request
+
+    platform = conn.execute("PRAGMA platform").fetchone()[0]
+    url = f"https://extensions.duckdb.org/v{duckdb.__version__}/{platform}/mysql_scanner.duckdb_extension.gz"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "mysql_scanner.duckdb_extension"
+        # The extensions CDN answers 403 to the default Python-urllib User-Agent.
+        req = urllib.request.Request(url, headers={"User-Agent": f"duckdb/{duckdb.__version__} vrcw-search-refresh"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            path.write_bytes(gzip.decompress(resp.read()))
+        conn.execute(f"INSTALL '{path}'")
+    conn.execute("LOAD mysql")
+
+
 def run(url: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect()
-    conn.execute("INSTALL mysql; LOAD mysql")
+    load_mysql(conn)
     conn.execute(f"ATTACH '{attach_string(url)}' AS mysqldb (TYPE mysql)")
     t0 = datetime.now()
     with tempfile.TemporaryDirectory(dir=output.parent) as td:
@@ -171,7 +198,9 @@ def run(url: str, output: Path) -> None:
     part.rename(output)
     ptmp.rename(pub)
     n = conn.execute(f"SELECT count(*) FROM read_parquet('{output}')").fetchone()[0]
-    print(f"wrote {n:,} rows -> {output} in {(datetime.now()-t0).total_seconds():.0f}s")
+    print(
+        f"wrote {n:,} rows -> {output} in {(datetime.now() - t0).total_seconds():.0f}s"
+    )
 
 
 if __name__ == "__main__":
