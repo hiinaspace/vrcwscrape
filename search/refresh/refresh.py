@@ -8,7 +8,7 @@ $STATE/runs/<run-id>.{log,json}.
 env: SEARCH_COMMIT (informational; the code is already checked out), STATE=/state, WORK=/work, IMAGES=/images,
      DATABASE_URL (read-only `search` user), CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID (deploy only),
      DRY_RUN=1 (everything except the deploy; writes the checked dist to state), REUSE_EXTRACT=1 (skip the DB window, reuse $STATE/extract/current),
-     NS=vrcw, PROJECT=worldsearch, LIVE_URL, THREADS, WINDOW_MIN=40.
+     NS=vrcw, PROJECT=worldsearch, LIVE_URL, THREADS, FLAG_TTL_MIN=20 (rolling), HISTORY_FULL=1 (rescan every upload row, ~25 min).
 """
 from __future__ import annotations
 
@@ -37,7 +37,6 @@ LIVE_URL = os.environ.get("LIVE_URL", "https://worldsearch.hiina.space").rstrip(
 DRY = os.environ.get("DRY_RUN", "") not in ("", "0")
 REUSE = os.environ.get("REUSE_EXTRACT", "") not in ("", "0")
 THREADS = os.environ.get("THREADS", "10")
-WINDOW_MIN = int(os.environ.get("WINDOW_MIN", "40"))
 WRANGLER = "wrangler@4.151.3"
 SEARCH = Path(__file__).resolve().parents[1]  # <checkout>/search
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -156,12 +155,29 @@ def flag_set(until: float) -> None:
         f.write(f"{int(until)}\n")
 
 
+FLAG_TTL = int(os.environ.get("FLAG_TTL_MIN", "20")) * 60
+_keeper_stop = threading.Event()
+
+
 def flag_open() -> None:
-    flag_set(time.time() + WINDOW_MIN * 60)
-    say(f"maintenance flag set until +{WINDOW_MIN} min")
+    """Hold the flag for the whole window: a keeper thread pushes the expiry to now + FLAG_TTL every 60 s until flag_clear(). If the pod dies,
+    the flag lapses by itself within FLAG_TTL, so a crash costs at most one more skipped scrape."""
+    _keeper_stop.clear()
+    flag_set(time.time() + FLAG_TTL)
+    say(f"maintenance flag held (rolling {FLAG_TTL // 60} min expiry)")
+
+    def keep():
+        while not _keeper_stop.wait(60):
+            try:
+                flag_set(time.time() + FLAG_TTL)
+            except OSError as e:
+                say(f"WARNING: flag refresh failed: {e}")
+
+    threading.Thread(target=keep, daemon=True).start()
 
 
 def flag_clear() -> None:
+    _keeper_stop.set()
     try:
         flag_set(0)
         say("maintenance flag cleared")
@@ -169,31 +185,8 @@ def flag_clear() -> None:
         say(f"WARNING: could not clear maintenance flag: {e}")
 
 
-def in_restart_minutes() -> bool:
-    m = datetime.now().astimezone().minute % 30
-    return m >= 26 or m == 0  # dolt-restart fires at :28/:58; the scrape at :00/:30 (skipped while the flag is set)
-
-
-def wait_not_restart_minutes() -> None:
-    while in_restart_minutes():
-        say("inside the dolt-restart / scrape minute, waiting 20 s")
-        time.sleep(20)
-
-
-def wait_extract_slot(need_min: int = 15) -> None:
-    """The dolt-restart cron deletes dolt-0 at :28 and :58: do not start the DB extract unless that is >= need_min away."""
-    while True:
-        m = datetime.now().astimezone().minute % 30
-        if 1 <= m <= 28 - need_min:
-            return
-        wait = ((31 - m) % 30 or 30) * 60 - datetime.now().second  # until :01 / :31 plus a minute margin
-        say(f"minute {m} of the half hour: extract would straddle the dolt-restart cron, waiting {wait // 60} min")
-        time.sleep(min(wait, 120))
-
-
 def restart_dolt(reason: str) -> None:
     old = kube("GET", f"/api/v1/namespaces/{NS}/pods/dolt-0")
-    wait_not_restart_minutes()
     say(f"deleting dolt-0 ({reason})")
     kube("DELETE", f"/api/v1/namespaces/{NS}/pods/dolt-0")
     deadline = time.time() + 600
@@ -285,8 +278,6 @@ def extract_window(ex: Path) -> dict:
                     raise RuntimeError(f"scrape still running after 20 min: {busy}")
                 say(f"scrape running: {busy}")
                 time.sleep(15)
-        with step("window: wait for a restart-free slot"):
-            wait_extract_slot()
         with step("window: fresh dolt-0"):
             d = kube("GET", f"/api/v1/namespaces/{NS}/pods/dolt-0")
             done = [parse_t(c["state"]["terminated"]["finishedAt"]) for p in pods("app=vrcw-scrape") for c in p["status"].get("containerStatuses", []) if c.get("state", {}).get("terminated")]
@@ -308,15 +299,13 @@ def extract_window(ex: Path) -> dict:
         u = urlparse(os.environ["DATABASE_URL"])
         url = urlunparse(u._replace(path="/vrcwscrape/" + head["hash"]))
         D = SEARCH / "data"
-        flag_open()
         with step("extract: ETL (full + public parquet)"):
             py([str(D / "etl_search.py"), "--database-url", url, "--output", str(new / "worlds-full.parquet")], tag="[etl] ")
-        flag_open()
         with step("extract: recent popularity"):
             py([str(D / "recent_popularity.py"), "--database-url", url, "--input", str(new / "worlds-full-public.parquet"),
                 "--output", str(new / "public-v2.parquet")], tag="[recent] ")
         with step("extract: upload/metrics history"):
-            py([str(D / "history_extract.py"), "--database-url", url, str(new / "public-v2.parquet"), str(new / "history")], tag="[hist] ")
+            py([str(D / "history_extract.py"), "--database-url", url, "--base", str(STATE / "history-base"), str(new / "public-v2.parquet"), str(new / "history")], tag="[hist] ")
         (new / "extract.json").write_text(json.dumps({**head, "extractedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}))
         return head
     finally:
