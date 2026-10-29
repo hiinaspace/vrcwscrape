@@ -23,7 +23,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from embed_delta import text_sha, texts_of  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+import genstate  # noqa: E402
+from embed_delta import model_meta, text_sha, texts_of  # noqa: E402
 
 
 def planes_to_u32(buf: bytes) -> np.ndarray:
@@ -34,7 +36,7 @@ def planes_to_u32(buf: bytes) -> np.ndarray:
 
 def seed_emb(a):
     d = Path(a.data)
-    out = Path(a.out)
+    out = Path(a.out) / "gen-0"  # generation layout (build/genstate.py); CURRENT is written last
     (out / "static").mkdir(parents=True, exist_ok=True)
     ids = pd.read_parquet(d / "emb/ids.parquet")["world_id"].tolist()
     full = pd.read_parquet(d / a.full, columns=["world_id", "name", "description", "author_name", "tags"]).set_index("world_id")
@@ -49,12 +51,15 @@ def seed_emb(a):
     for f in (d / "emb/static").iterdir():
         if f.name.startswith(("static_tokens", "static_tokenizer", "static_meta")):
             shutil.copyfile(f, out / "static" / f.name)
+    (out / "meta.json").write_text(json.dumps(model_meta()))
+    genstate.fsync_tree(out)
+    genstate.write_pointer(Path(a.out), "gen-0")
     print("emb seeded:", len(ids), "worlds")
 
 
 def seed_thumbs(a):
-    dist, out = Path(a.dist), Path(a.out)
-    (out / "packs").mkdir(parents=True, exist_ok=True)
+    dist, out = Path(a.dist), Path(a.out) / "gen-0"  # generation layout (build/thumbstate.py); CURRENT is written last
+    out.mkdir(parents=True, exist_ok=True)
     gz = lambda p: gzip.decompress(Path(p).read_bytes())  # noqa: E731
     hdr = gz(dist / "data/thumbs_index.bin")
     assert hdr[:4] == b"THM2"
@@ -73,7 +78,7 @@ def seed_thumbs(a):
         src = dist / "thumbs" / f"p-{k:03d}.bin"
         data = src.read_bytes()
         assert len(data) == nbytes, (k, len(data), nbytes)
-        shutil.copyfile(src, out / "packs" / src.name)
+        shutil.copyfile(src, out / src.name)
         o = 0
         for b in range(int(first), end):
             ln = int(lens[b])
@@ -87,6 +92,8 @@ def seed_thumbs(a):
     pq.write_table(pa.table({"sha256": [r[0] for r in rows], "blob": pa.array([r[1] for r in rows], pa.int64()), "len": pa.array([r[2] for r in rows], pa.int64())}),
                    out / "blobs.parquet")
     (out / "packs.json").write_text(json.dumps({"packs": plist}))
+    genstate.fsync_tree(out)
+    genstate.write_pointer(Path(a.out), "gen-0")
     print("shas without a blob:", sum(len(v) for v in h2sha.values()))
     print("thumbs seeded:", len(rows), "blobs,", len(plist), "packs")
 
