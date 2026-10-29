@@ -283,3 +283,28 @@ def test_rerun_into_the_same_out_dir_never_writes_through_a_hard_link(env):
     cur = genstate.resolve(env.state)
     assert cur.name == "gen-1" and (out / "p-000.bin").read_bytes() == (cur / "p-000.bin").read_bytes()
     env.assert_maps_to_truth()
+
+
+def test_unattended_runs_never_prune_and_a_healthy_week_needs_no_reencode(env, monkeypatch, capsys):
+    """Codex #3: a bad extract omits 31 of 100 shas. Old behaviour: unreferenced > 10% -> auto repack -> blobs gone -> next week re-encodes 31 (31k
+    in production, over --max-new). Now: appended only, warning, every blob kept."""
+    shas = [f"{i:064x}" for i in range(100)]
+    new = {s: avif(s) for s in shas}
+    env.week(worlds_of(shas), new)
+    monkeypatch.delenv("THUMB_REPACK", raising=False)
+    info = env.week(worlds_of(shas[:69]), None)  # bad week
+    assert info["mode"] == "append" and info["orphan_frac"] > 0.10 and "THUMB-WARNING" in capsys.readouterr().out and info["warning"]
+    g = thumbstate.load(env.state)
+    assert set(g.known) == set(shas)
+    info = env.week(worlds_of(shas), None)  # healthy week: nothing missing, nothing to encode
+    assert info["missing"] == 0 and info["new_blobs"] == 0
+    env.assert_maps_to_truth()
+    # also with brand-new shas appended (the append path keeps the 31 unreferenced ones)
+    extra = {f"{i:064x}": avif(f"x{i}") for i in range(200, 205)}
+    env.week(worlds_of(shas[:69] + list(extra)), extra)
+    assert set(thumbstate.load(env.state).known) == set(shas) | set(extra)
+    # attended: THUMB_REPACK=1 may prune (crash-safe path unchanged, covered by the kill matrix)
+    monkeypatch.setenv("THUMB_REPACK", "1")
+    info = env.week(worlds_of(shas[:69]), None)
+    assert info["mode"] == "repack" and set(thumbstate.load(env.state).known) == set(shas[:69])
+    env.assert_maps_to_truth()

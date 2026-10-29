@@ -13,7 +13,7 @@ Checks
   4. week over week against the live manifest and the last deployed id list: public count +-3% per week since deployed.json's time (1..4 weeks),
      >=99% of last deployed public worlds retained unless they turned non-public, thumbnail coverage >= min(99%, live coverage - 0.5pp),
      neighbour coverage 100%, data as-of newer than live, manifest.snapshot == manifest.history.asof.
-  5. extract drift (extract/current vs extract/previous): null/empty rate of the user-visible columns up by <= 2pp, < 25% of worlds with changed text.
+  5. extract drift (extract/current vs the extract of the live build, extract/accepted; extract/previous until the first deploy): null/empty rate of the user-visible columns up by <= 2pp, < 25% of worlds with changed text.
 """
 from __future__ import annotations
 
@@ -268,7 +268,13 @@ def main() -> int:
 
     print("-- 5. extract drift", flush=True)
     if a.extract_dir:
-        check_extract_drift(a.extract_dir / "current" / "public-v2.parquet", a.extract_dir / "previous" / "public-v2.parquet")
+        # baseline = the extract of the build that is LIVE (advanced only by baseline.promote). The rotation current/previous also moves on
+        # failed and dry runs, so comparing with it would let a rejected extract become next week's reference.
+        acc = baseline.accepted_file(a.extract_dir.parent)
+        if acc is None:
+            print("  WARNING: no accepted extract baseline yet (first deploy): comparing with extract/previous, which is NOT known to be good", flush=True)
+            acc = a.extract_dir / "previous" / baseline.DRIFT_FILE
+        check_extract_drift(a.extract_dir / "current" / baseline.DRIFT_FILE, acc)
 
     ok = all(x["ok"] for x in results)
     if a.report:

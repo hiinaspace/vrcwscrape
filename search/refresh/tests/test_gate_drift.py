@@ -54,3 +54,25 @@ def test_no_previous_extract_is_not_a_failure(tmp_path):
     pq.write_table(table(), tmp_path / "cur.parquet")
     gate.check_extract_drift(tmp_path / "cur.parquet", tmp_path / "missing.parquet")
     assert gate.results[0]["ok"]
+
+
+def test_rejected_extract_never_becomes_the_baseline(tmp_path):
+    """Codex #1: week 1's bad extract is rejected; week 2 has the same defect. The comparison is with the accepted (live) extract, not last week's."""
+    import baseline
+
+    s = tmp_path / "state"
+    s.mkdir()
+    (s / "pending-deploy").mkdir()
+    good = tmp_path / "good.parquet"
+    pq.write_table(table(), good)
+    (s / "deployed.json").write_text("{}")
+    # first deploy promoted: accepted = good
+    baseline.promote_accepted(s, good)
+    for week in (1, 2):  # two runs with the same defect, each rotated into extract/previous by refresh.py in between
+        gate.results.clear()
+        pq.write_table(table(blank_fav=0.20), tmp_path / f"bad{week}.parquet")
+        gate.check_extract_drift(tmp_path / f"bad{week}.parquet", baseline.accepted_file(s))
+        assert not all(r["ok"] for r in gate.results), f"week {week}: defect passed"
+    gate.results.clear()
+    gate.check_extract_drift(tmp_path / "bad1.parquet", tmp_path / "bad2.parquet")  # what the old current/previous comparison saw
+    assert all(r["ok"] for r in gate.results)

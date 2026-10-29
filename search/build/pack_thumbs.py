@@ -15,7 +15,8 @@ Incremental (weekly refresh; `-` as the thumbs argument):
   --state   DIR/CURRENT -> DIR/gen-<N>/{p-NNN.bin (frozen), blobs.parquet (sha256, blob, len), packs.json} (build/thumbstate.py, genstate.py).
             Blob ids are frozen per sha and existing pack files are never rewritten: a new generation hard-links the old packs and adds NEW
             packs after the last one. When appended packs exceed --repack-frac (10%) of all pack bytes, or unreferenced blobs do, everything
-            is repacked in popularity order (fresh ids) into a fresh generation. The only commit point is the atomic replace of CURRENT; a
+            is repacked in popularity order ONLY with --repack or env THUMB_REPACK=1 (attended; a repack drops blobs the extract does not reference, which
+            a bad extract week must not do): unattended runs keep appending and print a THUMB-WARNING with the unreferenced fraction. A repack writes fresh ids into a fresh generation. The only commit point is the atomic replace of CURRENT; a
             killed run leaves the previous generation current (the next run discards the half-written one). The state is validated on every
             load (pack sizes, pack hashes, blob table) and a mismatch fails the run; nothing is repaired in place.
   The state packs are the only store of AVIF bytes; a repack reads the surviving blobs back out of them.
@@ -171,16 +172,24 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
     app_bytes = sum(p["bytes"] for p in packs if p.get("kind") == "append") + add_bytes
     orphan = sum(ln for s, (b, ln) in known.items() if s not in used)
     why = None
+    warn = None
+    allow = os.environ.get("THUMB_REPACK", "") not in ("", "0")  # attended only: a repack DROPS blobs the candidate extract does not reference
+    auto = None
+    if total_bytes and app_bytes / total_bytes > a.repack_frac:
+        auto = f"appended packs are {app_bytes / total_bytes:.1%} of bytes"
+    elif total_bytes and orphan / total_bytes > a.repack_frac:
+        auto = f"unreferenced blobs are {orphan / total_bytes:.1%} of bytes"
     if not packs:
         why = "no state"
     elif a.repack:
         why = "--repack"
-    elif total_bytes and app_bytes / total_bytes > a.repack_frac:
-        why = f"appended packs are {app_bytes / total_bytes:.1%} of bytes"
-    elif total_bytes and orphan / total_bytes > a.repack_frac:
-        why = f"unreferenced blobs are {orphan / total_bytes:.1%} of bytes"
+    elif auto and allow:
+        why = auto
+    elif auto:
+        warn = f"THUMB-WARNING: {auto} (repack due, not run unattended; set THUMB_REPACK=1 to allow): unreferenced {orphan / max(1, total_bytes):.1%}; appending only, every existing blob is kept"
+        print(warn, flush=True)
     info = {"mode": "repack" if why else "append", "why": why, "new_blobs": len(add), "new_bytes": add_bytes,
-            "appended_bytes": app_bytes, "orphan_bytes": orphan, "missing": len(used - set(known) - set(new_avif))}
+            "appended_bytes": app_bytes, "orphan_bytes": orphan, "missing": len(used - set(known) - set(new_avif)), "orphan_frac": round(orphan / max(1, total_bytes), 4), "warning": warn}
     if why:
         # fresh ids in popularity order; surviving blobs are read back out of the current generation's (validated) packs
         old_off: dict[int, tuple[int, int]] = {}  # blob -> (pack index, offset)

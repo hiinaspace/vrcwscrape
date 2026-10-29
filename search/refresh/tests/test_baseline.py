@@ -146,3 +146,95 @@ def test_weeks_since_rounds_up_and_caps():
     d = lambda days: baseline.weeks_since(dj(), datetime(2026, 10, 28, tzinfo=timezone.utc) + timedelta(days=days))  # noqa: E731
     assert [d(0), d(1), d(7), d(7.1), d(14), d(21.5), d(28), d(90)] == [1, 1, 1, 2, 2, 4, 4, 4]
     assert baseline.weeks_since(None) == 1
+
+
+# ---- accepted drift baseline, resumable cleanup, incomplete pending
+
+
+def drift_file(tmp_path, content=b"extract-B"):
+    p = tmp_path / "ex-public-v2.parquet"
+    p.write_bytes(content)
+    return p
+
+
+def pend_b(s, tmp_path):
+    baseline.write_pending(s, ids_file(tmp_path), META_B, drift_src=drift_file(tmp_path))
+
+
+def leftovers(s):
+    return sorted(p.name for p in s.iterdir() if p.name.startswith("pending-deploy"))
+
+
+def test_accepted_baseline_advances_only_on_promote(tmp_path):
+    s = mk_state(tmp_path)
+    assert baseline.accepted_file(s) is None
+    pend_b(s, tmp_path)
+    assert baseline.accepted_file(s) is None  # a written (or failed, or dry) run never advances it
+    baseline.reconcile(s, A, say=lambda *_: None)  # the deploy never happened: pending dropped
+    assert baseline.accepted_file(s) is None
+    pend_b(s, tmp_path)
+    baseline.promote(s)
+    assert baseline.accepted_file(s).read_bytes() == b"extract-B"
+
+
+def test_kill_every_step_of_cleanup_and_accepted(tmp_path, steps):
+    def prep(name):
+        s = mk_state(tmp_path / name)
+        pend_b(s, tmp_path / name)
+        return s
+
+    probe = prep("probe")
+    steps.record()
+    baseline.promote(probe)
+    seen = list(steps.calls)
+    steps.off()
+    assert {"accepted-copy", "retire-rename", "cleanup-unlink", "cleanup-rmdir", "pointer-replace"} <= set(seen)
+    assert seen.count("cleanup-unlink") >= 3  # ids, drift file, meta: a kill after each deletion is exercised
+    for i, name in enumerate(seen):
+        s = prep(f"k{i}")
+        steps.kill_at(i)
+        with pytest.raises(Killed):
+            baseline.promote(s)
+        steps.off()
+        assert baseline.reconcile(s, B, say=lambda *_: None)["version"] == B, f"kill at {name}"
+        assert leftovers(s) == [] and (s / "deployed-ids.parquet").read_bytes() == b"ids-B" and baseline.accepted_file(s).read_bytes() == b"extract-B"
+        baseline.write_pending(s, ids_file(tmp_path), {**META_B, "version": 3333})  # the next deploy can proceed
+
+
+def test_kill_inside_drop_cleanup_with_live_still_at_a(tmp_path, steps):
+    probe = mk_state(tmp_path / "probe")
+    pend_b(probe, tmp_path / "probe")
+    steps.record()
+    baseline.reconcile(probe, A, say=lambda *_: None)
+    seen = list(steps.calls)
+    steps.off()
+    assert "cleanup-unlink" in seen
+    for i, name in enumerate(seen):
+        s = mk_state(tmp_path / f"d{i}")
+        pend_b(s, tmp_path / f"d{i}")
+        steps.kill_at(i)
+        with pytest.raises(Killed):
+            baseline.reconcile(s, A, say=lambda *_: None)
+        steps.off()
+        assert baseline.reconcile(s, A, say=lambda *_: None)["version"] == A, f"kill at {name}"
+        assert leftovers(s) == [] and baseline.accepted_file(s) is None and (s / "deployed-ids.parquet").read_bytes() == b"ids-A"
+
+
+def test_incomplete_pending_dir(tmp_path):
+    s = mk_state(tmp_path)
+    (s / "pending-deploy").mkdir()
+    (s / "pending-deploy" / "meta.json").write_text(json.dumps(META_B))  # ids.parquet missing
+    with pytest.raises(baseline.UnknownLive, match="incomplete"):
+        baseline.reconcile(s, B, say=lambda *_: None)  # live moved: cannot tell what happened -> loud
+    assert baseline.reconcile(s, A, say=lambda *_: None)["version"] == A  # never reached wrangler: discarded
+    assert leftovers(s) == []
+
+
+def test_write_pending_precedes_wrangler_and_meta_is_written_last():
+    from pathlib import Path
+
+    src = (Path(baseline.__file__).parent / "refresh.py").read_text()
+    assert src.index("baseline.write_pending(") < src.index('"pages", "deploy"') < src.index("baseline.promote(STATE)")
+    w = Path(baseline.__file__).read_text()
+    body = w[w.index("def write_pending") : w.index("def pending_complete")]
+    assert body.index('"pending-meta"') > body.index("ids.parquet") and body.index("os.rename(tmp, pend)") > body.index('"pending-meta"')

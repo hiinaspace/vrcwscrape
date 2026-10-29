@@ -21,7 +21,7 @@ export function initAsof(eng: Engine): Asof {
 }
 
 export function asofTitle(a: Asof): string {
-  const parts = [a.snapshot ? `World data: scraped through ${a.snapshot}.` : "", a.history ? `Upload history: as of ${a.history}.` : "",
+  const parts = [a.snapshot ? `World data as of ${a.snapshot}.` : "", a.history ? `Upload history: as of ${a.history}.` : "",
     "Data is refreshed weekly (Sundays): changes after these dates are not shown."].filter(Boolean);
   return parts.join(" ");
 }

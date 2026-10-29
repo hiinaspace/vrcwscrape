@@ -6,11 +6,14 @@ candidate with them. They must never describe a different build than the live on
 
   1. write_pending(): STATE/pending-deploy/{ids.parquet, meta.json {version, commit, commitTime, run}} (tmp dir, fsync, rename)
   2. wrangler pages deploy ...                               <- a kill from here on leaves the intent record behind
-  3. live manifest shows the version -> promote(): deployed-ids.parquet, then deployed.json (each tmp + fsync + replace), then drop pending
+  3. live manifest shows the version -> promote(): deployed-ids.parquet, then deployed.json (each tmp + fsync + replace), then the accepted
+     drift baseline STATE/extract/accepted (a genstate generation, advanced ONLY here: never by a dry run, a failed or a killed run), then
+     pending is retired with ONE rename to pending-deploy.retired-<run> and deleted file by file (any leftover is garbage-collected at the next start)
 
 reconcile() runs at the START of every run, before the window: it fetches the live manifest version and
   * == pending.version   the previous run deployed and died: promote pending (idempotent);
   * == deployed.version  the deploy never happened: drop pending;
+  * pending incomplete   (cannot happen after a completed write_pending; defensive) and live == deployed.version: discard it;
   * anything else        FAIL LOUDLY ("live site is at an unknown version"): somebody deployed outside the job, or the live site is broken.
 A pending record is only ever promoted after the live site showed its version, so deployed-ids never gets ahead of what is live. The one-time
 migration for the hand-built launch build applies only when deployed.json is absent and the live version is exactly LAUNCH_VERSION.
@@ -34,6 +37,7 @@ import genstate  # noqa: E402
 LAUNCH_VERSION = 1792630179  # the hand-built 2026-10-20 snapshot deployed on 10-23
 LAUNCH_DEPLOYED_AT = "2026-10-23T00:00:00Z"
 STALE_DAYS = 9
+DRIFT_FILE = "public-v2.parquet"  # the one extract file gate.py compares week over week
 
 
 class UnknownLive(RuntimeError):
@@ -74,7 +78,8 @@ def deployed(state: Path) -> dict | None:
     return read_json(Path(state) / "deployed.json")
 
 
-def write_pending(state: Path, ids_src: Path, meta: dict) -> None:
+def write_pending(state: Path, ids_src: Path, meta: dict, drift_src: Path | None = None) -> None:
+    """Complete record first (ids, the extract file the drift gate reads, meta last), then one rename: a pending-deploy dir is either absent or whole."""
     state = Path(state)
     pend, tmp = state / "pending-deploy", state / "pending-deploy.tmp"
     if pend.exists():
@@ -83,6 +88,9 @@ def write_pending(state: Path, ids_src: Path, meta: dict) -> None:
     tmp.mkdir()
     genstate.hook("pending-ids")
     shutil.copyfile(ids_src, tmp / "ids.parquet")
+    if drift_src:
+        genstate.hook("pending-drift")
+        shutil.copyfile(drift_src, tmp / DRIFT_FILE)
     genstate.hook("pending-meta")
     genstate.write_durable(tmp / "meta.json", json.dumps(meta).encode())
     genstate.fsync_tree(tmp)
@@ -91,8 +99,50 @@ def write_pending(state: Path, ids_src: Path, meta: dict) -> None:
     genstate.fsync_dir(state)
 
 
+def pending_complete(state: Path) -> bool:
+    p = Path(state) / "pending-deploy"
+    return (p / "meta.json").is_file() and (p / "ids.parquet").is_file()
+
+
+def gc_retired(state: Path) -> None:
+    """Delete retired/half-written pending dirs, file by file (resumable: a kill leaves a smaller garbage dir that is found again)."""
+    state = Path(state)
+    for d in [*state.glob("pending-deploy.retired-*"), *state.glob("pending-deploy.tmp")]:
+        for f in sorted(x for x in d.rglob("*") if x.is_file()):
+            genstate.hook("cleanup-unlink")
+            f.unlink()
+        genstate.hook("cleanup-rmdir")
+        shutil.rmtree(d, ignore_errors=True)
+    genstate.fsync_dir(state)
+
+
+def retire_pending(state: Path, run: str = "x") -> None:
+    """The ONLY way pending-deploy goes away: one atomic rename (the record is then 'not pending'), fsync the parent, then delete."""
+    state = Path(state)
+    pend = state / "pending-deploy"
+    if pend.exists():
+        genstate.hook("retire-rename")
+        os.rename(pend, state / f"pending-deploy.retired-{run}-{int(time.time())}")
+        genstate.fsync_dir(state)
+    gc_retired(state)
+
+
+def promote_accepted(state: Path, src: Path) -> None:
+    """Advance the accepted extract baseline (the drift gate's 'previous') to the extract of the build that is now live."""
+    def populate(tmp: Path) -> None:
+        genstate.hook("accepted-copy")
+        shutil.copyfile(src, tmp / DRIFT_FILE)
+
+    genstate.publish(Path(state) / "extract" / "accepted", populate)
+
+
+def accepted_file(state: Path) -> Path | None:
+    g = genstate.resolve(Path(state) / "extract" / "accepted")
+    return g / DRIFT_FILE if g and (g / DRIFT_FILE).is_file() else None
+
+
 def promote(state: Path) -> dict:
-    """pending-deploy -> deployed-ids.parquet + deployed.json. Idempotent: pending is removed last, so a kill anywhere re-runs from the top."""
+    """pending-deploy -> deployed-ids.parquet + deployed.json + accepted extract. Idempotent: pending is retired last, so a kill anywhere re-runs from the top."""
     state = Path(state)
     pend = state / "pending-deploy"
     meta = json.loads((pend / "meta.json").read_text())
@@ -105,24 +155,25 @@ def promote(state: Path) -> dict:
     genstate.hook("promote-json")
     d = {**meta, "deployedAt": meta.get("deployedAt") or now_iso()}
     write_json(state / "deployed.json", d)
+    if (pend / DRIFT_FILE).is_file():
+        genstate.hook("promote-accepted")
+        promote_accepted(state, pend / DRIFT_FILE)
     genstate.hook("promote-drop")
-    shutil.rmtree(pend)
-    genstate.fsync_dir(state)
+    retire_pending(state, str(meta.get("run", "x")))
     return d
 
 
 def drop_pending(state: Path) -> None:
-    shutil.rmtree(Path(state) / "pending-deploy", ignore_errors=True)
-    genstate.fsync_dir(Path(state))
+    retire_pending(Path(state), "dropped")
 
 
 def reconcile(state: Path, live_version: int, live: dict | None = None, say=print) -> dict:
     """Make deployed.json describe the live site, or raise UnknownLive. Returns deployed.json."""
     state = Path(state)
+    gc_retired(state)  # leftovers of a retire/cleanup that was killed
     dj = deployed(state)
-    pend = read_json(state / "pending-deploy" / "meta.json")
-    if (state / "pending-deploy").exists() and pend is None:
-        raise UnknownLive(f"{state / 'pending-deploy'} has no readable meta.json")
+    incomplete = (state / "pending-deploy").exists() and not pending_complete(state)
+    pend = read_json(state / "pending-deploy" / "meta.json") if not incomplete else None
     if dj is None and not pend:
         if live_version == LAUNCH_VERSION and (state / "deployed-ids.parquet").is_file():
             snap = ((live or {}).get("snapshot") or "")[:10]
@@ -132,6 +183,12 @@ def reconcile(state: Path, live_version: int, live: dict | None = None, say=prin
             say(f"baseline: seeded deployed.json for the launch build {LAUNCH_VERSION}")
         else:
             raise UnknownLive(f"live site is at an unknown version {live_version}: no deployed.json (the launch build is {LAUNCH_VERSION})")
+    if incomplete:
+        if dj and live_version == dj["version"]:
+            say("baseline: incomplete pending-deploy (it was written completely before wrangler, so no deploy happened); discarding")
+            retire_pending(state, "incomplete")
+            return dj
+        raise UnknownLive(f"{state / 'pending-deploy'} is incomplete and live {live_version} is not deployed.json's {dj and dj['version']}")
     if pend and live_version == pend["version"]:
         say(f"baseline: live is at pending version {live_version}: the previous run deployed but did not finish; promoting its ids")
         return promote(state)

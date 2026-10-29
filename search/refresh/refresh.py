@@ -67,7 +67,12 @@ def redact(s: str) -> str:
     return s
 
 
+WARNINGS: list[str] = []
+
+
 def say(msg: str) -> None:
+    if "THUMB-WARNING" in msg:
+        WARNINGS.append(msg[msg.index("THUMB-WARNING"):])
     line = redact(f"[{time.time() - T_START:7.1f}s] {msg}")
     with _lock:
         print(line, flush=True)
@@ -462,7 +467,7 @@ def main() -> int:
         else:
             pending = {"version": man["version"], "commit": head["hash"], "commitTime": head["time"], "run": RUN_ID, "deployedAt": baseline.now_iso()}
             with step("deploy: record pending baseline (before wrangler)"):
-                baseline.write_pending(STATE, bpq, pending)  # public ids + meta, fsynced; reconciled against the live manifest at the next start
+                baseline.write_pending(STATE, bpq, pending, drift_src=ex / baseline.DRIFT_FILE)  # public ids + meta, fsynced; reconciled against the live manifest at the next start
             with step("deploy: wrangler pages deploy"):
                 sh(["npx", "--yes", WRANGLER, "pages", "deploy", str(dist), "--project-name", PROJECT, "--branch", "main",
                     "--commit-dirty=true", "--commit-message", f"refresh dolt {head['hash'][:10]}"], tag="[wrangler] ")
@@ -496,8 +501,10 @@ def main() -> int:
         say("---- timings ----")
         for n, s in TIMINGS:
             say(f"{s:8.0f}s  {n}")
+        for w in WARNINGS:
+            say(w)
         say(f"{total:8.0f}s  TOTAL ({'ok' if ok else 'FAILED'})")
-        (STATE / "runs" / f"{RUN_ID}.json").write_text(json.dumps({"ok": ok, "dry": DRY, "noop": noop, "total": total, "steps": TIMINGS}))
+        (STATE / "runs" / f"{RUN_ID}.json").write_text(json.dumps({"ok": ok, "dry": DRY, "noop": noop, "warnings": WARNINGS, "total": total, "steps": TIMINGS}))
         shutil.rmtree(WORK / "build", ignore_errors=True) if ok else None
 
 
