@@ -265,3 +265,21 @@ def test_repack_reads_current_generation_and_keeps_old_until_pointer_moves(env, 
         env.week(list(reversed(worlds_of(SHAS[:8]))), None, repack=True)
     steps.off()
     assert env.snapshot() == before and (env.state / "gen-0").is_dir()
+
+
+def test_rerun_into_the_same_out_dir_never_writes_through_a_hard_link(env):
+    """found by the real-data smoke: out/p-NNN.bin is a hard link to a state pack; a second build into the same out dir used to
+    copyfile() over it and rewrote the (immutable, shared) state pack in place"""
+    shas = SHAS[:8]
+    env.week(worlds_of(shas), {s: avif(s) for s in shas})
+    old = {f.name: f.read_bytes() for f in (env.state / "gen-0").glob("p-*.bin")}
+    out = env.root / "shared-out"
+    out.mkdir()
+    for name in old:
+        os.link(env.state / "gen-0" / name, out / name)  # what the previous build left behind
+    a = argparse.Namespace(state=str(env.state), worlds=str(env.root / "w" / "worlds.parquet"), new=None, repack=True, repack_frac=0.1, ws=4096, bs=2048)
+    pack_thumbs.run_incremental(a, [w for w, _ in reversed(worlds_of(shas))], out, env.root / "idx", LIMIT)  # reversed popularity: the repack changes every pack
+    assert {f.name: f.read_bytes() for f in (env.state / "gen-0").glob("p-*.bin")} == old  # untouched, although the repack re-created the same names
+    cur = genstate.resolve(env.state)
+    assert cur.name == "gen-1" and (out / "p-000.bin").read_bytes() == (cur / "p-000.bin").read_bytes()
+    env.assert_maps_to_truth()

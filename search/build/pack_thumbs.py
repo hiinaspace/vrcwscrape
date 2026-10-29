@@ -248,6 +248,7 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
     out.mkdir(parents=True, exist_ok=True)
     for k in range(len(packs)):
         dst = out / f"p-{k:03d}.bin"
+        dst.unlink(missing_ok=True)  # a leftover from an earlier run may be a hard link to a state pack: never write through it
         try:
             os.link(gen / dst.name, dst)
         except OSError:

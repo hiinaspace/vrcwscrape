@@ -52,6 +52,8 @@ def fsync_tree(p: Path) -> None:
 
 
 def write_durable(path: Path, data: bytes) -> None:
+    """Never opens an existing file for writing: it may be a hard link to an immutable file of another generation."""
+    path.unlink(missing_ok=True)
     with open(path, "wb") as f:
         f.write(data)
         f.flush()
