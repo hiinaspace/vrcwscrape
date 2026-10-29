@@ -4,6 +4,8 @@ import type { Engine } from "../engine";
 import type { WorldInfo } from "../data";
 import type { Kind, Meters } from "./meters";
 import { thumbBox } from "./thumbs";
+import { asof } from "./asof";
+import { isStale } from "./stale";
 import { NOSIZE, esc, fmt, kb, label } from "./util";
 
 export interface RowCard { desc: string; tags: string[] }
@@ -29,6 +31,14 @@ export function meterBlock(eng: Engine, meters: Meters, i: number, rank = false)
   return m("cap", "cap", cap) + m("pc", "PC", pc) + m("quest", "Quest", qu) + m("visits", "visits", vis) + m("fav", "favs", fav);
 }
 
+/** data date for the rule: the world snapshot (metrics are world data), else the byline anchor */
+const dataDay = () => { const a = asof(); return a.snapshot ? Math.round((Date.parse(a.snapshot + "T00:00:00Z") - Date.UTC(2010, 0, 1)) / 86400000) : a.anchorDay; };
+/** metrics date (ISO) when world i's metrics are stale, else null */
+export function staleSince(eng: Engine, i: number): string | null {
+  const m = eng.c.metricsDay?.[i] ?? 0;
+  return m && isStale(dataDay(), m, Math.max(eng.c.created[i], eng.c.updatedAt[i])) ? dateOfDay(m) : null;
+}
+
 /** row date slot: the newer of updated_at and the newest package upload ("upd" / "uploaded"); with a recent/most-updated view, the upload counts */
 let uploadsView = false;
 export function setUploadsView(on: boolean) { uploadsView = on; }
@@ -36,9 +46,10 @@ export function dateSlot(eng: Engine, i: number): string {
   const c = eng.c;
   const upd = c.updatedAt[i], lu = c.lastUpload?.[i] ?? 0;
   const tip = `world updated ${dateOfDay(upd)}${lu ? `, newest package upload ${dateOfDay(lu)}` : ""}, published ${dateOfDay(c.created[i])}`;
-  if (uploadsView && c.uploads90) return `<span class="m date" title="${tip}">${c.uploads90[i]} uploads/90d · last ${lu ? dateOfDay(lu) : "–"}</span>`;
-  if (lu > upd) return `<span class="m date" title="${tip}">uploaded ${dateOfDay(lu)}</span>`;
-  return `<span class="m date" title="${tip}">upd ${dateOfDay(upd)}</span>`;
+  const sm = staleSince(eng, i), st = sm ? `<span class="stale"> · stale</span>` : "", tp = sm ? `${tip}; visits as of ${sm}` : tip;
+  if (uploadsView && c.uploads90) return `<span class="m date" title="${tp}">${c.uploads90[i]} uploads/90d · last ${lu ? dateOfDay(lu) : "–"}${st}</span>`;
+  if (lu > upd) return `<span class="m date" title="${tp}">uploaded ${dateOfDay(lu)}${st}</span>`;
+  return `<span class="m date" title="${tp}">upd ${dateOfDay(upd)}${st}</span>`;
 }
 
 /** tags + description start; rendered into `.rowx`, which is filled in once the card chunk has arrived */

@@ -126,6 +126,11 @@ def load(path: str) -> dict:
             d[k] = np.clip(days, 0, 65535)
         else:
             d[k] = np.zeros(n, dtype=np.int64)
+    if "metrics_scrape_time" in cols:  # latest world_metrics row's scrape time (0 = no metrics); drives the site's stale-metrics marker
+        arr = t["metrics_scrape_time"].cast(pa.timestamp("s"), safe=False).to_numpy(zero_copy_only=False)
+        d["metrics_d"] = np.where(np.isnat(arr), 0, np.clip((arr.astype("datetime64[D]") - EPOCH).astype(np.int64), 0, 65535))
+    else:
+        d["metrics_d"] = np.zeros(n, dtype=np.int64)
     d["tags"] = [list(x) if x else [] for x in col("tags", [])]
     # thumbnails are self-hosted (build/pack_thumbs.py); the VRChat CDN URLs in the parquet are never emitted
     d["thumb"] = None
@@ -295,6 +300,7 @@ def main() -> None:
     add("quest", d["quest"], np.uint32)
     add("created", d["created"], np.uint16)
     add("updated", d["updated"], np.uint16)
+    add("metrics_d", d["metrics_d"], np.uint16)
     vis = d["visits"]
     dv = np.concatenate([[vis[0]], vis[:-1] - vis[1:]]) if n else vis
     add("visits_delta", dv, np.uint32, "delta_desc")

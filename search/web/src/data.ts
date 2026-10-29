@@ -39,6 +39,8 @@ export interface Core {
   visits: Uint32Array;
   fav: Uint32Array;
   trend: Uint16Array | null; // round(scale*log10(1+recent visits/day)); null in pre-round-5 builds
+  /** days since 2010-01-01 of the world's latest metrics scrape (0 = unknown); null on older builds */
+  metricsDay: Uint16Array | null;
   lastUpload: Uint16Array | null; // days since 2010-01-01 of the newest package upload (0 = none); null without history
   uploads90: Uint16Array | null; // upload events in the 90 days before the history as-of date
   plat: Uint8Array; // bit0 pc, bit1 quest
@@ -147,7 +149,7 @@ export async function loadCore(m: Manifest): Promise<Core> {
   if (lastUpload) { updated = new Uint16Array(updatedAt); const lu = lastUpload; for (let i = 0; i < n; i++) if (lu[i] > updated[i]) updated[i] = lu[i]; }
   return {
     n, cap: col.cap, pc: col.pc, quest: col.quest, created: col.created, updated, updatedAt,
-    visits, fav: col.fav, trend: col.trend ?? null, lastUpload, uploads90: col.uploads_90d ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
+    visits, fav: col.fav, trend: col.trend ?? null, metricsDay: col.metrics_d ?? null, lastUpload, uploads90: col.uploads_90d ?? null, plat: col.plat, flags: col.flags, tagOff, tagIds: col.tagids,
   };
 }
 

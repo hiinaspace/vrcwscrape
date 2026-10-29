@@ -129,6 +129,7 @@ main{min-width:0}
 .m .bar{flex:1 1 16px;max-width:44px;height:6px;border-radius:3px;background:var(--line);overflow:hidden;display:inline-block}.m .bar i{display:block;height:100%;border-radius:3px}
 .m b{font-weight:500;color:var(--fg);min-width:34px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .m.cap i{background:var(--m-cap)}.m.pc i{background:var(--m-pc)}.m.quest i{background:var(--m-q)}.m.visits i{background:var(--m-vis)}.m.fav i{background:var(--m-fav)}
+.stale{color:var(--dim);opacity:.75;font-size:.9em}
 .m.date{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.m.none b{color:var(--dim)}
 .badge{font-size:11px;padding:0 6px;border-radius:4px;background:#8884;color:var(--fg)}.badge.cw{background:var(--neg-t);color:var(--neg)}.badge.status{background:var(--acc-t)}
 .badges{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
