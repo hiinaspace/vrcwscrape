@@ -29,7 +29,20 @@ Packs use `?v=<content hash of that pack>` URLs (`manifest.thumbs.hashes`), so t
 
 ## Weekly refresh (k8s)
 The weekly rebuild runs unattended as the CronJob `search-refresh` (fleet-infra `infra/my-cluster/vrcw/`, README section "Weekly search refresh");
-its code is `search/refresh/` (`refresh.py` orchestrator, `embed_delta.py`, `thumbs_delta.py`, `gate.py`, `seed_state.py`, `Containerfile`).
+its code is `search/refresh/` (`refresh.py` orchestrator, `baseline.py`, `embed_delta.py`, `thumbs_delta.py`, `gate.py`, `seed_state.py`, `Containerfile`).
 It does not use `deploy.sh`: it calls `build.sh` with `THUMB_STATE`/`FINALIZE_ARGS`, then `gate.py` (which wraps `check.py`), then `wrangler pages deploy`.
 Incremental thumbnails: `build/pack_thumbs.py --state` keeps blob ids and existing packs frozen (new blobs go to new `p-NNN.bin`; repack above 10%).
+
+Crash safety (a kill at any step must leave the next run correct or loudly failing). The thumbnail, embedding and history-base state dirs are
+generations (`CURRENT` -> `gen-N/`, `build/genstate.py`): a generation is written and fsynced completely, then `CURRENT` is replaced with
+tmp + fsync + `os.replace`, the only commit point; unchanged packs are hard links. Nothing is repaired in place: a state that fails validation
+(pack sizes, pack sha256, blob table) fails the run. The maintenance flag is opened first and held until after the post-extract dolt restart.
+A deploy is bracketed by `STATE/pending-deploy/` (public ids + version + commit, written before `wrangler pages deploy`); the next run's first step
+compares the live manifest version with it and with `STATE/deployed.json` and promotes the pending ids, drops them, or fails with "live site is at an
+unknown version". The Job is NOT "untouched" once `wrangler` has run: a failure after that (message "DEPLOYED BUT NOT VERIFIED") means the site may
+have changed, and the next run reconciles it. After a deploy outside the job, re-baseline attended: `python3 refresh/baseline.py adopt --state <STATE>
+--ids <public-v2.parquet of the live build> --live-url https://worldsearch.hiina.space`.
+Gate extras: unchanged Dolt head = successful no-op (exit non-zero when the live data is older than 9 days), count tolerance +-3% per elapsed week
+(max 4), thumbnail coverage >= min(99%, live - 0.5pp), extract drift vs `extract/previous`. Tests: `uv run --no-project --with pytest --with pyarrow
+--with numpy --with pandas --with duckdb==1.5.6 --with pymysql pytest search/refresh/tests -q`.
 The browser oracle is not part of the job. Attended: `deploy/serve_headers.py <dist> 4317`, then `cd oracle && uv run python run.py --url http://localhost:4317 --parquet <public-v2.parquet> --dist <dist>`.

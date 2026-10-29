@@ -45,6 +45,13 @@ def steps(monkeypatch):
 
             monkeypatch.setattr(genstate, "hook", h)
 
+        def kill_on(self, name: str):
+            def h(step):
+                if step == name:
+                    raise Killed(step)
+
+            monkeypatch.setattr(genstate, "hook", h)
+
         def off(self):
             monkeypatch.setattr(genstate, "hook", lambda step: None)
 

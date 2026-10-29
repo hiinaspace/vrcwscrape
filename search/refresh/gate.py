@@ -2,7 +2,7 @@
 """Automatic gate before a deploy. Any failure -> exit 1 (the refresh then does not deploy and the Job fails).
 
   gate.py --dist D --public PUBLIC.parquet --full FULL.parquet --excluded excluded_ids.txt --deployed-ids IDS.parquet
-          --thumb-state STATE --live-url URL --search <checkout>/search [--report out.json]
+          --thumb-state STATE --live-url URL --search <checkout>/search [--deployed-json F] [--extract-dir STATE/extract] [--report out.json]
 Run with the build venv (pyarrow, numpy). The browser oracle (search/oracle) is NOT part of the job; run it attended, see deploy/README.md.
 
 Checks
@@ -10,8 +10,10 @@ Checks
   2. web engine tests (web/test/run.mjs: engine + query) against dist/data, with the real packs.
   3. thumbnail pack integrity, independent of the builder: decode the new THM3 index and, for a sample of worlds, check blob id / length against the
      state's sha->blob table and that the bytes in the pack are an AVIF.
-  4. week over week against the live manifest and the last deployed id list: public count +-3%, >=99% of last deployed public worlds retained
-     unless they turned non-public, thumbnail coverage >= 99%, neighbour coverage 100%, data as-of newer than live.
+  4. week over week against the live manifest and the last deployed id list: public count +-3% per week since deployed.json's time (1..4 weeks),
+     >=99% of last deployed public worlds retained unless they turned non-public, thumbnail coverage >= min(99%, live coverage - 0.5pp),
+     neighbour coverage 100%, data as-of newer than live, manifest.snapshot == manifest.history.asof.
+  5. extract drift (extract/current vs extract/previous): null/empty rate of the user-visible columns up by <= 2pp, < 25% of worlds with changed text.
 """
 from __future__ import annotations
 
@@ -28,6 +30,11 @@ from pathlib import Path
 import numpy as np
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+import baseline  # noqa: E402
+import thumbstate  # noqa: E402
 
 results: list[dict] = []
 
@@ -81,8 +88,18 @@ def check_thumbs(dist: Path, public: Path, state: Path, man: dict) -> None:
         ord_of.update({"wrld_" + k: v for k, v in d.items()})
     t = pq.read_table(public, columns=["world_id", "thumb_sha256"])
     sha_of = {w: s for w, s in zip(t["world_id"].to_pylist(), t["thumb_sha256"].to_pylist())}
-    bt = pq.read_table(state / "blobs.parquet")
-    tab = {s: (b, ln) for s, b, ln in zip(bt["sha256"].to_pylist(), bt["blob"].to_pylist(), bt["len"].to_pylist())}
+    try:
+        st = thumbstate.load(state)  # CURRENT generation, fully validated incl. pack hashes
+    except thumbstate.StateError as e:
+        rec("thumb integrity", False, f"thumb state invalid: {e}")
+        return
+    if st is None:
+        rec("thumb integrity", False, f"no thumb state in {state}")
+        return
+    tab = st.known
+    if [p["hash"] for p in st.packs] != list(th.get("hashes") or []):
+        rec("thumb integrity", False, "manifest pack hashes != the state generation's packs.json")
+        return
     bad = []
     ids = sorted(ord_of)
     random.Random(7).shuffle(ids)
@@ -121,6 +138,48 @@ def check_thumbs(dist: Path, public: Path, state: Path, man: dict) -> None:
     rec("thumb integrity", not bad and not hbad, f"{checked} sampled worlds map to the right AVIF bytes; {len(bad)} bad {bad[:2]}; pack hash mismatches {hbad[:3]}")
 
 
+DRIFT_COLS = ["name", "description", "tags", "author_name", "capacity", "favorites", "visits"]
+DRIFT_MAX_RISE = 0.02  # null/empty rate of a user-visible column may rise by at most 2pp week over week
+DRIFT_MAX_CHANGED = 0.25  # fraction of worlds present in both extracts whose text (name, description, tags, author) changed; observed ~1-2% / week
+
+
+def empty_rates(t) -> dict[str, float]:
+    out = {}
+    for c in DRIFT_COLS:
+        col = t[c]
+        if str(col.type).endswith("string"):
+            bad = pc.equal(pc.utf8_trim_whitespace(col), "")
+        elif str(col.type).startswith("list"):
+            bad = pc.equal(pc.list_value_length(col), 0)
+        else:  # numeric: 0 (a blanked scrape shows up as null or 0)
+            bad = pc.equal(col, 0)
+        bad = pc.fill_null(bad, True)  # null counts as empty
+        out[c] = pc.sum(pc.cast(bad, "int64")).as_py() / max(1, len(col))
+    return out
+
+
+def text_keys(t) -> dict[str, int]:
+    cols = [t[c].to_pylist() for c in ("name", "description", "tags", "author_name")]
+    return {w: hash((n, d, tuple(tg or ()), au)) for w, n, d, tg, au in zip(t["world_id"].to_pylist(), *cols)}
+
+
+def check_extract_drift(cur: Path, prev: Path) -> None:
+    if not prev.is_file() or not cur.is_file():
+        rec("extract drift", True, f"no previous extract to compare ({prev})")
+        return
+    cols = ["world_id", *DRIFT_COLS, "author_name"]
+    c, p = pq.read_table(cur, columns=list(dict.fromkeys(cols))), pq.read_table(prev, columns=list(dict.fromkeys(cols)))
+    rc, rp = empty_rates(c), empty_rates(p)
+    worst = max(DRIFT_COLS, key=lambda k: rc[k] - rp[k])
+    rise = {k: rc[k] - rp[k] for k in DRIFT_COLS}
+    print("  empty rates (previous -> current): " + ", ".join(f"{k} {rp[k]:.2%}->{rc[k]:.2%}" for k in DRIFT_COLS), flush=True)
+    rec("extract drift: empty/null rates", all(v <= DRIFT_MAX_RISE for v in rise.values()), f"worst {worst} {rise[worst] * 100:+.2f}pp (limit +{DRIFT_MAX_RISE * 100:.0f}pp)")
+    kc, kp = text_keys(c), text_keys(p)
+    both = kc.keys() & kp.keys()
+    changed = sum(1 for w in both if kc[w] != kp[w]) / max(1, len(both))
+    rec("extract drift: text changed", changed < DRIFT_MAX_CHANGED, f"{changed:.2%} of {len(both)} worlds in both extracts (limit {DRIFT_MAX_CHANGED:.0%})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dist", type=Path, required=True)
@@ -131,6 +190,8 @@ def main() -> int:
     ap.add_argument("--thumb-state", type=Path, required=True)
     ap.add_argument("--live-url", required=True)
     ap.add_argument("--search", type=Path, required=True)
+    ap.add_argument("--deployed-json", type=Path)
+    ap.add_argument("--extract-dir", type=Path)
     ap.add_argument("--report", type=Path)
     a = ap.parse_args()
     dist = a.dist.resolve()
@@ -156,7 +217,6 @@ def main() -> int:
     n = man["n"]
     th = man.get("thumbs") or {}
     cov = (th.get("count", 0) / n) if n else 0
-    rec("thumbnail coverage >= 99%", cov >= 0.99, f"{th.get('count', 0)}/{n} = {cov:.2%}")
     try:
         sim = json.loads(gz(dist / "data/sim/index.json"))
         rec("neighbour coverage 100%", sim.get("count") == n, f"{sim.get('count')}/{n}")
@@ -169,9 +229,20 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         live = None
         rec("live manifest readable", False, str(e))
+    rec("manifest.snapshot == history.asof", not man.get("history") or (man["history"].get("asof") or "")[:10] == (man.get("snapshot") or "")[:10],
+        f"snapshot {man.get('snapshot')} history.asof {(man.get('history') or {}).get('asof')}")
     if live:
+        lth = live.get("thumbs") or {}
+        live_cov = (lth.get("count", 0) / live["n"]) if live.get("n") else 0
+        need_cov = min(0.99, live_cov - 0.005)
+        rec("thumbnail coverage >= min(99%, live - 0.5pp)", cov >= need_cov, f"{th.get('count', 0)}/{n} = {cov:.2%}; live {lth.get('count', 0)}/{live['n']} = {live_cov:.2%}; need {need_cov:.2%}")
+        dj = baseline.read_json(a.deployed_json) if a.deployed_json else None
+        weeks = baseline.weeks_since(dj)
+        tol = 0.03 * weeks
         d = (n - live["n"]) / live["n"]
-        rec("public world count within +-3% of live", abs(d) <= 0.03, f"{n} vs live {live['n']} ({d:+.2%})")
+        rec(f"public world count within +-{tol:.0%} of live", abs(d) <= tol, f"{n} vs live {live['n']} ({d:+.2%}); {weeks} week(s) since deployed.json {dj and dj.get('deployedAt')}")
+        if dj and live["version"] != dj.get("version"):
+            rec("deployed.json describes the live site", False, f"live {live['version']} != deployed.json {dj.get('version')}")
         new_t = (man.get("refresh") or {}).get("commitTime") or man.get("snapshot")
         live_t = (live.get("refresh") or {}).get("commitTime") or ((live.get("snapshot") or "")[:10] + "T23:59:59Z")  # a bare date is the newest scrape's day
         rec("data as-of newer than live", bool(new_t) and new_t > live_t, f"{new_t} vs live {live_t}")
@@ -194,6 +265,10 @@ def main() -> int:
             f"{len(prev)} last week, {len(lost)} gone ({len(turned_private)} now non-public, {len(unexplained)} unexplained) -> {kept:.2%} retained")
     else:
         rec(">= 99% of last deployed public worlds retained", False, f"no {a.deployed_ids} (seed it from the live build)")
+
+    print("-- 5. extract drift", flush=True)
+    if a.extract_dir:
+        check_extract_drift(a.extract_dir / "current" / "public-v2.parquet", a.extract_dir / "previous" / "public-v2.parquet")
 
     ok = all(x["ok"] for x in results)
     if a.report:

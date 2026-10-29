@@ -5,6 +5,12 @@ Phases: window (stop the scraper, pin the Dolt read to a commit, extract) -> bui
 gate -> deploy (or DRY_RUN). See deploy/README.md for the runbook. Every phase logs its wall time; a summary goes to stdout and
 $STATE/runs/<run-id>.{log,json}.
 
+Crash safety (a kill at any step must leave next week's run correct or loudly failing): the maintenance flag is opened first thing and held
+until after the post-extract dolt restart; the thumbnail, embedding and history-base states are generation dirs whose only commit point is
+one atomic CURRENT pointer replace (build/genstate.py); a deploy is bracketed by STATE/pending-deploy and reconciled against the live
+manifest at the start of the next run (baseline.py). A failed Job therefore leaves the live site untouched ONLY until `wrangler pages deploy`
+has run; after that "failed" can mean "deployed but not verified" (the message says so) and the next run reconciles it.
+
 env: SEARCH_COMMIT (informational; the code is already checked out), STATE=/state, WORK=/work, IMAGES=/images,
      DATABASE_URL (read-only `search` user), CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID (deploy only),
      DRY_RUN=1 (everything except the deploy; writes the checked dist to state), REUSE_EXTRACT=1 (skip the DB window, reuse $STATE/extract/current),
@@ -39,6 +45,8 @@ REUSE = os.environ.get("REUSE_EXTRACT", "") not in ("", "0")
 THREADS = os.environ.get("THREADS", "10")
 WRANGLER = "wrangler@4.151.3"
 SEARCH = Path(__file__).resolve().parents[1]  # <checkout>/search
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import baseline  # noqa: E402  (stdlib only)
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 SECRETS = [v for k in ("DATABASE_URL", "CLOUDFLARE_API_TOKEN") if (v := os.environ.get(k))]
 if os.environ.get("DATABASE_URL"):
@@ -157,13 +165,16 @@ def flag_set(until: float) -> None:
 
 FLAG_TTL = int(os.environ.get("FLAG_TTL_MIN", "20")) * 60
 _keeper_stop = threading.Event()
+_flag_held = False
 
 
 def flag_open() -> None:
     """Hold the flag for the whole window: a keeper thread pushes the expiry to now + FLAG_TTL every 60 s until flag_clear(). If the pod dies,
     the flag lapses by itself within FLAG_TTL, so a crash costs at most one more skipped scrape."""
+    global _flag_held
     _keeper_stop.clear()
     flag_set(time.time() + FLAG_TTL)
+    _flag_held = True
     say(f"maintenance flag held (rolling {FLAG_TTL // 60} min expiry)")
 
     def keep():
@@ -177,6 +188,10 @@ def flag_open() -> None:
 
 
 def flag_clear() -> None:
+    global _flag_held
+    if not _flag_held:
+        return
+    _flag_held = False
     _keeper_stop.set()
     try:
         flag_set(0)
@@ -264,15 +279,25 @@ def prep_deps() -> None:
         save_cache("uv")
 
 
+def pin_head() -> dict:
+    r = subprocess.run(["uv", "run", "--frozen", "--project", str(SEARCH / "refresh"), "python", str(SEARCH / "refresh/dbhead.py")],
+                       env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(VENV_REFRESH)}, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("dbhead failed: " + redact(r.stderr[-500:]))
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
 def extract_window(ex: Path) -> dict:
-    """Stop the scraper, restart dolt, read a pinned commit, extract. Returns {hash, time}."""
+    """The maintenance flag is already held (main). Wait for the scrape, restart dolt, read a pinned commit, extract. Returns {hash, time}.
+    Raises baseline.NoNewData (nothing was extracted) when the pinned commit is the one already live."""
     new = STATE / "extract/new"
     shutil.rmtree(new, ignore_errors=True)
     new.mkdir(parents=True)
-    flag_open()
     bg = None
+    early: list = []  # NoNewData / DataStale found by the cheap head check while the scrape is still running
     try:
-        # install deps while we wait for the running scrape to end (cluster-side idle wait is the long pole)
+        # install deps while we wait for the running scrape to end (cluster-side idle wait is the long pole), then look at Dolt's head:
+        # a head that is already live ends the run before any restart or ETL
         err: list = []
 
         def bgdeps():
@@ -280,19 +305,33 @@ def extract_window(ex: Path) -> dict:
                 prep_deps()
             except Exception as e:  # noqa: BLE001
                 err.append(e)
+                return
+            try:
+                h = pin_head()
+                say(f"early check: dolt main = {h['hash']} committed {h['time']}")
+                baseline.preflight(baseline.deployed(STATE), h, say=say)
+            except (baseline.NoNewData, baseline.DataStale) as e:
+                early.append(e)
+            except Exception as e:  # noqa: BLE001
+                say(f"WARNING: early head check failed: {e} (the pin after the restart decides)")
 
         bg = threading.Thread(target=bgdeps)
         bg.start()
         with step("window: wait for scrape pods to finish"):
-            deadline = time.time() + 20 * 60
-            while True:
+            deadline = time.time() + 30 * 60  # a wave-week scrape runs 20-25 min and may have started before the flag was opened
+            while not early:
                 busy = [p["metadata"]["name"] for p in pods("app=vrcw-scrape") if p["status"].get("phase") in ("Running", "Pending")]
                 if not busy:
                     break
                 if time.time() > deadline:
-                    raise RuntimeError(f"scrape still running after 20 min: {busy}")
+                    raise RuntimeError(f"scrape still running after 30 min: {busy}")
                 say(f"scrape running: {busy}")
                 time.sleep(15)
+        bg.join()  # deps + the cheap head check come first: an unchanged head must not cost a dolt restart
+        if err:
+            raise err[0]
+        if early:
+            raise early[0]
         with step("window: fresh dolt-0"):
             d = kube("GET", f"/api/v1/namespaces/{NS}/pods/dolt-0")
             done = [parse_t(c["state"]["terminated"]["finishedAt"]) for p in pods("app=vrcw-scrape") for c in p["status"].get("containerStatuses", []) if c.get("state", {}).get("terminated")]
@@ -301,16 +340,10 @@ def extract_window(ex: Path) -> dict:
                 say("dolt-0 started after the last scrape ended: heap is fresh, no restart needed")
             else:
                 restart_dolt("fresh heap for the extract")
-        bg.join()
-        if err:
-            raise err[0]
         with step("window: pin commit"):
-            r = subprocess.run(["uv", "run", "--frozen", "--project", str(SEARCH / "refresh"), "python", str(SEARCH / "refresh/dbhead.py")],
-                               env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(VENV_REFRESH)}, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError("dbhead failed: " + redact(r.stderr[-500:]))
-            head = json.loads(r.stdout.strip().splitlines()[-1])
+            head = pin_head()
             say(f"dolt main = {head['hash']} committed {head['time']}")
+            baseline.preflight(baseline.deployed(STATE), head, say=say)
         u = urlparse(os.environ["DATABASE_URL"])
         url = urlunparse(u._replace(path="/vrcwscrape/" + head["hash"]))
         D = SEARCH / "data"
@@ -326,12 +359,15 @@ def extract_window(ex: Path) -> dict:
     finally:
         if bg and bg.is_alive():
             bg.join()
-        flag_clear()
         try:
-            with step("window: restart dolt-0 (free the extract heap)"):
-                restart_dolt("release memory after the extract")
+            if early:
+                shutil.rmtree(new, ignore_errors=True)  # nothing was read from Dolt: no heap to free
+            else:
+                with step("window: restart dolt-0 (free the extract heap)"):
+                    restart_dolt("release memory after the extract")
         except Exception as e:  # noqa: BLE001
             say(f"WARNING: post-window dolt restart failed: {e} (dolt-restart cron will do it)")
+        flag_clear()  # only now: a scraper admitted earlier could have its database deleted by the restart
 
 
 def live_manifest() -> dict | None:
@@ -346,13 +382,20 @@ def live_manifest() -> dict | None:
 
 def main() -> int:
     say(f"run {RUN_ID} DRY_RUN={int(DRY)} REUSE_EXTRACT={int(REUSE)} code={os.environ.get('SEARCH_COMMIT', '?')[:10]} host={os.uname().nodename}")
-    for d in ("cache/hf", "extract", "dists", "emb", "thumbs"):
-        (STATE / d).mkdir(parents=True, exist_ok=True)
-    ex = STATE / "extract/current"
+    if not REUSE:
+        flag_open()  # before anything slow: the 03:30 scrape must see it even if setup stalls (cleared in extract_window, and in finally)
     ok = False
-    hf_thread = threading.Thread(target=restore_hf)
-    hf_thread.start()
+    noop = False
     try:
+        for d in ("cache/hf", "extract", "dists", "emb", "thumbs"):
+            (STATE / d).mkdir(parents=True, exist_ok=True)
+        ex = STATE / "extract/current"
+        hf_thread = threading.Thread(target=restore_hf)
+        hf_thread.start()
+        with step("baseline: reconcile with the live site"):
+            lm = baseline.fetch_live(LIVE_URL)
+            dj = baseline.reconcile(STATE, lm["version"], lm, say)
+            say(f"live {lm['version']} = deployed.json (commit {str(dj.get('commit'))[:10]}, deployed {dj.get('deployedAt')})")
         if REUSE:
             prep_deps()
             head = json.loads((ex / "extract.json").read_text())
@@ -397,7 +440,8 @@ def main() -> int:
         with step("gate"):
             rc = py([str(SEARCH / "refresh/gate.py"), "--dist", str(dist), "--public", str(bpq), "--full", str(full), "--excluded", str(excl),
                      "--deployed-ids", str(STATE / "deployed-ids.parquet"), "--thumb-state", str(STATE / "thumbs"), "--live-url", LIVE_URL,
-                     "--search", str(SEARCH), "--report", str(STATE / "runs" / f"{RUN_ID}.gate.json")],
+                     "--search", str(SEARCH), "--deployed-json", str(STATE / "deployed.json"), "--extract-dir", str(STATE / "extract"),
+                     "--report", str(STATE / "runs" / f"{RUN_ID}.gate.json")],
                     venv=VENV_BUILD, project="build", check=False, tag="[gate] ")
             if rc:
                 raise RuntimeError("GATE FAILED: no deploy")
@@ -416,32 +460,44 @@ def main() -> int:
                 save_cache("npm")
             say(f"DRY_RUN done: checked dist tarball at {ddir} (manifest version {man['version']})")
         else:
+            pending = {"version": man["version"], "commit": head["hash"], "commitTime": head["time"], "run": RUN_ID, "deployedAt": baseline.now_iso()}
+            with step("deploy: record pending baseline (before wrangler)"):
+                baseline.write_pending(STATE, bpq, pending)  # public ids + meta, fsynced; reconciled against the live manifest at the next start
             with step("deploy: wrangler pages deploy"):
                 sh(["npx", "--yes", WRANGLER, "pages", "deploy", str(dist), "--project-name", PROJECT, "--branch", "main",
                     "--commit-dirty=true", "--commit-message", f"refresh dolt {head['hash'][:10]}"], tag="[wrangler] ")
-                save_cache("npm")
+                try:
+                    save_cache("npm")
+                except Exception as e:  # noqa: BLE001
+                    say(f"WARNING: npm cache save failed after the deploy: {e}")
             with step("deploy: verify live manifest"):
-                for _ in range(30):
+                for _ in range(60):
                     lm = live_manifest()
                     if lm and lm.get("version") == man["version"]:
                         break
                     time.sleep(10)
                 else:
-                    raise RuntimeError(f"live manifest version != built {man['version']} after 5 min")
-                shutil.copyfile(bpq, STATE / "deployed-ids.parquet.new")  # public ids of the deployed build
-                sh(["python3", "-c", "import sys,shutil; shutil.move(sys.argv[1], sys.argv[2])", str(STATE / "deployed-ids.parquet.new"), str(STATE / "deployed-ids.parquet")])
+                    raise RuntimeError(f"DEPLOYED BUT NOT VERIFIED: wrangler succeeded but the live manifest is not at {man['version']} after 10 min; "
+                                       "pending-deploy is kept and the next run reconciles it against the live site")
+                baseline.promote(STATE)
+                say(f"baseline promoted: deployed.json = version {man['version']}, commit {head['hash'][:10]}")
         ok = True
+        return 0
+    except baseline.NoNewData as e:
+        say(str(e))
+        ok = noop = True
         return 0
     except Exception as e:  # noqa: BLE001
         say(f"FAILED: {e}")
         return 1
     finally:
+        flag_clear()  # no-op after extract_window; covers a failure before it
         total = time.time() - T_START
         say("---- timings ----")
         for n, s in TIMINGS:
             say(f"{s:8.0f}s  {n}")
         say(f"{total:8.0f}s  TOTAL ({'ok' if ok else 'FAILED'})")
-        (STATE / "runs" / f"{RUN_ID}.json").write_text(json.dumps({"ok": ok, "dry": DRY, "total": total, "steps": TIMINGS}))
+        (STATE / "runs" / f"{RUN_ID}.json").write_text(json.dumps({"ok": ok, "dry": DRY, "noop": noop, "total": total, "steps": TIMINGS}))
         shutil.rmtree(WORK / "build", ignore_errors=True) if ok else None
 
 
