@@ -31,3 +31,4 @@ artifacts_full/
 history/
 history.json
 recent.json
+.scratch/

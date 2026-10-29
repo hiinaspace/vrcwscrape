@@ -12,9 +12,12 @@ Incremental (weekly refresh; `-` as the thumbs argument):
   pack_thumbs.py - <world_order.parquet> <out_dir> --state DIR --worlds <public.parquet> [--new new.parquet] [--repack] [--manifest ..]
   --worlds  parquet with world_id and thumb_sha256 (the build's world list)
   --new     sha256, avif, width, height for shas not yet in the state (thumbs_delta.py)
-  --state   DIR/packs/p-NNN.bin (frozen), DIR/blobs.parquet (sha256, blob, len), DIR/packs.json. Blob ids are frozen per sha and existing
-            pack files are never rewritten: new blobs go into NEW packs appended after the last one. When appended packs exceed
-            --repack-frac (10%) of all pack bytes, or unreferenced blobs do, everything is repacked in popularity order (fresh ids).
+  --state   DIR/CURRENT -> DIR/gen-<N>/{p-NNN.bin (frozen), blobs.parquet (sha256, blob, len), packs.json} (build/thumbstate.py, genstate.py).
+            Blob ids are frozen per sha and existing pack files are never rewritten: a new generation hard-links the old packs and adds NEW
+            packs after the last one. When appended packs exceed --repack-frac (10%) of all pack bytes, or unreferenced blobs do, everything
+            is repacked in popularity order (fresh ids) into a fresh generation. The only commit point is the atomic replace of CURRENT; a
+            killed run leaves the previous generation current (the next run discards the half-written one). The state is validated on every
+            load (pack sizes, pack hashes, blob table) and a mismatch fails the run; nothing is repaired in place.
   The state packs are the only store of AVIF bytes; a repack reads the surviving blobs back out of them.
 
 Output (both modes)
@@ -46,8 +49,11 @@ import struct
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
+
+import genstate
+import thumbstate
+from thumbstate import pack_name, sha16
 
 
 def planes(a: np.ndarray) -> bytes:
@@ -57,14 +63,6 @@ def planes(a: np.ndarray) -> bytes:
 
 WS = 4096  # worlds per world shard (default; --ws)
 BS = 2048  # blobs per blob shard (default; --bs)
-
-
-def sha16(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 22), b""):
-            h.update(chunk)
-    return h.hexdigest()[:16]
 
 
 class PackWriter:
@@ -82,8 +80,9 @@ class PackWriter:
     def flush(self) -> None:
         if not self.cur:
             return
-        p = self.out / f"p-{self.no:03d}.bin"
-        p.write_bytes(self.cur)
+        p = self.out / pack_name(self.no)
+        genstate.hook("pack-write")
+        genstate.write_durable(p, bytes(self.cur))
         self.packs.append({"first": self.cur_first, "bytes": len(self.cur), "hash": sha16(p)})
         self.no += 1
         self.cur = bytearray()
@@ -162,13 +161,9 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
         t = pq.read_table(a.new, columns=["sha256", "avif"])
         new_avif = dict(zip(t["sha256"].to_pylist(), t["avif"].to_pylist()))
 
-    known: dict[str, tuple[int, int]] = {}
-    packs: list[dict] = []
-    if (state / "packs.json").is_file():
-        packs = json.loads((state / "packs.json").read_text())["packs"]
-        bt = pq.read_table(state / "blobs.parquet")
-        known = {s: (b, ln) for s, b, ln in zip(bt["sha256"].to_pylist(), bt["blob"].to_pylist(), bt["len"].to_pylist())}
-    assert not known or sorted(b for b, _ in known.values()) == list(range(len(known))), "state blob table is not a dense 0..N-1 sha->blob map"
+    st = thumbstate.load(state)  # validates (sizes + pack hashes); raises StateError on any inconsistency
+    known: dict[str, tuple[int, int]] = st.known if st else {}
+    packs: list[dict] = st.packs if st else []
     used = set(sha_of.values())
     add = [s for s in first_use_order(sha_of) if s not in known and s in new_avif]
     add_bytes = sum(len(new_avif[s]) for s in add)
@@ -186,9 +181,8 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
         why = f"unreferenced blobs are {orphan / total_bytes:.1%} of bytes"
     info = {"mode": "repack" if why else "append", "why": why, "new_blobs": len(add), "new_bytes": add_bytes,
             "appended_bytes": app_bytes, "orphan_bytes": orphan, "missing": len(used - set(known) - set(new_avif))}
-    spacks = state / "packs"
     if why:
-        # fresh ids in popularity order; surviving blobs are read back out of the old packs
+        # fresh ids in popularity order; surviving blobs are read back out of the current generation's (validated) packs
         old_off: dict[int, tuple[int, int]] = {}  # blob -> (pack index, offset)
         lens = {b: ln for b, ln in known.values()}
         for k, p in enumerate(packs):
@@ -197,53 +191,47 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
             for b in range(p["first"], end):
                 old_off[b] = (k, o)
                 o += lens.get(b, 0)
-        tmp = state / "packs.new"
-        shutil.rmtree(tmp, ignore_errors=True)
-        wr = PackWriter(tmp, 0, 0, limit)
-        handles: dict[int, object] = {}
-        for s in first_use_order(sha_of):
-            if s in new_avif:
-                data = new_avif[s]
-            elif s in known:
-                b, ln = known[s]
-                k, o = old_off[b]
-                f = handles.get(k) or handles.setdefault(k, open(spacks / f"p-{k:03d}.bin", "rb"))
-                f.seek(o)
-                data = f.read(ln)
-                assert len(data) == ln
-            else:
-                continue
-            wr.add(s, data)
-        wr.flush()
-        for f in handles.values():
-            f.close()
-        for p in wr.packs:
-            p["kind"] = "base"
-        old = state / "packs.old"
-        shutil.rmtree(old, ignore_errors=True)
-        if spacks.exists():
-            spacks.rename(old)
-        tmp.rename(spacks)
-        shutil.rmtree(old, ignore_errors=True)
-        packs, rows = wr.packs, wr.rows
+
+        def fill(tmp: Path):
+            wr = PackWriter(tmp, 0, 0, limit)
+            handles: dict[int, object] = {}
+            for s in first_use_order(sha_of):
+                if s in new_avif:
+                    data = new_avif[s]
+                elif s in known:
+                    b, ln = known[s]
+                    k, o = old_off[b]
+                    f = handles.get(k) or handles.setdefault(k, open(st.path / pack_name(k), "rb"))
+                    f.seek(o)
+                    data = f.read(ln)
+                    assert len(data) == ln
+                else:
+                    continue
+                wr.add(s, data)
+            wr.flush()
+            for f in handles.values():
+                f.close()
+            for p in wr.packs:
+                p["kind"] = "base"
+            return wr.packs, wr.rows
+
+        gen, packs, rows = thumbstate.write_generation(state, fill)  # the old generation stays untouched until CURRENT moves
+    elif add:
+        def fill(tmp: Path):
+            for k in range(len(packs)):
+                genstate.link_or_copy(st.path / pack_name(k), tmp / pack_name(k))
+            # ids continue after the highest id ever assigned (unreferenced blobs keep their ids until the next repack)
+            wr = PackWriter(tmp, len(packs), max(b for b, _ in known.values()) + 1, limit)
+            for s in add:
+                wr.add(s, new_avif[s])
+            wr.flush()
+            for p in wr.packs:
+                p["kind"] = "append"
+            return packs + wr.packs, [(s, b, ln) for s, (b, ln) in known.items()] + wr.rows
+
+        gen, packs, rows = thumbstate.write_generation(state, fill)
     else:
-        first_no = len(packs)
-        # ids continue after the highest id ever assigned (unreferenced blobs keep their ids until the next repack)
-        wr = PackWriter(spacks, first_no, max(b for b, _ in known.values()) + 1, limit)
-        for s in add:
-            wr.add(s, new_avif[s])
-        wr.flush()
-        for p in wr.packs:
-            p["kind"] = "append"
-        packs = packs + wr.packs
-        rows = [(s, b, ln) for s, (b, ln) in known.items()] + wr.rows
-    # blob table + pack table (atomic)
-    rows.sort(key=lambda r: r[1])
-    bt = pa.table({"sha256": [r[0] for r in rows], "blob": pa.array([r[1] for r in rows], pa.int64()), "len": pa.array([r[2] for r in rows], pa.int64())})
-    pq.write_table(bt, state / "blobs.parquet.part")
-    (state / "packs.json.part").write_text(json.dumps({"packs": packs}))
-    os.replace(state / "blobs.parquet.part", state / "blobs.parquet")
-    os.replace(state / "packs.json.part", state / "packs.json")
+        gen, rows = st.path, sorted(((s, b, ln) for s, (b, ln) in known.items()), key=lambda r: r[1])
 
     blob_of = {s: b for s, b, _ in rows}
     nblobs = (rows[-1][1] + 1) if rows else 0
@@ -261,9 +249,9 @@ def run_incremental(a, order: list[str], out: Path, idx_dir: Path, limit: int) -
     for k in range(len(packs)):
         dst = out / f"p-{k:03d}.bin"
         try:
-            os.link(spacks / dst.name, dst)
+            os.link(gen / dst.name, dst)
         except OSError:
-            shutil.copyfile(spacks / dst.name, dst)
+            shutil.copyfile(gen / dst.name, dst)
     idx_bytes = write_index(idx_dir, code, lens_by_blob, packs, a.ws, a.bs)
     info.update({"packs": len(packs), "count": int((code >= 0).sum()), "blobs": nblobs, "bytes": sum(p["bytes"] for p in packs),
                  "hashes": [p["hash"] for p in packs], "index_gz_bytes_total": idx_bytes})

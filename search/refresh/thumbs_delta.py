@@ -3,6 +3,7 @@
 
   thumbs_delta.py --parquet PUBLIC.parquet --state STATE_THUMBS --images /images --out new.parquet [--workers N] [--max-new N]
 
+State: `--state` is the generation-pointer dir of build/thumbstate.py (CURRENT -> gen-N/); the old flat layout is adopted as gen-0.
 Reads `<images>/<aa>/<bb>/<sha256>.png` (read-only) and encodes exactly like data/encode_stream.py (Pillow AVIF, 256 px wide, q50, speed 4).
 Output new.parquet: sha256, avif, width, height. Missing/undecodable shas are listed in new.parquet.missing.txt and simply get no thumbnail
 this week (they are retried next run).
@@ -17,7 +18,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
 from encode_stream import encode  # noqa: E402  (same encoder settings as the original 193k-image run)
+import thumbstate  # noqa: E402
 
 
 def one(args):
@@ -44,10 +47,8 @@ def main() -> int:
     a = ap.parse_args()
     t0 = time.time()
     used = {s for s in pq.read_table(a.parquet, columns=["thumb_sha256"])["thumb_sha256"].to_pylist() if s}
-    known = set()
-    bp = Path(a.state) / "blobs.parquet"
-    if bp.is_file():
-        known = set(pq.read_table(bp, columns=["sha256"])["sha256"].to_pylist())
+    st = thumbstate.load(Path(a.state), verify_hashes=False)  # CURRENT generation, sizes validated (pack_thumbs re-checks the hashes); raises on a bad state
+    known = set(st.known) if st else set()
     new = sorted(used - known)
     print(f"thumbs_delta: {len(used)} shas in use, {len(known)} in state, {len(new)} new", flush=True)
     if len(new) > a.max_new:
