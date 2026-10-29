@@ -138,9 +138,14 @@ class ImageContent(Base):
 class Database:
     """Database layer for VRChat world metadata storage."""
 
-    def __init__(self, connection_string: str):
-        """Initialize database connection."""
+    def __init__(self, connection_string: str, age_k: float = 0.25):
+        """Initialize database connection.
+
+        age_k: coefficient of the age-aware rescrape cadence (interval is at most
+        age_k * world age in days); 0 disables the age term.
+        """
         self.connection_string = connection_string
+        self.age_k = age_k
         converted_connection_string = self._convert_connection_string(connection_string)
 
         # SQLite doesn't support pool_size parameter
@@ -490,21 +495,115 @@ class Database:
             dt = dt.replace(tzinfo=None)
         return dt
 
+    def _rescrape_due_clauses(self, now: datetime):
+        """Build the shared rescrape due rule for SUCCESS worlds.
+
+        Returns (latest_metrics, due_expr, overdue_ratio_expr). Only scalar
+        columns are touched (never the JSON columns), to keep Dolt memory low.
+
+        interval_days = least(tier_days, greatest(1, K * hours(born -> last
+        metrics) / 24)), where born is the later of publish and update date
+        (falling back to the last metrics time when both are NULL, which means
+        no age shortening). With K == 0 the age term is dropped entirely.
+        """
+        is_mysql = "mysql" in self.connection_string.lower()
+        _, hours_diff = self._get_time_diff_funcs()
+
+        latest_metrics_time = (
+            select(
+                WorldMetrics.world_id.label("world_id"),
+                func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
+            )
+            .group_by(WorldMetrics.world_id)
+            .subquery()
+        )
+        latest_metrics = (
+            select(
+                WorldMetrics.world_id.label("world_id"),
+                WorldMetrics.scrape_time.label("last_metrics_time"),
+                WorldMetrics.heat.label("heat"),
+                WorldMetrics.popularity.label("popularity"),
+                WorldMetrics.occupants.label("occupants"),
+            )
+            .join(
+                latest_metrics_time,
+                and_(
+                    WorldMetrics.world_id == latest_metrics_time.c.world_id,
+                    WorldMetrics.scrape_time == latest_metrics_time.c.last_metrics_time,
+                ),
+            )
+            .subquery()
+        )
+
+        tier_days = sqlalchemy.case(
+            (
+                or_(
+                    latest_metrics.c.heat >= 50,
+                    latest_metrics.c.popularity >= 50,
+                    latest_metrics.c.occupants >= 25,
+                ),
+                1,
+            ),
+            (
+                or_(
+                    latest_metrics.c.heat >= 10,
+                    latest_metrics.c.popularity >= 10,
+                    latest_metrics.c.occupants >= 5,
+                ),
+                7,
+            ),
+            (
+                or_(
+                    latest_metrics.c.heat > 0,
+                    latest_metrics.c.popularity > 0,
+                    latest_metrics.c.occupants > 0,
+                ),
+                30,
+            ),
+            else_=180,
+        )
+
+        last = latest_metrics.c.last_metrics_time
+        if self.age_k > 0:
+            greatest = func.greatest if is_mysql else func.max
+            born = func.coalesce(
+                greatest(
+                    World.publish_date,
+                    func.coalesce(World.update_date, World.publish_date),
+                ),
+                World.update_date,
+            )
+            age_interval = self.age_k * hours_diff(last, born) / 24.0
+            age_interval = sqlalchemy.case((age_interval < 1, 1.0), else_=age_interval)
+            interval_days = sqlalchemy.case(
+                # No publish/update date at all: no age shortening.
+                (born.is_(None), tier_days),
+                (age_interval < tier_days, age_interval),
+                else_=tier_days,
+            )
+        else:
+            interval_days = tier_days
+
+        days_since = hours_diff(now, last) / 24.0
+        due = or_(last.is_(None), days_since >= interval_days)
+        # No metrics at all: most overdue possible.
+        ratio = func.coalesce(days_since / interval_days, 1e9)
+        return latest_metrics, due, ratio
+
     async def count_worlds_due_for_scraping(self) -> dict:
         """Count how many worlds are due for scraping, broken down by category.
 
         Returns:
             dict with counts:
                 - pending: Worlds with PENDING status
-                - due_for_rescrape: Worlds that need rescraping based on activity cadence
+                - due_for_rescrape: Worlds that need rescraping (popularity tier
+                  and world-age cadence, see _rescrape_due_clauses)
                 - total: Total worlds due for scraping
                 - deleted: Worlds marked as DELETED (for visibility)
                 - success: Worlds marked as SUCCESS (for visibility)
                 - error: Worlds marked as ERROR (for visibility)
         """
         async with self.async_session() as session:
-            days_diff, hours_diff = self._get_time_diff_funcs()
-
             # Count worlds by status for visibility
             status_counts = {}
             for status in ScrapeStatus:
@@ -516,84 +615,14 @@ class Database:
                 result = await session.execute(stmt)
                 status_counts[status.value.lower()] = result.scalar()
 
-            # Count PENDING worlds
             pending_count = status_counts["pending"]
 
-            # Count worlds due for rescraping
-            now = datetime.utcnow()
-
-            # Same logic as get_worlds_to_scrape
-            latest_metrics_time = (
-                select(
-                    WorldMetrics.world_id.label("world_id"),
-                    func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
-                )
-                .group_by(WorldMetrics.world_id)
-                .subquery()
-            )
-            latest_metrics = (
-                select(
-                    WorldMetrics.world_id.label("world_id"),
-                    WorldMetrics.scrape_time.label("last_metrics_time"),
-                    WorldMetrics.heat.label("heat"),
-                    WorldMetrics.popularity.label("popularity"),
-                    WorldMetrics.occupants.label("occupants"),
-                )
-                .join(
-                    latest_metrics_time,
-                    and_(
-                        WorldMetrics.world_id == latest_metrics_time.c.world_id,
-                        WorldMetrics.scrape_time
-                        == latest_metrics_time.c.last_metrics_time,
-                    ),
-                )
-                .subquery()
-            )
-
-            cadence_days_expr = sqlalchemy.case(
-                (
-                    or_(
-                        latest_metrics.c.heat >= 50,
-                        latest_metrics.c.popularity >= 50,
-                        latest_metrics.c.occupants >= 25,
-                    ),
-                    1,
-                ),
-                (
-                    or_(
-                        latest_metrics.c.heat >= 10,
-                        latest_metrics.c.popularity >= 10,
-                        latest_metrics.c.occupants >= 5,
-                    ),
-                    7,
-                ),
-                (
-                    or_(
-                        latest_metrics.c.heat > 0,
-                        latest_metrics.c.popularity > 0,
-                        latest_metrics.c.occupants > 0,
-                    ),
-                    30,
-                ),
-                else_=180,
-            )
-
-            days_since_metrics_expr = days_diff(now, latest_metrics.c.last_metrics_time)
-            due_for_metrics = or_(
-                latest_metrics.c.last_metrics_time.is_(None),
-                days_since_metrics_expr >= cadence_days_expr,
-            )
-
+            latest_metrics, due, _ = self._rescrape_due_clauses(datetime.utcnow())
             rescrape_stmt = (
                 select(func.count())
                 .select_from(World)
                 .outerjoin(latest_metrics, latest_metrics.c.world_id == World.world_id)
-                .where(
-                    and_(
-                        World.scrape_status == ScrapeStatus.SUCCESS,
-                        due_for_metrics,
-                    )
-                )
+                .where(and_(World.scrape_status == ScrapeStatus.SUCCESS, due))
             )
 
             result = await session.execute(rescrape_stmt)
@@ -608,11 +637,21 @@ class Database:
                 "error": status_counts["error"],
             }
 
+    def _build_rescrape_stmt(self, now: datetime, limit: int):
+        """Single-query rescrape selection, most overdue first (ties random)."""
+        latest_metrics, due, ratio = self._rescrape_due_clauses(now)
+        return (
+            select(World.world_id)
+            .outerjoin(latest_metrics, latest_metrics.c.world_id == World.world_id)
+            .where(and_(World.scrape_status == ScrapeStatus.SUCCESS, due))
+            .order_by(ratio.desc(), self._get_random_func())
+            .limit(limit)
+        )
+
     async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
         """Get world IDs that need scraping based on strategy."""
         async with self.async_session() as session:
             random_func = self._get_random_func()
-            days_diff, hours_diff = self._get_time_diff_funcs()
 
             # First get PENDING worlds
             pending_stmt = (
@@ -625,89 +664,8 @@ class Database:
             world_ids = [row[0] for row in result.fetchall()]
 
             if len(world_ids) < limit:
-                # Get worlds that need rescraping based on age
                 remaining = limit - len(world_ids)
-                now = datetime.utcnow()
-
-                # Determine last metrics time and cadence tiers from latest metrics
-                latest_metrics_time = (
-                    select(
-                        WorldMetrics.world_id.label("world_id"),
-                        func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
-                    )
-                    .group_by(WorldMetrics.world_id)
-                    .subquery()
-                )
-                latest_metrics = (
-                    select(
-                        WorldMetrics.world_id.label("world_id"),
-                        WorldMetrics.scrape_time.label("last_metrics_time"),
-                        WorldMetrics.heat.label("heat"),
-                        WorldMetrics.popularity.label("popularity"),
-                        WorldMetrics.occupants.label("occupants"),
-                    )
-                    .join(
-                        latest_metrics_time,
-                        and_(
-                            WorldMetrics.world_id == latest_metrics_time.c.world_id,
-                            WorldMetrics.scrape_time
-                            == latest_metrics_time.c.last_metrics_time,
-                        ),
-                    )
-                    .subquery()
-                )
-
-                cadence_days_expr = sqlalchemy.case(
-                    (
-                        or_(
-                            latest_metrics.c.heat >= 50,
-                            latest_metrics.c.popularity >= 50,
-                            latest_metrics.c.occupants >= 25,
-                        ),
-                        1,
-                    ),
-                    (
-                        or_(
-                            latest_metrics.c.heat >= 10,
-                            latest_metrics.c.popularity >= 10,
-                            latest_metrics.c.occupants >= 5,
-                        ),
-                        7,
-                    ),
-                    (
-                        or_(
-                            latest_metrics.c.heat > 0,
-                            latest_metrics.c.popularity > 0,
-                            latest_metrics.c.occupants > 0,
-                        ),
-                        30,
-                    ),
-                    else_=180,
-                )
-
-                days_since_metrics_expr = days_diff(
-                    now, latest_metrics.c.last_metrics_time
-                )
-                due_for_metrics = or_(
-                    latest_metrics.c.last_metrics_time.is_(None),
-                    days_since_metrics_expr >= cadence_days_expr,
-                )
-
-                rescrape_stmt = (
-                    select(World.world_id)
-                    .outerjoin(
-                        latest_metrics, latest_metrics.c.world_id == World.world_id
-                    )
-                    .where(
-                        and_(
-                            World.scrape_status == ScrapeStatus.SUCCESS,
-                            due_for_metrics,
-                        )
-                    )
-                    .order_by(random_func)
-                    .limit(remaining)
-                )
-
+                rescrape_stmt = self._build_rescrape_stmt(datetime.utcnow(), remaining)
                 result = await session.execute(rescrape_stmt)
                 world_ids.extend([row[0] for row in result.fetchall()])
 
