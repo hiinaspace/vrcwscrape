@@ -390,7 +390,7 @@ def main() -> int:
         for d in ("cache/hf", "extract", "dists", "emb", "thumbs"):
             (STATE / d).mkdir(parents=True, exist_ok=True)
         ex = STATE / "extract/current"
-        hf_thread = threading.Thread(target=restore_hf)
+        hf_thread = threading.Thread(target=restore_hf, daemon=True)  # a no-op run must not wait for the 2 GB copy at exit
         hf_thread.start()
         with step("baseline: reconcile with the live site"):
             lm = baseline.fetch_live(LIVE_URL)
