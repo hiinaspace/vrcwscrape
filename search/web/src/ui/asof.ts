@@ -1,4 +1,4 @@
-// Data freshness: updates are manual, so everything that would say "now" is anchored to the data instead.
+// Data freshness: the data is a weekly snapshot, not live, so everything that would say "now" is anchored to the data instead.
 //   snapshot = newest world scrape (manifest.snapshot), history = upload-history as-of (manifest.history.asof).
 //   anchor   = the older of the two (what the byline shows); date presets and open-ended ranges are expressed relative to it.
 import type { Engine } from "../engine";
@@ -22,6 +22,6 @@ export function initAsof(eng: Engine): Asof {
 
 export function asofTitle(a: Asof): string {
   const parts = [a.snapshot ? `World data: scraped through ${a.snapshot}.` : "", a.history ? `Upload history: as of ${a.history}.` : "",
-    "Data is refreshed by hand: changes after these dates are not shown."].filter(Boolean);
+    "Data is refreshed weekly (Sundays): changes after these dates are not shown."].filter(Boolean);
   return parts.join(" ");
 }

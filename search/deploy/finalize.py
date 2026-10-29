@@ -49,11 +49,15 @@ def main() -> int:
     snap = opts["--asof"][:10] if "--asof" in opts else newest.strftime("%Y-%m-%d")
     if "--commit" in opts:
         man.setdefault("refresh", {}).update({"commit": opts["--commit"], "commitTime": opts.get("--asof")})
-        (dist / "data/manifest.json").write_text(json.dumps(man, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    # The weekly refresh extracts world data and upload history from one pinned commit, so both carry its date: the history's
+    # own newest metrics time can fall minutes before midnight UTC and put a different day in the byline.
+    if "--asof" in opts and man.get("history") and man["history"].get("asof") != snap:
+        print(f"manifest.history.asof {man['history'].get('asof')} -> {snap} (commit date)")
+        man["history"]["asof"] = snap
     if man.get("snapshot") != snap:
         man["snapshot"] = snap
-        (dist / "data/manifest.json").write_text(json.dumps(man, separators=(",", ":")), encoding="utf-8")
         print(f"manifest.snapshot = {snap}")
+    (dist / "data/manifest.json").write_text(json.dumps(man, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     hist_asof = ((man.get("history") or {}).get("asof") or snap)[:10]
     s = s.replace("@@HISTORY@@", hist_asof)
     commit_txt = f" (Dolt commit <code>{opts['--commit'][:10]}</code>)" if "--commit" in opts else ""

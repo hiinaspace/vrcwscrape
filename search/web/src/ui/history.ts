@@ -154,5 +154,5 @@ export async function fillHistory(eng: Engine, host: HTMLElement, idx: number, a
   if (!h || (!h.events && !h.metrics)) { host.innerHTML = `<h3>History</h3><p class="dim">No package upload history recorded for this world.</p>`; return; }
   const up = h.events || h.recent.length ? renderUploads(h, asof, h.recent.length ? h.recent[h.recent.length - 1].day : asof) : `<p class="dim" data-testid="history-summary">No package uploads recorded.</p>`;
   host.dataset.events = String(h?.events ?? 0);
-  host.innerHTML = `<h3>History</h3>${up}${renderMetrics(h, asof, hi.metricsFrom)}<p class="hnote dim">upload history as of ${esc(hi.asof ?? "")} (data is refreshed by hand); from the public data mirror</p>`;
+  host.innerHTML = `<h3>History</h3>${up}${renderMetrics(h, asof, hi.metricsFrom)}<p class="hnote dim">upload history as of ${esc(hi.asof ?? "")} (refreshed weekly); from the public data mirror</p>`;
 }
