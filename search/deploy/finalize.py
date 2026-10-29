@@ -49,11 +49,10 @@ def main() -> int:
     snap = opts["--asof"][:10] if "--asof" in opts else newest.strftime("%Y-%m-%d")
     if "--commit" in opts:
         man.setdefault("refresh", {}).update({"commit": opts["--commit"], "commitTime": opts.get("--asof")})
-    # The weekly refresh extracts world data and upload history from one pinned commit, so both carry its date: the history's
-    # own newest metrics time can fall minutes before midnight UTC and put a different day in the byline.
-    if "--asof" in opts and man.get("history") and man["history"].get("asof") != snap:
-        print(f"manifest.history.asof {man['history'].get('asof')} -> {snap} (commit date)")
-        man["history"]["asof"] = snap
+    # Weekly refresh: world data and upload history both come from the one pinned commit (history_extract anchors its asof to the commit
+    # time), so the byline (history.asof) and About (snapshot) must show the same day. Disagreement = a bug upstream: fail the build.
+    if "--asof" in opts and man.get("history") and (man["history"].get("asof") or "")[:10] != snap:
+        sys.exit(f"finalize: manifest.history.asof {man['history'].get('asof')!r} != commit date {snap!r}; refusing to stamp inconsistent dates")
     if man.get("snapshot") != snap:
         man["snapshot"] = snap
         print(f"manifest.snapshot = {snap}")

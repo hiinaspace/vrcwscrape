@@ -5,7 +5,7 @@ Usage
   history_extract.py --database-url mysql://user:pw@host:3306/db [--base DIR] [--full] <public-v2.parquet> <out-dir>
   history_extract.py <dolt-bin> <clone-dir> <public-v2.parquet> <out-dir> [--port 13307]      (legacy: spawns a local dolt sql-server)
 
-Incremental (the weekly k8s refresh): --base DIR keeps a per-file_id table of the parsed upload rows (rows.parquet), the file list with each
+Incremental (the weekly k8s refresh): --base DIR (generation dirs + CURRENT, build/genstate.py; replaced only by moving CURRENT) keeps a per-file_id table of the parsed upload rows (rows.parquet), the file list with each
 file's last_scrape_time (files.parquet) and all world_metrics rows (metrics.parquet), on the state volume.
   * full mode (no base, --full, or env HISTORY_FULL=1): keyset pages over file_metadata (a single streaming scan of the JSON column
     OOM-kills dolt-sql-server at 8 GiB; ~15 GB of JSON in all, ~23 min). Writes the base.
@@ -13,6 +13,8 @@ file's last_scrape_time (files.parquet) and all world_metrics rows (metrics.parq
     time differs from the base (or are new) are fetched by primary key in batches of 200 and re-parsed; files that left the list are dropped.
     world_metrics (append-only) is fetched from (base max time - 1 day) and merged on (world_id, t).
 Both modes then write exactly the same outputs: uploads.parquet, metrics.parquet, summary.parquet, asof.json (filtered to the public worlds).
+asof (the reference time of uploads_30d/90d/365d and asof.json "asof") is the pinned Dolt commit time when known, so it is the same instant as
+the world snapshot; the newest metrics time is kept as asof.json "metrics_max".
 Upload rows of non-public worlds are kept in the base (a world can turn public later) but never written out.
 """
 import json
@@ -22,12 +24,16 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build"))
+import genstate  # noqa: E402
 
 DOT = "․"
 PLAT = {"android": "quest", "standalonewindows": "pc", "ios": "ios"}
@@ -139,6 +145,17 @@ def write_rows(parsed, path):
     return n
 
 
+BASE_FILES = ("files.parquet", "rows.parquet", "metrics.parquet")
+
+
+def as_naive_utc(t):
+    if isinstance(t, str):
+        t = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    if isinstance(t, datetime) and t.tzinfo:
+        t = t.astimezone(timezone.utc).replace(tzinfo=None)
+    return t
+
+
 def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
     os.makedirs(out, exist_ok=True)
     work = os.path.join(out, "_work")
@@ -146,7 +163,15 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
     os.makedirs(work)
     bad = {"bad_json": 0, "no_created_at": 0}
     con = duckdb.connect()
-    have_base = bool(base) and all(os.path.isfile(os.path.join(base, f)) for f in ("files.parquet", "rows.parquet", "metrics.parquet"))
+    bdir = None
+    if base:
+        if os.path.isdir(base):
+            genstate.migrate(Path(base), [(f, f) for f in BASE_FILES])  # old flat layout -> gen-0
+        g = genstate.resolve(Path(base))
+        bdir = str(g) if g else None
+        if bdir and not all(os.path.isfile(os.path.join(bdir, f)) for f in BASE_FILES):
+            raise genstate.StateError(f"{bdir}: incomplete history base")
+    have_base = bdir is not None
     mode = "full" if (full or not have_base) else "incremental"
     log(f"mode {mode}")
 
@@ -166,7 +191,7 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
         log(f"full scan: {n} version rows")
         changed = deleted = None
     else:
-        bf = pq.read_table(os.path.join(base, "files.parquet"))
+        bf = pq.read_table(os.path.join(bdir, "files.parquet"))
         bt = dict(zip(bf["file_id"].to_pylist(), bf["last_scrape_time"].to_pylist()))
         now = {fid: t for fid, _w, t in files}
         changed = sorted(fid for fid, t in now.items() if bt.get(fid) != t)
@@ -181,7 +206,7 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
         pq.write_table(table(got, ROW_SCHEMA), new_pq, compression="zstd")
         drop = pa.table({"file_id": pa.array(changed + deleted, pa.string())})
         con.register("drop_ids", drop)
-        con.execute(f"""copy (select b.* from read_parquet('{os.path.join(base, "rows.parquet")}') b
+        con.execute(f"""copy (select b.* from read_parquet('{os.path.join(bdir, "rows.parquet")}') b
                          where b.file_id not in (select file_id from drop_ids)
                          union all select * from read_parquet('{new_pq}')) to '{rows_pq}' (format parquet, compression zstd)""")
         log(f"re-parsed {len(got)} version rows for the changed files")
@@ -202,7 +227,7 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
         w.close()
         log(f"metrics: {total} rows streamed")
     else:
-        base_met = os.path.join(base, "metrics.parquet")
+        base_met = os.path.join(bdir, "metrics.parquet")
         since = con.execute(f"select max(t) from read_parquet('{base_met}')").fetchone()[0]
         since = since - timedelta(days=1)
         tail = [r for r in src.metrics(since)]
@@ -226,7 +251,9 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
     con.execute(f"""copy (select * from read_parquet('{met_pq}') where world_id in {pub} order by world_id, t)
         to '{out}/metrics.parquet' (format parquet, compression zstd)""")
     log("uploads + metrics written")
-    asof = con.execute(f"select max(t) from '{out}/metrics.parquet'").fetchone()[0]
+    metrics_max = con.execute(f"select max(t) from '{out}/metrics.parquet'").fetchone()[0]
+    head_t = as_naive_utc(head[1])
+    asof = head_t or metrics_max  # the pinned commit time; the newest metrics row only when it is unknown
     con.execute(f"""create temp table ev as
       with u as (select world_id, created_at, lag(created_at) over (partition by world_id order by created_at) p
                  from read_parquet('{out}/uploads.parquet')),
@@ -242,23 +269,21 @@ def run(src, public_pq, out, base=None, full=False, head=("unknown", None)):
       group by p.world_id, p.r order by p.r) to '{out}/summary.tmp.parquet'""")
     con.execute(f"copy (select * from read_parquet('{out}/summary.tmp.parquet')) to '{out}/summary.parquet' (format parquet, compression zstd)")
     os.remove(f"{out}/summary.tmp.parquet")
-    json.dump({"head": head[0], "head_date": str(head[1]), "asof": str(asof), "mode": mode,
+    json.dump({"head": head[0], "head_date": str(head[1]), "asof": str(asof), "metrics_max": str(metrics_max),
+               "asof_source": "dolt-commit" if head_t else "metrics-max", "mode": mode,
                "changed_files": None if changed is None else len(changed), "deleted_files": None if deleted is None else len(deleted), **bad},
               open(f"{out}/asof.json", "w"))
 
-    if base:  # replace the base atomically (3 files)
-        new = base.rstrip("/") + ".new"
-        shutil.rmtree(new, ignore_errors=True)
-        os.makedirs(new)
-        pq.write_table(ftab, os.path.join(new, "files.parquet"), compression="zstd")
-        shutil.copyfile(rows_pq, os.path.join(new, "rows.parquet"))
-        shutil.copyfile(met_pq, os.path.join(new, "metrics.parquet"))
-        old = base.rstrip("/") + ".old"
-        shutil.rmtree(old, ignore_errors=True)
-        if os.path.isdir(base):
-            os.rename(base, old)
-        os.rename(new, base)
-        shutil.rmtree(old, ignore_errors=True)
+    if base:  # new generation of the base; CURRENT moves only after all 3 files are written
+        def populate(tmp):
+            genstate.hook("base-files")
+            pq.write_table(ftab, os.path.join(tmp, "files.parquet"), compression="zstd")
+            genstate.hook("base-rows")
+            shutil.copyfile(rows_pq, os.path.join(tmp, "rows.parquet"))
+            genstate.hook("base-metrics")
+            shutil.copyfile(met_pq, os.path.join(tmp, "metrics.parquet"))
+
+        genstate.publish(Path(base), populate)
         log("base updated")
     shutil.rmtree(work, ignore_errors=True)
     log("done")
