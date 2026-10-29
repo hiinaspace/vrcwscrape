@@ -14,6 +14,10 @@ class Config(BaseSettings):
     oneshot_max_worlds: int = Field(
         2500, description="Maximum number of worlds to scrape in oneshot mode"
     )
+    scrape_age_k: float = Field(
+        0.25,
+        description="Age-aware rescrape cadence: interval <= k * world age (days). 0 disables.",
+    )
     oneshot_max_seconds: float | None = Field(
         None,
         description="Optional wall-clock budget for oneshot mode; no new batches start after it elapses (None = unlimited)",

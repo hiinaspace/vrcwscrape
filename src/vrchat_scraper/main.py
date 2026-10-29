@@ -127,10 +127,10 @@ async def async_main(mode: str = "daemon") -> int:
     manage_dolt = mode == "oneshot" and config.oneshot_manage_dolt
     if manage_dolt:
         # Create database object but don't initialize yet
-        db = Database(config.database_url)
+        db = Database(config.database_url, age_k=config.scrape_age_k)
         await start_dolt_service(db)
     else:
-        db = Database(config.database_url)
+        db = Database(config.database_url, age_k=config.scrape_age_k)
 
     try:
         # Initialize database schema
