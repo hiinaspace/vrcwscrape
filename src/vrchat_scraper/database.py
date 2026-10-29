@@ -631,18 +631,18 @@ class Database:
                 result = await session.execute(stmt)
                 status_counts[status.value.lower()] = result.scalar()
 
-            pending_count = status_counts["pending"]
+        pending_count = status_counts["pending"]
+        # Outside the session: the cache fetch opens its own, and the MySQL pool holds one connection.
+        rescrape_count = (await self._get_rescrape_cache())["due_total"]
 
-            rescrape_count = (await self._get_rescrape_cache())["due_total"]
-
-            return {
-                "pending": pending_count,
-                "due_for_rescrape": rescrape_count,
-                "total": pending_count + rescrape_count,
-                "deleted": status_counts["deleted"],
-                "success": status_counts["success"],
-                "error": status_counts["error"],
-            }
+        return {
+            "pending": pending_count,
+            "due_for_rescrape": rescrape_count,
+            "total": pending_count + rescrape_count,
+            "deleted": status_counts["deleted"],
+            "success": status_counts["success"],
+            "error": status_counts["error"],
+        }
 
     async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
         """Get world IDs that need scraping based on strategy."""
@@ -659,14 +659,14 @@ class Database:
             result = await session.execute(pending_stmt)
             world_ids = [row[0] for row in result.fetchall()]
 
-            if len(world_ids) < limit:
-                remaining = limit - len(world_ids)
-                cache = await self._get_rescrape_cache()
-                taken = cache["candidates"][:remaining]
-                del cache["candidates"][:remaining]
-                world_ids.extend(taken)
+        if len(world_ids) < limit:  # outside the session (one-connection pool)
+            remaining = limit - len(world_ids)
+            cache = await self._get_rescrape_cache()
+            taken = cache["candidates"][:remaining]
+            del cache["candidates"][:remaining]
+            world_ids.extend(taken)
 
-            return world_ids
+        return world_ids
 
     async def upsert_world_with_files(
         self,

@@ -226,3 +226,30 @@ async def test_batches_pop_from_cache_without_repeats():
     assert (await db.count_worlds_due_for_scraping())["due_for_rescrape"] == 5
     db.reset_rescrape_cache()
     assert len(await db.get_worlds_to_scrape(limit=10)) == 5
+
+
+@pytest.mark.asyncio
+async def test_never_nests_sessions_one_connection_pool():
+    """Production's MySQL pool holds ONE connection: opening a session inside another deadlocks (2026-10-29)."""
+    import contextlib
+
+    db = await make_db()
+    await add_world(db, "wrld_young", published=NOW - timedelta(days=3), scraped=NOW - timedelta(days=2))
+    real, depth = db.async_session, [0]
+
+    @contextlib.asynccontextmanager
+    async def guarded():
+        depth[0] += 1
+        try:
+            assert depth[0] == 1, "nested session: would deadlock a size-1 pool"
+            async with real() as s:
+                yield s
+        finally:
+            depth[0] -= 1
+
+    db.async_session = guarded
+    db.reset_rescrape_cache()
+    counts = await db.count_worlds_due_for_scraping()
+    assert counts["due_for_rescrape"] == 1
+    db.reset_rescrape_cache()
+    assert await db.get_worlds_to_scrape(limit=10) == ["wrld_young"]
