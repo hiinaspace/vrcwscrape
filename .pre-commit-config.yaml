@@ -1,3 +1,4 @@
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # Ruff version.
@@ -8,3 +9,20 @@ repos:
       args: [ --fix ]
     # Run the formatter.
     - id: ruff-format
+- repo: local
+  hooks:
+    - id: persona-lint
+      name: persona-lint (gitleaks + private denylist)
+      entry: |-
+        sh -c 'if command -v persona-lint >/dev/null; then exec persona-lint "$@"; elif [ -d "$HOME/org" ]; then echo "persona-lint missing; reinstall via the tools dir in ~/org (see the install flag there)" >&2; exit 1; fi' --
+      language: system
+      pass_filenames: false
+      always_run: true
+      stages: [pre-commit]
+    - id: persona-lint-msg
+      name: persona-lint (commit message)
+      entry: |-
+        sh -c 'if command -v persona-lint >/dev/null; then exec persona-lint "$@"; elif [ -d "$HOME/org" ]; then echo "persona-lint missing; reinstall via the tools dir in ~/org (see the install flag there)" >&2; exit 1; fi' -- --msg
+      language: system
+      pass_filenames: true
+      stages: [commit-msg]
