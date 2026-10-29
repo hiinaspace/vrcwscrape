@@ -1,6 +1,7 @@
 """Database connection and operations for VRChat scraper."""
 
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -18,7 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.sql import and_, or_
+from sqlalchemy.sql import and_
 
 from .models import FileReference, PendingImageDownload
 
@@ -135,8 +136,54 @@ class ImageContent(Base):
     file_metadata: Mapped["FileMetadata"] = relationship()
 
 
+def tier_days(heat, popularity, occupants) -> int:
+    """Popularity tier rescrape interval in days (None metrics count as 0)."""
+    heat, popularity, occupants = heat or 0, popularity or 0, occupants or 0
+    if heat >= 50 or popularity >= 50 or occupants >= 25:
+        return 1
+    if heat >= 10 or popularity >= 10 or occupants >= 5:
+        return 7
+    if heat > 0 or popularity > 0 or occupants > 0:
+        return 30
+    return 180
+
+
+def compute_born(publish: Optional[datetime], update: Optional[datetime]):
+    """Later of publish and update date; None if both are missing."""
+    dates = [d for d in (publish, update) if d is not None]
+    return max(dates) if dates else None
+
+
+def rescrape_interval_days(
+    tier: float, born: Optional[datetime], last: datetime, k: float
+) -> float:
+    """min(tier, max(1, k * hours(born -> last) / 24)); tier if k<=0 or no born."""
+    if k <= 0 or born is None:
+        return tier
+    age_days = (last - born).total_seconds() / 3600.0 / 24.0
+    return min(tier, max(1.0, k * age_days))
+
+
+def is_due(tier, born, last: Optional[datetime], now: datetime, k: float) -> bool:
+    """Worlds with no metrics are always due."""
+    if last is None:
+        return True
+    days_since = (now - last).total_seconds() / 86400.0
+    return days_since >= rescrape_interval_days(tier, born, last, k)
+
+
+def overdue_ratio(tier, born, last: Optional[datetime], now: datetime, k: float):
+    """days_since_last / interval; infinite for worlds with no metrics."""
+    if last is None:
+        return float("inf")
+    days_since = (now - last).total_seconds() / 86400.0
+    return days_since / rescrape_interval_days(tier, born, last, k)
+
+
 class Database:
     """Database layer for VRChat world metadata storage."""
+
+    RESCRAPE_CACHE_TTL = timedelta(minutes=30)
 
     def __init__(self, connection_string: str, age_k: float = 0.25):
         """Initialize database connection.
@@ -146,6 +193,7 @@ class Database:
         """
         self.connection_string = connection_string
         self.age_k = age_k
+        self._rescrape_cache: Optional[dict] = None
         converted_connection_string = self._convert_connection_string(connection_string)
 
         # SQLite doesn't support pool_size parameter
@@ -495,100 +543,68 @@ class Database:
             dt = dt.replace(tzinfo=None)
         return dt
 
-    def _rescrape_due_clauses(self, now: datetime):
-        """Build the shared rescrape due rule for SUCCESS worlds.
+    def reset_rescrape_cache(self) -> None:
+        """Drop the cached rescrape candidate list (call at the start of a run)."""
+        self._rescrape_cache = None
 
-        Returns (latest_metrics, due_expr, overdue_ratio_expr). Only scalar
-        columns are touched (never the JSON columns), to keep Dolt memory low.
+    async def _get_rescrape_cache(self) -> dict:
+        """Fetch scalar columns once and build the sorted candidate list.
 
-        interval_days = least(tier_days, greatest(1, K * hours(born -> last
-        metrics) / 24)), where born is the later of publish and update date
-        (falling back to the last metrics time when both are NULL, which means
-        no age shortening). With K == 0 the age term is dropped entirely.
+        One cheap query (no JSON columns); the due rule and ordering are applied
+        in Python, with `now` fixed at fetch time. The cache is reused for
+        later batches until reset_rescrape_cache() or RESCRAPE_CACHE_TTL.
         """
-        is_mysql = "mysql" in self.connection_string.lower()
-        _, hours_diff = self._get_time_diff_funcs()
-
-        latest_metrics_time = (
+        cache = self._rescrape_cache
+        if cache is not None and (
+            datetime.utcnow() - cache["now"] < self.RESCRAPE_CACHE_TTL
+        ):
+            return cache
+        now = datetime.utcnow()
+        lm = (
             select(
                 WorldMetrics.world_id.label("world_id"),
-                func.max(WorldMetrics.scrape_time).label("last_metrics_time"),
+                func.max(WorldMetrics.scrape_time).label("t"),
             )
             .group_by(WorldMetrics.world_id)
             .subquery()
         )
-        latest_metrics = (
+        stmt = (
             select(
-                WorldMetrics.world_id.label("world_id"),
-                WorldMetrics.scrape_time.label("last_metrics_time"),
-                WorldMetrics.heat.label("heat"),
-                WorldMetrics.popularity.label("popularity"),
-                WorldMetrics.occupants.label("occupants"),
-            )
-            .join(
-                latest_metrics_time,
-                and_(
-                    WorldMetrics.world_id == latest_metrics_time.c.world_id,
-                    WorldMetrics.scrape_time == latest_metrics_time.c.last_metrics_time,
-                ),
-            )
-            .subquery()
-        )
-
-        tier_days = sqlalchemy.case(
-            (
-                or_(
-                    latest_metrics.c.heat >= 50,
-                    latest_metrics.c.popularity >= 50,
-                    latest_metrics.c.occupants >= 25,
-                ),
-                1,
-            ),
-            (
-                or_(
-                    latest_metrics.c.heat >= 10,
-                    latest_metrics.c.popularity >= 10,
-                    latest_metrics.c.occupants >= 5,
-                ),
-                7,
-            ),
-            (
-                or_(
-                    latest_metrics.c.heat > 0,
-                    latest_metrics.c.popularity > 0,
-                    latest_metrics.c.occupants > 0,
-                ),
-                30,
-            ),
-            else_=180,
-        )
-
-        last = latest_metrics.c.last_metrics_time
-        if self.age_k > 0:
-            greatest = func.greatest if is_mysql else func.max
-            born = func.coalesce(
-                greatest(
-                    World.publish_date,
-                    func.coalesce(World.update_date, World.publish_date),
-                ),
+                World.world_id,
+                World.publish_date,
                 World.update_date,
+                lm.c.t,
+                WorldMetrics.heat,
+                WorldMetrics.popularity,
+                WorldMetrics.occupants,
             )
-            age_interval = self.age_k * hours_diff(last, born) / 24.0
-            age_interval = sqlalchemy.case((age_interval < 1, 1.0), else_=age_interval)
-            interval_days = sqlalchemy.case(
-                # No publish/update date at all: no age shortening.
-                (born.is_(None), tier_days),
-                (age_interval < tier_days, age_interval),
-                else_=tier_days,
+            .outerjoin(lm, lm.c.world_id == World.world_id)
+            .outerjoin(
+                WorldMetrics,
+                and_(
+                    WorldMetrics.world_id == lm.c.world_id,
+                    WorldMetrics.scrape_time == lm.c.t,
+                ),
             )
-        else:
-            interval_days = tier_days
-
-        days_since = hours_diff(now, last) / 24.0
-        due = or_(last.is_(None), days_since >= interval_days)
-        # No metrics at all: most overdue possible.
-        ratio = func.coalesce(days_since / interval_days, 1e9)
-        return latest_metrics, due, ratio
+            .where(World.scrape_status == ScrapeStatus.SUCCESS)
+        )
+        async with self.async_session() as session:
+            rows = (await session.execute(stmt)).all()
+        scored = []
+        for wid, pub, upd, last, heat, pop, occ in rows:
+            tier = tier_days(heat, pop, occ)
+            born = compute_born(pub, upd)
+            if is_due(tier, born, last, now, self.age_k):
+                scored.append((overdue_ratio(tier, born, last, now, self.age_k), wid))
+        random.shuffle(scored)  # random tie order
+        scored.sort(key=lambda x: x[0], reverse=True)  # stable
+        self._rescrape_cache = {
+            "now": now,
+            "candidates": [wid for _, wid in scored],
+            "due_total": len(scored),
+            "handed": 0,
+        }
+        return self._rescrape_cache
 
     async def count_worlds_due_for_scraping(self) -> dict:
         """Count how many worlds are due for scraping, broken down by category.
@@ -617,16 +633,7 @@ class Database:
 
             pending_count = status_counts["pending"]
 
-            latest_metrics, due, _ = self._rescrape_due_clauses(datetime.utcnow())
-            rescrape_stmt = (
-                select(func.count())
-                .select_from(World)
-                .outerjoin(latest_metrics, latest_metrics.c.world_id == World.world_id)
-                .where(and_(World.scrape_status == ScrapeStatus.SUCCESS, due))
-            )
-
-            result = await session.execute(rescrape_stmt)
-            rescrape_count = result.scalar()
+            rescrape_count = (await self._get_rescrape_cache())["due_total"]
 
             return {
                 "pending": pending_count,
@@ -636,17 +643,6 @@ class Database:
                 "success": status_counts["success"],
                 "error": status_counts["error"],
             }
-
-    def _build_rescrape_stmt(self, now: datetime, limit: int):
-        """Single-query rescrape selection, most overdue first (ties random)."""
-        latest_metrics, due, ratio = self._rescrape_due_clauses(now)
-        return (
-            select(World.world_id)
-            .outerjoin(latest_metrics, latest_metrics.c.world_id == World.world_id)
-            .where(and_(World.scrape_status == ScrapeStatus.SUCCESS, due))
-            .order_by(ratio.desc(), self._get_random_func())
-            .limit(limit)
-        )
 
     async def get_worlds_to_scrape(self, limit: int = 100) -> List[str]:
         """Get world IDs that need scraping based on strategy."""
@@ -665,9 +661,10 @@ class Database:
 
             if len(world_ids) < limit:
                 remaining = limit - len(world_ids)
-                rescrape_stmt = self._build_rescrape_stmt(datetime.utcnow(), remaining)
-                result = await session.execute(rescrape_stmt)
-                world_ids.extend([row[0] for row in result.fetchall()])
+                cache = await self._get_rescrape_cache()
+                taken = cache["candidates"][:remaining]
+                del cache["candidates"][:remaining]
+                world_ids.extend(taken)
 
             return world_ids
 

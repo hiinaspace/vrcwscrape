@@ -165,8 +165,9 @@ async def test_most_overdue_first_and_count_matches():
     await add_world(db, "r11", published=pub, scraped=NOW - timedelta(days=198))
     await add_world(db, "r20", published=pub, scraped=NOW - timedelta(days=360))
     assert await due(db) == ["r20", "r15", "r11"]
-    assert await due(db, limit=2) == ["r20", "r15"]
     assert (await db.count_worlds_due_for_scraping())["due_for_rescrape"] == 3
+    db.reset_rescrape_cache()
+    assert await due(db, limit=2) == ["r20", "r15"]
 
 
 @pytest.mark.asyncio
@@ -178,3 +179,50 @@ async def test_pending_first():
         db, "pend", published=pub, scraped=None, status=ScrapeStatus.PENDING
     )
     assert await due(db) == ["pend", "old"]
+
+
+def test_pure_rule():
+    from src.vrchat_scraper.database import (
+        compute_born,
+        is_due,
+        overdue_ratio,
+        rescrape_interval_days,
+        tier_days,
+    )
+
+    last = datetime(2026, 1, 10)
+    born = last - timedelta(hours=9)
+    assert rescrape_interval_days(180, born, last, 0.25) == 1.0
+    assert rescrape_interval_days(180, born, last, 0) == 180
+    assert rescrape_interval_days(180, None, last, 0.25) == 180
+    assert rescrape_interval_days(1, last - timedelta(days=400), last, 0.25) == 1
+    assert rescrape_interval_days(180, last - timedelta(days=40), last, 0.25) == 10
+    assert rescrape_interval_days(180, last - timedelta(days=1000), last, 0.25) == 180
+    assert compute_born(None, None) is None
+    assert compute_born(last, None) == last
+    assert compute_born(last - timedelta(days=1), last) == last
+    assert tier_days(0, 0, 0) == 180 and tier_days(None, 0, 5) == 7
+    assert tier_days(60, 0, 0) == 1 and tier_days(1, 0, 0) == 30
+    now = last + timedelta(hours=23)
+    assert not is_due(180, born, last, now, 0.25)
+    assert is_due(180, born, last, last + timedelta(hours=24), 0.25)
+    assert is_due(180, born, None, now, 0.25)
+    assert overdue_ratio(180, born, last, last + timedelta(days=2), 0.25) == 2.0
+    assert overdue_ratio(180, born, None, now, 0.25) == float("inf")
+
+
+@pytest.mark.asyncio
+async def test_batches_pop_from_cache_without_repeats():
+    db = await make_db()
+    pub = NOW - timedelta(days=1000)
+    for i in range(5):
+        await add_world(
+            db, f"w{i}", published=pub, scraped=NOW - timedelta(days=200 + i * 10)
+        )
+    first = await db.get_worlds_to_scrape(limit=2)
+    second = await db.get_worlds_to_scrape(limit=2)
+    third = await db.get_worlds_to_scrape(limit=2)
+    assert first == ["w4", "w3"] and second == ["w2", "w1"] and third == ["w0"]
+    assert (await db.count_worlds_due_for_scraping())["due_for_rescrape"] == 5
+    db.reset_rescrape_cache()
+    assert len(await db.get_worlds_to_scrape(limit=10)) == 5

@@ -107,6 +107,7 @@ class VRChatScraper:
             self._oneshot_deadline = self._time_source() + self._oneshot_max_seconds
             logger.info(f"One-shot time budget: {self._oneshot_max_seconds}s")
 
+        self.database.reset_rescrape_cache()
         try:
             # Log how many worlds are due for scraping before we start
             try:
