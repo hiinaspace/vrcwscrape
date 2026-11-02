@@ -43,6 +43,7 @@ LIVE_URL = os.environ.get("LIVE_URL", "https://worldsearch.hiina.space").rstrip(
 DRY = os.environ.get("DRY_RUN", "") not in ("", "0")
 REUSE = os.environ.get("REUSE_EXTRACT", "") not in ("", "0")
 THREADS = os.environ.get("THREADS", "10")
+MAX_EMBED = os.environ.get("MAX_EMBED", "30000")  # a normal week is ~10k new worlds; the guard is for a seed or model mismatch
 WRANGLER = "wrangler@4.151.3"
 SEARCH = Path(__file__).resolve().parents[1]  # <checkout>/search
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -430,7 +431,7 @@ def main() -> int:
 
         hf_thread.join()
         with step("embeddings: delta (CPU fp32) + static bits"):
-            py([str(SEARCH / "refresh/embed_delta.py"), "--parquet", str(bpq), "--state", str(STATE / "emb"), "--out", str(build / "emb")], tag="[emb] ")
+            py([str(SEARCH / "refresh/embed_delta.py"), "--parquet", str(bpq), "--state", str(STATE / "emb"), "--out", str(build / "emb"), "--max-embed", MAX_EMBED], tag="[emb] ")
             save_hf()
         with step("thumbnails: encode new shas"):
             py([str(SEARCH / "refresh/thumbs_delta.py"), "--parquet", str(bpq), "--state", str(STATE / "thumbs"), "--images", str(IMAGES),
